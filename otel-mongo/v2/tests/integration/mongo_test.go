@@ -28,6 +28,7 @@ var mongoURI string
 func TestMain(m *testing.M) {
 	_ = os.Setenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED", "1")
 	_ = os.Setenv("OTEL_MONGO_TRACING_ENABLED", "1")
+	_ = os.Setenv("OTEL_MONGO_PROPAGATION_ENABLED", "1")
 
 	ctx := context.Background()
 
