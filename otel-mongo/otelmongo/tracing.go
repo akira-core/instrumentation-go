@@ -89,7 +89,12 @@ func extractMetadataFromRaw(raw bson.Raw) (*TraceMetadata, bool) {
 // is returned unchanged.
 // Uses otel.GetTextMapPropagator() (global, read-only). For isolated propagator use,
 // pre-enrich ctx with the desired propagator before calling this function.
+// When document propagation is disabled (same env gates as Collection write/read paths:
+// OTEL_INSTRUMENTATION_GO_TRACING_ENABLED and OTEL_MONGO_PROPAGATION_ENABLED), returns ctx unchanged.
 func ContextFromRawDocument(ctx context.Context, raw bson.Raw) context.Context {
+	if !mongoPropagationEnabled() {
+		return ctx
+	}
 	meta, ok := extractMetadataFromRaw(raw)
 	if !ok {
 		return ctx
@@ -100,7 +105,11 @@ func ContextFromRawDocument(ctx context.Context, raw bson.Raw) context.Context {
 // ContextFromDocument extracts span context from fullDoc._oteltrace and injects
 // it into the provided ctx before reading the resulting span context.
 // Returns (zero, false) when metadata is absent/invalid or marshal fails.
+// When document propagation is disabled (same env gates as Collection), returns (zero, false).
 func ContextFromDocument(ctx context.Context, fullDoc any) (trace.SpanContext, bool) {
+	if !mongoPropagationEnabled() {
+		return trace.SpanContext{}, false
+	}
 	raw, err := bson.Marshal(fullDoc)
 	if err != nil {
 		return trace.SpanContext{}, false

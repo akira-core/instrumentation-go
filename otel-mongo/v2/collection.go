@@ -9,6 +9,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 // Collection wraps *mongo.Collection and overrides CRUD methods to inject and
@@ -25,9 +26,21 @@ type Collection struct {
 
 // NewCollection wraps an existing *mongo.Collection with trace propagation.
 // Tracer and propagator are required; use WithTracerProvider/WithPropagators via Connect
-// for the standard init path.
+// for the standard init path. Document _oteltrace injection follows the same env gates as
+// Connect (OTEL_INSTRUMENTATION_GO_TRACING_ENABLED and OTEL_MONGO_PROPAGATION_ENABLED); there is
+// no per-wrapper option—use ConnectWithOptions(..., WithTracePropagationEnabled(...)) for that.
+// When the global+module tracing gate is off, the supplied tracer is replaced with a noop
+// tracer so wrapper CLIENT spans are suppressed — symmetric with Connect.
 func NewCollection(coll *mongo.Collection, tracer trace.Tracer, propagator propagation.TextMapPropagator) *Collection {
-	return &Collection{Collection: coll, tracer: tracer, propagator: propagator}
+	if !mongoTracingEnabled() {
+		tracer = noop.NewTracerProvider().Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
+	}
+	return &Collection{
+		Collection:         coll,
+		tracer:             tracer,
+		propagator:         propagator,
+		propagationEnabled: mongoPropagationEnabled(),
+	}
 }
 
 func (c *Collection) dbAndColl() (dbName, collName string) {
