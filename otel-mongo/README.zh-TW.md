@@ -53,8 +53,13 @@ coll := db.Collection("mycoll")
 
 ### 3. 從文件還原 trace（例如 change stream）
 
+需與寫入相同的 propagation 環境變數（`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`、`OTEL_MONGO_PROPAGATION_ENABLED`，或 global 開啟時用 `ConnectWithOptions` 的 `WithTracePropagationEnabled`）。當 gates 關閉時，`ContextFromDocument` / `ContextFromRawDocument` 會回傳零值或不變的 ctx — 忽略 `ok` 回傳值的舊呼叫端會靜默變成 no-op。
+
 ```go
-outCtx := otelmongo.ContextFromDocument(ctx, fullDoc)
+if sc, ok := otelmongo.ContextFromDocument(ctx, fullDoc); ok {
+	next := trace.ContextWithRemoteSpanContext(ctx, sc)
+	_ = next // 用於後續 span 或轉發（例如 NATS）
+}
 ```
 
 ### 4. 測試

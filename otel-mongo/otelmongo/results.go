@@ -4,9 +4,9 @@ import (
 	"context"
 
 	"go.mongodb.org/mongo-driver/mongo"
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -40,18 +40,21 @@ type BulkWriteResult struct {
 // or ContextFromDocument(ctx, event.FullDocument) for manual extraction.
 type ChangeStream struct {
 	*mongo.ChangeStream
-	spanName        string
-	baseSpanOpts    []trace.SpanStartOption
-	deliverTracer   trace.Tracer         // nil when disabled
-	deliverSpanName string               // e.g. "messaging.messages deliver"
-	deliverAttrs    []attribute.KeyValue // same attrs as producer-side deliver span
+	tracer             trace.Tracer                  // consumer-side app tracer
+	propagator         propagation.TextMapPropagator // for extracting trace from documents
+	propagationEnabled bool
+	spanName           string
+	baseSpanOpts       []trace.SpanStartOption
+	deliverTracer      trace.Tracer         // nil when disabled
+	deliverSpanName    string               // e.g. "messaging.messages deliver"
+	deliverAttrs       []attribute.KeyValue // same attrs as producer-side deliver span
 }
 
 // buildConsumerCtx creates a detached context with a consumer span linked to originSpanCtx.
 // When deliverTracer is non-nil and originSpanCtx is valid, a consumer-side deliver span
 // (SpanKindProducer) is created first and the consumer span becomes its child.
 // This helper is extracted for testability.
-func buildConsumerCtx(ctx context.Context, deliverTracer trace.Tracer, deliverSpanName string, deliverAttrs []attribute.KeyValue, spanName string, baseSpanOpts []trace.SpanStartOption, originSpanCtx trace.SpanContext) (context.Context, trace.Span) {
+func buildConsumerCtx(ctx context.Context, tracer trace.Tracer, deliverTracer trace.Tracer, deliverSpanName string, deliverAttrs []attribute.KeyValue, spanName string, baseSpanOpts []trace.SpanStartOption, originSpanCtx trace.SpanContext) (context.Context, trace.Span) {
 	detachedCtx := trace.ContextWithSpanContext(ctx, trace.SpanContext{})
 	consumerCtx := detachedCtx
 
@@ -71,7 +74,6 @@ func buildConsumerCtx(ctx context.Context, deliverTracer trace.Tracer, deliverSp
 		spanOpts = append(spanOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
 	}
 
-	tracer := otel.GetTracerProvider().Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
 	return tracer.Start(consumerCtx, spanName, spanOpts...)
 }
 
@@ -94,17 +96,17 @@ func (cs *ChangeStream) DecodeWithContext(ctx context.Context, val any) (context
 	var originSpanCtx trace.SpanContext
 
 	fullDoc, err := cs.Current.LookupErr("fullDocument")
-	if err == nil {
+	if err == nil && cs.propagationEnabled {
 		docRaw, ok := fullDoc.DocumentOK()
 		if ok {
 			if meta, ok := extractMetadataFromRaw(docRaw); ok {
-				originCtx := contextFromTraceMetadata(context.Background(), meta)
+				originCtx := contextFromTraceMetadata(context.Background(), meta, cs.propagator)
 				originSpanCtx = trace.SpanContextFromContext(originCtx)
 			}
 		}
 	}
 
-	newCtx, span := buildConsumerCtx(ctx, cs.deliverTracer, cs.deliverSpanName, cs.deliverAttrs, cs.spanName, cs.baseSpanOpts, originSpanCtx)
+	newCtx, span := buildConsumerCtx(ctx, cs.tracer, cs.deliverTracer, cs.deliverSpanName, cs.deliverAttrs, cs.spanName, cs.baseSpanOpts, originSpanCtx)
 
 	if err := cs.ChangeStream.Decode(val); err != nil {
 		span.RecordError(err)

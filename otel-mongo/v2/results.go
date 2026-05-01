@@ -4,9 +4,9 @@ import (
 	"context"
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -40,11 +40,14 @@ type BulkWriteResult struct {
 // or ContextFromDocument(ctx, event.FullDocument) for manual extraction.
 type ChangeStream struct {
 	*mongo.ChangeStream
-	spanName        string
-	baseSpanOpts    []trace.SpanStartOption
-	deliverTracer   trace.Tracer         // nil when disabled
-	deliverSpanName string               // e.g. "messaging.messages deliver"
-	deliverAttrs    []attribute.KeyValue // same attrs as producer-side deliver span
+	tracer             trace.Tracer                  // consumer-side app tracer
+	propagator         propagation.TextMapPropagator // for extracting trace from documents
+	propagationEnabled bool
+	spanName           string
+	baseSpanOpts       []trace.SpanStartOption
+	deliverTracer      trace.Tracer         // nil when disabled
+	deliverSpanName    string               // e.g. "messaging.messages deliver"
+	deliverAttrs       []attribute.KeyValue // same attrs as producer-side deliver span
 }
 
 // Next advances the change stream to the next change document. See *mongo.ChangeStream.Next.
@@ -67,12 +70,12 @@ func (cs *ChangeStream) DecodeWithContext(ctx context.Context, val any) (context
 	var originSpanCtx trace.SpanContext
 
 	fullDoc, err := cs.Current.LookupErr("fullDocument")
-	if err == nil {
+	if err == nil && cs.propagationEnabled {
 		docRaw, ok := fullDoc.DocumentOK()
 		if ok {
 			if meta, ok := extractMetadataFromRaw(docRaw); ok {
 				// Keep it separate from `ctx` so the created span stays "link-only".
-				originCtx := contextFromTraceMetadata(context.Background(), meta)
+				originCtx := contextFromTraceMetadata(context.Background(), meta, cs.propagator)
 				originSpanCtx = trace.SpanContextFromContext(originCtx)
 			}
 		}
@@ -101,8 +104,7 @@ func (cs *ChangeStream) DecodeWithContext(ctx context.Context, val any) (context
 		spanOpts = append(spanOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
 	}
 
-	tracer := otel.GetTracerProvider().Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
-	newCtx, span := tracer.Start(consumerCtx, cs.spanName, spanOpts...)
+	newCtx, span := cs.tracer.Start(consumerCtx, cs.spanName, spanOpts...)
 
 	if err := cs.ChangeStream.Decode(val); err != nil {
 		span.RecordError(err)

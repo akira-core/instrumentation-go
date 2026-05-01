@@ -28,7 +28,7 @@ func TestBuildConsumerCtx_NewTraceIDAndLinksOriginTrace(t *testing.T) {
 	originSpan.End()
 
 	// Pass a context that still carries origin span context, and ensure the helper detaches it.
-	newCtx, span := buildConsumerCtx(originCtx, nil, "", nil, "test-decode-span", nil, originSpanCtx)
+	newCtx, span := buildConsumerCtx(originCtx, tracer, nil, "", nil, "test-decode-span", nil, originSpanCtx)
 	span.End()
 
 	recovered := trace.SpanContextFromContext(newCtx)
@@ -73,7 +73,7 @@ func TestBuildConsumerCtx_WithDeliverTracer_ChildOfDeliver(t *testing.T) {
 	originSpanCtx := originSpan.SpanContext()
 	originSpan.End()
 
-	newCtx, span := buildConsumerCtx(context.Background(), deliverTracer, "test deliver", nil, "test-consumer-span", nil, originSpanCtx)
+	newCtx, span := buildConsumerCtx(context.Background(), tracer, deliverTracer, "test deliver", nil, "test-consumer-span", nil, originSpanCtx)
 	span.End()
 
 	consumerSpanCtx := trace.SpanContextFromContext(newCtx)

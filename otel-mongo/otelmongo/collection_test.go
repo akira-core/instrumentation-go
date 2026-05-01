@@ -9,9 +9,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	tcmongo "github.com/testcontainers/testcontainers-go/modules/mongodb"
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.opentelemetry.io/otel"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -144,7 +144,7 @@ func TestConnectGlobalOff_ZeroWrapperSpans(t *testing.T) {
 	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
 	otel.SetTracerProvider(tp)
 
-	client, err := Connect(options.Client().ApplyURI(uri))
+	client, err := Connect(context.Background(), options.Client().ApplyURI(uri))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
 
@@ -174,7 +174,7 @@ func TestCollectionInsertOneAndFind(t *testing.T) {
 	tracer := tp.Tracer("otelmongo", trace.WithInstrumentationVersion("0.1.0"))
 
 	otel.SetTracerProvider(tp)
-	client, err := Connect(options.Client().ApplyURI(uri))
+	client, err := Connect(context.Background(), options.Client().ApplyURI(uri))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
 
@@ -207,7 +207,7 @@ func TestCollectionInsertMany_StoresOtelTrace(t *testing.T) {
 	tracer := tp.Tracer("otelmongo", trace.WithInstrumentationVersion("0.1.0"))
 
 	otel.SetTracerProvider(tp)
-	client, err := Connect(options.Client().ApplyURI(uri))
+	client, err := Connect(context.Background(), options.Client().ApplyURI(uri))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
 
@@ -243,7 +243,7 @@ func TestCollectionReplaceOne_StoresOtelTrace(t *testing.T) {
 	tracer := tp.Tracer("otelmongo", trace.WithInstrumentationVersion("0.1.0"))
 
 	otel.SetTracerProvider(tp)
-	client, err := Connect(options.Client().ApplyURI(uri))
+	client, err := Connect(context.Background(), options.Client().ApplyURI(uri))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
 
@@ -277,7 +277,7 @@ func TestCollectionUpdateOne_InjectTrace(t *testing.T) {
 	tracer := tp.Tracer("otelmongo", trace.WithInstrumentationVersion("0.1.0"))
 
 	otel.SetTracerProvider(tp)
-	client, err := Connect(options.Client().ApplyURI(uri))
+	client, err := Connect(context.Background(), options.Client().ApplyURI(uri))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
 
@@ -313,7 +313,7 @@ func TestCollectionDeleteOne_OneRoundTrip(t *testing.T) {
 	tp, sr := integrationTP(t)
 
 	otel.SetTracerProvider(tp)
-	client, err := Connect(options.Client().ApplyURI(uri))
+	client, err := Connect(context.Background(), options.Client().ApplyURI(uri))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
 
@@ -343,7 +343,7 @@ func TestCollectionCountDocuments(t *testing.T) {
 	uri := requireMongoDB(t)
 	tp, _ := integrationTP(t)
 	otel.SetTracerProvider(tp)
-	client, err := Connect(options.Client().ApplyURI(uri))
+	client, err := Connect(context.Background(), options.Client().ApplyURI(uri))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
 
@@ -366,7 +366,7 @@ func TestCollectionUpdateByID_InjectTrace(t *testing.T) {
 	tp, sr := integrationTP(t)
 	tracer := tp.Tracer("otelmongo", trace.WithInstrumentationVersion("0.1.0"))
 	otel.SetTracerProvider(tp)
-	client, err := Connect(options.Client().ApplyURI(uri))
+	client, err := Connect(context.Background(), options.Client().ApplyURI(uri))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
 
@@ -397,7 +397,7 @@ func TestCollectionDeleteOneByID(t *testing.T) {
 	uri := requireMongoDB(t)
 	tp, sr := integrationTP(t)
 	otel.SetTracerProvider(tp)
-	client, err := Connect(options.Client().ApplyURI(uri))
+	client, err := Connect(context.Background(), options.Client().ApplyURI(uri))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
 
@@ -426,7 +426,7 @@ func TestCollectionFindOneByID(t *testing.T) {
 	uri := requireMongoDB(t)
 	tp, _ := integrationTP(t)
 	otel.SetTracerProvider(tp)
-	client, err := Connect(options.Client().ApplyURI(uri))
+	client, err := Connect(context.Background(), options.Client().ApplyURI(uri))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
 
@@ -450,7 +450,7 @@ func TestCollectionFindByIDs(t *testing.T) {
 	uri := requireMongoDB(t)
 	tp, _ := integrationTP(t)
 	otel.SetTracerProvider(tp)
-	client, err := Connect(options.Client().ApplyURI(uri))
+	client, err := Connect(context.Background(), options.Client().ApplyURI(uri))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
 
@@ -477,7 +477,7 @@ func TestCollectionBulkWrite(t *testing.T) {
 	uri := requireMongoDB(t)
 	tp, sr := integrationTP(t)
 	otel.SetTracerProvider(tp)
-	client, err := Connect(options.Client().ApplyURI(uri))
+	client, err := Connect(context.Background(), options.Client().ApplyURI(uri))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
 

@@ -25,6 +25,13 @@ func enableTracing(t *testing.T) {
 	t.Setenv(envMongoTracingEnabled, "1")
 }
 
+// enableDocumentPropagation sets the same env gates as Collection / ContextFrom* for _oteltrace.
+func enableDocumentPropagation(t *testing.T) {
+	t.Helper()
+	t.Setenv(envGlobalTracingEnabled, "1")
+	t.Setenv(envMongoPropagationEnabled, "1")
+}
+
 func Test_extractMetadataFromRaw(t *testing.T) {
 	enableTracing(t)
 	t.Run("valid_document_returns_metadata", func(t *testing.T) {
@@ -87,7 +94,7 @@ func Test_injectTraceIntoDocument(t *testing.T) {
 		ctx := context.Background()
 		doc := bson.D{{Key: "x", Value: 1}}
 
-		out, err := injectTraceIntoDocument(ctx, doc)
+		out, err := injectTraceIntoDocument(ctx, doc, otel.GetTextMapPropagator())
 		require.NoError(t, err)
 		require.Len(t, out, 1)
 		assert.Equal(t, "x", out[0].Key)
@@ -110,7 +117,7 @@ func Test_injectTraceIntoDocument(t *testing.T) {
 		defer span.End()
 
 		doc := bson.D{{Key: "x", Value: 1}}
-		out, err := injectTraceIntoDocument(ctx, doc)
+		out, err := injectTraceIntoDocument(ctx, doc, otel.GetTextMapPropagator())
 		require.NoError(t, err)
 		require.GreaterOrEqual(t, len(out), 2)
 		var meta TraceMetadata
@@ -130,14 +137,14 @@ func Test_injectTraceIntoDocument(t *testing.T) {
 		ctx := context.Background()
 		ch := make(chan int)
 
-		_, err := injectTraceIntoDocument(ctx, ch)
+		_, err := injectTraceIntoDocument(ctx, ch, otel.GetTextMapPropagator())
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "marshal")
 	})
 }
 
 func Test_ContextFromRawDocument(t *testing.T) {
-	enableTracing(t)
+	enableDocumentPropagation(t)
 	t.Run("raw_without_oteltrace_returns_ctx_unchanged", func(t *testing.T) {
 		doc := bson.D{{Key: "a", Value: 1}}
 		raw, err := bson.Marshal(doc)
@@ -167,10 +174,27 @@ func Test_ContextFromRawDocument(t *testing.T) {
 		assert.True(t, sc.IsValid())
 		assert.Equal(t, "12345678901234567890123456789012", sc.TraceID().String())
 	})
+
+	t.Run("propagation_disabled_returns_ctx_unchanged_even_with_oteltrace", func(t *testing.T) {
+		t.Setenv(envGlobalTracingEnabled, "true")
+		t.Setenv(envMongoPropagationEnabled, "false")
+		traceparent := "00-12345678901234567890123456789012-0123456789012345-01"
+		doc := bson.D{
+			{Key: TraceMetadataKey, Value: bson.D{
+				{Key: "traceparent", Value: traceparent},
+			}},
+		}
+		raw, err := bson.Marshal(doc)
+		require.NoError(t, err)
+		ctx := context.Background()
+		out := ContextFromRawDocument(ctx, raw)
+		assert.Equal(t, ctx, out)
+		assert.False(t, trace.SpanFromContext(out).SpanContext().IsValid())
+	})
 }
 
 func Test_ContextFromDocument(t *testing.T) {
-	enableTracing(t)
+	enableDocumentPropagation(t)
 	t.Run("full_document_with_trace_metadata_returns_valid_span_context", func(t *testing.T) {
 		fullDoc := bson.M{
 			"_oteltrace": bson.M{
@@ -194,10 +218,23 @@ func Test_ContextFromDocument(t *testing.T) {
 		require.False(t, ok)
 		assert.False(t, sc.IsValid())
 	})
+
+	t.Run("propagation_disabled_returns_false_despite_metadata", func(t *testing.T) {
+		t.Setenv(envGlobalTracingEnabled, "true")
+		t.Setenv(envMongoPropagationEnabled, "false")
+		fullDoc := bson.M{
+			"_oteltrace": bson.M{
+				"traceparent": "00-12345678901234567890123456789012-0123456789012345-01",
+			},
+		}
+		sc, ok := ContextFromDocument(context.Background(), fullDoc)
+		require.False(t, ok)
+		assert.False(t, sc.IsValid())
+	})
 }
 
 func Test_ContextFromRawDocument_Exported(t *testing.T) {
-	enableTracing(t)
+	enableDocumentPropagation(t)
 	traceparent := "00-12345678901234567890123456789012-0123456789012345-01"
 	doc := bson.D{
 		{Key: TraceMetadataKey, Value: bson.D{
@@ -218,7 +255,7 @@ func Test_injectTraceIntoUpdate(t *testing.T) {
 		ctx := context.Background()
 		update := bson.D{{Key: "$set", Value: bson.D{{Key: "x", Value: 1}}}}
 
-		out, err := injectTraceIntoUpdate(ctx, update)
+		out, err := injectTraceIntoUpdate(ctx, update, otel.GetTextMapPropagator())
 		require.NoError(t, err)
 		assert.Equal(t, update, out)
 	})
@@ -231,7 +268,7 @@ func Test_injectTraceIntoUpdate(t *testing.T) {
 		defer span.End()
 
 		update := bson.D{{Key: "$set", Value: bson.D{{Key: "status", Value: "ok"}}}}
-		out, err := injectTraceIntoUpdate(ctx, update)
+		out, err := injectTraceIntoUpdate(ctx, update, otel.GetTextMapPropagator())
 		require.NoError(t, err)
 		outD, ok := out.(bson.D)
 		require.True(t, ok)
@@ -262,7 +299,7 @@ func Test_injectTraceIntoUpdate(t *testing.T) {
 		defer span.End()
 
 		replacement := bson.D{{Key: "name", Value: "foo"}}
-		out, err := injectTraceIntoUpdate(ctx, replacement)
+		out, err := injectTraceIntoUpdate(ctx, replacement, otel.GetTextMapPropagator())
 		require.NoError(t, err)
 		outD, ok := out.(bson.D)
 		require.True(t, ok)
@@ -296,7 +333,7 @@ func Test_injectTraceIntoUpdate_DotNotationPreserved(t *testing.T) {
 		{Key: "p._id", Value: "444"},
 	}}}
 
-	out, err := injectTraceIntoUpdate(ctx, update)
+	out, err := injectTraceIntoUpdate(ctx, update, otel.GetTextMapPropagator())
 	require.NoError(t, err)
 	outD, ok := out.(bson.D)
 	require.True(t, ok)

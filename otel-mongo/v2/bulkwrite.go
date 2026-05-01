@@ -6,11 +6,12 @@ import (
 	"reflect"
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 // buildBulkWriteModelsWithTrace returns a new slice of WriteModels with _oteltrace
 // injected into InsertOneModel, UpdateOneModel, and UpdateManyModel. Other model types are unchanged.
-func buildBulkWriteModelsWithTrace(ctx context.Context, models []mongo.WriteModel) ([]mongo.WriteModel, error) {
+func buildBulkWriteModelsWithTrace(ctx context.Context, models []mongo.WriteModel, prop propagation.TextMapPropagator) ([]mongo.WriteModel, error) {
 	out := make([]mongo.WriteModel, 0, len(models))
 	for _, m := range models {
 		switch vm := m.(type) {
@@ -20,7 +21,7 @@ func buildBulkWriteModelsWithTrace(ctx context.Context, models []mongo.WriteMode
 				out = append(out, m)
 				continue
 			}
-			docWithTrace, err := injectTraceIntoDocument(ctx, doc)
+			docWithTrace, err := injectTraceIntoDocument(ctx, doc, prop)
 			if err != nil {
 				return nil, fmt.Errorf("otelmongo: bulk insert inject trace: %w", err)
 			}
@@ -31,7 +32,7 @@ func buildBulkWriteModelsWithTrace(ctx context.Context, models []mongo.WriteMode
 				out = append(out, m)
 				continue
 			}
-			updateWithTrace, err := injectTraceIntoUpdate(ctx, update)
+			updateWithTrace, err := injectTraceIntoUpdate(ctx, update, prop)
 			if err != nil {
 				return nil, fmt.Errorf("otelmongo: bulk updateOne inject trace: %w", err)
 			}
@@ -44,7 +45,7 @@ func buildBulkWriteModelsWithTrace(ctx context.Context, models []mongo.WriteMode
 				out = append(out, m)
 				continue
 			}
-			updateWithTrace, err := injectTraceIntoUpdate(ctx, update)
+			updateWithTrace, err := injectTraceIntoUpdate(ctx, update, prop)
 			if err != nil {
 				return nil, fmt.Errorf("otelmongo: bulk updateMany inject trace: %w", err)
 			}

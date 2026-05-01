@@ -19,18 +19,23 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.27.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 // Client wraps *mongo.Client with OpenTelemetry instrumentation.
-// Tracer and propagator are read from otel globals (set via WithTracerProvider/WithPropagators at Connect).
+// Tracer and propagator are derived once at Connect time from WithTracerProvider/WithPropagators options,
+// falling back to otel globals when not provided. The globals are never overwritten.
 type Client struct {
 	*mongo.Client
-	serverAddr    string
-	serverPort    int
-	deliverTracer trace.Tracer             // MongoDB deliver span tracer (nil when disabled)
-	mongoTP       *sdktrace.TracerProvider // independent TracerProvider (nil when disabled)
+	serverAddr         string
+	serverPort         int
+	tracer             trace.Tracer                  // derived from option or otel.GetTracerProvider()
+	propagator         propagation.TextMapPropagator // from option or otel.GetTextMapPropagator()
+	propagationEnabled bool
+	deliverTracer      trace.Tracer             // MongoDB deliver span tracer (nil when disabled)
+	mongoTP            *sdktrace.TracerProvider // independent TracerProvider for deliver spans (nil when disabled)
 }
 
 // ClientOption configures Connect/NewClient. Per OTel contrib: accept TracerProvider and Propagators.
@@ -43,8 +48,9 @@ type clientOptionFunc func(*clientConfig)
 func (f clientOptionFunc) apply(c *clientConfig) { f(c) }
 
 type clientConfig struct {
-	TracerProvider trace.TracerProvider
-	Propagators    propagation.TextMapPropagator
+	TracerProvider     trace.TracerProvider
+	Propagators        propagation.TextMapPropagator
+	PropagationEnabled *bool
 }
 
 // WithTracerProvider sets the TracerProvider for the client. Defaults to otel.GetTracerProvider().
@@ -65,6 +71,16 @@ func WithPropagators(p propagation.TextMapPropagator) ClientOption {
 	})
 }
 
+// WithTracePropagationEnabled sets whether _oteltrace propagation is enabled for this client
+// when the global switch OTEL_INSTRUMENTATION_GO_TRACING_ENABLED is truthy.
+// It overrides OTEL_MONGO_PROPAGATION_ENABLED for the module default only; it cannot enable
+// propagation while the global switch is unset or false.
+func WithTracePropagationEnabled(v bool) ClientOption {
+	return clientOptionFunc(func(c *clientConfig) {
+		c.PropagationEnabled = &v
+	})
+}
+
 func newClientConfig(opts []ClientOption) *clientConfig {
 	cfg := &clientConfig{}
 	for _, o := range opts {
@@ -79,17 +95,25 @@ func Connect(ctx context.Context, opts ...*options.ClientOptions) (*Client, erro
 	return ConnectWithOptions(ctx, nil, opts...)
 }
 
-// ConnectWithOptions creates a Client. Passed-in TracerProvider/Propagators are set to otel globals;
-// tracer/propagator are then read from globals. Call otel.SetTracerProvider and otel.SetTextMapPropagator
-// at process startup as an alternative to passing options here.
+// ConnectWithOptions creates a Client. When WithTracerProvider/WithPropagators are passed, they are
+// stored in the Client and used for all tracing — the otel globals are never overwritten.
+// Without options, falls back to otel.GetTracerProvider()/otel.GetTextMapPropagator() at connect time.
 func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*options.ClientOptions) (*Client, error) {
 	cfg := newClientConfig(traceOpts)
-	if cfg.TracerProvider != nil {
-		otel.SetTracerProvider(cfg.TracerProvider)
+	tp := cfg.TracerProvider
+	if tp == nil {
+		tp = otel.GetTracerProvider()
 	}
-	if cfg.Propagators != nil {
-		otel.SetTextMapPropagator(cfg.Propagators)
+	prop := cfg.Propagators
+	if prop == nil {
+		prop = otel.GetTextMapPropagator()
 	}
+	propEnabled := resolveDocumentPropagation(cfg.PropagationEnabled)
+	tracerProvider := tp
+	if !mongoTracingEnabled() {
+		tracerProvider = noop.NewTracerProvider()
+	}
+	tracer := tracerProvider.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
 	merged := options.MergeClientOptions(opts...)
 	mc, err := mongo.Connect(ctx, merged)
 	if err != nil {
@@ -102,11 +126,14 @@ func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*
 		mongoTP, deliverTracer = initMongoProvider(addr, port)
 	}
 	return &Client{
-		Client:        mc,
-		serverAddr:    addr,
-		serverPort:    port,
-		mongoTP:       mongoTP,
-		deliverTracer: deliverTracer,
+		Client:             mc,
+		serverAddr:         addr,
+		serverPort:         port,
+		tracer:             tracer,
+		propagator:         prop,
+		propagationEnabled: propEnabled,
+		mongoTP:            mongoTP,
+		deliverTracer:      deliverTracer,
 	}, nil
 }
 
@@ -234,12 +261,15 @@ func mongoServiceName(addr string, port int) string {
 	return "mongodb://" + addr
 }
 
-// Database returns a wrapped Database for document-level tracing (uses otel globals).
+// Database returns a wrapped Database for document-level tracing.
 func (c *Client) Database(name string, opts ...*options.DatabaseOptions) *Database {
 	return &Database{
-		Database:      c.Client.Database(name, opts...),
-		serverAddr:    c.serverAddr,
-		serverPort:    c.serverPort,
-		deliverTracer: c.deliverTracer,
+		Database:           c.Client.Database(name, opts...),
+		serverAddr:         c.serverAddr,
+		serverPort:         c.serverPort,
+		tracer:             c.tracer,
+		propagator:         c.propagator,
+		propagationEnabled: c.propagationEnabled,
+		deliverTracer:      c.deliverTracer,
 	}
 }

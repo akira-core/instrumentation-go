@@ -16,7 +16,7 @@ package otelgorillaws
 
 // Version is the current release version of the WebSocket instrumentation.
 func Version() string {
-	return "0.2.9"
+	return "0.2.11"
 }
 
 // SemVersion returns the version string for tracer creation. Alias for Version().

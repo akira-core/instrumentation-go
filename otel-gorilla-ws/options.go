@@ -3,6 +3,7 @@ package otelgorillaws
 import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -50,5 +51,5 @@ func applyOptions(c *Conn, opts []Option) {
 	if tp == nil {
 		tp = otel.GetTracerProvider()
 	}
-	c.tracer = tp.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
+	c.tracer = tp.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()), trace.WithSchemaURL(semconv.SchemaURL))
 }
