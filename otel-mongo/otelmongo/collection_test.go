@@ -74,8 +74,9 @@ func TestNewCollection(t *testing.T) {
 	assert.Equal(t, raw, coll.Collection)
 	assert.NotNil(t, coll.tracer)
 
-	t.Run("propagationEnabled follows env when global on", func(t *testing.T) {
+	t.Run("propagationEnabled follows env when tracing on", func(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "1")
+		t.Setenv(envMongoTracingEnabled, "1")
 		t.Setenv(envMongoPropagationEnabled, "1")
 		c2 := NewCollection(raw, tracer, otel.GetTextMapPropagator())
 		assert.True(t, c2.propagationEnabled)
@@ -83,7 +84,16 @@ func TestNewCollection(t *testing.T) {
 
 	t.Run("propagationEnabled false when module propagation env false", func(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "1")
+		t.Setenv(envMongoTracingEnabled, "1")
 		t.Setenv(envMongoPropagationEnabled, "false")
+		c2 := NewCollection(raw, tracer, otel.GetTextMapPropagator())
+		assert.False(t, c2.propagationEnabled)
+	})
+
+	t.Run("propagationEnabled false when mongo tracing off even if propagation on", func(t *testing.T) {
+		t.Setenv(envGlobalTracingEnabled, "1")
+		t.Setenv(envMongoTracingEnabled, "false")
+		t.Setenv(envMongoPropagationEnabled, "1")
 		c2 := NewCollection(raw, tracer, otel.GetTextMapPropagator())
 		assert.False(t, c2.propagationEnabled)
 	})

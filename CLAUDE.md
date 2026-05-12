@@ -88,10 +88,10 @@ Three env vars plus optional `ConnectWithOptions` override (all default **disabl
 | Env var | Scope |
 |---|---|
 | `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | global master switch (must be truthy for any mongo module flag or `WithTracePropagationEnabled` to apply) |
-| `OTEL_MONGO_TRACING_ENABLED` | wrapper **CLIENT** spans, deliver-span wiring, and noop vs real tracer for this package |
-| `OTEL_MONGO_PROPAGATION_ENABLED` | `_oteltrace` inject/extract on Collection/Cursor/ChangeStream and **ContextFromDocument** / **ContextFromRawDocument** |
+| `OTEL_MONGO_TRACING_ENABLED` | gates **both** wrapper **CLIENT** spans (noop vs real tracer, deliver-span wiring) **and** `_oteltrace` document propagation for this package |
+| `OTEL_MONGO_PROPAGATION_ENABLED` | only consulted when both global and `OTEL_MONGO_TRACING_ENABLED` are on; final say on `_oteltrace` inject/extract on Collection/Cursor/ChangeStream and **ContextFromDocument** / **ContextFromRawDocument** |
 
-`envEnabledByDefault()` returns `false` when a var is absent. When `OTEL_MONGO_TRACING_ENABLED` is unset/disabled, this package uses a noop tracer for its wrapper spans — **no Mongo CLIENT spans from otel-mongo** (driver/contrib monitor spans are unchanged). Document propagation still follows `OTEL_MONGO_PROPAGATION_ENABLED` and global when using `Connect`; `WithTracePropagationEnabled` only overrides the module propagation default and **cannot** enable propagation if the global switch is off.
+`envEnabledByDefault()` returns `false` when a var is absent. When `OTEL_MONGO_TRACING_ENABLED` is unset/disabled, this package uses a noop tracer for its wrapper spans **and** force-disables `_oteltrace` propagation — Mongo tracing and Mongo trace propagation share a single kill switch. `WithTracePropagationEnabled` only overrides the propagation default while both tracing gates are on; it **cannot** enable propagation when global or module tracing is off.
 
 ### Deliver Spans
 
@@ -118,7 +118,7 @@ When any feature flag returns false, **no OTel SDK code path may run**: no `trac
 
 ### Propagation flag caching (otel-mongo)
 
-`ContextFromDocument` / `ContextFromRawDocument` (`tracing.go`, both v1 and v2) call `cachedPropagationEnabled()`, which reads env **once** via `sync.Once` and stores in `atomic.Bool` (`env_flags.go`). **Env changes after first call are ignored.** Tests that toggle `OTEL_MONGO_PROPAGATION_ENABLED` or `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` via `t.Setenv` **must** call `resetPropEnabledCacheForTest()` after the Setenv to reset the cache. Helpers `enableTracing` / `enableDocumentPropagation` in `tracing_test.go` already invoke reset + `t.Cleanup`. Do **not** add `t.Parallel()` to tests that touch these env vars — the reset is not parallel-safe.
+`ContextFromDocument` / `ContextFromRawDocument` (`tracing.go`, both v1 and v2) call `cachedPropagationEnabled()`, which reads env **once** via `sync.Once` and stores in `atomic.Bool` (`env_flags.go`). The cached value reflects the full gate: `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` AND `OTEL_MONGO_TRACING_ENABLED` AND `OTEL_MONGO_PROPAGATION_ENABLED`. **Env changes after first call are ignored.** Tests that toggle any of those three vars via `t.Setenv` **must** call `resetPropEnabledCacheForTest()` after the Setenv to reset the cache. Helpers `enableTracing` / `enableDocumentPropagation` in `tracing_test.go` already invoke reset + `t.Cleanup` (and `enableDocumentPropagation` now sets all three flags). Do **not** add `t.Parallel()` to tests that touch these env vars — the reset is not parallel-safe.
 
 ### `oteljetstream.MessageBatch.Stop()`
 

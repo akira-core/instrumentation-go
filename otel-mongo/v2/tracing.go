@@ -90,7 +90,8 @@ func extractMetadataFromRaw(raw bson.Raw) (*TraceMetadata, bool) {
 // Uses otel.GetTextMapPropagator() (global, read-only). For isolated propagator use,
 // pre-enrich ctx with the desired propagator before calling this function.
 // When document propagation is disabled (same env gates as Collection write/read paths:
-// OTEL_INSTRUMENTATION_GO_TRACING_ENABLED and OTEL_MONGO_PROPAGATION_ENABLED), returns ctx unchanged.
+// OTEL_INSTRUMENTATION_GO_TRACING_ENABLED **and** OTEL_MONGO_TRACING_ENABLED must both be
+// on for OTEL_MONGO_PROPAGATION_ENABLED to take effect), returns ctx unchanged.
 func ContextFromRawDocument(ctx context.Context, raw bson.Raw) context.Context {
 	if !cachedPropagationEnabled() {
 		return ctx

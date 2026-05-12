@@ -28,10 +28,12 @@ type Collection struct {
 // NewCollection wraps an existing *mongo.Collection with trace propagation.
 // Tracer and propagator are required; use WithTracerProvider/WithPropagators via Connect
 // for the standard init path. Document _oteltrace injection follows the same env gates as
-// Connect (OTEL_INSTRUMENTATION_GO_TRACING_ENABLED and OTEL_MONGO_PROPAGATION_ENABLED); there is
-// no per-wrapper option—use ConnectWithOptions(..., WithTracePropagationEnabled(...)) for that.
-// When the global+module tracing gate is off, the supplied tracer is replaced with a noop
-// tracer so wrapper CLIENT spans are suppressed — symmetric with Connect.
+// Connect: OTEL_INSTRUMENTATION_GO_TRACING_ENABLED **and** OTEL_MONGO_TRACING_ENABLED must
+// both be on before OTEL_MONGO_PROPAGATION_ENABLED is consulted. There is no per-wrapper
+// option—use ConnectWithOptions(..., WithTracePropagationEnabled(...)) for that. When the
+// global+module tracing gate is off, the supplied tracer is replaced with a noop tracer
+// **and** propagationEnabled is forced false so no _oteltrace is injected — wrapper
+// CLIENT spans and document propagation share one kill switch.
 func NewCollection(coll *mongo.Collection, tracer trace.Tracer, propagator propagation.TextMapPropagator) *Collection {
 	tracingOn := mongoTracingEnabled()
 	if !tracingOn {

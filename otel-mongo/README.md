@@ -52,11 +52,13 @@ otel-mongo/
 Defaults: all disabled when unset. Values `false/0/no/off` disable.
 
 Priority:
-1. If global is disabled, mongo module flags and **`WithTracePropagationEnabled(true)`** do not enable document propagation (global cannot be overridden by that option).
-2. If global is enabled, `OTEL_MONGO_TRACING_ENABLED` controls whether this package records wrapper CLIENT spans (when off, a noop tracer is used for those spans).
-3. If global is enabled, `OTEL_MONGO_PROPAGATION_ENABLED` is the default for `_oteltrace`; **`WithTracePropagationEnabled`** in `ConnectWithOptions` overrides that default only while global stays on.
+1. If **global** is disabled, every module flag and **`WithTracePropagationEnabled(true)`** is force-disabled — no wrapper spans, no `_oteltrace` inject/extract.
+2. If global is enabled but **`OTEL_MONGO_TRACING_ENABLED`** is disabled, this package treats Mongo tracing as off: a noop tracer is used for wrapper CLIENT spans **and** `_oteltrace` inject/extract is disabled. `WithTracePropagationEnabled(true)` cannot bypass this — propagation is gated by the same tracing switch.
+3. Only when both global and `OTEL_MONGO_TRACING_ENABLED` are on does `OTEL_MONGO_PROPAGATION_ENABLED` become the default for `_oteltrace`. **`WithTracePropagationEnabled`** in `ConnectWithOptions` overrides that default while both tracing gates stay on.
 
-When tracing flags are unset/disabled, this package’s wrapper does not emit Mongo CLIENT spans to your configured TracerProvider (noop). Deliver spans still require tracing flags plus `OTEL_EXPORTER_OTLP_ENDPOINT` as documented below.
+Rationale: turning off Mongo tracing also turns off Mongo trace propagation so callers get a single, predictable kill switch — there is no scenario where wrapper spans are noop while documents still carry `_oteltrace`.
+
+When tracing flags are unset/disabled, this package’s wrapper does not emit Mongo CLIENT spans to your configured TracerProvider (noop) **and** documents are written without `_oteltrace`. Deliver spans still require tracing flags plus `OTEL_EXPORTER_OTLP_ENDPOINT` as documented below.
 
 ### 1. Initialize provider and propagator (application responsibility)
 
@@ -103,7 +105,7 @@ Optional: **ConnectWithOptions(ctx, traceOpts, mongoOpts)** (v1) or **ConnectWit
 
 ### 3. Restore trace from document (e.g. change streams)
 
-Requires the same propagation env gates as writes (`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` and `OTEL_MONGO_PROPAGATION_ENABLED`, or global on plus `WithTracePropagationEnabled(true)` via `ConnectWithOptions`). When the gates are off, `ContextFromDocument`/`ContextFromRawDocument` return zero/unchanged — existing callers that ignored the `ok` return value will silently no-op.
+Requires the same propagation env gates as writes: **all three of** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`, `OTEL_MONGO_TRACING_ENABLED`, and `OTEL_MONGO_PROPAGATION_ENABLED` must be on — or both tracing gates on plus `WithTracePropagationEnabled(true)` via `ConnectWithOptions`. When any of those gates is off, `ContextFromDocument`/`ContextFromRawDocument` return zero/unchanged — existing callers that ignored the `ok` return value will silently no-op.
 
 ```go
 fullDoc := changeStreamEvent.FullDocument
@@ -226,7 +228,7 @@ Every `InsertOne`, `InsertMany`, `ReplaceOne`, and `UpdateOne`/`UpdateMany`/`Upd
 
 ### `NewCollection` vs `Connect`
 
-`NewCollection` sets **document** `_oteltrace` behaviour from the same env gates as `Connect` (global + `OTEL_MONGO_PROPAGATION_ENABLED`). There is no per-collection functional option for propagation; use **`ConnectWithOptions`** with **`WithTracePropagationEnabled`** when you need to override the env default for a client.
+`NewCollection` sets **document** `_oteltrace` behaviour from the same env gates as `Connect` (global + `OTEL_MONGO_TRACING_ENABLED` + `OTEL_MONGO_PROPAGATION_ENABLED`). When either tracing gate is off, the collection is constructed with propagation disabled. There is no per-collection functional option for propagation; use **`ConnectWithOptions`** with **`WithTracePropagationEnabled`** when you need to override the env default for a client (note: it still cannot bypass a disabled tracing gate).
 
 ### DecodeWithContext vs Decode on Cursor
 

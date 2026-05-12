@@ -73,9 +73,10 @@ func WithPropagators(p propagation.TextMapPropagator) ClientOption {
 }
 
 // WithTracePropagationEnabled sets whether _oteltrace propagation is enabled for this client
-// when the global switch OTEL_INSTRUMENTATION_GO_TRACING_ENABLED is truthy.
+// when both OTEL_INSTRUMENTATION_GO_TRACING_ENABLED and OTEL_MONGO_TRACING_ENABLED are truthy.
 // It overrides OTEL_MONGO_PROPAGATION_ENABLED for the module default only; it cannot enable
-// propagation while the global switch is unset or false.
+// propagation while either tracing gate is unset or false (propagation is force-disabled
+// whenever Mongo tracing is off, so callers get a single kill switch).
 func WithTracePropagationEnabled(v bool) ClientOption {
 	return clientOptionFunc(func(c *clientConfig) {
 		c.PropagationEnabled = &v

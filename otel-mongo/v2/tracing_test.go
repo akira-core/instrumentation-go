@@ -28,9 +28,11 @@ func enableTracing(t *testing.T) {
 }
 
 // enableDocumentPropagation sets the same env gates as Collection / ContextFrom* for _oteltrace.
+// Propagation requires both the global and module tracing flags to be on.
 func enableDocumentPropagation(t *testing.T) {
 	t.Helper()
 	t.Setenv(envGlobalTracingEnabled, "1")
+	t.Setenv(envMongoTracingEnabled, "1")
 	t.Setenv(envMongoPropagationEnabled, "1")
 	resetPropEnabledCacheForTest()
 	t.Cleanup(resetPropEnabledCacheForTest)

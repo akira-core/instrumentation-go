@@ -29,6 +29,25 @@ otel-mongo/
 
 ## 使用方式
 
+### Tracing 功能旗標
+
+`otel-mongo`（v1 + v2）使用一個全域開關加兩個模組開關：
+
+- `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`（全域總開關）
+- `OTEL_MONGO_TRACING_ENABLED`（控制本套件的 wrapper **CLIENT** span、deliver-span 路徑、與 noop vs 實際 tracer — driver/contrib command span 不受此影響）
+- `OTEL_MONGO_PROPAGATION_ENABLED`（控制 wrapped Collection/Cursor/ChangeStream 的 `_oteltrace` 注入/還原，以及 **ContextFromDocument** / **ContextFromRawDocument**）
+
+預設值：未設定即停用。值為 `false/0/no/off` 視為停用。
+
+優先順序：
+1. 若**全域**停用，所有模組旗標與 **`WithTracePropagationEnabled(true)`** 皆強制停用 — 不會產生 wrapper span，也不會做 `_oteltrace` 注入/還原。
+2. 若全域啟用但 **`OTEL_MONGO_TRACING_ENABLED`** 停用，本套件視 Mongo tracing 為關閉：wrapper CLIENT span 改用 noop tracer，**同時** `_oteltrace` 注入/還原也一併停用。`WithTracePropagationEnabled(true)` 無法跨越此 gate — propagation 與 tracing 共用同一個開關。
+3. 只有當全域與 `OTEL_MONGO_TRACING_ENABLED` **皆啟用**時，`OTEL_MONGO_PROPAGATION_ENABLED` 才會作為 `_oteltrace` 的預設值；在兩個 tracing gate 都開啟期間，`ConnectWithOptions` 內的 **`WithTracePropagationEnabled`** 可覆寫該預設。
+
+設計理由：關閉 Mongo tracing 時連同 Mongo trace propagation 也一併關閉，呼叫端只需一個 kill switch — 不會出現 wrapper span 為 noop 但文件仍被寫入 `_oteltrace` 的情境。
+
+當 tracing 旗標未設定或停用時，本套件的 wrapper 不會送出 Mongo CLIENT span 到你配置的 TracerProvider（noop），**且**寫入的文件不會帶有 `_oteltrace`。Deliver span 另外還需 `OTEL_EXPORTER_OTLP_ENDPOINT`，見下文。
+
 ### 1. 初始化 Provider 與 Propagator（應用程式負責）
 
 見 **example/main.go**：建立 TracerProvider（如 OTLP）、設定 `otel.SetTracerProvider(tp)` 與 `otel.SetTextMapPropagator(prop)`、defer shutdown。
@@ -53,7 +72,7 @@ coll := db.Collection("mycoll")
 
 ### 3. 從文件還原 trace（例如 change stream）
 
-需與寫入相同的 propagation 環境變數（`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`、`OTEL_MONGO_PROPAGATION_ENABLED`，或 global 開啟時用 `ConnectWithOptions` 的 `WithTracePropagationEnabled`）。當 gates 關閉時，`ContextFromDocument` / `ContextFromRawDocument` 會回傳零值或不變的 ctx — 忽略 `ok` 回傳值的舊呼叫端會靜默變成 no-op。
+需與寫入相同的 propagation 環境變數：**`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`、`OTEL_MONGO_TRACING_ENABLED`、`OTEL_MONGO_PROPAGATION_ENABLED` 三者都要啟用**，或兩個 tracing gate 啟用搭配 `ConnectWithOptions` 的 `WithTracePropagationEnabled(true)`。當任一 gate 關閉時，`ContextFromDocument` / `ContextFromRawDocument` 會回傳零值或不變的 ctx — 忽略 `ok` 回傳值的舊呼叫端會靜默變成 no-op。
 
 ```go
 if sc, ok := otelmongo.ContextFromDocument(ctx, fullDoc); ok {

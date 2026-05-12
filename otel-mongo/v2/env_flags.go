@@ -31,11 +31,14 @@ func mongoPropagationEnabled() bool {
 }
 
 // resolveDocumentPropagation returns the effective _oteltrace propagation flag for a Client.
-// The global env (OTEL_INSTRUMENTATION_GO_TRACING_ENABLED) must be on; an explicit option
-// override (e.g. WithTracePropagationEnabled) wins, otherwise OTEL_MONGO_PROPAGATION_ENABLED
-// is the default. WithTracePropagationEnabled cannot bypass a disabled global.
+// Both the global env (OTEL_INSTRUMENTATION_GO_TRACING_ENABLED) and the module env
+// (OTEL_MONGO_TRACING_ENABLED) must be on; otherwise propagation is force-disabled so
+// no _oteltrace inject/extract occurs while wrapper spans are off. When both are on,
+// an explicit option override (e.g. WithTracePropagationEnabled) wins, otherwise
+// OTEL_MONGO_PROPAGATION_ENABLED is the default. WithTracePropagationEnabled cannot
+// bypass a disabled tracing gate.
 func resolveDocumentPropagation(override *bool) bool {
-	if !envEnabledByDefault(envGlobalTracingEnabled) {
+	if !mongoTracingEnabled() {
 		return false
 	}
 	return resolveFlag(override, mongoPropagationEnvOnly())
