@@ -36,15 +36,18 @@ type Collection struct {
 // CLIENT spans and document propagation share one kill switch.
 func NewCollection(coll *mongo.Collection, tracer trace.Tracer, propagator propagation.TextMapPropagator) *Collection {
 	tracingOn := mongoTracingEnabled()
+	propagationOn := false
 	if !tracingOn {
 		tracer = noop.NewTracerProvider().Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
+	} else {
+		propagationOn = mongoPropagationEnabled()
 	}
 	return &Collection{
 		Collection:         coll,
 		tracer:             tracer,
 		propagator:         propagator,
 		tracingEnabled:     tracingOn,
-		propagationEnabled: mongoPropagationEnabled(),
+		propagationEnabled: propagationOn,
 	}
 }
 
@@ -88,15 +91,8 @@ func (c *Collection) startDeliverSpan(ctx context.Context, dbName, collName stri
 // InsertOne inserts a document, injecting the deliver span traceparent into "_oteltrace".
 func (c *Collection) InsertOne(ctx context.Context, document any, opts ...options.Lister[options.InsertOneOptions]) (*InsertOneResult, error) {
 	if !c.tracingEnabled {
-		docToInsert := document
-		if c.propagationEnabled {
-			d, err := injectTraceIntoDocument(ctx, document, c.propagator)
-			if err != nil {
-				return nil, fmt.Errorf("otelmongo: inject trace: %w", err)
-			}
-			docToInsert = d
-		}
-		res, err := c.Collection.InsertOne(ctx, docToInsert, opts...)
+		// Tracing off ⇒ propagation off (single kill switch); skip _oteltrace inject entirely.
+		res, err := c.Collection.InsertOne(ctx, document, opts...)
 		if err != nil {
 			return nil, err
 		}
@@ -130,19 +126,7 @@ func (c *Collection) InsertOne(ctx context.Context, document any, opts ...option
 // InsertMany inserts documents, injecting the deliver span traceparent into each "_oteltrace".
 func (c *Collection) InsertMany(ctx context.Context, documents []any, opts ...options.Lister[options.InsertManyOptions]) (*InsertManyResult, error) {
 	if !c.tracingEnabled {
-		docsToInsert := documents
-		if c.propagationEnabled {
-			docsWithTrace := make([]any, 0, len(documents))
-			for _, doc := range documents {
-				d, err := injectTraceIntoDocument(ctx, doc, c.propagator)
-				if err != nil {
-					return nil, fmt.Errorf("otelmongo: inject trace: %w", err)
-				}
-				docsWithTrace = append(docsWithTrace, d)
-			}
-			docsToInsert = docsWithTrace
-		}
-		res, err := c.Collection.InsertMany(ctx, docsToInsert, opts...)
+		res, err := c.Collection.InsertMany(ctx, documents, opts...)
 		if err != nil {
 			return nil, err
 		}
@@ -225,13 +209,7 @@ func (c *Collection) FindOne(ctx context.Context, filter any, opts ...options.Li
 // UpdateOne injects the current trace context into the update and replaces the document's _oteltrace.
 func (c *Collection) UpdateOne(ctx context.Context, filter any, update any, opts ...options.Lister[options.UpdateOneOptions]) (*UpdateResult, error) {
 	if !c.tracingEnabled {
-		updateWithTrace := update
-		if c.propagationEnabled {
-			if u, err := injectTraceIntoUpdate(ctx, update, c.propagator); err == nil {
-				updateWithTrace = u
-			}
-		}
-		res, err := c.Collection.UpdateOne(ctx, filter, updateWithTrace, opts...)
+		res, err := c.Collection.UpdateOne(ctx, filter, update, opts...)
 		if err != nil {
 			return nil, err
 		}
@@ -267,13 +245,7 @@ func (c *Collection) UpdateOne(ctx context.Context, filter any, update any, opts
 // UpdateMany injects the current trace context into the update for all matched documents.
 func (c *Collection) UpdateMany(ctx context.Context, filter any, update any, opts ...options.Lister[options.UpdateManyOptions]) (*UpdateResult, error) {
 	if !c.tracingEnabled {
-		updateWithTrace := update
-		if c.propagationEnabled {
-			if u, err := injectTraceIntoUpdate(ctx, update, c.propagator); err == nil {
-				updateWithTrace = u
-			}
-		}
-		res, err := c.Collection.UpdateMany(ctx, filter, updateWithTrace, opts...)
+		res, err := c.Collection.UpdateMany(ctx, filter, update, opts...)
 		if err != nil {
 			return nil, err
 		}
@@ -309,15 +281,7 @@ func (c *Collection) UpdateMany(ctx context.Context, filter any, update any, opt
 // ReplaceOne injects the current trace context into the replacement document.
 func (c *Collection) ReplaceOne(ctx context.Context, filter any, replacement any, opts ...options.Lister[options.ReplaceOptions]) (*UpdateResult, error) {
 	if !c.tracingEnabled {
-		replacementToUse := replacement
-		if c.propagationEnabled {
-			r, err := injectTraceIntoDocument(ctx, replacement, c.propagator)
-			if err != nil {
-				return nil, fmt.Errorf("otelmongo: inject trace: %w", err)
-			}
-			replacementToUse = r
-		}
-		res, err := c.Collection.ReplaceOne(ctx, filter, replacementToUse, opts...)
+		res, err := c.Collection.ReplaceOne(ctx, filter, replacement, opts...)
 		if err != nil {
 			return nil, err
 		}
@@ -470,13 +434,7 @@ func (c *Collection) Aggregate(ctx context.Context, pipeline any, opts ...option
 // UpdateByID updates one document by _id, injecting the current trace into the update.
 func (c *Collection) UpdateByID(ctx context.Context, id any, update any, opts ...options.Lister[options.UpdateOneOptions]) (*UpdateResult, error) {
 	if !c.tracingEnabled {
-		updateWithTrace := update
-		if c.propagationEnabled {
-			if u, err := injectTraceIntoUpdate(ctx, update, c.propagator); err == nil {
-				updateWithTrace = u
-			}
-		}
-		res, err := c.Collection.UpdateByID(ctx, id, updateWithTrace, opts...)
+		res, err := c.Collection.UpdateByID(ctx, id, update, opts...)
 		if err != nil {
 			return nil, err
 		}
@@ -527,15 +485,7 @@ func (c *Collection) FindByIDs(ctx context.Context, ids []any, opts ...options.L
 // BulkWrite runs multiple write operations, injecting trace context into write models.
 func (c *Collection) BulkWrite(ctx context.Context, models []mongo.WriteModel, opts ...options.Lister[options.BulkWriteOptions]) (*BulkWriteResult, error) {
 	if !c.tracingEnabled {
-		modelsToWrite := models
-		if c.propagationEnabled {
-			injected, err := buildBulkWriteModelsWithTrace(ctx, models, c.propagator)
-			if err != nil {
-				return nil, err
-			}
-			modelsToWrite = injected
-		}
-		res, err := c.Collection.BulkWrite(ctx, modelsToWrite, opts...)
+		res, err := c.Collection.BulkWrite(ctx, models, opts...)
 		if err != nil {
 			return nil, err
 		}

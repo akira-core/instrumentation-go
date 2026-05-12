@@ -119,6 +119,10 @@ func (r *SingleResult) Decode(v any) error {
 func (r *SingleResult) TraceContext() context.Context {
 	defer r.endSpan()
 
+	if !r.tracingEnabled {
+		// Tracing off ⇒ propagation off; never extract _oteltrace.
+		return r.ctx
+	}
 	raw, err := r.SingleResult.Raw()
 	if err != nil {
 		return r.ctx

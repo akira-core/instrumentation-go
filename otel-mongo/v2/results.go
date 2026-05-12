@@ -68,25 +68,11 @@ func (cs *ChangeStream) Decode(val any) error {
 // does not need a fullDocument field; extraction uses the raw BSON internally.
 func (cs *ChangeStream) DecodeWithContext(ctx context.Context, val any) (context.Context, error) {
 	if !cs.tracingEnabled {
+		// Tracing off ⇒ propagation off (single kill switch); skip _oteltrace extract entirely.
 		if err := cs.ChangeStream.Decode(val); err != nil {
 			return ctx, err
 		}
-		if !cs.propagationEnabled {
-			return ctx, nil
-		}
-		fullDoc, err := cs.Current.LookupErr("fullDocument")
-		if err != nil {
-			return ctx, nil
-		}
-		docRaw, ok := fullDoc.DocumentOK()
-		if !ok {
-			return ctx, nil
-		}
-		meta, ok := extractMetadataFromRaw(docRaw)
-		if !ok {
-			return ctx, nil
-		}
-		return contextFromTraceMetadata(ctx, meta, cs.propagator), nil
+		return ctx, nil
 	}
 	// Extract origin trace context from this change event's fullDocument._oteltrace.
 	var originSpanCtx trace.SpanContext
