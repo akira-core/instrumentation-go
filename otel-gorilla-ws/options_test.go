@@ -26,7 +26,7 @@ func TestApplyOptions_GlobalFallback(t *testing.T) {
 	otel.SetTracerProvider(globalTP)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 
-	c := &Conn{}
+	c := &Conn{featureEnabled: true}
 	applyOptions(c, nil)
 
 	_, span := c.tracer.Start(context.Background(), "global-fallback")
@@ -37,6 +37,20 @@ func TestApplyOptions_GlobalFallback(t *testing.T) {
 	assert.Equal(t, propagation.TraceContext{}.Fields(), c.propagator.Fields())
 }
 
+func TestApplyOptions_FeatureDisabled_UsesNoopTracer(t *testing.T) {
+	globalTP, globalRecorder := newRecorderTP(t)
+	otel.SetTracerProvider(globalTP)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	c := &Conn{featureEnabled: false}
+	applyOptions(c, nil)
+
+	_, span := c.tracer.Start(context.Background(), "should-not-be-recorded")
+	span.End()
+
+	assert.Empty(t, globalRecorder.Ended(), "no spans should be recorded on caller's TracerProvider when feature flag is off")
+}
+
 func TestApplyOptions_UsesProvidedOptionsWithoutMutatingGlobals(t *testing.T) {
 	globalTP, globalRecorder := newRecorderTP(t)
 	otel.SetTracerProvider(globalTP)
@@ -45,7 +59,7 @@ func TestApplyOptions_UsesProvidedOptionsWithoutMutatingGlobals(t *testing.T) {
 	customTP, customRecorder := newRecorderTP(t)
 	customProp := propagation.NewCompositeTextMapPropagator(propagation.Baggage{})
 
-	c := &Conn{}
+	c := &Conn{featureEnabled: true}
 	applyOptions(c, []Option{
 		WithTracerProvider(customTP),
 		WithPropagators(customProp),

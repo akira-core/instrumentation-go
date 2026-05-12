@@ -5,6 +5,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 // Option configures a Conn.
@@ -45,6 +46,12 @@ func applyOptions(c *Conn, opts []Option) {
 		c.propagator = cfg.propagator
 	} else {
 		c.propagator = otel.GetTextMapPropagator()
+	}
+
+	if !c.featureEnabled {
+		// Feature flag off ⇒ no OTel SDK call on caller's TracerProvider; use noop tracer.
+		c.tracer = noop.NewTracerProvider().Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
+		return
 	}
 
 	tp := cfg.tracerProvider

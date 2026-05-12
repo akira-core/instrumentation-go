@@ -20,6 +20,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 const (
@@ -113,19 +114,27 @@ func Version() string {
 
 func newConn(nc *nats.Conn, opts ...Option) *Conn {
 	cfg := newConnConfig(opts...)
-	if cfg.TracerProvider == nil {
-		cfg.TracerProvider = otel.GetTracerProvider()
-	}
 	if cfg.Propagators == nil {
 		cfg.Propagators = otel.GetTextMapPropagator()
 	}
-	tracer := cfg.TracerProvider.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()), trace.WithSchemaURL(semconv.SchemaURL))
+	tracingOn := natsTracingEnabled()
+	var tracer trace.Tracer
+	if tracingOn {
+		tp := cfg.TracerProvider
+		if tp == nil {
+			tp = otel.GetTracerProvider()
+		}
+		tracer = tp.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()), trace.WithSchemaURL(semconv.SchemaURL))
+	} else {
+		// Tracing off ⇒ no OTel SDK call on caller's TracerProvider; use noop tracer.
+		tracer = noop.NewTracerProvider().Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
+	}
 	serverAttrs := serverAttrsFromConn(nc)
 	c := &Conn{
 		nc:             nc,
 		tracer:         tracer,
 		propagator:     cfg.Propagators,
-		tracingEnabled: natsTracingEnabled(),
+		tracingEnabled: tracingOn,
 		serverAttrs:    serverAttrs,
 		traceDest:      cfg.TraceDest,
 	}

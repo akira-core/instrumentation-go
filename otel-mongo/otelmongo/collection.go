@@ -168,7 +168,7 @@ func (c *Collection) Find(ctx context.Context, filter any, opts ...*options.Find
 		if err != nil {
 			return nil, err
 		}
-		return &Cursor{Cursor: cursor, parentCtx: ctx, tracer: c.tracer, propagator: c.propagator, tracingEnabled: false, propagationEnabled: c.propagationEnabled}, nil
+		return &Cursor{Cursor: cursor, parentCtx: ctx, tracer: c.tracer, propagator: c.propagator, tracingEnabled: false, propagationEnabled: false}, nil
 	}
 	dbName, collName := c.dbAndColl()
 	ctx, span := c.tracer.Start(ctx, dbSpanName("find", collName),
@@ -193,7 +193,7 @@ func (c *Collection) Find(ctx context.Context, filter any, opts ...*options.Find
 func (c *Collection) FindOne(ctx context.Context, filter any, opts ...*options.FindOneOptions) *SingleResult {
 	if !c.tracingEnabled {
 		sr := c.Collection.FindOne(ctx, filter, opts...)
-		return &SingleResult{SingleResult: sr, ctx: ctx, propagator: c.propagator, tracingEnabled: false, propagationEnabled: c.propagationEnabled}
+		return &SingleResult{SingleResult: sr, ctx: ctx, propagator: c.propagator, tracingEnabled: false, propagationEnabled: false}
 	}
 	dbName, collName := c.dbAndColl()
 	ctx, span := c.tracer.Start(ctx, dbSpanName("find", collName),
@@ -413,7 +413,7 @@ func (c *Collection) Aggregate(ctx context.Context, pipeline any, opts ...*optio
 		if err != nil {
 			return nil, err
 		}
-		return &Cursor{Cursor: cursor, parentCtx: ctx, tracer: c.tracer, propagator: c.propagator, tracingEnabled: false, propagationEnabled: c.propagationEnabled}, nil
+		return &Cursor{Cursor: cursor, parentCtx: ctx, tracer: c.tracer, propagator: c.propagator, tracingEnabled: false, propagationEnabled: false}, nil
 	}
 	dbName, collName := c.dbAndColl()
 	ctx, span := c.tracer.Start(ctx, dbSpanName("aggregate", collName),
@@ -531,7 +531,7 @@ func (c *Collection) Watch(ctx context.Context, pipeline interface{}, opts ...*o
 			tracer:             c.tracer,
 			propagator:         c.propagator,
 			tracingEnabled:     false,
-			propagationEnabled: c.propagationEnabled,
+			propagationEnabled: false,
 		}, nil
 	}
 	dbName, collName := c.dbAndColl()
