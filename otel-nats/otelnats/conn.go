@@ -300,11 +300,11 @@ func (c *Conn) Publish(ctx context.Context, subject string, data []byte) error {
 // Per OTel messaging semconv: "Send" span with creation context injected into message; consumer
 // spans link to this context. Span name is "{operation.name} {destination}".
 func (c *Conn) PublishMsg(ctx context.Context, msg *nats.Msg) error {
-	if msg.Header == nil {
-		msg.Header = make(nats.Header)
-	}
 	if !c.tracingEnabled {
 		return c.nc.PublishMsg(msg)
+	}
+	if msg.Header == nil {
+		msg.Header = make(nats.Header)
 	}
 	if c.traceDest != "" {
 		msg.Header.Set("Nats-Trace-Dest", c.traceDest)

@@ -120,12 +120,12 @@ func (j *jsImpl) Publish(ctx context.Context, subject string, data []byte, opts 
 }
 
 func (j *jsImpl) PublishMsg(ctx context.Context, msg *nats.Msg, opts ...jetstream.PublishOpt) (*PubAck, error) {
+	if !j.conn.TracingEnabled() {
+		return j.js.PublishMsg(ctx, msg, opts...)
+	}
 	tracer, prop := j.conn.TraceContext()
 	if msg.Header == nil {
 		msg.Header = make(nats.Header)
-	}
-	if !j.conn.TracingEnabled() {
-		return j.js.PublishMsg(ctx, msg, opts...)
 	}
 	if dest := j.conn.TraceDest(); dest != "" {
 		msg.Header.Set("Nats-Trace-Dest", dest)
