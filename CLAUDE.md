@@ -105,6 +105,36 @@ Subscribers always receive a `MsgWithContext` (NATS/JetStream) or a new `context
 
 Async consumers (NATS subscribers, MongoDB change stream readers, WebSocket readers) use **span links** rather than parent-child relationships to connect to the producer span. This is intentional — preserves causality without implying synchronous nesting.
 
+### Disabled-mode invariant (0.3.0+)
+
+When any feature flag returns false, **no OTel SDK code path may run**: no `tracer.Start` on a real tracer, no `sdktrace.NewTracerProvider`, no `otlptracegrpc.New` / `otlptracehttp.New`, no `[]attribute.KeyValue` build, no propagator inject/extract. Implementation pattern:
+
+- Connect/constructor reads env once → caches `tracingEnabled bool` on the wrapper struct (`Conn`, `Client`, `Database`, `Collection`, `Cursor`, `SingleResult`, `ChangeStream`).
+- Every public method on the wrapper starts with `if !c.tracingEnabled { /* delegate to native, optional propagation only */ }`.
+- For otel-mongo, `Connect` also substitutes `noop.NewTracerProvider()` when disabled so any stray `tracer.Start` is inert.
+- Deliver-tracer init (`initNATSProvider`, `initMongoProvider`) is gated behind the same `tracingEnabled` check — no exporter or batched SDK provider is spun up when disabled.
+
+**When adding a new public method to any wrapper, the fast-path gate is the first statement.** Examples to copy: `otelmongo.Collection.InsertOne`, `otelnats.Conn.Publish`, `otelgorillaws.Conn.WriteMessage`.
+
+### Propagation flag caching (otel-mongo)
+
+`ContextFromDocument` / `ContextFromRawDocument` (`tracing.go`, both v1 and v2) call `cachedPropagationEnabled()`, which reads env **once** via `sync.Once` and stores in `atomic.Bool` (`env_flags.go`). **Env changes after first call are ignored.** Tests that toggle `OTEL_MONGO_PROPAGATION_ENABLED` or `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` via `t.Setenv` **must** call `resetPropEnabledCacheForTest()` after the Setenv to reset the cache. Helpers `enableTracing` / `enableDocumentPropagation` in `tracing_test.go` already invoke reset + `t.Cleanup`. Do **not** add `t.Parallel()` to tests that touch these env vars — the reset is not parallel-safe.
+
+### `oteljetstream.MessageBatch.Stop()`
+
+`MessageBatch` interface (`oteljetstream/consumer.go`) includes a `Stop()` method (added 0.3.0; **breaking** for custom implementations). Callers that drain `Messages()` to channel close need not call it; callers that `break` / `return` early **must** `defer batch.Stop()` to release the internal goroutine and end the in-flight span. The disabled-tracing path uses `directMessageBatch` (no spans, no attributes, but still 1 goroutine for `jetstream.Msg → Msg` type adaptation).
+
+## Versioning
+
+Each module is tagged independently as `<module>/v<x.y.z>`. Version strings live in:
+
+- `otel-nats/otelnats/conn.go` — `instrumentationVersion` const
+- `otel-mongo/otelmongo/version.go` — `instrumentationVersion` const
+- `otel-mongo/v2/version.go` — `instrumentationVersion` const
+- `otel-gorilla-ws/version.go` — return literal from `Version()`
+
+Bump on any code change to a module before pushing release tag. Module pre-1.0 (`0.x.y`): minor bump allowed for breaking changes.
+
 ## Module-Specific Notes
 
 ### otel-mongo
