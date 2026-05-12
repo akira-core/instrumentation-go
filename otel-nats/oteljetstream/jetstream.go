@@ -108,6 +108,9 @@ func New(conn *otelnats.Conn) (JetStream, error) {
 }
 
 func (j *jsImpl) Publish(ctx context.Context, subject string, data []byte, opts ...jetstream.PublishOpt) (*PubAck, error) {
+	if !j.conn.TracingEnabled() {
+		return j.js.Publish(ctx, subject, data, opts...)
+	}
 	msg := &nats.Msg{
 		Subject: subject,
 		Data:    data,

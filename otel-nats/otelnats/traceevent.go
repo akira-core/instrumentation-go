@@ -124,6 +124,9 @@ func hopTypeName(t string) string {
 // The publisher must set Nats-Trace-Dest on each message (or use WithTraceDestination option).
 // Requires NATS server 2.11+.
 func SubscribeTraceEvents(conn *Conn, subject string) (*nats.Subscription, error) {
+	if !conn.TracingEnabled() {
+		return conn.nc.Subscribe(subject, func(*nats.Msg) {})
+	}
 	tracer, prop := conn.TraceContext()
 	return conn.nc.Subscribe(subject, func(msg *nats.Msg) {
 		var event TraceEvent

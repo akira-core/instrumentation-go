@@ -47,7 +47,7 @@ func TestCursorDecodeWithContext_NewTraceIDAndLinksOriginTrace(t *testing.T) {
 	defer func() { _ = cur.Close(context.Background()) }()
 	require.True(t, cur.Next(context.Background()), "expected cursor.Next=true")
 
-	wrapped := &Cursor{Cursor: cur, parentCtx: context.Background(), tracer: tracer, propagator: prop, propagationEnabled: true}
+	wrapped := &Cursor{Cursor: cur, parentCtx: context.Background(), tracer: tracer, propagator: prop, tracingEnabled: true, propagationEnabled: true}
 
 	var out bson.D
 	enrichedCtx, err := wrapped.DecodeWithContext(context.Background(), &out)

@@ -14,6 +14,7 @@ type Database struct {
 	serverPort         int
 	tracer             trace.Tracer
 	propagator         propagation.TextMapPropagator
+	tracingEnabled     bool
 	propagationEnabled bool
 	deliverTracer      trace.Tracer
 }
@@ -24,6 +25,7 @@ func (d *Database) Collection(name string, opts ...*options.CollectionOptions) *
 		Collection:         d.Database.Collection(name, opts...),
 		tracer:             d.tracer,
 		propagator:         d.propagator,
+		tracingEnabled:     d.tracingEnabled,
 		propagationEnabled: d.propagationEnabled,
 		serverAddr:         d.serverAddr,
 		serverPort:         d.serverPort,

@@ -16,6 +16,7 @@ type Cursor struct {
 	parentCtx          context.Context
 	tracer             trace.Tracer
 	propagator         propagation.TextMapPropagator
+	tracingEnabled     bool
 	propagationEnabled bool
 }
 
@@ -28,6 +29,12 @@ type Cursor struct {
 func (c *Cursor) DecodeWithContext(ctx context.Context, val any) (context.Context, error) {
 	if err := c.Cursor.Decode(val); err != nil {
 		return ctx, err
+	}
+	if !c.tracingEnabled {
+		// Original semantics: when tracing is off the decode span is suppressed,
+		// the origin trace is not enriched into ctx (callers can use ContextFromRawDocument
+		// explicitly for that). Returning ctx unchanged matches the noop-tracer behaviour.
+		return ctx, nil
 	}
 	raw := c.Current
 	var originSpanCtx trace.SpanContext
@@ -62,13 +69,19 @@ type SingleResult struct {
 	span               trace.Span
 	ctx                context.Context
 	propagator         propagation.TextMapPropagator
+	tracingEnabled     bool
 	propagationEnabled bool
 	endOnce            sync.Once
 }
 
-// endSpan ensures the associated span is ended exactly once.
+// endSpan ensures the associated span is ended exactly once. Nil-safe for fast-path
+// SingleResults that have no span attached.
 func (r *SingleResult) endSpan() {
-	r.endOnce.Do(func() { r.span.End() })
+	r.endOnce.Do(func() {
+		if r.span != nil {
+			r.span.End()
+		}
+	})
 }
 
 // Decode decodes the document and records any stored trace context as a span
@@ -76,6 +89,10 @@ func (r *SingleResult) endSpan() {
 // The span is ended exactly once regardless of how many times Decode is called.
 func (r *SingleResult) Decode(v any) error {
 	defer r.endSpan()
+
+	if !r.tracingEnabled {
+		return r.SingleResult.Decode(v)
+	}
 
 	raw, err := r.SingleResult.Raw()
 	if err != nil {

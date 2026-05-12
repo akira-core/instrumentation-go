@@ -23,6 +23,8 @@ func enableTracing(t *testing.T) {
 	t.Helper()
 	t.Setenv(envGlobalTracingEnabled, "1")
 	t.Setenv(envMongoTracingEnabled, "1")
+	resetPropEnabledCacheForTest()
+	t.Cleanup(resetPropEnabledCacheForTest)
 }
 
 // enableDocumentPropagation sets the same env gates as Collection / ContextFrom* for _oteltrace.
@@ -30,6 +32,8 @@ func enableDocumentPropagation(t *testing.T) {
 	t.Helper()
 	t.Setenv(envGlobalTracingEnabled, "1")
 	t.Setenv(envMongoPropagationEnabled, "1")
+	resetPropEnabledCacheForTest()
+	t.Cleanup(resetPropEnabledCacheForTest)
 }
 
 func Test_extractMetadataFromRaw(t *testing.T) {
@@ -178,6 +182,8 @@ func Test_ContextFromRawDocument(t *testing.T) {
 	t.Run("propagation_disabled_returns_ctx_unchanged_even_with_oteltrace", func(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "true")
 		t.Setenv(envMongoPropagationEnabled, "false")
+		resetPropEnabledCacheForTest()
+		t.Cleanup(resetPropEnabledCacheForTest)
 		traceparent := "00-12345678901234567890123456789012-0123456789012345-01"
 		doc := bson.D{
 			{Key: TraceMetadataKey, Value: bson.D{
@@ -222,6 +228,8 @@ func Test_ContextFromDocument(t *testing.T) {
 	t.Run("propagation_disabled_returns_false_despite_metadata", func(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "true")
 		t.Setenv(envMongoPropagationEnabled, "false")
+		resetPropEnabledCacheForTest()
+		t.Cleanup(resetPropEnabledCacheForTest)
 		fullDoc := bson.M{
 			"_oteltrace": bson.M{
 				"traceparent": "00-12345678901234567890123456789012-0123456789012345-01",

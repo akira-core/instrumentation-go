@@ -92,7 +92,7 @@ func extractMetadataFromRaw(raw bson.Raw) (*TraceMetadata, bool) {
 // When document propagation is disabled (same env gates as Collection write/read paths:
 // OTEL_INSTRUMENTATION_GO_TRACING_ENABLED and OTEL_MONGO_PROPAGATION_ENABLED), returns ctx unchanged.
 func ContextFromRawDocument(ctx context.Context, raw bson.Raw) context.Context {
-	if !mongoPropagationEnabled() {
+	if !cachedPropagationEnabled() {
 		return ctx
 	}
 	meta, ok := extractMetadataFromRaw(raw)
@@ -107,7 +107,7 @@ func ContextFromRawDocument(ctx context.Context, raw bson.Raw) context.Context {
 // Returns (zero, false) when metadata is absent/invalid or marshal fails.
 // When document propagation is disabled (same env gates as Collection), returns (zero, false).
 func ContextFromDocument(ctx context.Context, fullDoc any) (trace.SpanContext, bool) {
-	if !mongoPropagationEnabled() {
+	if !cachedPropagationEnabled() {
 		return trace.SpanContext{}, false
 	}
 	raw, err := bson.Marshal(fullDoc)

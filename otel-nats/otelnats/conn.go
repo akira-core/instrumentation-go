@@ -285,6 +285,9 @@ func (c *Conn) Drain() error {
 
 // Publish publishes data to subject. Same as nats.Conn.Publish but accepts context for trace.
 func (c *Conn) Publish(ctx context.Context, subject string, data []byte) error {
+	if !c.tracingEnabled {
+		return c.nc.Publish(subject, data)
+	}
 	msg := &nats.Msg{
 		Subject: subject,
 		Data:    data,
@@ -328,15 +331,15 @@ func (c *Conn) PublishMsg(ctx context.Context, msg *nats.Msg) error {
 // Request sends a request and waits for reply. Same as nats.Conn.Request but accepts context.
 // The timeout parameter is applied to the request; the call returns when the reply is received or timeout is reached.
 func (c *Conn) Request(ctx context.Context, subject string, data []byte, timeout time.Duration) (*nats.Msg, error) {
+	if !c.tracingEnabled {
+		reqCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		return c.nc.RequestWithContext(reqCtx, subject, data)
+	}
 	msg := &nats.Msg{
 		Subject: subject,
 		Data:    data,
 		Header:  make(nats.Header),
-	}
-	if !c.tracingEnabled {
-		reqCtx, cancel := context.WithTimeout(ctx, timeout)
-		defer cancel()
-		return c.nc.RequestMsgWithContext(reqCtx, msg)
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

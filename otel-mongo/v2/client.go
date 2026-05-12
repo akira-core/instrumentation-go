@@ -33,6 +33,7 @@ type Client struct {
 	serverPort         int
 	tracer             trace.Tracer                  // derived from option or otel.GetTracerProvider()
 	propagator         propagation.TextMapPropagator // from option or otel.GetTextMapPropagator()
+	tracingEnabled     bool                          // cached mongoTracingEnabled() result; gates wrapper CLIENT spans
 	propagationEnabled bool
 	deliverTracer      trace.Tracer             // MongoDB deliver span tracer (nil when disabled)
 	mongoTP            *sdktrace.TracerProvider // independent TracerProvider for deliver spans (nil when disabled)
@@ -110,8 +111,9 @@ func ConnectWithOptions(traceOpts []ClientOption, opts ...*options.ClientOptions
 		prop = otel.GetTextMapPropagator()
 	}
 	propEnabled := resolveDocumentPropagation(cfg.PropagationEnabled)
+	tracingOn := mongoTracingEnabled()
 	tracerProvider := tp
-	if !mongoTracingEnabled() {
+	if !tracingOn {
 		tracerProvider = noop.NewTracerProvider()
 	}
 	tracer := tracerProvider.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
@@ -123,7 +125,7 @@ func ConnectWithOptions(traceOpts []ClientOption, opts ...*options.ClientOptions
 	addr, port := parseServerFromURI(merged.GetURI())
 	var mongoTP *sdktrace.TracerProvider
 	var deliverTracer trace.Tracer
-	if mongoTracingEnabled() {
+	if tracingOn {
 		mongoTP, deliverTracer = initMongoProvider(addr, port)
 	}
 	return &Client{
@@ -132,6 +134,7 @@ func ConnectWithOptions(traceOpts []ClientOption, opts ...*options.ClientOptions
 		serverPort:         port,
 		tracer:             tracer,
 		propagator:         prop,
+		tracingEnabled:     tracingOn,
 		propagationEnabled: propEnabled,
 		mongoTP:            mongoTP,
 		deliverTracer:      deliverTracer,
@@ -263,6 +266,7 @@ func (c *Client) Database(name string, opts ...options.Lister[options.DatabaseOp
 		serverPort:         c.serverPort,
 		tracer:             c.tracer,
 		propagator:         c.propagator,
+		tracingEnabled:     c.tracingEnabled,
 		propagationEnabled: c.propagationEnabled,
 		deliverTracer:      c.deliverTracer,
 	}

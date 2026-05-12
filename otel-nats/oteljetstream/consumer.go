@@ -2,6 +2,7 @@ package oteljetstream
 
 import (
 	"context"
+	"sync"
 
 	nats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -40,10 +41,12 @@ type Msg struct {
 func (m Msg) Context() context.Context { return m.Ctx }
 
 // MessageBatch is the result of Fetch/FetchBytes/FetchNoWait. Use Messages() for Msg + trace context.
-// Call Error() after the channel is closed.
+// Call Error() after the channel is closed. Stop releases the internal goroutine and ends any
+// in-flight span; callers that abandon Messages() before it closes must call Stop to avoid leaks.
 type MessageBatch interface {
 	Messages() <-chan Msg
 	Error() error
+	Stop()
 }
 
 // ConsumerInfo mirrors jetstream.ConsumerInfo.
@@ -230,9 +233,26 @@ func receiveAttrs(msg jetstream.Msg, opType string, serverAttrs []attribute.KeyV
 	return attrs
 }
 
+// directMessageBatch is the disabled-tracing wrapper: forwards messages with empty context,
+// no spans, no carriers, no attributes. Stop signals the background goroutine to exit.
+type directMessageBatch struct {
+	ch       chan Msg
+	raw      jetstream.MessageBatch
+	done     chan struct{}
+	stopOnce sync.Once
+}
+
+func (m *directMessageBatch) Messages() <-chan Msg { return m.ch }
+func (m *directMessageBatch) Error() error         { return m.raw.Error() }
+func (m *directMessageBatch) Stop() {
+	m.stopOnce.Do(func() { close(m.done) })
+}
+
 type messageBatchTrace struct {
-	ch  chan Msg
-	raw jetstream.MessageBatch
+	ch       chan Msg
+	raw      jetstream.MessageBatch
+	done     chan struct{}
+	stopOnce sync.Once
 }
 
 // Messages returns a channel of messages with their extracted trace contexts.
@@ -246,20 +266,44 @@ func (m *messageBatchTrace) Error() error {
 	return m.raw.Error()
 }
 
+// Stop signals the background goroutine to exit. Idempotent; safe to call multiple times.
+// Callers that abandon Messages() before it closes must call Stop to release the goroutine
+// and end any in-flight span.
+func (m *messageBatchTrace) Stop() {
+	m.stopOnce.Do(func() { close(m.done) })
+}
+
 func wrapMessageBatch(conn *otelnats.Conn, consumerName string, raw jetstream.MessageBatch) MessageBatch {
+	if !conn.TracingEnabled() {
+		ch := make(chan Msg)
+		done := make(chan struct{})
+		go func() {
+			defer close(ch)
+			for msg := range raw.Messages() {
+				select {
+				case ch <- Msg{Msg: msg, Ctx: context.Background()}:
+				case <-done:
+					return
+				}
+			}
+		}()
+		return &directMessageBatch{ch: ch, raw: raw, done: done}
+	}
 	ch := make(chan Msg)
+	done := make(chan struct{})
 	go func() {
 		defer close(ch)
-		tracer, prop := conn.TraceContext()
 		var lastSpan trace.Span
+		defer func() {
+			if lastSpan != nil {
+				lastSpan.End()
+			}
+		}()
+		tracer, prop := conn.TraceContext()
 		for msg := range raw.Messages() {
 			if lastSpan != nil {
 				lastSpan.End()
 				lastSpan = nil
-			}
-			if !conn.TracingEnabled() {
-				ch <- Msg{Msg: msg, Ctx: context.Background()}
-				continue
 			}
 			h := msg.Headers()
 			if h == nil {
@@ -277,14 +321,16 @@ func wrapMessageBatch(conn *otelnats.Conn, consumerName string, raw jetstream.Me
 				opts = append(opts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
 			}
 			ctx, span := tracer.Start(consumerParentCtx, "receive "+msg.Subject(), opts...)
-			lastSpan = span
-			ch <- Msg{Msg: msg, Ctx: ctx}
-		}
-		if lastSpan != nil {
-			lastSpan.End()
+			select {
+			case ch <- Msg{Msg: msg, Ctx: ctx}:
+				lastSpan = span
+			case <-done:
+				span.End()
+				return
+			}
 		}
 	}()
-	return &messageBatchTrace{ch: ch, raw: raw}
+	return &messageBatchTrace{ch: ch, raw: raw, done: done}
 }
 
 type consumeContextImpl struct {

@@ -54,7 +54,7 @@ func TestCursorDecodeWithContext_ExtractsTrace(t *testing.T) {
 
 	require.True(t, cursor.Next(context.Background()))
 
-	c := &Cursor{Cursor: cursor, parentCtx: ctx, tracer: tracer, propagator: stdProp, propagationEnabled: true}
+	c := &Cursor{Cursor: cursor, parentCtx: ctx, tracer: tracer, propagator: stdProp, tracingEnabled: true, propagationEnabled: true}
 
 	var result bson.D
 	_, err = c.DecodeWithContext(context.Background(), &result)
@@ -93,7 +93,7 @@ func TestCursorDecodeWithContext_NoTrace(t *testing.T) {
 	require.True(t, cursor.Next(context.Background()))
 
 	baseCtx := context.Background()
-	c := &Cursor{Cursor: cursor, parentCtx: baseCtx, tracer: tracer, propagator: stdProp}
+	c := &Cursor{Cursor: cursor, parentCtx: baseCtx, tracer: tracer, propagator: stdProp, tracingEnabled: true}
 
 	var result bson.D
 	_, err = c.DecodeWithContext(baseCtx, &result)
@@ -171,6 +171,7 @@ func TestSingleResultDecodeLinksOriginTrace(t *testing.T) {
 		propagator:         stdProp,
 		span:               findSpan,
 		ctx:                ctx,
+		tracingEnabled:     true,
 		propagationEnabled: true,
 	}
 
@@ -218,6 +219,7 @@ func TestSingleResultTraceContext(t *testing.T) {
 		propagator:         stdProp,
 		span:               findSpan,
 		ctx:                ctx,
+		tracingEnabled:     true,
 		propagationEnabled: true,
 	}
 

@@ -3,6 +3,8 @@ package otelmongo
 import (
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -44,6 +46,25 @@ func resolveFlag(override *bool, envDefault bool) bool {
 		return *override
 	}
 	return envDefault
+}
+
+// cachedPropagationEnabled returns the effective document propagation flag, evaluated once
+// per process. Used by package-level ContextFromDocument / ContextFromRawDocument to avoid
+// repeated os.LookupEnv calls in hot loops (e.g. change-stream iteration).
+//
+// WARNING: env changes after the first call are ignored. This is intentional — OTel
+// instrumentation env is expected to be set at process startup. Tests must call
+// resetPropEnabledCacheForTest after t.Setenv to re-evaluate.
+var (
+	propEnabledOnce sync.Once
+	propEnabledFlag atomic.Bool
+)
+
+func cachedPropagationEnabled() bool {
+	propEnabledOnce.Do(func() {
+		propEnabledFlag.Store(mongoPropagationEnabled())
+	})
+	return propEnabledFlag.Load()
 }
 
 func envEnabledByDefault(key string) bool {

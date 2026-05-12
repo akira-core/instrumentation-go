@@ -42,6 +42,7 @@ type ChangeStream struct {
 	*mongo.ChangeStream
 	tracer             trace.Tracer                  // consumer-side app tracer
 	propagator         propagation.TextMapPropagator // for extracting trace from documents
+	tracingEnabled     bool
 	propagationEnabled bool
 	spanName           string
 	baseSpanOpts       []trace.SpanStartOption
@@ -93,6 +94,28 @@ func (cs *ChangeStream) Decode(val any) error {
 // context is unchanged. The val parameter can be any user-defined struct — it
 // does not need a fullDocument field; extraction uses the raw BSON internally.
 func (cs *ChangeStream) DecodeWithContext(ctx context.Context, val any) (context.Context, error) {
+	if !cs.tracingEnabled {
+		if err := cs.ChangeStream.Decode(val); err != nil {
+			return ctx, err
+		}
+		if !cs.propagationEnabled {
+			return ctx, nil
+		}
+		fullDoc, err := cs.Current.LookupErr("fullDocument")
+		if err != nil {
+			return ctx, nil
+		}
+		docRaw, ok := fullDoc.DocumentOK()
+		if !ok {
+			return ctx, nil
+		}
+		meta, ok := extractMetadataFromRaw(docRaw)
+		if !ok {
+			return ctx, nil
+		}
+		return contextFromTraceMetadata(ctx, meta, cs.propagator), nil
+	}
+
 	var originSpanCtx trace.SpanContext
 
 	fullDoc, err := cs.Current.LookupErr("fullDocument")
