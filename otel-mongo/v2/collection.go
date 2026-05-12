@@ -185,7 +185,7 @@ func (c *Collection) Find(ctx context.Context, filter any, opts ...options.Liste
 	if err != nil {
 		return nil, err
 	}
-	return &Cursor{Cursor: cursor, parentCtx: ctx, tracer: c.tracer, propagator: c.propagator, propagationEnabled: c.propagationEnabled}, nil
+	return &Cursor{Cursor: cursor, parentCtx: ctx, tracer: c.tracer, propagator: c.propagator, tracingEnabled: true, propagationEnabled: c.propagationEnabled}, nil
 }
 
 // FindOne executes a find command returning at most one document.
@@ -428,7 +428,7 @@ func (c *Collection) Aggregate(ctx context.Context, pipeline any, opts ...option
 	if err != nil {
 		return nil, err
 	}
-	return &Cursor{Cursor: cursor, parentCtx: ctx, tracer: c.tracer, propagator: c.propagator, propagationEnabled: c.propagationEnabled}, nil
+	return &Cursor{Cursor: cursor, parentCtx: ctx, tracer: c.tracer, propagator: c.propagator, tracingEnabled: true, propagationEnabled: c.propagationEnabled}, nil
 }
 
 // UpdateByID updates one document by _id, injecting the current trace into the update.
