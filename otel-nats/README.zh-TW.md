@@ -4,7 +4,7 @@
 
 ---
 
-為 [NATS](https://nats.io/) 與 [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream) 提供 OpenTelemetry 追蹤，對齊官方 `nats.go` / `nats.go/jetstream` API，並在訊息 header 中傳播 W3C Trace Context。`oteljetstream` 已完整包裝 JetStream consumer 管理 API（`JetStream` 的 `StreamConsumerManager` 與 `Stream` 的 `ConsumerManager`），同時維持既有訊息 publish/consume 的 tracing 行為。依 [OTel Go Contrib](https://github.com/open-telemetry/opentelemetry-go-contrib/tree/main/instrumentation) 規範：套件僅透過 option 接受 **TracerProvider** 與 **Propagators**，不提供 InitTracer；由應用程式在啟動時設定 global provider 與 propagator（見 **example/**）。
+為 [NATS](https://nats.io/) 與 [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream) 提供 OpenTelemetry 追蹤，對齊官方 `nats.go` / `nats.go/jetstream` API，並在訊息 header 中傳播 W3C Trace Context。`oteljetstream` 已完整包裝 JetStream consumer 管理 API（`JetStream` 的 `StreamConsumerManager` 與 `Stream` 的 `ConsumerManager`），同時維持既有訊息 publish/consume 的 tracing 行為。依 [OTel Go Contrib](https://github.com/open-telemetry/opentelemetry-go-contrib/tree/main/instrumentation) 規範：套件僅透過 option 接受 **TracerProvider** 與 **Propagators**，不提供 InitTracer；由應用程式在啟動時設定 global provider 與 propagator（見 **examples/**）。
 
 ---
 
@@ -14,7 +14,7 @@
 otel-nats/
 ├── otelnats/           # Core NATS：Connect、Conn、Publish、Subscribe、HeaderCarrier
 ├── oteljetstream/      # JetStream：New、JetStream、Stream、Consumer、PushConsumer、完整 consumer-manager 包裝、Consume、Messages、Fetch
-├── example/            # 如何建立 TracerProvider、設定 global、使用 otelnats/oteljetstream
+├── examples/            # 如何建立 TracerProvider、設定 global、使用 otelnats/oteljetstream
 ├── go.mod
 └── README.md
 ```
@@ -25,7 +25,7 @@ otel-nats/
 
 ### 1. 初始化 Provider 與 Propagator（應用程式負責）
 
-在程式啟動時建立 TracerProvider（例如 OTLP）、設定 global provider 與 propagator 一次。完整可執行範例見 **example/main.go**。
+在程式啟動時建立 TracerProvider（例如 OTLP）、設定 global provider 與 propagator 一次。完整可執行範例見 **examples/main.go**。
 
 ```go
 otel.SetTracerProvider(tp)

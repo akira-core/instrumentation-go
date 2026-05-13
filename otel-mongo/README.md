@@ -4,7 +4,7 @@
 
 ---
 
-OpenTelemetry wrapper around the [MongoDB Go Driver](https://www.mongodb.com/docs/drivers/go/current/). Injects **W3C Trace Context** into documents on write (`_oteltrace` field) and restores it on read so the same trace can be followed across services. Per [OTel Go Contrib](https://github.com/open-telemetry/opentelemetry-go-contrib/tree/main/instrumentation): the package accepts **TracerProvider** and **Propagators** via options; it does **not** provide InitTracer. Set the global provider and propagator at process startup (see **example/**).
+OpenTelemetry wrapper around the [MongoDB Go Driver](https://www.mongodb.com/docs/drivers/go/current/). Injects **W3C Trace Context** into documents on write (`_oteltrace` field) and restores it on read so the same trace can be followed across services. Per [OTel Go Contrib](https://github.com/open-telemetry/opentelemetry-go-contrib/tree/main/instrumentation): the package accepts **TracerProvider** and **Propagators** via options; it does **not** provide InitTracer. Set the global provider and propagator at process startup (see **examples/**).
 
 Two driver versions are supported (Go convention: v2 lives under `/v2` for a clear import path):
 
@@ -30,7 +30,7 @@ otel-mongo/
 │   ├── version.go, client.go, database.go, collection.go, cursor.go
 │   ├── tracing.go, semconv.go, bulkwrite.go, results.go, filter_exporter.go
 │   └── *_test.go
-├── example/             # TracerProvider + global + otelmongo (uses v2)
+├── examples/             # TracerProvider + global + otelmongo (uses v2)
 └── README.md
 ```
 
@@ -62,7 +62,7 @@ When tracing flags are unset/disabled, this package’s wrapper does not emit Mo
 
 ### 1. Initialize provider and propagator (application responsibility)
 
-See **example/main.go**. In short: create TracerProvider (e.g. OTLP), set `otel.SetTracerProvider(tp)` and `otel.SetTextMapPropagator(prop)`, defer shutdown.
+See **examples/main.go**. In short: create TracerProvider (e.g. OTLP), set `otel.SetTracerProvider(tp)` and `otel.SetTextMapPropagator(prop)`, defer shutdown.
 
 ### 2. Connect and use
 

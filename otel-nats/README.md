@@ -4,7 +4,7 @@
 
 ---
 
-OpenTelemetry tracing for [NATS](https://nats.io/) and [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream), aligned with the official `nats.go` / `nats.go/jetstream` APIs. Propagates W3C Trace Context in message headers. `oteljetstream` now fully wraps JetStream consumer management APIs (`StreamConsumerManager` on `JetStream` and `ConsumerManager` on `Stream`) while keeping message publish/consume tracing behavior unchanged. Per [OTel Go Contrib](https://github.com/open-telemetry/opentelemetry-go-contrib/tree/main/instrumentation): packages accept **TracerProvider** and **Propagators** via options; they do **not** provide InitTracer. Set the global provider and propagator at process startup (see **example/**).
+OpenTelemetry tracing for [NATS](https://nats.io/) and [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream), aligned with the official `nats.go` / `nats.go/jetstream` APIs. Propagates W3C Trace Context in message headers. `oteljetstream` now fully wraps JetStream consumer management APIs (`StreamConsumerManager` on `JetStream` and `ConsumerManager` on `Stream`) while keeping message publish/consume tracing behavior unchanged. Per [OTel Go Contrib](https://github.com/open-telemetry/opentelemetry-go-contrib/tree/main/instrumentation): packages accept **TracerProvider** and **Propagators** via options; they do **not** provide InitTracer. Set the global provider and propagator at process startup (see **examples/**).
 
 ---
 
@@ -22,7 +22,7 @@ otel-nats/
 │   ├── stream.go       # Stream, Consumer/PushConsumer, CreateOrUpdateConsumer/CreateOrUpdatePushConsumer
 │   ├── consumer.go     # Consume, Messages, Fetch, MessageBatch (Messages), Msg
 │   └── doc.go
-├── example/            # How to create TracerProvider + set global + use otelnats/oteljetstream
+├── examples/            # How to create TracerProvider + set global + use otelnats/oteljetstream
 ├── go.mod
 └── README.md
 ```
@@ -48,7 +48,7 @@ When disabled, both span creation and W3C header propagation are turned off.
 
 ### 1. Initialize provider and propagator (application responsibility)
 
-Create a TracerProvider (e.g. OTLP) and set the global provider and propagator once at startup. See **example/main.go** for a full runnable.
+Create a TracerProvider (e.g. OTLP) and set the global provider and propagator once at startup. See **examples/main.go** for a full runnable.
 
 ```go
 import (
