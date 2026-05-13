@@ -6,6 +6,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/direct"
+	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/shared"
 	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/traced"
 )
 
@@ -34,23 +35,17 @@ type BulkWriteResult struct {
 	*mongo.BulkWriteResult
 }
 
-// changeStreamImpl is the polymorphic core of ChangeStream. Only strategy-relevant
-// methods are listed — Next/Close/Err stay as facade passthroughs against the
-// embedded *mongo.ChangeStream.
-type changeStreamImpl interface {
-	DecodeWithContext(ctx context.Context, val any) (context.Context, error)
-	Decode(val any) error
-}
-
+// Compile-time checks that the impl-package change-stream types satisfy the
+// shared polymorphic interface consumed by the facade ChangeStream.
 var (
-	_ changeStreamImpl = (*traced.ChangeStream)(nil)
-	_ changeStreamImpl = (*direct.ChangeStream)(nil)
+	_ shared.ChangeStreamImpl = (*traced.ChangeStream)(nil)
+	_ shared.ChangeStreamImpl = (*direct.ChangeStream)(nil)
 )
 
 // ChangeStream wraps *mongo.ChangeStream with optional trace propagation.
 type ChangeStream struct {
 	*mongo.ChangeStream
-	impl changeStreamImpl
+	impl shared.ChangeStreamImpl
 }
 
 // Next advances the change stream to the next change document.

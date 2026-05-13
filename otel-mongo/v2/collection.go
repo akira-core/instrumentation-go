@@ -7,37 +7,49 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/direct"
+	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/shared"
+	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/traced"
 )
 
 // Collection wraps *mongo.Collection. Public methods delegate to a polymorphic
-// collectionImpl chosen once at construction time — tracedCollection when the
-// tracing gate is on, directCollection (passthrough) when off. The facade
-// itself stores no instrumentation state.
+// collectionImpl chosen once at construction time — *traced.Collection when
+// the tracing gate is on, *direct.Collection (passthrough) when off. The
+// facade itself stores no instrumentation state; impls live in
+// internal/{direct,traced} so the disabled-mode invariant (no OTel SDK
+// reachable from the direct path) is compiler-enforced by package boundary.
 type Collection struct {
 	*mongo.Collection
 	impl collectionImpl
 }
 
-// collectionImpl is the polymorphic core of Collection. Two implementations
-// exist (tracedCollection / directCollection). Selection happens at
-// construction so per-method gates are unnecessary.
+// collectionImpl is the polymorphic core of Collection. Methods return raw
+// driver types (and shared.CursorImpl / shared.SingleResultImpl /
+// shared.ChangeStreamImpl for the streaming results) so the impl packages
+// never need to import the facade — avoids any facade ↔ internal cycle.
 type collectionImpl interface {
-	InsertOne(ctx context.Context, document any, opts ...options.Lister[options.InsertOneOptions]) (*InsertOneResult, error)
-	InsertMany(ctx context.Context, documents []any, opts ...options.Lister[options.InsertManyOptions]) (*InsertManyResult, error)
-	Find(ctx context.Context, filter any, opts ...options.Lister[options.FindOptions]) (*Cursor, error)
-	FindOne(ctx context.Context, filter any, opts ...options.Lister[options.FindOneOptions]) *SingleResult
-	UpdateOne(ctx context.Context, filter, update any, opts ...options.Lister[options.UpdateOneOptions]) (*UpdateResult, error)
-	UpdateMany(ctx context.Context, filter, update any, opts ...options.Lister[options.UpdateManyOptions]) (*UpdateResult, error)
-	ReplaceOne(ctx context.Context, filter, replacement any, opts ...options.Lister[options.ReplaceOptions]) (*UpdateResult, error)
-	DeleteOne(ctx context.Context, filter any, opts ...options.Lister[options.DeleteOneOptions]) (*DeleteResult, error)
-	DeleteMany(ctx context.Context, filter any, opts ...options.Lister[options.DeleteManyOptions]) (*DeleteResult, error)
+	InsertOne(ctx context.Context, document any, opts ...options.Lister[options.InsertOneOptions]) (*mongo.InsertOneResult, error)
+	InsertMany(ctx context.Context, documents []any, opts ...options.Lister[options.InsertManyOptions]) (*mongo.InsertManyResult, error)
+	Find(ctx context.Context, filter any, opts ...options.Lister[options.FindOptions]) (*mongo.Cursor, shared.CursorImpl, error)
+	FindOne(ctx context.Context, filter any, opts ...options.Lister[options.FindOneOptions]) (*mongo.SingleResult, shared.SingleResultImpl)
+	UpdateOne(ctx context.Context, filter, update any, opts ...options.Lister[options.UpdateOneOptions]) (*mongo.UpdateResult, error)
+	UpdateMany(ctx context.Context, filter, update any, opts ...options.Lister[options.UpdateManyOptions]) (*mongo.UpdateResult, error)
+	ReplaceOne(ctx context.Context, filter, replacement any, opts ...options.Lister[options.ReplaceOptions]) (*mongo.UpdateResult, error)
+	DeleteOne(ctx context.Context, filter any, opts ...options.Lister[options.DeleteOneOptions]) (*mongo.DeleteResult, error)
+	DeleteMany(ctx context.Context, filter any, opts ...options.Lister[options.DeleteManyOptions]) (*mongo.DeleteResult, error)
 	CountDocuments(ctx context.Context, filter any, opts ...options.Lister[options.CountOptions]) (int64, error)
 	Distinct(ctx context.Context, fieldName string, filter any, opts ...options.Lister[options.DistinctOptions]) *mongo.DistinctResult
-	Aggregate(ctx context.Context, pipeline any, opts ...options.Lister[options.AggregateOptions]) (*Cursor, error)
-	UpdateByID(ctx context.Context, id, update any, opts ...options.Lister[options.UpdateOneOptions]) (*UpdateResult, error)
-	BulkWrite(ctx context.Context, models []mongo.WriteModel, opts ...options.Lister[options.BulkWriteOptions]) (*BulkWriteResult, error)
-	Watch(ctx context.Context, pipeline any, opts ...options.Lister[options.ChangeStreamOptions]) (*ChangeStream, error)
+	Aggregate(ctx context.Context, pipeline any, opts ...options.Lister[options.AggregateOptions]) (*mongo.Cursor, shared.CursorImpl, error)
+	UpdateByID(ctx context.Context, id, update any, opts ...options.Lister[options.UpdateOneOptions]) (*mongo.UpdateResult, error)
+	BulkWrite(ctx context.Context, models []mongo.WriteModel, opts ...options.Lister[options.BulkWriteOptions]) (*mongo.BulkWriteResult, error)
+	Watch(ctx context.Context, pipeline any, opts ...options.Lister[options.ChangeStreamOptions]) (*mongo.ChangeStream, shared.ChangeStreamImpl, error)
 }
+
+var (
+	_ collectionImpl = (*traced.Collection)(nil)
+	_ collectionImpl = (*direct.Collection)(nil)
+)
 
 // NewCollection wraps an existing *mongo.Collection with trace propagation.
 // Document _oteltrace injection follows the env gates:
@@ -47,15 +59,15 @@ type collectionImpl interface {
 // _oteltrace, no propagator extract.
 func NewCollection(coll *mongo.Collection, tracer trace.Tracer, propagator propagation.TextMapPropagator) *Collection {
 	if !mongoTracingEnabled() {
-		return &Collection{Collection: coll, impl: &directCollection{coll: coll}}
+		return &Collection{Collection: coll, impl: direct.NewCollection(coll)}
 	}
 	return &Collection{
 		Collection: coll,
-		impl: &tracedCollection{
-			coll:               coll,
-			tracer:             tracer,
-			propagator:         propagator,
-			propagationEnabled: mongoPropagationEnabled(),
+		impl: &traced.Collection{
+			Coll:               coll,
+			Tracer:             tracer,
+			Propagator:         propagator,
+			PropagationEnabled: mongoPropagationEnabled(),
 		},
 	}
 }
@@ -65,65 +77,98 @@ func NewCollection(coll *mongo.Collection, tracer trace.Tracer, propagator propa
 // Connect-time decision flows through.
 func newCollectionForDatabase(d *Database, raw *mongo.Collection) *Collection {
 	if !d.tracingEnabled {
-		return &Collection{Collection: raw, impl: &directCollection{coll: raw}}
+		return &Collection{Collection: raw, impl: direct.NewCollection(raw)}
 	}
 	return &Collection{
 		Collection: raw,
-		impl: &tracedCollection{
-			coll:               raw,
-			tracer:             d.tracer,
-			propagator:         d.propagator,
-			propagationEnabled: d.propagationEnabled,
-			deliverTracer:      d.deliverTracer,
-			serverAddr:         d.serverAddr,
-			serverPort:         d.serverPort,
+		impl: &traced.Collection{
+			Coll:               raw,
+			Tracer:             d.tracer,
+			Propagator:         d.propagator,
+			PropagationEnabled: d.propagationEnabled,
+			DeliverTracer:      d.deliverTracer,
+			ServerAddr:         d.serverAddr,
+			ServerPort:         d.serverPort,
 		},
 	}
 }
 
 // InsertOne inserts a document.
 func (c *Collection) InsertOne(ctx context.Context, document any, opts ...options.Lister[options.InsertOneOptions]) (*InsertOneResult, error) {
-	return c.impl.InsertOne(ctx, document, opts...)
+	res, err := c.impl.InsertOne(ctx, document, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &InsertOneResult{res}, nil
 }
 
 // InsertMany inserts multiple documents.
 func (c *Collection) InsertMany(ctx context.Context, documents []any, opts ...options.Lister[options.InsertManyOptions]) (*InsertManyResult, error) {
-	return c.impl.InsertMany(ctx, documents, opts...)
+	res, err := c.impl.InsertMany(ctx, documents, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &InsertManyResult{res}, nil
 }
 
 // Find executes a find command and returns a Cursor.
 func (c *Collection) Find(ctx context.Context, filter any, opts ...options.Lister[options.FindOptions]) (*Cursor, error) {
-	return c.impl.Find(ctx, filter, opts...)
+	raw, cImpl, err := c.impl.Find(ctx, filter, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &Cursor{Cursor: raw, impl: cImpl}, nil
 }
 
 // FindOne executes a find command returning at most one document.
 func (c *Collection) FindOne(ctx context.Context, filter any, opts ...options.Lister[options.FindOneOptions]) *SingleResult {
-	return c.impl.FindOne(ctx, filter, opts...)
+	raw, sImpl := c.impl.FindOne(ctx, filter, opts...)
+	return &SingleResult{SingleResult: raw, impl: sImpl}
 }
 
 // UpdateOne updates one matching document.
 func (c *Collection) UpdateOne(ctx context.Context, filter any, update any, opts ...options.Lister[options.UpdateOneOptions]) (*UpdateResult, error) {
-	return c.impl.UpdateOne(ctx, filter, update, opts...)
+	res, err := c.impl.UpdateOne(ctx, filter, update, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &UpdateResult{res}, nil
 }
 
 // UpdateMany updates all matching documents.
 func (c *Collection) UpdateMany(ctx context.Context, filter any, update any, opts ...options.Lister[options.UpdateManyOptions]) (*UpdateResult, error) {
-	return c.impl.UpdateMany(ctx, filter, update, opts...)
+	res, err := c.impl.UpdateMany(ctx, filter, update, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &UpdateResult{res}, nil
 }
 
 // ReplaceOne replaces one matching document.
 func (c *Collection) ReplaceOne(ctx context.Context, filter any, replacement any, opts ...options.Lister[options.ReplaceOptions]) (*UpdateResult, error) {
-	return c.impl.ReplaceOne(ctx, filter, replacement, opts...)
+	res, err := c.impl.ReplaceOne(ctx, filter, replacement, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &UpdateResult{res}, nil
 }
 
 // DeleteOne deletes one matching document.
 func (c *Collection) DeleteOne(ctx context.Context, filter any, opts ...options.Lister[options.DeleteOneOptions]) (*DeleteResult, error) {
-	return c.impl.DeleteOne(ctx, filter, opts...)
+	res, err := c.impl.DeleteOne(ctx, filter, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &DeleteResult{res}, nil
 }
 
 // DeleteMany deletes all documents matching filter.
 func (c *Collection) DeleteMany(ctx context.Context, filter any, opts ...options.Lister[options.DeleteManyOptions]) (*DeleteResult, error) {
-	return c.impl.DeleteMany(ctx, filter, opts...)
+	res, err := c.impl.DeleteMany(ctx, filter, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &DeleteResult{res}, nil
 }
 
 // CountDocuments counts documents matching filter.
@@ -138,12 +183,20 @@ func (c *Collection) Distinct(ctx context.Context, fieldName string, filter any,
 
 // Aggregate runs an aggregation pipeline and returns a Cursor.
 func (c *Collection) Aggregate(ctx context.Context, pipeline any, opts ...options.Lister[options.AggregateOptions]) (*Cursor, error) {
-	return c.impl.Aggregate(ctx, pipeline, opts...)
+	raw, cImpl, err := c.impl.Aggregate(ctx, pipeline, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &Cursor{Cursor: raw, impl: cImpl}, nil
 }
 
 // UpdateByID updates one document by _id.
 func (c *Collection) UpdateByID(ctx context.Context, id any, update any, opts ...options.Lister[options.UpdateOneOptions]) (*UpdateResult, error) {
-	return c.impl.UpdateByID(ctx, id, update, opts...)
+	res, err := c.impl.UpdateByID(ctx, id, update, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &UpdateResult{res}, nil
 }
 
 // DeleteOneByID deletes one document by _id.
@@ -163,10 +216,18 @@ func (c *Collection) FindByIDs(ctx context.Context, ids []any, opts ...options.L
 
 // BulkWrite runs multiple write operations.
 func (c *Collection) BulkWrite(ctx context.Context, models []mongo.WriteModel, opts ...options.Lister[options.BulkWriteOptions]) (*BulkWriteResult, error) {
-	return c.impl.BulkWrite(ctx, models, opts...)
+	res, err := c.impl.BulkWrite(ctx, models, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &BulkWriteResult{res}, nil
 }
 
 // Watch starts a change stream on the collection.
 func (c *Collection) Watch(ctx context.Context, pipeline any, opts ...options.Lister[options.ChangeStreamOptions]) (*ChangeStream, error) {
-	return c.impl.Watch(ctx, pipeline, opts...)
+	raw, csImpl, err := c.impl.Watch(ctx, pipeline, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &ChangeStream{ChangeStream: raw, impl: csImpl}, nil
 }

@@ -7,6 +7,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 
 	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/direct"
+	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/shared"
 	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/traced"
 )
 
@@ -35,22 +36,18 @@ type BulkWriteResult struct {
 	*mongo.BulkWriteResult
 }
 
-// singleResultImpl is the polymorphic core of SingleResult.
-type singleResultImpl interface {
-	Decode(v any) error
-	TraceContext() context.Context
-	Raw() (bson.Raw, error)
-}
-
+// Compile-time impl assertions.
 var (
-	_ singleResultImpl = (*traced.SingleResult)(nil)
-	_ singleResultImpl = (*direct.SingleResult)(nil)
+	_ shared.SingleResultImpl = (*traced.SingleResult)(nil)
+	_ shared.SingleResultImpl = (*direct.SingleResult)(nil)
+	_ shared.ChangeStreamImpl = (*traced.ChangeStream)(nil)
+	_ shared.ChangeStreamImpl = (*direct.ChangeStream)(nil)
 )
 
 // SingleResult wraps *mongo.SingleResult with optional trace propagation.
 type SingleResult struct {
 	*mongo.SingleResult
-	impl singleResultImpl
+	impl shared.SingleResultImpl
 }
 
 // Decode decodes the document.
@@ -63,23 +60,10 @@ func (r *SingleResult) TraceContext() context.Context { return r.impl.TraceConte
 // Raw returns the raw BSON document.
 func (r *SingleResult) Raw() (bson.Raw, error) { return r.impl.Raw() }
 
-// changeStreamImpl is the polymorphic core of ChangeStream. Only the
-// strategy-relevant methods are listed — Next/Close/Err stay as facade
-// passthroughs against the embedded *mongo.ChangeStream.
-type changeStreamImpl interface {
-	DecodeWithContext(ctx context.Context, val any) (context.Context, error)
-	Decode(val any) error
-}
-
-var (
-	_ changeStreamImpl = (*traced.ChangeStream)(nil)
-	_ changeStreamImpl = (*direct.ChangeStream)(nil)
-)
-
 // ChangeStream wraps *mongo.ChangeStream with optional trace propagation.
 type ChangeStream struct {
 	*mongo.ChangeStream
-	impl changeStreamImpl
+	impl shared.ChangeStreamImpl
 }
 
 // Next advances the change stream to the next change document.

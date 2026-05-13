@@ -12,6 +12,8 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/traced"
 )
 
 func init() {
@@ -127,30 +129,30 @@ func TestContextFromRawDocumentV1_PropagationDisabled(t *testing.T) {
 }
 
 func TestStartDeliverSpanDisabled(t *testing.T) {
-	// startDeliverSpan now lives on tracedCollection (the only impl that creates
-	// deliver spans). When deliverTracer is nil the helper must return ctx unchanged.
-	impl := &tracedCollection{deliverTracer: nil}
+	// StartDeliverSpan now lives on *traced.Collection (the only impl that creates
+	// deliver spans). When DeliverTracer is nil the helper must return ctx unchanged.
+	impl := &traced.Collection{DeliverTracer: nil}
 	ctx := context.Background()
-	got, span := impl.startDeliverSpan(ctx, "testdb", "testcoll")
+	got, span := impl.StartDeliverSpan(ctx, "testdb", "testcoll")
 	defer span.End()
-	assert.Equal(t, ctx, got, "expected unchanged ctx when deliverTracer is nil")
-	assert.False(t, trace.SpanFromContext(got).SpanContext().IsValid(), "expected no span in ctx when deliverTracer is nil")
+	assert.Equal(t, ctx, got, "expected unchanged ctx when DeliverTracer is nil")
+	assert.False(t, trace.SpanFromContext(got).SpanContext().IsValid(), "expected no span in ctx when DeliverTracer is nil")
 }
 
 func TestStartDeliverSpanEnabled(t *testing.T) {
 	tp := sdktrace.NewTracerProvider()
 	tracer := tp.Tracer(ScopeName)
-	impl := &tracedCollection{
-		deliverTracer: tracer,
-		serverAddr:    "localhost",
-		serverPort:    27017,
+	impl := &traced.Collection{
+		DeliverTracer: tracer,
+		ServerAddr:    "localhost",
+		ServerPort:    27017,
 	}
 
 	// Establish a parent span so we can verify the deliver span is a child.
 	parentCtx, parentSpan := tp.Tracer(ScopeName).Start(context.Background(), "parent")
 	defer parentSpan.End()
 
-	got, deliverSpan := impl.startDeliverSpan(parentCtx, "testdb", "testcoll")
+	got, deliverSpan := impl.StartDeliverSpan(parentCtx, "testdb", "testcoll")
 	defer deliverSpan.End()
 
 	deliverSC := trace.SpanFromContext(got).SpanContext()

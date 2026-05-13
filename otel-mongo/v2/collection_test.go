@@ -16,6 +16,9 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/direct"
+	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/traced"
 )
 
 // testMongoURI is populated by TestMain from the container. Zero value = Docker unavailable.
@@ -72,17 +75,17 @@ func TestNewCollection(t *testing.T) {
 	coll := NewCollection(raw, tracer, otel.GetTextMapPropagator())
 	require.NotNil(t, coll)
 	assert.Equal(t, raw, coll.Collection)
-	// Default env unset → directCollection (kill-switch path).
-	assert.IsType(t, &directCollection{}, coll.impl)
+	// Default env unset → direct.Collection (kill-switch path).
+	assert.IsType(t, &direct.Collection{}, coll.impl)
 
 	t.Run("propagationEnabled follows env when tracing on", func(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "1")
 		t.Setenv(envMongoTracingEnabled, "1")
 		t.Setenv(envMongoPropagationEnabled, "1")
 		c2 := NewCollection(raw, tracer, otel.GetTextMapPropagator())
-		traced, ok := c2.impl.(*tracedCollection)
-		require.True(t, ok, "expected tracedCollection impl")
-		assert.True(t, traced.propagationEnabled)
+		tc, ok := c2.impl.(*traced.Collection)
+		require.True(t, ok, "expected *traced.Collection impl")
+		assert.True(t, tc.PropagationEnabled)
 	})
 
 	t.Run("propagationEnabled false when module propagation env false", func(t *testing.T) {
@@ -90,9 +93,9 @@ func TestNewCollection(t *testing.T) {
 		t.Setenv(envMongoTracingEnabled, "1")
 		t.Setenv(envMongoPropagationEnabled, "false")
 		c2 := NewCollection(raw, tracer, otel.GetTextMapPropagator())
-		traced, ok := c2.impl.(*tracedCollection)
-		require.True(t, ok, "expected tracedCollection impl")
-		assert.False(t, traced.propagationEnabled)
+		tc, ok := c2.impl.(*traced.Collection)
+		require.True(t, ok, "expected *traced.Collection impl")
+		assert.False(t, tc.PropagationEnabled)
 	})
 
 	t.Run("propagationEnabled false when mongo tracing off even if propagation on", func(t *testing.T) {
@@ -100,19 +103,19 @@ func TestNewCollection(t *testing.T) {
 		t.Setenv(envMongoTracingEnabled, "false")
 		t.Setenv(envMongoPropagationEnabled, "1")
 		c2 := NewCollection(raw, tracer, otel.GetTextMapPropagator())
-		// mongo tracing off → directCollection (no propagation possible by design).
-		assert.IsType(t, &directCollection{}, c2.impl)
+		// mongo tracing off → direct.Collection (no propagation possible by design).
+		assert.IsType(t, &direct.Collection{}, c2.impl)
 	})
 
-	t.Run("global off → directCollection (no OTel SDK reachable)", func(t *testing.T) {
+	t.Run("global off → direct.Collection (no OTel SDK reachable)", func(t *testing.T) {
 		_ = os.Unsetenv(envGlobalTracingEnabled)
 		_ = os.Unsetenv(envMongoTracingEnabled)
 		realTracer := tp.Tracer("test")
 		c2 := NewCollection(raw, realTracer, otel.GetTextMapPropagator())
-		assert.IsType(t, &directCollection{}, c2.impl)
+		assert.IsType(t, &direct.Collection{}, c2.impl)
 	})
 
-	t.Run("global on → tracedCollection keeps caller tracer", func(t *testing.T) {
+	t.Run("global on → traced.Collection keeps caller tracer", func(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "1")
 		t.Setenv(envMongoTracingEnabled, "1")
 		sr2 := tracetest.NewSpanRecorder()
@@ -120,10 +123,10 @@ func TestNewCollection(t *testing.T) {
 		t.Cleanup(func() { _ = tp2.Shutdown(context.Background()) })
 		realTracer := tp2.Tracer("test")
 		c2 := NewCollection(raw, realTracer, otel.GetTextMapPropagator())
-		traced, ok := c2.impl.(*tracedCollection)
-		require.True(t, ok, "expected tracedCollection impl")
-		assert.Same(t, realTracer, traced.tracer, "caller tracer must be retained")
-		_, span := traced.tracer.Start(context.Background(), "probe")
+		tc, ok := c2.impl.(*traced.Collection)
+		require.True(t, ok, "expected *traced.Collection impl")
+		assert.Same(t, realTracer, tc.Tracer, "caller tracer must be retained")
+		_, span := tc.Tracer.Start(context.Background(), "probe")
 		span.End()
 		assert.Len(t, sr2.Ended(), 1)
 	})

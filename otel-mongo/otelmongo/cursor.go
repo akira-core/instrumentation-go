@@ -6,23 +6,16 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 
 	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/direct"
+	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/shared"
 	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/traced"
 )
 
-// cursorImpl is the polymorphic core of Cursor. Two implementations exist
-// (internal/traced.Cursor / internal/direct.Cursor); selection happens at
-// construction so per-method gates are unnecessary.
-type cursorImpl interface {
-	DecodeWithContext(ctx context.Context, val any) (context.Context, error)
-	Decode(val any) error
-}
-
-// Compile-time impl assertions. Forces the impls in internal/traced/ and
-// internal/direct/ to satisfy cursorImpl — adding a method to the interface
-// without updating both impls breaks the build here.
+// Compile-time checks that the impl-package Cursor types satisfy the shared
+// polymorphic interface consumed by the facade Cursor. Adding a method to
+// shared.CursorImpl without updating both impls breaks the build here.
 var (
-	_ cursorImpl = (*traced.Cursor)(nil)
-	_ cursorImpl = (*direct.Cursor)(nil)
+	_ shared.CursorImpl = (*traced.Cursor)(nil)
+	_ shared.CursorImpl = (*direct.Cursor)(nil)
 )
 
 // Cursor wraps *mongo.Cursor with optional trace propagation. The embedded
@@ -30,7 +23,7 @@ var (
 // to a strategy impl chosen at construction time.
 type Cursor struct {
 	*mongo.Cursor
-	impl cursorImpl
+	impl shared.CursorImpl
 }
 
 // DecodeWithContext decodes the current document into val and returns a

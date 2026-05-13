@@ -7,24 +7,24 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/direct"
+	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/shared"
 	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/traced"
 )
 
-// cursorImpl is the polymorphic core of Cursor.
-type cursorImpl interface {
-	DecodeWithContext(ctx context.Context, val any) (context.Context, error)
-	Decode(val any) error
-}
-
+// Compile-time checks that the impl-package types satisfy the shared
+// polymorphic interfaces consumed by the facade Cursor / SingleResult /
+// ChangeStream.
 var (
-	_ cursorImpl = (*traced.Cursor)(nil)
-	_ cursorImpl = (*direct.Cursor)(nil)
+	_ shared.CursorImpl       = (*traced.Cursor)(nil)
+	_ shared.CursorImpl       = (*direct.Cursor)(nil)
+	_ shared.SingleResultImpl = (*traced.SingleResult)(nil)
+	_ shared.SingleResultImpl = (*direct.SingleResult)(nil)
 )
 
 // Cursor wraps *mongo.Cursor with optional trace propagation.
 type Cursor struct {
 	*mongo.Cursor
-	impl cursorImpl
+	impl shared.CursorImpl
 }
 
 // DecodeWithContext decodes the current document into val and returns a
@@ -37,22 +37,10 @@ func (c *Cursor) DecodeWithContext(ctx context.Context, val any) (context.Contex
 // Decode decodes the current document into val.
 func (c *Cursor) Decode(val any) error { return c.impl.Decode(val) }
 
-// singleResultImpl is the polymorphic core of SingleResult.
-type singleResultImpl interface {
-	Decode(v any) error
-	TraceContext() context.Context
-	Raw() (bson.Raw, error)
-}
-
-var (
-	_ singleResultImpl = (*traced.SingleResult)(nil)
-	_ singleResultImpl = (*direct.SingleResult)(nil)
-)
-
 // SingleResult wraps *mongo.SingleResult with optional trace propagation.
 type SingleResult struct {
 	*mongo.SingleResult
-	impl singleResultImpl
+	impl shared.SingleResultImpl
 }
 
 // Decode decodes the document.
