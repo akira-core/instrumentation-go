@@ -45,6 +45,22 @@ jobs:
           version: latest
           working-directory: ${{ matrix.module }}
 
+      - name: Verify direct/ has no OTel SDK imports
+        # Enforces the otel-mongo disabled-mode invariant: internal/direct/
+        # packages must never import go.opentelemetry.io/otel/* so the
+        # compiler can prove no SDK code path is reachable when tracing is off.
+        # See otel-mongo/STRATEGY_REFACTOR_PLAN.html §8.
+        if: matrix.module == 'otel-mongo' || matrix.module == 'otel-mongo/v2'
+        run: |
+          if [ -d "internal/direct" ]; then
+            if grep -rE '"go\.opentelemetry\.io/otel' internal/direct; then
+              echo "::error::internal/direct/ must not import go.opentelemetry.io/otel/* — see STRATEGY_REFACTOR_PLAN §8"
+              exit 1
+            fi
+            echo "OK: internal/direct/ has zero OTel SDK imports"
+          fi
+        working-directory: ${{ matrix.module }}
+
   integration-test:
     name: Integration (${{ matrix.module }})
     runs-on: ubuntu-latest

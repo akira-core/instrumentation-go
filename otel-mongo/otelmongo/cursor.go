@@ -4,21 +4,33 @@ import (
 	"context"
 
 	"go.mongodb.org/mongo-driver/mongo"
-	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/trace"
+
+	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/direct"
+	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/traced"
 )
 
-// Cursor wraps *mongo.Cursor with trace propagation. The tracing/propagation
-// flags are populated by the Collection that produced this cursor — when the
-// gate is off all fields except Cursor stay zero-valued and DecodeWithContext
-// is a passthrough.
+// cursorImpl is the polymorphic core of Cursor. Two implementations exist
+// (internal/traced.Cursor / internal/direct.Cursor); selection happens at
+// construction so per-method gates are unnecessary.
+type cursorImpl interface {
+	DecodeWithContext(ctx context.Context, val any) (context.Context, error)
+	Decode(val any) error
+}
+
+// Compile-time impl assertions. Forces the impls in internal/traced/ and
+// internal/direct/ to satisfy cursorImpl — adding a method to the interface
+// without updating both impls breaks the build here.
+var (
+	_ cursorImpl = (*traced.Cursor)(nil)
+	_ cursorImpl = (*direct.Cursor)(nil)
+)
+
+// Cursor wraps *mongo.Cursor with optional trace propagation. The embedded
+// *mongo.Cursor preserves the upstream API; DecodeWithContext + Decode delegate
+// to a strategy impl chosen at construction time.
 type Cursor struct {
 	*mongo.Cursor
-	parentCtx          context.Context
-	tracer             trace.Tracer
-	propagator         propagation.TextMapPropagator
-	tracingEnabled     bool
-	propagationEnabled bool
+	impl cursorImpl
 }
 
 // DecodeWithContext decodes the current document into val and returns a
@@ -26,34 +38,8 @@ type Cursor struct {
 // "_oteltrace" field. When tracing is off (or the field is absent) the
 // returned context is unchanged.
 func (c *Cursor) DecodeWithContext(ctx context.Context, val any) (context.Context, error) {
-	if err := c.Cursor.Decode(val); err != nil {
-		return ctx, err
-	}
-	if !c.tracingEnabled {
-		return ctx, nil
-	}
-	raw := c.Current
-	var originSpanCtx trace.SpanContext
-	if c.propagationEnabled {
-		if meta, ok := extractMetadataFromRaw(raw); ok {
-			originCtx := contextFromTraceMetadata(context.Background(), meta, c.propagator)
-			originSpanCtx = trace.SpanContextFromContext(originCtx)
-		}
-	}
-
-	// Detach any existing parent so tracer.Start creates a new TraceID.
-	detachedCtx := trace.ContextWithSpanContext(ctx, trace.SpanContext{})
-	spanOpts := []trace.SpanStartOption{trace.WithSpanKind(trace.SpanKindInternal)}
-	if originSpanCtx.IsValid() {
-		spanOpts = append(spanOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
-	}
-
-	newCtx, span := c.tracer.Start(detachedCtx, "mongo.cursor.decode", spanOpts...)
-	span.End()
-	return newCtx, nil
+	return c.impl.DecodeWithContext(ctx, val)
 }
 
-// Decode decodes the current document into val. Delegates to *mongo.Cursor.Decode.
-func (c *Cursor) Decode(val any) error {
-	return c.Cursor.Decode(val)
-}
+// Decode decodes the current document into val.
+func (c *Cursor) Decode(val any) error { return c.impl.Decode(val) }

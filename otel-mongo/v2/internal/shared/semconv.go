@@ -1,8 +1,6 @@
-// Package otelmongo: OTel database and MongoDB semantic convention helpers.
-// See https://opentelemetry.io/docs/specs/semconv/db/database-spans/ and
-// https://opentelemetry.io/docs/specs/semconv/db/mongodb/
+// OTel database and MongoDB semantic convention helpers.
 
-package otelmongo
+package shared
 
 import (
 	"errors"
@@ -14,7 +12,6 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// DB semconv attribute keys (stable per OTel spec).
 const (
 	keyDBSystemName         = "db.system.name"
 	keyDBCollection         = "db.collection.name"
@@ -29,23 +26,38 @@ const (
 
 const (
 	dbSystemMongoDB = "mongodb"
-	// ErrorTypeOther is the fallback error.type per OTel when no custom value applies.
-	ErrorTypeOther = "_OTHER"
+	errorTypeOther  = "_OTHER"
 )
 
-// dbSpanName returns the span name per OTel: "{db.operation.name} {target}".
-// Target is the collection name for MongoDB.
-func dbSpanName(operation, collectionName string) string {
+// DeliverAttributes returns the attribute set for a MongoDB deliver span
+// (the synthetic CONSUMER span that represents broker delivery).
+func DeliverAttributes(dbName, collName, serverAddr string, serverPort int) []attribute.KeyValue {
+	attrs := []attribute.KeyValue{
+		attribute.String(keyDBSystemName, dbSystemMongoDB),
+		attribute.String(keyDBCollection, collName),
+	}
+	if dbName != "" {
+		attrs = append(attrs, attribute.String(keyDBNamespace, dbName))
+	}
+	if serverAddr != "" {
+		attrs = append(attrs, attribute.String(keyServerAddress, serverAddr))
+		if serverPort > 0 && serverPort != 27017 {
+			attrs = append(attrs, attribute.Int(keyServerPort, serverPort))
+		}
+	}
+	return attrs
+}
+
+// DBSpanName returns the span name per OTel: "{db.operation.name} {target}".
+func DBSpanName(operation, collectionName string) string {
 	if collectionName == "" {
 		return operation
 	}
 	return operation + " " + collectionName
 }
 
-// dbAttributes returns attributes for a MongoDB client span.
-// batchSize is 0 for single-doc ops; for batch ops (insertMany, updateMany, deleteMany) pass size >= 2.
-// serverAddr and serverPort are optional; server.port is only set when address is set and port != 27017.
-func dbAttributes(dbName, collName, operation string, batchSize int, serverAddr string, serverPort int) []attribute.KeyValue {
+// DBAttributes returns attributes for a MongoDB client span.
+func DBAttributes(dbName, collName, operation string, batchSize int, serverAddr string, serverPort int) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{
 		attribute.String(keyDBSystemName, dbSystemMongoDB),
 		attribute.String(keyDBCollection, collName),
@@ -66,9 +78,8 @@ func dbAttributes(dbName, collName, operation string, batchSize int, serverAddr 
 	return attrs
 }
 
-// recordSpanError sets span status to Error and records db.response.status_code and error.type
-// per OTel MongoDB/database semantic conventions when err is non-nil.
-func recordSpanError(span trace.Span, err error) {
+// RecordSpanError sets span status to Error and records db.response.status_code and error.type.
+func RecordSpanError(span trace.Span, err error) {
 	if err == nil {
 		return
 	}
@@ -98,5 +109,5 @@ func recordSpanError(span trace.Span, err error) {
 		return
 	}
 
-	span.SetAttributes(attribute.String(keyErrorType, ErrorTypeOther))
+	span.SetAttributes(attribute.String(keyErrorType, errorTypeOther))
 }

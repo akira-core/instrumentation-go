@@ -37,10 +37,6 @@ type collectionImpl interface {
 	UpdateByID(ctx context.Context, id, update any, opts ...options.Lister[options.UpdateOneOptions]) (*UpdateResult, error)
 	BulkWrite(ctx context.Context, models []mongo.WriteModel, opts ...options.Lister[options.BulkWriteOptions]) (*BulkWriteResult, error)
 	Watch(ctx context.Context, pipeline any, opts ...options.Lister[options.ChangeStreamOptions]) (*ChangeStream, error)
-
-	tracingOn() bool
-	propagationOn() bool
-	tracerProbe() trace.Tracer
 }
 
 // NewCollection wraps an existing *mongo.Collection with trace propagation.
@@ -84,10 +80,6 @@ func newCollectionForDatabase(d *Database, raw *mongo.Collection) *Collection {
 		},
 	}
 }
-
-func (c *Collection) tracingOn() bool           { return c.impl.tracingOn() }
-func (c *Collection) propagationOn() bool       { return c.impl.propagationOn() }
-func (c *Collection) tracerProbe() trace.Tracer { return c.impl.tracerProbe() }
 
 // InsertOne inserts a document.
 func (c *Collection) InsertOne(ctx context.Context, document any, opts ...options.Lister[options.InsertOneOptions]) (*InsertOneResult, error) {

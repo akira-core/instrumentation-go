@@ -1,4 +1,4 @@
-package otelmongo
+package shared
 
 import (
 	"context"
@@ -6,15 +6,19 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
+func init() {
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+}
+
 func TestBuildBulkWriteModelsWithTrace_InsertOneModel(t *testing.T) {
-	enableTracing(t)
 	sr := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
 	otel.SetTracerProvider(tp)
@@ -24,7 +28,7 @@ func TestBuildBulkWriteModelsWithTrace_InsertOneModel(t *testing.T) {
 	models := []mongo.WriteModel{
 		mongo.NewInsertOneModel().SetDocument(bson.D{{Key: "a", Value: 1}}),
 	}
-	out, err := buildBulkWriteModelsWithTrace(ctx, models, otel.GetTextMapPropagator())
+	out, err := BuildBulkWriteModelsWithTrace(ctx, models, otel.GetTextMapPropagator())
 	require.NoError(t, err)
 	require.Len(t, out, 1)
 	ins, ok := out[0].(*mongo.InsertOneModel)
@@ -40,11 +44,10 @@ func TestBuildBulkWriteModelsWithTrace_InsertOneModel(t *testing.T) {
 			break
 		}
 	}
-	assert.True(t, hasTrace, "InsertOneModel document should contain _oteltrace")
+	assert.True(t, hasTrace)
 }
 
 func TestBuildBulkWriteModelsWithTrace_UpdateOneModel(t *testing.T) {
-	enableTracing(t)
 	sr := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
 	otel.SetTracerProvider(tp)
@@ -54,12 +57,12 @@ func TestBuildBulkWriteModelsWithTrace_UpdateOneModel(t *testing.T) {
 	models := []mongo.WriteModel{
 		mongo.NewUpdateOneModel().SetFilter(bson.D{{Key: "x", Value: 1}}).SetUpdate(bson.D{{Key: "$set", Value: bson.D{{Key: "y", Value: 2}}}}),
 	}
-	out, err := buildBulkWriteModelsWithTrace(ctx, models, otel.GetTextMapPropagator())
+	out, err := BuildBulkWriteModelsWithTrace(ctx, models, otel.GetTextMapPropagator())
 	require.NoError(t, err)
 	require.Len(t, out, 1)
 	upd, ok := out[0].(*mongo.UpdateOneModel)
 	require.True(t, ok)
-	update, ok := getUpdateOneModelFilterUpdate(upd)
+	update, ok := getUpdateModelFilterUpdate(upd)
 	require.True(t, ok)
 	updateD, ok := update.(bson.D)
 	require.True(t, ok)
@@ -76,11 +79,10 @@ func TestBuildBulkWriteModelsWithTrace_UpdateOneModel(t *testing.T) {
 			break
 		}
 	}
-	assert.True(t, hasSetTrace, "UpdateOneModel update $set should contain _oteltrace")
+	assert.True(t, hasSetTrace)
 }
 
 func TestBuildBulkWriteModelsWithTrace_UpdateOneModel_PreservesOptions(t *testing.T) {
-	enableTracing(t)
 	sr := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
 	otel.SetTracerProvider(tp)
@@ -89,26 +91,28 @@ func TestBuildBulkWriteModelsWithTrace_UpdateOneModel_PreservesOptions(t *testin
 
 	upsertTrue := true
 	hint := bson.D{{Key: "x", Value: 1}}
+	arrayFilters := []any{bson.D{{Key: "elem.x", Value: bson.D{{Key: "$gt", Value: 0}}}}}
 	orig := mongo.NewUpdateOneModel().
 		SetFilter(bson.D{{Key: "x", Value: 1}}).
 		SetUpdate(bson.D{{Key: "$set", Value: bson.D{{Key: "y", Value: 2}}}}).
 		SetUpsert(upsertTrue).
-		SetHint(hint)
+		SetHint(hint).
+		SetArrayFilters(arrayFilters)
 
-	out, err := buildBulkWriteModelsWithTrace(ctx, []mongo.WriteModel{orig}, otel.GetTextMapPropagator())
+	out, err := BuildBulkWriteModelsWithTrace(ctx, []mongo.WriteModel{orig}, otel.GetTextMapPropagator())
 	require.NoError(t, err)
 	require.Len(t, out, 1)
 
 	got, ok := out[0].(*mongo.UpdateOneModel)
 	require.True(t, ok)
-	require.NotNil(t, got.Upsert, "Upsert must be preserved")
-	assert.True(t, *got.Upsert, "Upsert value must be true")
-	assert.Equal(t, orig.Hint, got.Hint, "Hint must be preserved")
-	assert.Equal(t, orig.Filter, got.Filter, "Filter must be preserved")
+	require.NotNil(t, got.Upsert)
+	assert.True(t, *got.Upsert)
+	assert.Equal(t, orig.Hint, got.Hint)
+	assert.Equal(t, orig.ArrayFilters, got.ArrayFilters)
+	assert.Equal(t, orig.Filter, got.Filter)
 }
 
 func TestBuildBulkWriteModelsWithTrace_UpdateOneModel_SetOnInsert(t *testing.T) {
-	enableTracing(t)
 	sr := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
 	otel.SetTracerProvider(tp)
@@ -121,14 +125,13 @@ func TestBuildBulkWriteModelsWithTrace_UpdateOneModel_SetOnInsert(t *testing.T) 
 		SetUpdate(bson.D{{Key: "$setOnInsert", Value: bson.D{{Key: "u._id", Value: "123"}, {Key: "p._id", Value: "444"}}}}).
 		SetUpsert(upsertTrue)
 
-	out, err := buildBulkWriteModelsWithTrace(ctx, []mongo.WriteModel{orig}, otel.GetTextMapPropagator())
+	out, err := BuildBulkWriteModelsWithTrace(ctx, []mongo.WriteModel{orig}, otel.GetTextMapPropagator())
 	require.NoError(t, err)
 	require.Len(t, out, 1)
 
 	got, ok := out[0].(*mongo.UpdateOneModel)
 	require.True(t, ok)
-
-	require.NotNil(t, got.Upsert, "Upsert must be preserved")
+	require.NotNil(t, got.Upsert)
 	assert.True(t, *got.Upsert)
 
 	updateD, ok := got.Update.(bson.D)
@@ -147,8 +150,6 @@ func TestBuildBulkWriteModelsWithTrace_UpdateOneModel_SetOnInsert(t *testing.T) 
 				case TraceMetadataKey:
 					hasTraceInSetOnInsert = true
 				case "u._id":
-					// Dot-notation field name must survive the marshal/unmarshal round-trip
-					// as a literal string — bson.D does not expand dots into nested documents.
 					uDotIDPreserved = true
 				case "p._id":
 					pDotIDPreserved = true
@@ -158,17 +159,17 @@ func TestBuildBulkWriteModelsWithTrace_UpdateOneModel_SetOnInsert(t *testing.T) 
 			hasSet = true
 		}
 	}
-	assert.True(t, hasTraceInSetOnInsert, "$setOnInsert must contain _oteltrace so upserted documents carry trace context")
-	assert.True(t, hasSet, "$set must be present so existing documents are also annotated")
-	assert.True(t, uDotIDPreserved, "dot-notation field name 'u._id' must be preserved verbatim in $setOnInsert after marshal/unmarshal round-trip")
-	assert.True(t, pDotIDPreserved, "dot-notation field name 'p._id' must be preserved verbatim in $setOnInsert after marshal/unmarshal round-trip")
+	assert.True(t, hasTraceInSetOnInsert)
+	assert.True(t, hasSet)
+	assert.True(t, uDotIDPreserved)
+	assert.True(t, pDotIDPreserved)
 }
 
 func TestBuildBulkWriteModelsWithTrace_OtherModelsUnchanged(t *testing.T) {
 	ctx := context.Background()
 	del := mongo.NewDeleteOneModel().SetFilter(bson.D{{Key: "_id", Value: 1}})
 	models := []mongo.WriteModel{del}
-	out, err := buildBulkWriteModelsWithTrace(ctx, models, otel.GetTextMapPropagator())
+	out, err := BuildBulkWriteModelsWithTrace(ctx, models, otel.GetTextMapPropagator())
 	require.NoError(t, err)
 	require.Len(t, out, 1)
 	assert.Same(t, del, out[0])

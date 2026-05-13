@@ -14,6 +14,9 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
+
+	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/direct"
+	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/traced"
 )
 
 func TestCursorDecodeWithContext_NewTraceIDAndLinksOriginTrace(t *testing.T) {
@@ -47,12 +50,8 @@ func TestCursorDecodeWithContext_NewTraceIDAndLinksOriginTrace(t *testing.T) {
 	require.True(t, cur.Next(context.Background()), "expected cursor.Next=true")
 
 	wrapped := &Cursor{
-		Cursor:             cur,
-		parentCtx:          context.Background(),
-		tracer:             tracer,
-		propagator:         prop,
-		tracingEnabled:     true,
-		propagationEnabled: true,
+		Cursor: cur,
+		impl:   traced.NewCursor(cur, tracer, prop, true),
 	}
 
 	var out bson.D
@@ -104,14 +103,13 @@ func TestCursorDecodeWithContext_NoFlagsNoSpan(t *testing.T) {
 	defer func() { _ = cur.Close(context.Background()) }()
 	require.True(t, cur.Next(context.Background()))
 
-	// tracingEnabled defaults to false → passthrough path. The noop tracer / prop
-	// stay unused but are kept for parity with the prior test setup.
+	// Disabled path: direct.NewCursor is the passthrough impl. noop tracer and
+	// propagator stay unused but kept for parity with the prior test setup.
 	_ = noop.NewTracerProvider()
+	_ = prop
 	wrapped := &Cursor{
-		Cursor:             cur,
-		parentCtx:          context.Background(),
-		propagator:         prop,
-		propagationEnabled: true,
+		Cursor: cur,
+		impl:   direct.NewCursor(cur),
 	}
 
 	var out bson.D

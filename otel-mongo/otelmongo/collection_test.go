@@ -72,14 +72,17 @@ func TestNewCollection(t *testing.T) {
 	coll := NewCollection(raw, tracer, otel.GetTextMapPropagator())
 	require.NotNil(t, coll)
 	assert.Equal(t, raw, coll.Collection)
-	assert.NotNil(t, coll.tracerProbe())
+	// Default env unset → directCollection (kill-switch path).
+	assert.IsType(t, &directCollection{}, coll.impl)
 
 	t.Run("propagationEnabled follows env when tracing on", func(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "1")
 		t.Setenv(envMongoTracingEnabled, "1")
 		t.Setenv(envMongoPropagationEnabled, "1")
 		c2 := NewCollection(raw, tracer, otel.GetTextMapPropagator())
-		assert.True(t, c2.propagationOn())
+		traced, ok := c2.impl.(*tracedCollection)
+		require.True(t, ok, "expected tracedCollection impl")
+		assert.True(t, traced.propagationEnabled)
 	})
 
 	t.Run("propagationEnabled false when module propagation env false", func(t *testing.T) {
@@ -87,7 +90,9 @@ func TestNewCollection(t *testing.T) {
 		t.Setenv(envMongoTracingEnabled, "1")
 		t.Setenv(envMongoPropagationEnabled, "false")
 		c2 := NewCollection(raw, tracer, otel.GetTextMapPropagator())
-		assert.False(t, c2.propagationOn())
+		traced, ok := c2.impl.(*tracedCollection)
+		require.True(t, ok, "expected tracedCollection impl")
+		assert.False(t, traced.propagationEnabled)
 	})
 
 	t.Run("propagationEnabled false when mongo tracing off even if propagation on", func(t *testing.T) {
@@ -95,26 +100,22 @@ func TestNewCollection(t *testing.T) {
 		t.Setenv(envMongoTracingEnabled, "false")
 		t.Setenv(envMongoPropagationEnabled, "1")
 		c2 := NewCollection(raw, tracer, otel.GetTextMapPropagator())
-		assert.False(t, c2.propagationOn())
+		// mongo tracing off → directCollection (no propagation possible by design).
+		assert.IsType(t, &directCollection{}, c2.impl)
 	})
 
-	t.Run("global off swaps caller tracer with noop", func(t *testing.T) {
+	t.Run("global off → directCollection (no OTel SDK reachable)", func(t *testing.T) {
 		// Even when the caller passes a real tracer, NewCollection must produce a
-		// directCollection (passthrough) when the global+module tracing gate is off —
-		// symmetric with Connect.
+		// directCollection (passthrough) when the global+module tracing gate is off.
+		// The strategy split guarantees no OTel SDK code path runs from this impl.
 		_ = os.Unsetenv(envGlobalTracingEnabled)
 		_ = os.Unsetenv(envMongoTracingEnabled)
-		sr2 := tracetest.NewSpanRecorder()
-		tp2 := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr2))
-		t.Cleanup(func() { _ = tp2.Shutdown(context.Background()) })
-		realTracer := tp2.Tracer("test")
+		realTracer := tp.Tracer("test")
 		c2 := NewCollection(raw, realTracer, otel.GetTextMapPropagator())
-		_, span := c2.tracerProbe().Start(context.Background(), "probe")
-		span.End()
-		assert.Empty(t, sr2.Ended(), "expected zero spans recorded when global tracing is off")
+		assert.IsType(t, &directCollection{}, c2.impl)
 	})
 
-	t.Run("global on keeps caller tracer", func(t *testing.T) {
+	t.Run("global on → tracedCollection keeps caller tracer", func(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "1")
 		t.Setenv(envMongoTracingEnabled, "1")
 		sr2 := tracetest.NewSpanRecorder()
@@ -122,9 +123,13 @@ func TestNewCollection(t *testing.T) {
 		t.Cleanup(func() { _ = tp2.Shutdown(context.Background()) })
 		realTracer := tp2.Tracer("test")
 		c2 := NewCollection(raw, realTracer, otel.GetTextMapPropagator())
-		_, span := c2.tracerProbe().Start(context.Background(), "probe")
+		traced, ok := c2.impl.(*tracedCollection)
+		require.True(t, ok, "expected tracedCollection impl")
+		assert.Same(t, realTracer, traced.tracer, "caller tracer must be retained")
+		// Sanity: the retained tracer records spans through the provided processor.
+		_, span := traced.tracer.Start(context.Background(), "probe")
 		span.End()
-		assert.Len(t, sr2.Ended(), 1, "expected 1 span recorded when tracing is on")
+		assert.Len(t, sr2.Ended(), 1)
 	})
 }
 

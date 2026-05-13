@@ -14,6 +14,9 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
+
+	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/direct"
+	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/traced"
 )
 
 // stdProp is the standard W3C propagator used across cursor tests.
@@ -41,7 +44,6 @@ func TestCursorDecodeWithContext_ExtractsTrace(t *testing.T) {
 	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
 	tracer := tp.Tracer("test")
 
-	// Start a span so we have a valid trace context to inject.
 	ctx, span := tracer.Start(context.Background(), "origin")
 	originSpanCtx := span.SpanContext()
 	span.End()
@@ -55,19 +57,14 @@ func TestCursorDecodeWithContext_ExtractsTrace(t *testing.T) {
 	require.True(t, cursor.Next(context.Background()))
 
 	c := &Cursor{
-		Cursor:             cursor,
-		parentCtx:          ctx,
-		tracer:             tracer,
-		propagator:         stdProp,
-		tracingEnabled:     true,
-		propagationEnabled: true,
+		Cursor: cursor,
+		impl:   traced.NewCursor(cursor, tracer, stdProp, true),
 	}
 
 	var result bson.D
 	_, err = c.DecodeWithContext(context.Background(), &result)
 	require.NoError(t, err)
 
-	// A mongo.cursor.decode span should be created with a link to the origin trace.
 	ended := sr.Ended()
 	var decodeSpan sdktrace.ReadOnlySpan
 	for _, s := range ended {
@@ -89,7 +86,6 @@ func TestCursorDecodeWithContext_NoTrace(t *testing.T) {
 	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
 	tracer := tp.Tracer("test")
 
-	// Document without trace metadata.
 	raw, err := bson.Marshal(bson.D{{Key: "x", Value: 1}})
 	require.NoError(t, err)
 
@@ -101,18 +97,14 @@ func TestCursorDecodeWithContext_NoTrace(t *testing.T) {
 
 	baseCtx := context.Background()
 	c := &Cursor{
-		Cursor:         cursor,
-		parentCtx:      baseCtx,
-		tracer:         tracer,
-		propagator:     stdProp,
-		tracingEnabled: true,
+		Cursor: cursor,
+		impl:   traced.NewCursor(cursor, tracer, stdProp, false),
 	}
 
 	var result bson.D
 	_, err = c.DecodeWithContext(baseCtx, &result)
 	require.NoError(t, err)
 
-	// A mongo.cursor.decode span should be created but with no links.
 	ended := sr.Ended()
 	var decodeSpan sdktrace.ReadOnlySpan
 	for _, s := range ended {
@@ -144,20 +136,17 @@ func TestCursorDecodeWithContext_NoFlagsNoSpan(t *testing.T) {
 	defer func() { _ = cursor.Close(context.Background()) }()
 	require.True(t, cursor.Next(context.Background()))
 
-	// tracingEnabled defaults to false → passthrough. Imports kept live for parity
-	// with the prior disabled-path setup.
+	// Disabled path: use direct.NewCursor — passthrough impl with no OTel SDK reachable.
 	_ = noop.NewTracerProvider()
 	c := &Cursor{
-		Cursor:             cursor,
-		parentCtx:          ctx,
-		propagator:         stdProp,
-		propagationEnabled: true,
+		Cursor: cursor,
+		impl:   direct.NewCursor(cursor),
 	}
 
 	var result bson.D
 	enrichedCtx, err := c.DecodeWithContext(context.Background(), &result)
 	require.NoError(t, err)
-	assert.False(t, trace.SpanContextFromContext(enrichedCtx).IsValid(), "expected noop tracer to avoid creating span context")
+	assert.False(t, trace.SpanContextFromContext(enrichedCtx).IsValid(), "expected passthrough to avoid creating span context")
 
 	for _, s := range sr.Ended() {
 		assert.NotEqual(t, "mongo.cursor.decode", s.Name(), "no decode span should be recorded when flags are disabled")
@@ -172,7 +161,6 @@ func TestSingleResultDecodeLinksOriginTrace(t *testing.T) {
 	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
 	tracer := tp.Tracer("test")
 
-	// Create a context with an active span so we can inject trace metadata.
 	ctx, originSpan := tracer.Start(context.Background(), "origin")
 	originSpan.End()
 
@@ -182,19 +170,14 @@ func TestSingleResultDecodeLinksOriginTrace(t *testing.T) {
 	_, findSpan := tracer.Start(context.Background(), "findone")
 
 	wrapped := &SingleResult{
-		SingleResult:       mongoSR,
-		propagator:         stdProp,
-		span:               findSpan,
-		ctx:                ctx,
-		tracingEnabled:     true,
-		propagationEnabled: true,
+		SingleResult: mongoSR,
+		impl:         traced.NewSingleResult(mongoSR, findSpan, ctx, stdProp, true),
 	}
 
 	var out bson.D
 	err := wrapped.Decode(&out)
 	require.NoError(t, err)
 
-	// The findone span should now be ended and have a link to the origin trace.
 	ended := sr.Ended()
 	require.NotEmpty(t, ended)
 
@@ -230,12 +213,8 @@ func TestSingleResultTraceContext(t *testing.T) {
 	_, findSpan := tracer.Start(context.Background(), "findone2")
 
 	wrapped := &SingleResult{
-		SingleResult:       mongoSR,
-		propagator:         stdProp,
-		span:               findSpan,
-		ctx:                ctx,
-		tracingEnabled:     true,
-		propagationEnabled: true,
+		SingleResult: mongoSR,
+		impl:         traced.NewSingleResult(mongoSR, findSpan, ctx, stdProp, true),
 	}
 
 	enriched := wrapped.TraceContext()
@@ -254,7 +233,7 @@ func TestCursorDecode(t *testing.T) {
 
 	require.True(t, cursor.Next(context.Background()))
 
-	c := &Cursor{Cursor: cursor, parentCtx: context.Background()}
+	c := &Cursor{Cursor: cursor, impl: direct.NewCursor(cursor)}
 
 	var result bson.D
 	err = c.Decode(&result)
@@ -279,16 +258,13 @@ func TestSingleResultRaw(t *testing.T) {
 
 	wrapped := &SingleResult{
 		SingleResult: mongoSR,
-		propagator:   stdProp,
-		span:         findSpan,
-		ctx:          ctx,
+		impl:         traced.NewSingleResult(mongoSR, findSpan, ctx, stdProp, false),
 	}
 
 	raw, err := wrapped.Raw()
 	require.NoError(t, err)
 	assert.NotEmpty(t, raw)
 
-	// Span should have ended after Raw()
 	ended := sr.Ended()
 	var found bool
 	for _, s := range ended {
@@ -317,12 +293,9 @@ func TestSingleResultDecodeSpanEndedOnce(t *testing.T) {
 
 	wrapped := &SingleResult{
 		SingleResult: mongoSR,
-		propagator:   stdProp,
-		span:         findSpan,
-		ctx:          ctx,
+		impl:         traced.NewSingleResult(mongoSR, findSpan, ctx, stdProp, false),
 	}
 
-	// Call Decode twice – span should be ended only once.
 	var out bson.D
 	_ = wrapped.Decode(&out)
 	_ = wrapped.Decode(&out)

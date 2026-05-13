@@ -5,25 +5,13 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
-	"go.opentelemetry.io/otel/trace"
-	"go.opentelemetry.io/otel/trace/noop"
+
+	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/direct"
 )
 
-// directCollection is the passthrough collectionImpl used when the tracing
-// gate is off. No spans, no _oteltrace inject, no propagator extract — calls
-// the upstream driver directly and wraps result types with disabled-strategy
-// impls so downstream Cursor/SingleResult/ChangeStream are also passthrough.
+// directCollection is the passthrough collectionImpl used when the tracing gate is off.
 type directCollection struct {
 	coll *mongo.Collection
-}
-
-func (d *directCollection) tracingOn() bool     { return false }
-func (d *directCollection) propagationOn() bool { return false }
-
-// tracerProbe returns a noop tracer so legacy test paths that capture
-// the tracer and call .Start on it see zero recorded spans.
-func (d *directCollection) tracerProbe() trace.Tracer {
-	return noop.NewTracerProvider().Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
 }
 
 func (d *directCollection) InsertOne(ctx context.Context, document any, opts ...options.Lister[options.InsertOneOptions]) (*InsertOneResult, error) {
@@ -47,12 +35,12 @@ func (d *directCollection) Find(ctx context.Context, filter any, opts ...options
 	if err != nil {
 		return nil, err
 	}
-	return &Cursor{Cursor: cursor}, nil
+	return &Cursor{Cursor: cursor, impl: direct.NewCursor(cursor)}, nil
 }
 
 func (d *directCollection) FindOne(ctx context.Context, filter any, opts ...options.Lister[options.FindOneOptions]) *SingleResult {
 	sr := d.coll.FindOne(ctx, filter, opts...)
-	return &SingleResult{SingleResult: sr, ctx: ctx}
+	return &SingleResult{SingleResult: sr, impl: direct.NewSingleResult(sr, ctx)}
 }
 
 func (d *directCollection) UpdateOne(ctx context.Context, filter any, update any, opts ...options.Lister[options.UpdateOneOptions]) (*UpdateResult, error) {
@@ -108,7 +96,7 @@ func (d *directCollection) Aggregate(ctx context.Context, pipeline any, opts ...
 	if err != nil {
 		return nil, err
 	}
-	return &Cursor{Cursor: cursor}, nil
+	return &Cursor{Cursor: cursor, impl: direct.NewCursor(cursor)}, nil
 }
 
 func (d *directCollection) UpdateByID(ctx context.Context, id any, update any, opts ...options.Lister[options.UpdateOneOptions]) (*UpdateResult, error) {
@@ -132,5 +120,5 @@ func (d *directCollection) Watch(ctx context.Context, pipeline any, opts ...opti
 	if err != nil {
 		return nil, err
 	}
-	return &ChangeStream{ChangeStream: cs}, nil
+	return &ChangeStream{ChangeStream: cs, impl: direct.NewChangeStream(cs)}, nil
 }

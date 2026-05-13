@@ -37,10 +37,6 @@ type collectionImpl interface {
 	UpdateByID(ctx context.Context, id, update any, opts ...*options.UpdateOptions) (*UpdateResult, error)
 	BulkWrite(ctx context.Context, models []mongo.WriteModel, opts ...*options.BulkWriteOptions) (*BulkWriteResult, error)
 	Watch(ctx context.Context, pipeline interface{}, opts ...*options.ChangeStreamOptions) (*ChangeStream, error)
-
-	tracingOn() bool
-	propagationOn() bool
-	tracerProbe() trace.Tracer
 }
 
 // NewCollection wraps an existing *mongo.Collection with trace propagation.
@@ -84,19 +80,6 @@ func newCollectionForDatabase(d *Database, raw *mongo.Collection) *Collection {
 		},
 	}
 }
-
-// tracingOn reports whether this Collection uses the full instrumentation
-// path. Internal helper; mainly useful in tests.
-func (c *Collection) tracingOn() bool { return c.impl.tracingOn() }
-
-// propagationOn reports whether this Collection injects _oteltrace metadata
-// on writes. Internal helper for tests.
-func (c *Collection) propagationOn() bool { return c.impl.propagationOn() }
-
-// tracerProbe exposes the underlying tracer chosen by the impl. Internal
-// helper for tests that verify the kill-switch swapped a real tracer for a
-// noop tracer.
-func (c *Collection) tracerProbe() trace.Tracer { return c.impl.tracerProbe() }
 
 // InsertOne inserts a document. When tracing is enabled, the call is wrapped
 // in a CLIENT span and (with propagation on) the deliver span traceparent is
