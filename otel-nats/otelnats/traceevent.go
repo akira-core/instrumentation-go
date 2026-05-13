@@ -123,12 +123,19 @@ func hopTypeName(t string) string {
 //
 // The publisher must set Nats-Trace-Dest on each message (or use WithTraceDestination option).
 // Requires NATS server 2.11+.
+//
+// The subscription handler is picked by the Conn's impl — tracedConn emits hop
+// spans, directConn discards events.
 func SubscribeTraceEvents(conn *Conn, subject string) (*nats.Subscription, error) {
-	if !conn.TracingEnabled() {
-		return conn.nc.Subscribe(subject, func(*nats.Msg) {})
-	}
-	tracer, prop := conn.TraceContext()
-	return conn.nc.Subscribe(subject, func(msg *nats.Msg) {
+	return conn.nc.Subscribe(subject, conn.impl.traceEventHandler())
+}
+
+// buildTraceEventHandler returns the instrumented closure that decodes a
+// NATS trace event payload and emits one OTel span per hop. Lives in this file
+// to keep the heavy event-parsing logic next to the type definitions; called
+// by tracedConn.traceEventHandler().
+func buildTraceEventHandler(tracer trace.Tracer, prop propagation.TextMapPropagator) nats.MsgHandler {
+	return func(msg *nats.Msg) {
 		var event TraceEvent
 		if err := json.Unmarshal(msg.Data, &event); err != nil {
 			slog.Warn("otelnats: traceevent unmarshal failed", "error", err, "raw", string(msg.Data))
@@ -150,7 +157,7 @@ func SubscribeTraceEvents(conn *Conn, subject string) (*nats.Subscription, error
 		for _, hop := range event.Events {
 			emitHopSpan(tracer, parentCtx, hop, serverName, event.Server.Version, event.Hops)
 		}
-	})
+	}
 }
 
 // extractTraceParent builds an OTel context from the traceparent header embedded in the
