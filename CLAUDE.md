@@ -107,14 +107,47 @@ Async consumers (NATS subscribers, MongoDB change stream readers, WebSocket read
 
 ### Disabled-mode invariant (0.3.0+)
 
-When any feature flag returns false, **no OTel SDK code path may run**: no `tracer.Start` on a real tracer, no `sdktrace.NewTracerProvider`, no `otlptracegrpc.New` / `otlptracehttp.New`, no `[]attribute.KeyValue` build, no propagator inject/extract. Implementation pattern:
+When any feature flag returns false, **no OTel SDK code path may run**: no `tracer.Start` on a real tracer, no `sdktrace.NewTracerProvider`, no `otlptracegrpc.New` / `otlptracehttp.New`, no `[]attribute.KeyValue` build, no propagator inject/extract. Two enforcement patterns coexist:
 
-- Connect/constructor reads env once → caches `tracingEnabled bool` on the wrapper struct (`Conn`, `Client`, `Database`, `Collection`, `Cursor`, `SingleResult`, `ChangeStream`).
-- Every public method on the wrapper starts with `if !c.tracingEnabled { /* delegate to native, optional propagation only */ }`.
-- For otel-mongo, `Connect` also substitutes `noop.NewTracerProvider()` when disabled so any stray `tracer.Start` is inert.
+**1. Strategy split (preferred — otel-mongo Collection / Cursor / SingleResult / ChangeStream).** The facade type holds an `impl` interface satisfied by either `internal/direct.X` (passthrough) or `internal/traced.X` (instrumented). Construction picks the impl once; per-method runtime gates disappear. `internal/direct/*.go` imports no `go.opentelemetry.io/otel/sdk/*` and no `otel/exporters/*` — the disabled path is **compiler-enforced** by package boundary.
+
+**2. Cached gate (otel-nats, otel-gorilla-ws, and otel-mongo Client/Database).** Connect/constructor reads env once → caches `tracingEnabled bool` on the wrapper struct. Every public method starts with `if !c.tracingEnabled { /* delegate to native */ }`. Reviewer-enforced. Planned migration to strategy split tracked in `DIRECTORY_LAYOUT_PLAN.html` at module root.
+
+Independent of pattern:
+- For otel-mongo, `Connect` substitutes `noop.NewTracerProvider()` when disabled so any stray `tracer.Start` is inert.
 - Deliver-tracer init (`initNATSProvider`, `initMongoProvider`) is gated behind the same `tracingEnabled` check — no exporter or batched SDK provider is spun up when disabled.
 
-**When adding a new public method to any wrapper, the fast-path gate is the first statement.** Examples to copy: `otelmongo.Collection.InsertOne`, `otelnats.Conn.Publish`, `otelgorillaws.Conn.WriteMessage`.
+**Adding a new public method to a strategy-split wrapper** (otel-mongo Collection/Cursor/SingleResult/ChangeStream) — touch THREE files in lockstep per module, mirror in v1↔v2 sibling:
+1. Add signature to the facade's `collectionImpl` interface (in `collection.go`) or extend `shared.CursorImpl` / `shared.SingleResultImpl` / `shared.ChangeStreamImpl` in `internal/shared/impls.go`.
+2. Implement passthrough in `internal/direct/<file>.go` — no `otel/sdk` or `otel/exporters` imports.
+3. Implement instrumented version in `internal/traced/<file>.go`.
+
+Compile-time `var _ shared.CursorImpl = (*traced.Cursor)(nil)` assertions in facade `cursor.go` / `results.go` (and `var _ collectionImpl = (*traced.Collection)(nil)` in `collection.go`) fail the build if any impl misses a method.
+
+**Adding a new public method to a cached-gate wrapper** (otel-nats, otel-gorilla-ws) — fast-path gate is the first statement: `if !c.tracingEnabled { return c.nc.Publish(...) }`. Examples to copy: `otelnats.Conn.Publish`, `otelgorillaws.Conn.WriteMessage`.
+
+### Strategy-split layout (otel-mongo)
+
+Per module (`otelmongo/` v1 and `v2/`), the facade package contains thin wrappers + the `collectionImpl` interface; impls live under `internal/`:
+
+```
+otelmongo/
+├── collection.go cursor.go results.go database.go client.go    # facade
+├── tracing.go env_flags.go version.go                          # facade helpers
+└── internal/
+    ├── shared/    # impls.go (CursorImpl/SingleResultImpl/ChangeStreamImpl interfaces),
+    │              # semconv.go, tracing.go, bulkwrite.go — helpers used by both paths
+    ├── direct/    # collection.go cursor.go singleresult.go changestream.go
+    │              # NO go.opentelemetry.io/otel/sdk/* or otel/exporters/* imports
+    └── traced/    # collection.go cursor.go singleresult.go changestream.go
+                   # full OTel SDK access
+```
+
+Key rules:
+- `internal/shared/impls.go` declares the polymorphic interfaces (`CursorImpl`, `SingleResultImpl`, `ChangeStreamImpl`) satisfied by both `internal/direct.X` and `internal/traced.X`. Facade `Cursor` / `SingleResult` / `ChangeStream` hold an `impl shared.XImpl` field.
+- Facade `collectionImpl` interface returns raw driver types (`*mongo.Cursor`, `*mongo.SingleResult`, `*mongo.ChangeStream`) + `shared.XImpl` — the impl packages never need to import the facade, preventing any facade ↔ internal cycle. Facade methods wrap raw types into facade wrappers (`&Cursor{Cursor: raw, impl: cImpl}`).
+- `internal/traced.Collection` has **exported fields** (`Coll`, `Tracer`, `Propagator`, `PropagationEnabled`, `DeliverTracer`, `ServerAddr`, `ServerPort`) and exported `StartDeliverSpan` so facade-package tests can build literals and call them directly.
+- v1/v2 parity extends to `internal/{direct,traced,shared}/`. The helpers in `internal/shared/{bulkwrite.go,semconv.go,tracing.go,impls.go}` are intentionally duplicated across modules (separate `internal/` trees cannot share). Drift-check CI step planned (`DIRECTORY_LAYOUT_PLAN.html` §6).
 
 ### Propagation flag caching (otel-mongo)
 
@@ -142,7 +175,8 @@ Bump on any code change to a module before pushing release tag. Module pre-1.0 (
 - `_oteltrace` field adds ~100–120 bytes per document. Schema-aware callers can use `SkipDBOperationsExporter` to suppress noisy spans (e.g., `getMore`).
 - Use `Cursor.DecodeWithContext(ctx, v)` (not `Decode`) when reading in a change-stream context — it extracts the trace from the document and links spans correctly.
 - `ContextFromDocument(ctx, doc)` extracts trace from an already-decoded document map; it respects the same propagation env gates as the Collection wrapper (not a bypass).
-- **v1 and v2 parity rule:** `otelmongo/` (v1) and `v2/` are parallel implementations. All logic changes — new flags, new fields, new inject/extract paths — must be applied to **both** sub-packages identically. Run lint and tests for both when either is touched.
+- **Strategy-split layout:** Collection / Cursor / SingleResult / ChangeStream all live in `internal/{direct,traced}/` (see *Strategy-split layout (otel-mongo)* above). Client and Database still use the cached-gate pattern.
+- **v1 and v2 parity rule:** `otelmongo/` (v1) and `v2/` are parallel implementations. All logic changes — new flags, new fields, new inject/extract paths, new strategy methods — must be applied to **both** sub-packages identically, including their `internal/{direct,traced,shared}/` trees. Run lint and tests for both when either is touched.
 
 ### otel-nats
 
