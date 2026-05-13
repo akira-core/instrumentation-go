@@ -1,8 +1,7 @@
 package otelnats
 
 import (
-	"os"
-	"strings"
+	"github.com/Marz32onE/instrumentation-go/otel-nats/otelnats/internal/flags"
 )
 
 const (
@@ -10,22 +9,15 @@ const (
 	envNATSTracingEnabled   = "OTEL_NATS_TRACING_ENABLED"
 )
 
-func natsTracingEnabled() bool {
-	if !envEnabledByDefault(envGlobalTracingEnabled) {
-		return false
-	}
-	return envEnabledByDefault(envNATSTracingEnabled)
-}
+// natsGate caches the composed two-tier tracing gate
+// (OTEL_INSTRUMENTATION_GO_TRACING_ENABLED AND OTEL_NATS_TRACING_ENABLED)
+// for the lifetime of the process. Constructed once at package init; the
+// constructor reads it once per Conn creation, so hot paths pay zero env
+// lookup cost.
+var natsGate = flags.NewGate(func() bool {
+	return flags.EnvEnabled(envGlobalTracingEnabled) && flags.EnvEnabled(envNATSTracingEnabled)
+})
 
-func envEnabledByDefault(key string) bool {
-	v, ok := os.LookupEnv(key)
-	if !ok {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "0", "false", "no", "off":
-		return false
-	default:
-		return true
-	}
+func natsTracingEnabled() bool {
+	return natsGate.Enabled()
 }

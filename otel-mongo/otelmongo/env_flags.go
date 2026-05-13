@@ -1,10 +1,7 @@
 package otelmongo
 
 import (
-	"os"
-	"strings"
-	"sync"
-	"sync/atomic"
+	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/flags"
 )
 
 const (
@@ -14,16 +11,16 @@ const (
 )
 
 func mongoTracingEnabled() bool {
-	if !envEnabledByDefault(envGlobalTracingEnabled) {
+	if !flags.EnvEnabled(envGlobalTracingEnabled) {
 		return false
 	}
-	return envEnabledByDefault(envMongoTracingEnabled)
+	return flags.EnvEnabled(envMongoTracingEnabled)
 }
 
 // mongoPropagationEnvOnly reports OTEL_MONGO_PROPAGATION_ENABLED alone (no global gate).
 // Used by resolveDocumentPropagation as the env default.
 func mongoPropagationEnvOnly() bool {
-	return envEnabledByDefault(envMongoPropagationEnabled)
+	return flags.EnvEnabled(envMongoPropagationEnabled)
 }
 
 func mongoPropagationEnabled() bool {
@@ -51,34 +48,16 @@ func resolveFlag(override *bool, envDefault bool) bool {
 	return envDefault
 }
 
-// cachedPropagationEnabled returns the effective document propagation flag, evaluated once
-// per process. Used by package-level ContextFromDocument / ContextFromRawDocument to avoid
-// repeated os.LookupEnv calls in hot loops (e.g. change-stream iteration).
+// propEnabledGate caches the effective document propagation flag (full three-tier
+// resolution) for the lifetime of the process. Used by package-level
+// ContextFromDocument / ContextFromRawDocument to avoid repeated os.LookupEnv calls
+// in hot loops (e.g. change-stream iteration).
 //
 // WARNING: env changes after the first call are ignored. This is intentional — OTel
 // instrumentation env is expected to be set at process startup. Tests must call
 // resetPropEnabledCacheForTest after t.Setenv to re-evaluate.
-var (
-	propEnabledOnce sync.Once
-	propEnabledFlag atomic.Bool
-)
+var propEnabledGate = flags.NewGate(mongoPropagationEnabled)
 
 func cachedPropagationEnabled() bool {
-	propEnabledOnce.Do(func() {
-		propEnabledFlag.Store(mongoPropagationEnabled())
-	})
-	return propEnabledFlag.Load()
-}
-
-func envEnabledByDefault(key string) bool {
-	v, ok := os.LookupEnv(key)
-	if !ok {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "0", "false", "no", "off":
-		return false
-	default:
-		return true
-	}
+	return propEnabledGate.Enabled()
 }
