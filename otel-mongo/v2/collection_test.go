@@ -72,14 +72,14 @@ func TestNewCollection(t *testing.T) {
 	coll := NewCollection(raw, tracer, otel.GetTextMapPropagator())
 	require.NotNil(t, coll)
 	assert.Equal(t, raw, coll.Collection)
-	assert.NotNil(t, coll.tracer)
+	assert.NotNil(t, coll.tracerProbe())
 
 	t.Run("propagationEnabled follows env when tracing on", func(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "1")
 		t.Setenv(envMongoTracingEnabled, "1")
 		t.Setenv(envMongoPropagationEnabled, "1")
 		c2 := NewCollection(raw, tracer, otel.GetTextMapPropagator())
-		assert.True(t, c2.propagationEnabled)
+		assert.True(t, c2.propagationOn())
 	})
 
 	t.Run("propagationEnabled false when module propagation env false", func(t *testing.T) {
@@ -87,7 +87,7 @@ func TestNewCollection(t *testing.T) {
 		t.Setenv(envMongoTracingEnabled, "1")
 		t.Setenv(envMongoPropagationEnabled, "false")
 		c2 := NewCollection(raw, tracer, otel.GetTextMapPropagator())
-		assert.False(t, c2.propagationEnabled)
+		assert.False(t, c2.propagationOn())
 	})
 
 	t.Run("propagationEnabled false when mongo tracing off even if propagation on", func(t *testing.T) {
@@ -95,12 +95,13 @@ func TestNewCollection(t *testing.T) {
 		t.Setenv(envMongoTracingEnabled, "false")
 		t.Setenv(envMongoPropagationEnabled, "1")
 		c2 := NewCollection(raw, tracer, otel.GetTextMapPropagator())
-		assert.False(t, c2.propagationEnabled)
+		assert.False(t, c2.propagationOn())
 	})
 
 	t.Run("global off swaps caller tracer with noop", func(t *testing.T) {
-		// Even when the caller passes a real tracer, NewCollection must replace it with noop
-		// when the global+module tracing gate is off — symmetric with Connect.
+		// Even when the caller passes a real tracer, NewCollection must produce a
+		// directCollection (passthrough) when the global+module tracing gate is off —
+		// symmetric with Connect.
 		_ = os.Unsetenv(envGlobalTracingEnabled)
 		_ = os.Unsetenv(envMongoTracingEnabled)
 		sr2 := tracetest.NewSpanRecorder()
@@ -108,7 +109,7 @@ func TestNewCollection(t *testing.T) {
 		t.Cleanup(func() { _ = tp2.Shutdown(context.Background()) })
 		realTracer := tp2.Tracer("test")
 		c2 := NewCollection(raw, realTracer, otel.GetTextMapPropagator())
-		_, span := c2.tracer.Start(context.Background(), "probe")
+		_, span := c2.tracerProbe().Start(context.Background(), "probe")
 		span.End()
 		assert.Empty(t, sr2.Ended(), "expected zero spans recorded when global tracing is off")
 	})
@@ -121,7 +122,7 @@ func TestNewCollection(t *testing.T) {
 		t.Cleanup(func() { _ = tp2.Shutdown(context.Background()) })
 		realTracer := tp2.Tracer("test")
 		c2 := NewCollection(raw, realTracer, otel.GetTextMapPropagator())
-		_, span := c2.tracer.Start(context.Background(), "probe")
+		_, span := c2.tracerProbe().Start(context.Background(), "probe")
 		span.End()
 		assert.Len(t, sr2.Ended(), 1, "expected 1 span recorded when tracing is on")
 	})

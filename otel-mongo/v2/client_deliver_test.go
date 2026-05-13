@@ -53,9 +53,11 @@ func TestMongoServiceNameV2(t *testing.T) {
 }
 
 func TestStartDeliverSpanDisabledV2(t *testing.T) {
-	coll := &Collection{deliverTracer: nil}
+	// startDeliverSpan now lives on tracedCollection (the only impl that creates
+	// deliver spans). When deliverTracer is nil the helper must return ctx unchanged.
+	impl := &tracedCollection{deliverTracer: nil}
 	ctx := context.Background()
-	got, span := coll.startDeliverSpan(ctx, "testdb", "testcoll")
+	got, span := impl.startDeliverSpan(ctx, "testdb", "testcoll")
 	defer span.End()
 	if got != ctx {
 		t.Error("expected unchanged ctx when deliverTracer is nil")
@@ -68,7 +70,7 @@ func TestStartDeliverSpanDisabledV2(t *testing.T) {
 func TestStartDeliverSpanEnabledV2(t *testing.T) {
 	tp := sdktrace.NewTracerProvider()
 	tracer := tp.Tracer(ScopeName)
-	coll := &Collection{
+	impl := &tracedCollection{
 		deliverTracer: tracer,
 		serverAddr:    "localhost",
 		serverPort:    27017,
@@ -77,7 +79,7 @@ func TestStartDeliverSpanEnabledV2(t *testing.T) {
 	parentCtx, parentSpan := tp.Tracer(ScopeName).Start(context.Background(), "parent")
 	defer parentSpan.End()
 
-	got, deliverSpan := coll.startDeliverSpan(parentCtx, "testdb", "testcoll")
+	got, deliverSpan := impl.startDeliverSpan(parentCtx, "testdb", "testcoll")
 	defer deliverSpan.End()
 
 	deliverSC := trace.SpanFromContext(got).SpanContext()

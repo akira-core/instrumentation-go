@@ -2,469 +2,156 @@ package otelmongo
 
 import (
 	"context"
-	"fmt"
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
-	"go.opentelemetry.io/otel/trace/noop"
 )
 
-// Collection wraps *mongo.Collection and overrides CRUD methods to inject and
-// extract OpenTelemetry trace contexts via the "_oteltrace" document field.
+// Collection wraps *mongo.Collection. Public methods delegate to a polymorphic
+// collectionImpl chosen once at construction time — tracedCollection when the
+// tracing gate is on, directCollection (passthrough) when off. The facade
+// itself stores no instrumentation state.
 type Collection struct {
 	*mongo.Collection
-	tracer             trace.Tracer
-	propagator         propagation.TextMapPropagator
-	tracingEnabled     bool // when false, wrapper CLIENT spans are skipped entirely
-	propagationEnabled bool
-	serverAddr         string
-	serverPort         int
-	deliverTracer      trace.Tracer // nil when disabled
+	impl collectionImpl
+}
+
+// collectionImpl is the polymorphic core of Collection. Two implementations
+// exist (tracedCollection / directCollection). Selection happens at
+// construction so per-method gates are unnecessary.
+type collectionImpl interface {
+	InsertOne(ctx context.Context, document any, opts ...options.Lister[options.InsertOneOptions]) (*InsertOneResult, error)
+	InsertMany(ctx context.Context, documents []any, opts ...options.Lister[options.InsertManyOptions]) (*InsertManyResult, error)
+	Find(ctx context.Context, filter any, opts ...options.Lister[options.FindOptions]) (*Cursor, error)
+	FindOne(ctx context.Context, filter any, opts ...options.Lister[options.FindOneOptions]) *SingleResult
+	UpdateOne(ctx context.Context, filter, update any, opts ...options.Lister[options.UpdateOneOptions]) (*UpdateResult, error)
+	UpdateMany(ctx context.Context, filter, update any, opts ...options.Lister[options.UpdateManyOptions]) (*UpdateResult, error)
+	ReplaceOne(ctx context.Context, filter, replacement any, opts ...options.Lister[options.ReplaceOptions]) (*UpdateResult, error)
+	DeleteOne(ctx context.Context, filter any, opts ...options.Lister[options.DeleteOneOptions]) (*DeleteResult, error)
+	DeleteMany(ctx context.Context, filter any, opts ...options.Lister[options.DeleteManyOptions]) (*DeleteResult, error)
+	CountDocuments(ctx context.Context, filter any, opts ...options.Lister[options.CountOptions]) (int64, error)
+	Distinct(ctx context.Context, fieldName string, filter any, opts ...options.Lister[options.DistinctOptions]) *mongo.DistinctResult
+	Aggregate(ctx context.Context, pipeline any, opts ...options.Lister[options.AggregateOptions]) (*Cursor, error)
+	UpdateByID(ctx context.Context, id, update any, opts ...options.Lister[options.UpdateOneOptions]) (*UpdateResult, error)
+	BulkWrite(ctx context.Context, models []mongo.WriteModel, opts ...options.Lister[options.BulkWriteOptions]) (*BulkWriteResult, error)
+	Watch(ctx context.Context, pipeline any, opts ...options.Lister[options.ChangeStreamOptions]) (*ChangeStream, error)
+
+	tracingOn() bool
+	propagationOn() bool
+	tracerProbe() trace.Tracer
 }
 
 // NewCollection wraps an existing *mongo.Collection with trace propagation.
-// Tracer and propagator are required; use WithTracerProvider/WithPropagators via Connect
-// for the standard init path. Document _oteltrace injection follows the same env gates as
-// Connect: OTEL_INSTRUMENTATION_GO_TRACING_ENABLED **and** OTEL_MONGO_TRACING_ENABLED must
-// both be on before OTEL_MONGO_PROPAGATION_ENABLED is consulted. There is no per-wrapper
-// option—use ConnectWithOptions(..., WithTracePropagationEnabled(...)) for that. When the
-// global+module tracing gate is off, the supplied tracer is replaced with a noop tracer
-// **and** propagationEnabled is forced false so no _oteltrace is injected — wrapper
-// CLIENT spans and document propagation share one kill switch.
+// Document _oteltrace injection follows the env gates:
+// OTEL_INSTRUMENTATION_GO_TRACING_ENABLED **and** OTEL_MONGO_TRACING_ENABLED
+// must both be on before OTEL_MONGO_PROPAGATION_ENABLED is consulted. When the
+// gate is off the returned wrapper is a passthrough — no spans, no
+// _oteltrace, no propagator extract.
 func NewCollection(coll *mongo.Collection, tracer trace.Tracer, propagator propagation.TextMapPropagator) *Collection {
-	tracingOn := mongoTracingEnabled()
-	propagationOn := false
-	if !tracingOn {
-		tracer = noop.NewTracerProvider().Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
-	} else {
-		propagationOn = mongoPropagationEnabled()
+	if !mongoTracingEnabled() {
+		return &Collection{Collection: coll, impl: &directCollection{coll: coll}}
 	}
 	return &Collection{
-		Collection:         coll,
-		tracer:             tracer,
-		propagator:         propagator,
-		tracingEnabled:     tracingOn,
-		propagationEnabled: propagationOn,
+		Collection: coll,
+		impl: &tracedCollection{
+			coll:               coll,
+			tracer:             tracer,
+			propagator:         propagator,
+			propagationEnabled: mongoPropagationEnabled(),
+		},
 	}
 }
 
-func (c *Collection) dbAndColl() (dbName, collName string) {
-	collName = c.Name()
-	if c.Database() != nil {
-		dbName = c.Database().Name()
+// newCollectionForDatabase builds the collectionImpl that Database.Collection
+// hands to its Collection facade. Uses the Database's cached gates so a single
+// Connect-time decision flows through.
+func newCollectionForDatabase(d *Database, raw *mongo.Collection) *Collection {
+	if !d.tracingEnabled {
+		return &Collection{Collection: raw, impl: &directCollection{coll: raw}}
 	}
-	return dbName, collName
+	return &Collection{
+		Collection: raw,
+		impl: &tracedCollection{
+			coll:               raw,
+			tracer:             d.tracer,
+			propagator:         d.propagator,
+			propagationEnabled: d.propagationEnabled,
+			deliverTracer:      d.deliverTracer,
+			serverAddr:         d.serverAddr,
+			serverPort:         d.serverPort,
+		},
+	}
 }
 
-// startDeliverSpan creates a synthetic CONSUMER span representing MongoDB broker delivery.
-// The returned context carries the deliver span, suitable for injecting into documents so
-// change stream consumers link to it. The caller must End the returned span after the
-// MongoDB operation completes. When deliverTracer is nil, returns a no-op span safe to End.
-func (c *Collection) startDeliverSpan(ctx context.Context, dbName, collName string) (context.Context, trace.Span) {
-	if c.deliverTracer == nil {
-		return ctx, trace.SpanFromContext(context.Background())
-	}
-	attrs := []attribute.KeyValue{
-		attribute.String(keyDBSystemName, dbSystemMongoDB),
-		attribute.String(keyDBCollection, collName),
-	}
-	if dbName != "" {
-		attrs = append(attrs, attribute.String(keyDBNamespace, dbName))
-	}
-	if c.serverAddr != "" {
-		attrs = append(attrs, attribute.String(keyServerAddress, c.serverAddr))
-		if c.serverPort > 0 && c.serverPort != 27017 {
-			attrs = append(attrs, attribute.Int(keyServerPort, c.serverPort))
-		}
-	}
-	deliverCtx, span := c.deliverTracer.Start(ctx,
-		dbName+"."+collName+" deliver",
-		trace.WithSpanKind(trace.SpanKindConsumer),
-		trace.WithAttributes(attrs...),
-	)
-	return deliverCtx, span
-}
+func (c *Collection) tracingOn() bool           { return c.impl.tracingOn() }
+func (c *Collection) propagationOn() bool       { return c.impl.propagationOn() }
+func (c *Collection) tracerProbe() trace.Tracer { return c.impl.tracerProbe() }
 
-// InsertOne inserts a document, injecting the deliver span traceparent into "_oteltrace".
+// InsertOne inserts a document.
 func (c *Collection) InsertOne(ctx context.Context, document any, opts ...options.Lister[options.InsertOneOptions]) (*InsertOneResult, error) {
-	if !c.tracingEnabled {
-		// Tracing off ⇒ propagation off (single kill switch); skip _oteltrace inject entirely.
-		res, err := c.Collection.InsertOne(ctx, document, opts...)
-		if err != nil {
-			return nil, err
-		}
-		return &InsertOneResult{res}, nil
-	}
-	dbName, collName := c.dbAndColl()
-	ctx, span := c.tracer.Start(ctx, dbSpanName("insert", collName),
-		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(dbAttributes(dbName, collName, "insert", 0, c.serverAddr, c.serverPort)...),
-	)
-	defer span.End()
-
-	injectCtx, deliverSpan := c.startDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
-	docToInsert := document
-	if c.propagationEnabled {
-		docWithTrace, err := injectTraceIntoDocument(injectCtx, document, c.propagator)
-		if err != nil {
-			return nil, fmt.Errorf("otelmongo: inject trace: %w", err)
-		}
-		docToInsert = docWithTrace
-	}
-	res, err := c.Collection.InsertOne(injectCtx, docToInsert, opts...)
-	recordSpanError(span, err)
-	if err != nil {
-		return nil, err
-	}
-	return &InsertOneResult{res}, nil
+	return c.impl.InsertOne(ctx, document, opts...)
 }
 
-// InsertMany inserts documents, injecting the deliver span traceparent into each "_oteltrace".
+// InsertMany inserts multiple documents.
 func (c *Collection) InsertMany(ctx context.Context, documents []any, opts ...options.Lister[options.InsertManyOptions]) (*InsertManyResult, error) {
-	if !c.tracingEnabled {
-		res, err := c.Collection.InsertMany(ctx, documents, opts...)
-		if err != nil {
-			return nil, err
-		}
-		return &InsertManyResult{res}, nil
-	}
-	dbName, collName := c.dbAndColl()
-	ctx, span := c.tracer.Start(ctx, dbSpanName("insert", collName),
-		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(dbAttributes(dbName, collName, "insert", len(documents), c.serverAddr, c.serverPort)...),
-	)
-	defer span.End()
-
-	injectCtx, deliverSpan := c.startDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
-	docsToInsert := documents
-	if c.propagationEnabled {
-		docsWithTrace := make([]any, 0, len(documents))
-		for _, doc := range documents {
-			d, err := injectTraceIntoDocument(injectCtx, doc, c.propagator)
-			if err != nil {
-				return nil, fmt.Errorf("otelmongo: inject trace: %w", err)
-			}
-			docsWithTrace = append(docsWithTrace, d)
-		}
-		docsToInsert = docsWithTrace
-	}
-	res, err := c.Collection.InsertMany(injectCtx, docsToInsert, opts...)
-	recordSpanError(span, err)
-	if err != nil {
-		return nil, err
-	}
-	return &InsertManyResult{res}, nil
+	return c.impl.InsertMany(ctx, documents, opts...)
 }
 
 // Find executes a find command and returns a Cursor.
 func (c *Collection) Find(ctx context.Context, filter any, opts ...options.Lister[options.FindOptions]) (*Cursor, error) {
-	if !c.tracingEnabled {
-		cursor, err := c.Collection.Find(ctx, filter, opts...)
-		if err != nil {
-			return nil, err
-		}
-		return &Cursor{Cursor: cursor, parentCtx: ctx, tracer: c.tracer, propagator: c.propagator, tracingEnabled: false, propagationEnabled: false}, nil
-	}
-	dbName, collName := c.dbAndColl()
-	ctx, span := c.tracer.Start(ctx, dbSpanName("find", collName),
-		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(dbAttributes(dbName, collName, "find", 0, c.serverAddr, c.serverPort)...),
-	)
-	defer span.End()
-
-	_, deliverSpan := c.startDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
-
-	cursor, err := c.Collection.Find(ctx, filter, opts...)
-	recordSpanError(span, err)
-	if err != nil {
-		return nil, err
-	}
-	return &Cursor{Cursor: cursor, parentCtx: ctx, tracer: c.tracer, propagator: c.propagator, tracingEnabled: true, propagationEnabled: c.propagationEnabled}, nil
+	return c.impl.Find(ctx, filter, opts...)
 }
 
 // FindOne executes a find command returning at most one document.
-// The span is held in the returned *SingleResult and ended when Decode is called.
 func (c *Collection) FindOne(ctx context.Context, filter any, opts ...options.Lister[options.FindOneOptions]) *SingleResult {
-	if !c.tracingEnabled {
-		sr := c.Collection.FindOne(ctx, filter, opts...)
-		return &SingleResult{SingleResult: sr, ctx: ctx, propagator: c.propagator, tracingEnabled: false, propagationEnabled: false}
-	}
-	dbName, collName := c.dbAndColl()
-	ctx, span := c.tracer.Start(ctx, dbSpanName("find", collName),
-		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(dbAttributes(dbName, collName, "find", 0, c.serverAddr, c.serverPort)...),
-	)
-	_, deliverSpan := c.startDeliverSpan(ctx, dbName, collName)
-	sr := c.Collection.FindOne(ctx, filter, opts...)
-	deliverSpan.End()
-	return &SingleResult{SingleResult: sr, span: span, ctx: ctx, propagator: c.propagator, tracingEnabled: true, propagationEnabled: c.propagationEnabled}
+	return c.impl.FindOne(ctx, filter, opts...)
 }
 
-// UpdateOne injects the current trace context into the update and replaces the document's _oteltrace.
+// UpdateOne updates one matching document.
 func (c *Collection) UpdateOne(ctx context.Context, filter any, update any, opts ...options.Lister[options.UpdateOneOptions]) (*UpdateResult, error) {
-	if !c.tracingEnabled {
-		res, err := c.Collection.UpdateOne(ctx, filter, update, opts...)
-		if err != nil {
-			return nil, err
-		}
-		return &UpdateResult{res}, nil
-	}
-	dbName, collName := c.dbAndColl()
-	ctx, span := c.tracer.Start(ctx, dbSpanName("update", collName),
-		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(dbAttributes(dbName, collName, "update", 0, c.serverAddr, c.serverPort)...),
-	)
-	defer span.End()
-
-	injectCtx, deliverSpan := c.startDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
-	updateWithTrace := update
-	if c.propagationEnabled {
-		var err error
-		updateWithTrace, err = injectTraceIntoUpdate(injectCtx, update, c.propagator)
-		if err != nil {
-			span.AddEvent("otelmongo.trace_inject_failed",
-				trace.WithAttributes(attribute.String("error.message", err.Error())))
-			updateWithTrace = update
-		}
-	}
-	res, err := c.Collection.UpdateOne(injectCtx, filter, updateWithTrace, opts...)
-	recordSpanError(span, err)
-	if err != nil {
-		return nil, err
-	}
-	return &UpdateResult{res}, nil
+	return c.impl.UpdateOne(ctx, filter, update, opts...)
 }
 
-// UpdateMany injects the current trace context into the update for all matched documents.
+// UpdateMany updates all matching documents.
 func (c *Collection) UpdateMany(ctx context.Context, filter any, update any, opts ...options.Lister[options.UpdateManyOptions]) (*UpdateResult, error) {
-	if !c.tracingEnabled {
-		res, err := c.Collection.UpdateMany(ctx, filter, update, opts...)
-		if err != nil {
-			return nil, err
-		}
-		return &UpdateResult{res}, nil
-	}
-	dbName, collName := c.dbAndColl()
-	ctx, span := c.tracer.Start(ctx, dbSpanName("update", collName),
-		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(dbAttributes(dbName, collName, "update", 0, c.serverAddr, c.serverPort)...),
-	)
-	defer span.End()
-
-	injectCtx, deliverSpan := c.startDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
-	updateWithTrace := update
-	if c.propagationEnabled {
-		var err error
-		updateWithTrace, err = injectTraceIntoUpdate(injectCtx, update, c.propagator)
-		if err != nil {
-			span.AddEvent("otelmongo.trace_inject_failed",
-				trace.WithAttributes(attribute.String("error.message", err.Error())))
-			updateWithTrace = update
-		}
-	}
-	res, err := c.Collection.UpdateMany(injectCtx, filter, updateWithTrace, opts...)
-	recordSpanError(span, err)
-	if err != nil {
-		return nil, err
-	}
-	return &UpdateResult{res}, nil
+	return c.impl.UpdateMany(ctx, filter, update, opts...)
 }
 
-// ReplaceOne injects the current trace context into the replacement document.
+// ReplaceOne replaces one matching document.
 func (c *Collection) ReplaceOne(ctx context.Context, filter any, replacement any, opts ...options.Lister[options.ReplaceOptions]) (*UpdateResult, error) {
-	if !c.tracingEnabled {
-		res, err := c.Collection.ReplaceOne(ctx, filter, replacement, opts...)
-		if err != nil {
-			return nil, err
-		}
-		return &UpdateResult{res}, nil
-	}
-	dbName, collName := c.dbAndColl()
-	ctx, span := c.tracer.Start(ctx, dbSpanName("update", collName),
-		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(dbAttributes(dbName, collName, "update", 0, c.serverAddr, c.serverPort)...),
-	)
-	defer span.End()
-
-	injectCtx, deliverSpan := c.startDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
-	replacementToUse := replacement
-	if c.propagationEnabled {
-		replacementWithTrace, err := injectTraceIntoDocument(injectCtx, replacement, c.propagator)
-		if err != nil {
-			return nil, fmt.Errorf("otelmongo: inject trace: %w", err)
-		}
-		replacementToUse = replacementWithTrace
-	}
-	res, err := c.Collection.ReplaceOne(injectCtx, filter, replacementToUse, opts...)
-	recordSpanError(span, err)
-	if err != nil {
-		return nil, err
-	}
-	return &UpdateResult{res}, nil
+	return c.impl.ReplaceOne(ctx, filter, replacement, opts...)
 }
 
 // DeleteOne deletes one matching document.
 func (c *Collection) DeleteOne(ctx context.Context, filter any, opts ...options.Lister[options.DeleteOneOptions]) (*DeleteResult, error) {
-	if !c.tracingEnabled {
-		res, err := c.Collection.DeleteOne(ctx, filter, opts...)
-		if err != nil {
-			return nil, err
-		}
-		return &DeleteResult{res}, nil
-	}
-	dbName, collName := c.dbAndColl()
-	ctx, span := c.tracer.Start(ctx, dbSpanName("delete", collName),
-		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(dbAttributes(dbName, collName, "delete", 0, c.serverAddr, c.serverPort)...),
-	)
-	defer span.End()
-
-	_, deliverSpan := c.startDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
-
-	res, err := c.Collection.DeleteOne(ctx, filter, opts...)
-	recordSpanError(span, err)
-	if err != nil {
-		return nil, err
-	}
-	return &DeleteResult{res}, nil
+	return c.impl.DeleteOne(ctx, filter, opts...)
 }
 
 // DeleteMany deletes all documents matching filter.
 func (c *Collection) DeleteMany(ctx context.Context, filter any, opts ...options.Lister[options.DeleteManyOptions]) (*DeleteResult, error) {
-	if !c.tracingEnabled {
-		res, err := c.Collection.DeleteMany(ctx, filter, opts...)
-		if err != nil {
-			return nil, err
-		}
-		return &DeleteResult{res}, nil
-	}
-	dbName, collName := c.dbAndColl()
-	ctx, span := c.tracer.Start(ctx, dbSpanName("delete", collName),
-		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(dbAttributes(dbName, collName, "delete", 0, c.serverAddr, c.serverPort)...),
-	)
-	defer span.End()
-
-	_, deliverSpan := c.startDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
-
-	res, err := c.Collection.DeleteMany(ctx, filter, opts...)
-	recordSpanError(span, err)
-	if err != nil {
-		return nil, err
-	}
-	return &DeleteResult{res}, nil
+	return c.impl.DeleteMany(ctx, filter, opts...)
 }
 
 // CountDocuments counts documents matching filter.
 func (c *Collection) CountDocuments(ctx context.Context, filter any, opts ...options.Lister[options.CountOptions]) (int64, error) {
-	if !c.tracingEnabled {
-		return c.Collection.CountDocuments(ctx, filter, opts...)
-	}
-	dbName, collName := c.dbAndColl()
-	ctx, span := c.tracer.Start(ctx, dbSpanName("aggregate", collName),
-		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(dbAttributes(dbName, collName, "aggregate", 0, c.serverAddr, c.serverPort)...),
-	)
-	defer span.End()
-
-	_, deliverSpan := c.startDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
-
-	n, err := c.Collection.CountDocuments(ctx, filter, opts...)
-	recordSpanError(span, err)
-	return n, err
+	return c.impl.CountDocuments(ctx, filter, opts...)
 }
 
 // Distinct returns distinct values for fieldName.
 func (c *Collection) Distinct(ctx context.Context, fieldName string, filter any, opts ...options.Lister[options.DistinctOptions]) *mongo.DistinctResult {
-	if !c.tracingEnabled {
-		return c.Collection.Distinct(ctx, fieldName, filter, opts...)
-	}
-	dbName, collName := c.dbAndColl()
-	ctx, span := c.tracer.Start(ctx, dbSpanName("distinct", collName),
-		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(dbAttributes(dbName, collName, "distinct", 0, c.serverAddr, c.serverPort)...),
-	)
-	defer span.End()
-
-	_, deliverSpan := c.startDeliverSpan(ctx, dbName, collName)
-	result := c.Collection.Distinct(ctx, fieldName, filter, opts...)
-	deliverSpan.End()
-	return result
+	return c.impl.Distinct(ctx, fieldName, filter, opts...)
 }
 
 // Aggregate runs an aggregation pipeline and returns a Cursor.
 func (c *Collection) Aggregate(ctx context.Context, pipeline any, opts ...options.Lister[options.AggregateOptions]) (*Cursor, error) {
-	if !c.tracingEnabled {
-		cursor, err := c.Collection.Aggregate(ctx, pipeline, opts...)
-		if err != nil {
-			return nil, err
-		}
-		return &Cursor{Cursor: cursor, parentCtx: ctx, tracer: c.tracer, propagator: c.propagator, tracingEnabled: false, propagationEnabled: false}, nil
-	}
-	dbName, collName := c.dbAndColl()
-	ctx, span := c.tracer.Start(ctx, dbSpanName("aggregate", collName),
-		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(dbAttributes(dbName, collName, "aggregate", 0, c.serverAddr, c.serverPort)...),
-	)
-	defer span.End()
-
-	_, deliverSpan := c.startDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
-
-	cursor, err := c.Collection.Aggregate(ctx, pipeline, opts...)
-	recordSpanError(span, err)
-	if err != nil {
-		return nil, err
-	}
-	return &Cursor{Cursor: cursor, parentCtx: ctx, tracer: c.tracer, propagator: c.propagator, tracingEnabled: true, propagationEnabled: c.propagationEnabled}, nil
+	return c.impl.Aggregate(ctx, pipeline, opts...)
 }
 
-// UpdateByID updates one document by _id, injecting the current trace into the update.
+// UpdateByID updates one document by _id.
 func (c *Collection) UpdateByID(ctx context.Context, id any, update any, opts ...options.Lister[options.UpdateOneOptions]) (*UpdateResult, error) {
-	if !c.tracingEnabled {
-		res, err := c.Collection.UpdateByID(ctx, id, update, opts...)
-		if err != nil {
-			return nil, err
-		}
-		return &UpdateResult{res}, nil
-	}
-	dbName, collName := c.dbAndColl()
-	ctx, span := c.tracer.Start(ctx, dbSpanName("update", collName),
-		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(dbAttributes(dbName, collName, "update", 0, c.serverAddr, c.serverPort)...),
-	)
-	defer span.End()
-
-	injectCtx, deliverSpan := c.startDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
-	updateWithTrace := update
-	if c.propagationEnabled {
-		var err error
-		updateWithTrace, err = injectTraceIntoUpdate(injectCtx, update, c.propagator)
-		if err != nil {
-			span.AddEvent("otelmongo.trace_inject_failed",
-				trace.WithAttributes(attribute.String("error.message", err.Error())))
-			updateWithTrace = update
-		}
-	}
-	res, err := c.Collection.UpdateByID(injectCtx, id, updateWithTrace, opts...)
-	recordSpanError(span, err)
-	if err != nil {
-		return nil, err
-	}
-	return &UpdateResult{res}, nil
+	return c.impl.UpdateByID(ctx, id, update, opts...)
 }
 
 // DeleteOneByID deletes one document by _id.
@@ -482,96 +169,12 @@ func (c *Collection) FindByIDs(ctx context.Context, ids []any, opts ...options.L
 	return c.Find(ctx, map[string]any{"_id": map[string]any{"$in": ids}}, opts...)
 }
 
-// BulkWrite runs multiple write operations, injecting trace context into write models.
+// BulkWrite runs multiple write operations.
 func (c *Collection) BulkWrite(ctx context.Context, models []mongo.WriteModel, opts ...options.Lister[options.BulkWriteOptions]) (*BulkWriteResult, error) {
-	if !c.tracingEnabled {
-		res, err := c.Collection.BulkWrite(ctx, models, opts...)
-		if err != nil {
-			return nil, err
-		}
-		return &BulkWriteResult{res}, nil
-	}
-	dbName, collName := c.dbAndColl()
-	ctx, span := c.tracer.Start(ctx, dbSpanName("bulkWrite", collName),
-		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(dbAttributes(dbName, collName, "bulkWrite", len(models), c.serverAddr, c.serverPort)...),
-	)
-	defer span.End()
-
-	injectCtx, deliverSpan := c.startDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
-	modelsToWrite := models
-	if c.propagationEnabled {
-		injected, err := buildBulkWriteModelsWithTrace(injectCtx, models, c.propagator)
-		if err != nil {
-			recordSpanError(span, err)
-			return nil, err
-		}
-		modelsToWrite = injected
-	}
-	res, err := c.Collection.BulkWrite(injectCtx, modelsToWrite, opts...)
-	recordSpanError(span, err)
-	if err != nil {
-		return nil, err
-	}
-	return &BulkWriteResult{res}, nil
+	return c.impl.BulkWrite(ctx, models, opts...)
 }
 
 // Watch starts a change stream on the collection.
 func (c *Collection) Watch(ctx context.Context, pipeline any, opts ...options.Lister[options.ChangeStreamOptions]) (*ChangeStream, error) {
-	if !c.tracingEnabled {
-		cs, err := c.Collection.Watch(ctx, pipeline, opts...)
-		if err != nil {
-			return nil, err
-		}
-		return &ChangeStream{
-			ChangeStream:       cs,
-			tracer:             c.tracer,
-			propagator:         c.propagator,
-			tracingEnabled:     false,
-			propagationEnabled: false,
-		}, nil
-	}
-	dbName, collName := c.dbAndColl()
-	spanName := dbSpanName("aggregate", collName)
-	ctx, span := c.tracer.Start(ctx, spanName,
-		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(dbAttributes(dbName, collName, "aggregate", 0, c.serverAddr, c.serverPort)...),
-	)
-	defer span.End()
-
-	cs, err := c.Collection.Watch(ctx, pipeline, opts...)
-	recordSpanError(span, err)
-	if err != nil {
-		return nil, err
-	}
-	baseSpanOpts := []trace.SpanStartOption{
-		trace.WithSpanKind(trace.SpanKindConsumer),
-		trace.WithAttributes(dbAttributes(dbName, collName, "aggregate", 0, c.serverAddr, c.serverPort)...),
-	}
-	deliverAttrs := []attribute.KeyValue{
-		attribute.String(keyDBSystemName, dbSystemMongoDB),
-		attribute.String(keyDBCollection, collName),
-	}
-	if dbName != "" {
-		deliverAttrs = append(deliverAttrs, attribute.String(keyDBNamespace, dbName))
-	}
-	if c.serverAddr != "" {
-		deliverAttrs = append(deliverAttrs, attribute.String(keyServerAddress, c.serverAddr))
-		if c.serverPort > 0 && c.serverPort != 27017 {
-			deliverAttrs = append(deliverAttrs, attribute.Int(keyServerPort, c.serverPort))
-		}
-	}
-	return &ChangeStream{
-		ChangeStream:       cs,
-		tracer:             c.tracer,
-		propagator:         c.propagator,
-		tracingEnabled:     true,
-		propagationEnabled: c.propagationEnabled,
-		spanName:           spanName,
-		baseSpanOpts:       baseSpanOpts,
-		deliverTracer:      c.deliverTracer,
-		deliverSpanName:    dbName + "." + collName + " deliver",
-		deliverAttrs:       deliverAttrs,
-	}, nil
+	return c.impl.Watch(ctx, pipeline, opts...)
 }

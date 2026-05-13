@@ -6,11 +6,15 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
 
-// Cursor wraps *mongo.Cursor with trace propagation.
+// Cursor wraps *mongo.Cursor with trace propagation. The tracing/propagation
+// flags are populated by the Collection that produced this cursor — when the
+// gate is off all fields except Cursor stay zero-valued and DecodeWithContext
+// is a passthrough.
 type Cursor struct {
 	*mongo.Cursor
 	parentCtx          context.Context
@@ -20,20 +24,15 @@ type Cursor struct {
 	propagationEnabled bool
 }
 
-// DecodeWithContext decodes the current document into val and returns a context
-// enriched with the trace context extracted from the document's "_oteltrace"
-// field. When the field is absent the returned context is unchanged.
-//
-// Use this instead of Decode when you need to propagate the document's origin
-// trace context downstream.
+// DecodeWithContext decodes the current document into val and returns a
+// context enriched with the trace context extracted from the document's
+// "_oteltrace" field. When tracing is off (or the field is absent) the
+// returned context is unchanged.
 func (c *Cursor) DecodeWithContext(ctx context.Context, val any) (context.Context, error) {
 	if err := c.Cursor.Decode(val); err != nil {
 		return ctx, err
 	}
 	if !c.tracingEnabled {
-		// Original semantics: when tracing is off the decode span is suppressed,
-		// the origin trace is not enriched into ctx (callers can use ContextFromRawDocument
-		// explicitly for that). Returning ctx unchanged matches the noop-tracer behaviour.
 		return ctx, nil
 	}
 	raw := c.Current
@@ -45,7 +44,6 @@ func (c *Cursor) DecodeWithContext(ctx context.Context, val any) (context.Contex
 		}
 	}
 
-	// Detach any existing parent so tracer.Start creates a new TraceID.
 	detachedCtx := trace.ContextWithSpanContext(ctx, trace.SpanContext{})
 	spanOpts := []trace.SpanStartOption{trace.WithSpanKind(trace.SpanKindInternal)}
 	if originSpanCtx.IsValid() {
@@ -58,12 +56,13 @@ func (c *Cursor) DecodeWithContext(ctx context.Context, val any) (context.Contex
 }
 
 // Decode decodes the current document into val.
-// It delegates directly to the underlying *mongo.Cursor.Decode.
 func (c *Cursor) Decode(val any) error {
 	return c.Cursor.Decode(val)
 }
 
-// SingleResult wraps *mongo.SingleResult with trace propagation.
+// SingleResult wraps *mongo.SingleResult with trace propagation. When the
+// tracing gate is off (tracingEnabled=false) Decode/TraceContext/Raw act as
+// passthroughs and the span field stays nil so endSpan is a no-op.
 type SingleResult struct {
 	*mongo.SingleResult
 	span               trace.Span
@@ -74,8 +73,7 @@ type SingleResult struct {
 	endOnce            sync.Once
 }
 
-// endSpan ensures the associated span is ended exactly once. Nil-safe for fast-path
-// SingleResults that have no span attached.
+// endSpan ensures the associated span is ended exactly once. Nil-safe.
 func (r *SingleResult) endSpan() {
 	r.endOnce.Do(func() {
 		if r.span != nil {
@@ -84,22 +82,21 @@ func (r *SingleResult) endSpan() {
 	})
 }
 
-// Decode decodes the document and records any stored trace context as a span
-// link on the FindOne span before ending it.
-// The span is ended exactly once regardless of how many times Decode is called.
+// Decode decodes the document and (when tracing is on) records any stored
+// trace context as a span link on the FindOne span before ending it.
 func (r *SingleResult) Decode(v any) error {
 	defer r.endSpan()
-
 	if !r.tracingEnabled {
 		return r.SingleResult.Decode(v)
 	}
-
 	raw, err := r.SingleResult.Raw()
 	if err != nil {
-		recordSpanError(r.span, err)
+		if r.span != nil {
+			r.span.RecordError(err)
+			r.span.SetStatus(codes.Error, err.Error())
+		}
 		return err
 	}
-
 	if r.propagationEnabled {
 		if meta, ok := extractMetadataFromRaw(raw); ok {
 			originCtx := contextFromTraceMetadata(context.Background(), meta, r.propagator)
@@ -109,18 +106,14 @@ func (r *SingleResult) Decode(v any) error {
 			}
 		}
 	}
-
 	return r.SingleResult.Decode(v)
 }
 
-// TraceContext returns a context enriched with the trace context stored in the
-// fetched document's "_oteltrace" field. It must be called after Decode or Raw.
-// The span is ended exactly once when this method is called.
+// TraceContext returns a context enriched with the trace context stored in
+// the fetched document's "_oteltrace" field. Must be called after Decode or Raw.
 func (r *SingleResult) TraceContext() context.Context {
 	defer r.endSpan()
-
 	if !r.tracingEnabled {
-		// Tracing off ⇒ propagation off; never extract _oteltrace.
 		return r.ctx
 	}
 	raw, err := r.SingleResult.Raw()

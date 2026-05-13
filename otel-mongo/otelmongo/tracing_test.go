@@ -127,9 +127,11 @@ func TestContextFromRawDocumentV1_PropagationDisabled(t *testing.T) {
 }
 
 func TestStartDeliverSpanDisabled(t *testing.T) {
-	coll := &Collection{deliverTracer: nil}
+	// startDeliverSpan now lives on tracedCollection (the only impl that creates
+	// deliver spans). When deliverTracer is nil the helper must return ctx unchanged.
+	impl := &tracedCollection{deliverTracer: nil}
 	ctx := context.Background()
-	got, span := coll.startDeliverSpan(ctx, "testdb", "testcoll")
+	got, span := impl.startDeliverSpan(ctx, "testdb", "testcoll")
 	defer span.End()
 	assert.Equal(t, ctx, got, "expected unchanged ctx when deliverTracer is nil")
 	assert.False(t, trace.SpanFromContext(got).SpanContext().IsValid(), "expected no span in ctx when deliverTracer is nil")
@@ -138,7 +140,7 @@ func TestStartDeliverSpanDisabled(t *testing.T) {
 func TestStartDeliverSpanEnabled(t *testing.T) {
 	tp := sdktrace.NewTracerProvider()
 	tracer := tp.Tracer(ScopeName)
-	coll := &Collection{
+	impl := &tracedCollection{
 		deliverTracer: tracer,
 		serverAddr:    "localhost",
 		serverPort:    27017,
@@ -148,7 +150,7 @@ func TestStartDeliverSpanEnabled(t *testing.T) {
 	parentCtx, parentSpan := tp.Tracer(ScopeName).Start(context.Background(), "parent")
 	defer parentSpan.End()
 
-	got, deliverSpan := coll.startDeliverSpan(parentCtx, "testdb", "testcoll")
+	got, deliverSpan := impl.startDeliverSpan(parentCtx, "testdb", "testcoll")
 	defer deliverSpan.End()
 
 	deliverSC := trace.SpanFromContext(got).SpanContext()
