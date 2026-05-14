@@ -41,10 +41,20 @@ func (d *directConn) PublishMsg(_ context.Context, msg *nats.Msg) error {
 	return d.nc.PublishMsg(msg)
 }
 
-func (d *directConn) Request(ctx context.Context, subject string, data []byte, timeout time.Duration) (*nats.Msg, error) {
-	reqCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	return d.nc.RequestWithContext(reqCtx, subject, data)
+func (d *directConn) Request(subject string, data []byte, timeout time.Duration) (*nats.Msg, error) {
+	return d.nc.Request(subject, data, timeout)
+}
+
+func (d *directConn) RequestWithContext(ctx context.Context, subject string, data []byte) (*nats.Msg, error) {
+	return d.nc.RequestWithContext(ctx, subject, data)
+}
+
+func (d *directConn) RequestMsg(msg *nats.Msg, timeout time.Duration) (*nats.Msg, error) {
+	return d.nc.RequestMsg(msg, timeout)
+}
+
+func (d *directConn) RequestMsgWithContext(ctx context.Context, msg *nats.Msg) (*nats.Msg, error) {
+	return d.nc.RequestMsgWithContext(ctx, msg)
 }
 
 func (d *directConn) wrapMsgHandler(_, _ string, handler MsgHandler) nats.MsgHandler {

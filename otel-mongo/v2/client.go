@@ -102,6 +102,24 @@ func Connect(opts ...*options.ClientOptions) (*Client, error) {
 // stored in the Client and used for all tracing — the otel globals are never overwritten.
 // Without options, falls back to otel.GetTracerProvider()/otel.GetTextMapPropagator() at connect time.
 func ConnectWithOptions(traceOpts []ClientOption, opts ...*options.ClientOptions) (*Client, error) {
+	if !mongoTracingEnabled() {
+		merged := options.MergeClientOptions(opts...)
+		mc, err := mongo.Connect(merged)
+		if err != nil {
+			return nil, err
+		}
+		addr, port := parseServerFromURI(merged.GetURI())
+		tracer := noop.NewTracerProvider().Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
+		return &Client{
+			Client:             mc,
+			serverAddr:         addr,
+			serverPort:         port,
+			tracer:             tracer,
+			propagator:         otel.GetTextMapPropagator(),
+			tracingEnabled:     false,
+			propagationEnabled: false,
+		}, nil
+	}
 	cfg := newClientConfig(traceOpts)
 	tp := cfg.TracerProvider
 	if tp == nil {
@@ -112,30 +130,21 @@ func ConnectWithOptions(traceOpts []ClientOption, opts ...*options.ClientOptions
 		prop = otel.GetTextMapPropagator()
 	}
 	propEnabled := resolveDocumentPropagation(cfg.PropagationEnabled)
-	tracingOn := mongoTracingEnabled()
-	tracerProvider := tp
-	if !tracingOn {
-		tracerProvider = noop.NewTracerProvider()
-	}
-	tracer := tracerProvider.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
+	tracer := tp.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
 	merged := options.MergeClientOptions(opts...)
 	mc, err := mongo.Connect(merged)
 	if err != nil {
 		return nil, err
 	}
 	addr, port := parseServerFromURI(merged.GetURI())
-	var mongoTP *sdktrace.TracerProvider
-	var deliverTracer trace.Tracer
-	if tracingOn {
-		mongoTP, deliverTracer = initMongoProvider(addr, port)
-	}
+	mongoTP, deliverTracer := initMongoProvider(addr, port)
 	return &Client{
 		Client:             mc,
 		serverAddr:         addr,
 		serverPort:         port,
 		tracer:             tracer,
 		propagator:         prop,
-		tracingEnabled:     tracingOn,
+		tracingEnabled:     true,
 		propagationEnabled: propEnabled,
 		mongoTP:            mongoTP,
 		deliverTracer:      deliverTracer,

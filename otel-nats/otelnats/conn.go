@@ -24,7 +24,7 @@ import (
 const (
 	// ScopeName is the instrumentation scope name for Tracer creation (OTel contrib guideline).
 	ScopeName              = "github.com/Marz32onE/instrumentation-go/otel-nats/otelnats"
-	instrumentationVersion = "0.4.0"
+	instrumentationVersion = "0.4.1"
 	messagingSystem        = "nats"
 )
 
@@ -58,7 +58,10 @@ type Conn struct {
 type connImpl interface {
 	Publish(ctx context.Context, subject string, data []byte) error
 	PublishMsg(ctx context.Context, msg *nats.Msg) error
-	Request(ctx context.Context, subject string, data []byte, timeout time.Duration) (*nats.Msg, error)
+	Request(subject string, data []byte, timeout time.Duration) (*nats.Msg, error)
+	RequestWithContext(ctx context.Context, subject string, data []byte) (*nats.Msg, error)
+	RequestMsg(msg *nats.Msg, timeout time.Duration) (*nats.Msg, error)
+	RequestMsgWithContext(ctx context.Context, msg *nats.Msg) (*nats.Msg, error)
 	wrapMsgHandler(subject, queue string, handler MsgHandler) nats.MsgHandler
 	traceEventHandler() nats.MsgHandler
 	StartDeliverSpan(ctx context.Context, subject string) context.Context
@@ -126,12 +129,12 @@ func Version() string {
 }
 
 func newConn(nc *nats.Conn, opts ...Option) *Conn {
+	if !natsTracingEnabled() {
+		return &Conn{nc: nc, impl: &directConn{nc: nc}}
+	}
 	cfg := newConnConfig(opts...)
 	if cfg.Propagators == nil {
 		cfg.Propagators = otel.GetTextMapPropagator()
-	}
-	if !natsTracingEnabled() {
-		return &Conn{nc: nc, impl: &directConn{nc: nc}}
 	}
 	tp := cfg.TracerProvider
 	if tp == nil {
@@ -293,10 +296,29 @@ func (c *Conn) PublishMsg(ctx context.Context, msg *nats.Msg) error {
 	return c.impl.PublishMsg(ctx, msg)
 }
 
-// Request sends a request and waits for reply. Same as nats.Conn.Request but accepts context.
-// The timeout parameter is applied to the request; the call returns when the reply is received or timeout is reached.
-func (c *Conn) Request(ctx context.Context, subject string, data []byte, timeout time.Duration) (*nats.Msg, error) {
-	return c.impl.Request(ctx, subject, data, timeout)
+// Request sends a request and waits for reply. Signature mirrors nats.Conn.Request exactly.
+// When tracing is enabled the producer span uses context.Background() as parent — callers that
+// need to chain into an existing trace should use RequestWithContext or RequestMsgWithContext.
+func (c *Conn) Request(subject string, data []byte, timeout time.Duration) (*nats.Msg, error) {
+	return c.impl.Request(subject, data, timeout)
+}
+
+// RequestWithContext sends a request with the timeout controlled by ctx. Signature mirrors
+// nats.Conn.RequestWithContext exactly; the producer span uses ctx as parent for trace chaining.
+func (c *Conn) RequestWithContext(ctx context.Context, subject string, data []byte) (*nats.Msg, error) {
+	return c.impl.RequestWithContext(ctx, subject, data)
+}
+
+// RequestMsg sends a pre-built request message. Signature mirrors nats.Conn.RequestMsg exactly.
+// When tracing is enabled the producer span uses context.Background() as parent.
+func (c *Conn) RequestMsg(msg *nats.Msg, timeout time.Duration) (*nats.Msg, error) {
+	return c.impl.RequestMsg(msg, timeout)
+}
+
+// RequestMsgWithContext sends a pre-built request message with ctx-controlled timeout.
+// Signature mirrors nats.Conn.RequestMsgWithContext exactly; the producer span uses ctx as parent.
+func (c *Conn) RequestMsgWithContext(ctx context.Context, msg *nats.Msg) (*nats.Msg, error) {
+	return c.impl.RequestMsgWithContext(ctx, msg)
 }
 
 // Subscribe subscribes to subject. Handler receives Msg (m.Msg, m.Context()).
@@ -315,6 +337,26 @@ func publishAttrs(msg *nats.Msg, serverAttrs []attribute.KeyValue) []attribute.K
 		semconv.MessagingDestinationNameKey.String(msg.Subject),
 		attribute.String(string(semconv.MessagingOperationTypeKey), "send"),
 		semconv.MessagingOperationNameKey.String("publish"),
+	}
+	if len(msg.Data) > 0 {
+		attrs = append(attrs, semconv.MessagingMessageBodySize(len(msg.Data)))
+	}
+	if msg.Reply != "" {
+		attrs = append(attrs, semconv.MessagingMessageConversationID(msg.Reply))
+	}
+	attrs = append(attrs, serverAttrs...)
+	return attrs
+}
+
+// requestAttrs builds attributes for the CLIENT span of a request/reply RPC.
+// Mirrors publishAttrs but with messaging.operation.name=request so backends
+// distinguish blocking RPC from fire-and-forget publish on the same destination.
+func requestAttrs(msg *nats.Msg, serverAttrs []attribute.KeyValue) []attribute.KeyValue {
+	attrs := []attribute.KeyValue{
+		semconv.MessagingSystemKey.String(messagingSystem),
+		semconv.MessagingDestinationNameKey.String(msg.Subject),
+		attribute.String(string(semconv.MessagingOperationTypeKey), "send"),
+		semconv.MessagingOperationNameKey.String("request"),
 	}
 	if len(msg.Data) > 0 {
 		attrs = append(attrs, semconv.MessagingMessageBodySize(len(msg.Data)))
