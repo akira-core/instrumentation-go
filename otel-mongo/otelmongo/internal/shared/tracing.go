@@ -56,27 +56,25 @@ func InjectTraceIntoDocument(ctx context.Context, document any, prop propagation
 	return doc, nil
 }
 
-// ExtractMetadataFromRaw looks up the "_oteltrace" field in raw and, when found,
-// unmarshals it into a TraceMetadata.
+// ExtractMetadataFromRaw looks up the "_oteltrace" field in raw and reads its
+// traceparent / tracestate string members directly via BSON byte lookups —
+// avoids reflection-based bson.Unmarshal so the per-document overhead in heavy
+// read paths (cursor decode, change stream) stays at zero allocations.
 func ExtractMetadataFromRaw(raw bson.Raw) (*TraceMetadata, bool) {
 	val, err := raw.LookupErr(TraceMetadataKey)
 	if err != nil {
 		return nil, false
 	}
-
-	rawDoc, ok := val.DocumentOK()
+	sub, ok := val.DocumentOK()
 	if !ok {
 		return nil, false
 	}
-
-	var meta TraceMetadata
-	if err := bson.Unmarshal(rawDoc, &meta); err != nil {
+	tp, ok := sub.Lookup("traceparent").StringValueOK()
+	if !ok || tp == "" {
 		return nil, false
 	}
-	if meta.Traceparent == "" {
-		return nil, false
-	}
-	return &meta, true
+	ts, _ := sub.Lookup("tracestate").StringValueOK()
+	return &TraceMetadata{Traceparent: tp, Tracestate: ts}, true
 }
 
 // ContextFromTraceMetadata injects the remote span context encoded in meta into ctx using prop.
