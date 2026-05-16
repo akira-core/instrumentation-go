@@ -21,12 +21,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-const (
-	// ScopeName is the instrumentation scope name for Tracer creation (OTel contrib guideline).
-	ScopeName              = "instrumentation-go/otel-nats/otelnats"
-	instrumentationVersion = "0.4.1"
-	messagingSystem        = "nats"
-)
+const messagingSystem = "nats"
 
 // Msg carries a message and the context with extracted trace (Subscribe/QueueSubscribe).
 // Use m.Msg for the message and m.Context() for the trace context.
@@ -121,11 +116,6 @@ func WithTraceDestination(subject string) Option {
 	return optionFunc(func(c *connConfig) {
 		c.TraceDest = subject
 	})
-}
-
-// Version returns the instrumentation module version for tracer creation (OTel contrib guideline).
-func Version() string {
-	return instrumentationVersion
 }
 
 func newConn(nc *nats.Conn, opts ...Option) *Conn {

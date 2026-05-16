@@ -14,12 +14,12 @@
 
 package otelgorillaws
 
-// Version is the current release version of the WebSocket instrumentation.
-func Version() string {
-	return "0.4.1"
-}
+// ScopeName is the instrumentation scope name for Tracer creation (OTel contrib guideline).
+const ScopeName = "instrumentation-go/otel-gorilla-ws"
 
-// SemVersion returns the version string for tracer creation. Alias for Version().
-func SemVersion() string {
-	return Version()
+const instrumentationVersion = "0.4.1"
+
+// Version returns the instrumentation module version (OTel contrib guideline).
+func Version() string {
+	return instrumentationVersion
 }

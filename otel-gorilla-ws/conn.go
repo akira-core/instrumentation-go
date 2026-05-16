@@ -30,9 +30,6 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// ScopeName is the instrumentation scope name for Tracer creation (OTel contrib guideline).
-const ScopeName = "instrumentation-go/otel-gorilla-ws"
-
 // otelWSProtocol is the subprotocol token injected during the WebSocket handshake
 // to negotiate otel-ws trace propagation support.
 const otelWSProtocol = "otel-ws"
