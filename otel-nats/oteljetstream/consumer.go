@@ -4,7 +4,6 @@ import (
 	"context"
 	"sync"
 
-	nats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
@@ -123,6 +122,13 @@ func (m *messageBatchTrace) Stop() {
 }
 
 // newDirectMessageBatch wraps a raw jetstream.MessageBatch with the passthrough variant.
+//
+// Lifecycle invariant: when Stop() closes done while raw still has
+// undelivered messages, we MUST keep receiving from raw.Messages() until that
+// channel is closed by the upstream jetstream driver. Otherwise the driver's
+// internal sender goroutine blocks forever on an unbuffered chan send — that's
+// the leak source. The drain loop is a tight no-op loop, just enough to keep
+// raw's sender unblocked until it naturally finishes / times out.
 func newDirectMessageBatch(raw jetstream.MessageBatch) MessageBatch {
 	ch := make(chan Msg)
 	done := make(chan struct{})
@@ -132,6 +138,10 @@ func newDirectMessageBatch(raw jetstream.MessageBatch) MessageBatch {
 			select {
 			case ch <- Msg{Msg: msg, Ctx: context.Background()}:
 			case <-done:
+				// Drain remaining raw messages so the upstream goroutine
+				// can complete and close raw.Messages() cleanly.
+				for range raw.Messages() {
+				}
 				return
 			}
 		}
@@ -157,11 +167,11 @@ func newTracedMessageBatch(conn *otelnats.Conn, consumerName string, raw jetstre
 				lastSpan.End()
 				lastSpan = nil
 			}
-			h := msg.Headers()
-			if h == nil {
-				h = make(nats.Header)
+			hdr := msg.Headers()
+			msgCtx := context.Background()
+			if hdr != nil && hdr.Get("traceparent") != "" {
+				msgCtx = prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: hdr})
 			}
-			msgCtx := prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: h})
 			originSpanCtx := trace.SpanContextFromContext(msgCtx)
 			consumerParentCtx := conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
 			attrs := append(receiveAttrs(msg, "receive", conn.ServerAttrs()), attribute.String(attrConsumerName, consumerName))
@@ -169,7 +179,8 @@ func newTracedMessageBatch(conn *otelnats.Conn, consumerName string, raw jetstre
 				trace.WithSpanKind(trace.SpanKindConsumer),
 				trace.WithAttributes(attrs...),
 			}
-			if originSpanCtx.IsValid() {
+			// Only attach link when origin trace is sampled (avoid dangling link to dropped span).
+			if originSpanCtx.IsValid() && originSpanCtx.IsSampled() {
 				opts = append(opts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
 			}
 			ctx, span := tracer.Start(consumerParentCtx, "receive "+msg.Subject(), opts...)
@@ -178,6 +189,12 @@ func newTracedMessageBatch(conn *otelnats.Conn, consumerName string, raw jetstre
 				lastSpan = span
 			case <-done:
 				span.End()
+				// Lifecycle invariant: drain remaining raw messages so the
+				// upstream jetstream driver goroutine can finish and close
+				// raw.Messages() — otherwise it blocks forever on chan send.
+				// See newDirectMessageBatch for the full rationale.
+				for range raw.Messages() {
+				}
 				return
 			}
 		}

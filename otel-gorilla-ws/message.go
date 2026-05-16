@@ -2,6 +2,8 @@ package otelgorillaws
 
 import (
 	"encoding/json"
+	"strconv"
+	"sync"
 )
 
 const (
@@ -13,9 +15,24 @@ const (
 
 // wireEnvelope is the on-wire format shared with the JS instrumentation packages.
 // Both otel-ws and otel-rxjs-ws produce and consume this exact structure.
+//
+// Kept exported as a type for tryUnmarshalWire fallback parsing; marshalWire
+// no longer constructs this struct — it writes the JSON form directly via a
+// pooled byte buffer to avoid reflection cost on the hot send path.
 type wireEnvelope struct {
 	Header map[string]string `json:"header"`
 	Data   json.RawMessage   `json:"data"`
+}
+
+// wireBufPool reuses byte buffers across marshalWire calls so the hot send
+// path does not pay heap allocation for the staging buffer per message.
+// Initial capacity 512 covers typical WS payloads; larger payloads grow the
+// buffer once per pool entry and stabilise after a few cycles.
+var wireBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 512)
+		return &b
+	},
 }
 
 // marshalWire wraps payload in the envelope format:
@@ -24,28 +41,51 @@ type wireEnvelope struct {
 //
 // All payload types are wrapped — objects, arrays, strings, numbers.
 // If payload is not valid JSON (e.g. raw binary), it is JSON-encoded as a string first.
+//
+// Hand-written serializer — no reflection, pooled staging buffer.
+// Output is structurally equivalent to the previous encoding/json path
+// (round-trips through json.Unmarshal into wireEnvelope identically).
 func marshalWire(carrier map[string]string, payload []byte) ([]byte, error) {
-	header := make(map[string]string)
+	bufp := wireBufPool.Get().(*[]byte)
+	buf := (*bufp)[:0]
+	defer func() {
+		// Cap retained capacity to avoid pinning very large buffers in the pool.
+		if cap(buf) <= 64*1024 {
+			*bufp = buf[:0]
+			wireBufPool.Put(bufp)
+		}
+	}()
+
+	buf = append(buf, `{"header":{`...)
+	wrote := false
 	if tp := carrier[TraceparentHeader]; tp != "" {
-		header[TraceparentHeader] = tp
+		buf = append(buf, `"traceparent":`...)
+		buf = strconv.AppendQuote(buf, tp)
+		wrote = true
 	}
 	if ts := carrier[TracestateHeader]; ts != "" {
-		header[TracestateHeader] = ts
-	}
-
-	var rawData json.RawMessage
-	if json.Valid(payload) {
-		rawData = payload
-	} else {
-		// Non-JSON bytes (e.g. raw binary text): encode as a JSON string so the
-		// data field is always valid JSON, mirroring what the JS packages do.
-		encoded, err := json.Marshal(string(payload))
-		if err != nil {
-			return payload, nil
+		if wrote {
+			buf = append(buf, ',')
 		}
-		rawData = encoded
+		buf = append(buf, `"tracestate":`...)
+		buf = strconv.AppendQuote(buf, ts)
 	}
-	return json.Marshal(wireEnvelope{Header: header, Data: rawData})
+	buf = append(buf, `},"data":`...)
+
+	if json.Valid(payload) {
+		buf = append(buf, payload...)
+	} else {
+		// Non-JSON bytes: encode as a JSON string so the data field is always
+		// valid JSON, mirroring the JS packages.
+		buf = strconv.AppendQuote(buf, string(payload))
+	}
+	buf = append(buf, '}')
+
+	// Copy out to a fresh slice — caller keeps a reference and the buffer
+	// goes back to the pool. This is the one unavoidable alloc.
+	out := make([]byte, len(buf))
+	copy(out, buf)
+	return out, nil
 }
 
 // tryUnmarshalWire extracts trace headers from an incoming message and returns

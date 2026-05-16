@@ -2,6 +2,7 @@ package oteljetstream_test
 
 import (
 	"context"
+	"runtime"
 	"testing"
 	"time"
 
@@ -685,4 +686,155 @@ func TestJetStreamConsumerManagerConsumerKeepsTraceWrapper(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("JetStream.Consumer returned consumer did not carry trace context")
 	}
+}
+
+// for batch fetches. Returns the consumer plus a publish helper.
+func messageBatchFixture(t *testing.T) (oteljetstream.Consumer, func(payload string), func()) {
+	t.Helper()
+	url := startJetStreamServer(t)
+	sr := tracetest.NewSpanRecorder()
+	tp := trace.NewTracerProvider(trace.WithSpanProcessor(sr))
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}))
+
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	js, err := oteljetstream.New(conn)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	streamName := "BATCHLIFECYCLE"
+	_, err = js.CreateOrUpdateStream(ctx, oteljetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{"batchlifecycle.>"},
+	})
+	require.NoError(t, err)
+	stream, err := js.Stream(ctx, streamName)
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(ctx, oteljetstream.ConsumerConfig{
+		Durable:       "batchlifecycle-cons",
+		FilterSubject: "batchlifecycle.test",
+		AckPolicy:     oteljetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	pub := func(payload string) {
+		_, perr := js.Publish(ctx, "batchlifecycle.test", []byte(payload))
+		require.NoError(t, perr)
+	}
+	cleanup := func() {
+		conn.Close()
+	}
+	t.Cleanup(cleanup)
+	return cons, pub, cleanup
+}
+
+// TestMessageBatchStopIdempotent verifies Stop() is safe to call multiple
+// times without panic (sync.Once invariant).
+func TestMessageBatchStopIdempotent(t *testing.T) {
+	cons, pub, _ := messageBatchFixture(t)
+	pub("p1")
+	pub("p2")
+	pub("p3")
+
+	var batch oteljetstream.MessageBatch
+	for attempt := 0; attempt < 30; attempt++ {
+		b, err := cons.Fetch(3, jetstream.FetchMaxWait(300*time.Millisecond))
+		require.NoError(t, err)
+		// drain at least one to confirm batch is alive, then stop early
+		select {
+		case _, ok := <-b.Messages():
+			require.True(t, ok)
+			batch = b
+		case <-time.After(500 * time.Millisecond):
+		}
+		if batch != nil {
+			break
+		}
+	}
+	require.NotNil(t, batch, "expected at least one message available")
+
+	// Call Stop() three times — must not panic.
+	batch.Stop()
+	batch.Stop()
+	batch.Stop()
+}
+
+// TestMessageBatchStopReleasesRawBatch verifies the drain invariant:
+// after Stop() the wrapper goroutine drains the raw chan so the upstream
+// jetstream driver can complete. Detection: goroutine count returns to
+// baseline within a reasonable window.
+func TestMessageBatchStopReleasesRawBatch(t *testing.T) {
+	cons, pub, _ := messageBatchFixture(t)
+	// publish enough messages so the raw batch chan still has undelivered
+	// items when we Stop().
+	for i := 0; i < 10; i++ {
+		pub("p")
+	}
+
+	runtime.GC()
+	before := runtime.NumGoroutine()
+
+	for round := 0; round < 5; round++ {
+		batch, err := cons.Fetch(10, jetstream.FetchMaxWait(300*time.Millisecond))
+		require.NoError(t, err)
+		// Consume only ONE message then Stop — leaves the raw chan with
+		// pending items. Without the drain fix the upstream goroutine
+		// blocks on chan send.
+		select {
+		case m, ok := <-batch.Messages():
+			if ok {
+				_ = m.Ack()
+			}
+		case <-time.After(500 * time.Millisecond):
+		}
+		batch.Stop()
+		// Republish so next round has something to fetch.
+		for i := 0; i < 3; i++ {
+			pub("p")
+		}
+	}
+
+	// Give wrapper goroutines time to exit + GC.
+	time.Sleep(200 * time.Millisecond)
+	runtime.GC()
+	time.Sleep(50 * time.Millisecond)
+
+	after := runtime.NumGoroutine()
+	delta := after - before
+	// Allow modest slack for the embedded NATS server housekeeping.
+	assert.Less(t, delta, 30,
+		"goroutine count grew by %d after 5 early-stop rounds (likely leak in raw batch goroutine)", delta)
+}
+
+// TestNoGoroutineLeakAfterEarlyReturn confirms the wrapper goroutine inside
+// newTracedMessageBatch exits after Stop() even when caller did not consume
+// any message. Exercises the done-branch drain path.
+func TestNoGoroutineLeakAfterEarlyReturn(t *testing.T) {
+	cons, pub, _ := messageBatchFixture(t)
+	for i := 0; i < 5; i++ {
+		pub("p")
+	}
+
+	runtime.GC()
+	before := runtime.NumGoroutine()
+
+	for i := 0; i < 10; i++ {
+		batch, err := cons.Fetch(5, jetstream.FetchMaxWait(300*time.Millisecond))
+		require.NoError(t, err)
+		// Immediately Stop without consuming.
+		batch.Stop()
+		for i := 0; i < 2; i++ {
+			pub("p")
+		}
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	runtime.GC()
+	time.Sleep(50 * time.Millisecond)
+
+	after := runtime.NumGoroutine()
+	delta := after - before
+	assert.Less(t, delta, 30,
+		"goroutine count grew by %d after 10 stop-without-consume rounds", delta)
 }

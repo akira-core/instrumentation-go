@@ -3,7 +3,6 @@ package oteljetstream
 import (
 	"context"
 
-	nats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -45,12 +44,12 @@ func (c *tracedConsumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (
 	if err != nil {
 		return nil, nil, err
 	}
-	h := msg.Headers()
-	if h == nil {
-		h = make(nats.Header)
-	}
+	hdr := msg.Headers()
 	tracer, prop := c.conn.TraceContext()
-	msgCtx := prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: h})
+	msgCtx := context.Background()
+	if hdr != nil && hdr.Get("traceparent") != "" {
+		msgCtx = prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: hdr})
+	}
 	originSpanCtx := trace.SpanContextFromContext(msgCtx)
 	consumerParentCtx := c.conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
 	spanName := "receive " + msg.Subject()
@@ -59,7 +58,8 @@ func (c *tracedConsumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (
 		trace.WithSpanKind(trace.SpanKindConsumer),
 		trace.WithAttributes(attrs...),
 	}
-	if originSpanCtx.IsValid() {
+	// Only attach link when origin trace is sampled (avoid dangling link to dropped span).
+	if originSpanCtx.IsValid() && originSpanCtx.IsSampled() {
 		startOpts = append(startOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
 	}
 	_, span := tracer.Start(consumerParentCtx, spanName, startOpts...)
@@ -128,11 +128,11 @@ func (c *tracedPushConsumer) CachedInfo() *ConsumerInfo {
 func tracedConsumeHandler(conn *otelnats.Conn, consumerName string, handler MsgHandler) func(jetstream.Msg) {
 	tracer, prop := conn.TraceContext()
 	return func(msg jetstream.Msg) {
-		h := msg.Headers()
-		if h == nil {
-			h = make(nats.Header)
+		hdr := msg.Headers()
+		msgCtx := context.Background()
+		if hdr != nil && hdr.Get("traceparent") != "" {
+			msgCtx = prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: hdr})
 		}
-		msgCtx := prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: h})
 		originSpanCtx := trace.SpanContextFromContext(msgCtx)
 		consumerParentCtx := conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
 		spanName := "process " + msg.Subject()
@@ -141,7 +141,8 @@ func tracedConsumeHandler(conn *otelnats.Conn, consumerName string, handler MsgH
 			trace.WithSpanKind(trace.SpanKindConsumer),
 			trace.WithAttributes(attrs...),
 		}
-		if originSpanCtx.IsValid() {
+		// Only attach link when origin trace is sampled (avoid dangling link to dropped span).
+		if originSpanCtx.IsValid() && originSpanCtx.IsSampled() {
 			startOpts = append(startOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
 		}
 		ctx, span := tracer.Start(consumerParentCtx, spanName, startOpts...)
@@ -167,12 +168,12 @@ func (m *tracedMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context
 	if err != nil {
 		return nil, nil, err
 	}
-	h := msg.Headers()
-	if h == nil {
-		h = make(nats.Header)
-	}
+	hdr := msg.Headers()
 	tracer, prop := m.conn.TraceContext()
-	msgCtx := prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: h})
+	msgCtx := context.Background()
+	if hdr != nil && hdr.Get("traceparent") != "" {
+		msgCtx = prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: hdr})
+	}
 	originSpanCtx := trace.SpanContextFromContext(msgCtx)
 	consumerParentCtx := m.conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
 	spanName := "receive " + msg.Subject()
@@ -181,7 +182,8 @@ func (m *tracedMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context
 		trace.WithSpanKind(trace.SpanKindConsumer),
 		trace.WithAttributes(attrs...),
 	}
-	if originSpanCtx.IsValid() {
+	// Only attach link when origin trace is sampled (avoid dangling link to dropped span).
+	if originSpanCtx.IsValid() && originSpanCtx.IsSampled() {
 		startOpts = append(startOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
 	}
 	ctx, span := tracer.Start(consumerParentCtx, spanName, startOpts...)

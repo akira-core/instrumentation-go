@@ -410,3 +410,263 @@ func TestDeliverSpanConsumerLinksToDeliverSpan(t *testing.T) {
 	assert.Equal(t, producer.SpanContext().TraceID(), consumer.Links()[0].SpanContext.TraceID(),
 		"deliver span should share traceID with producer")
 }
+
+// newAlwaysSampleProvider gives a TracerProvider that records all spans,
+// independent of the parent's sampled flag. Required for tests that extract
+// a sampled=0 traceparent — under ParentBased sampler the derived consumer
+// span would also be dropped and never appear in the recorder.
+func newAlwaysSampleProvider() (*trace.TracerProvider, *tracetest.SpanRecorder) {
+	sr := tracetest.NewSpanRecorder()
+	tp := trace.NewTracerProvider(
+		trace.WithSampler(trace.AlwaysSample()),
+		trace.WithSpanProcessor(sr),
+	)
+	return tp, sr
+}
+
+// publishWithFlags publishes a message whose traceparent header carries the
+// supplied trace-flags byte (01 = sampled, 00 = not sampled). Used to drive
+// the consumer-side link gate without depending on producer-side sampler
+// configuration.
+func publishWithFlags(t *testing.T, nc *nats.Conn, subject string, flagsHex string) {
+	t.Helper()
+	hdr := nats.Header{}
+	hdr.Set("traceparent", "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-"+flagsHex)
+	require.NoError(t, nc.PublishMsg(&nats.Msg{Subject: subject, Header: hdr, Data: []byte("payload")}))
+	require.NoError(t, nc.Flush())
+}
+
+// makeSpanContext builds a SpanContext with the supplied sampled flag.
+// 32-hex traceID + 16-hex spanID with caller-chosen TraceFlags.
+func makeSpanContext(t *testing.T, sampled bool) oteltrace.SpanContext {
+	t.Helper()
+	tid, err := oteltrace.TraceIDFromHex("aabbccddeeff00112233445566778899")
+	require.NoError(t, err)
+	sid, err := oteltrace.SpanIDFromHex("1122334455667788")
+	require.NoError(t, err)
+	var flags oteltrace.TraceFlags
+	if sampled {
+		flags = oteltrace.FlagsSampled
+	}
+	return oteltrace.NewSpanContext(oteltrace.SpanContextConfig{
+		TraceID:    tid,
+		SpanID:     sid,
+		TraceFlags: flags,
+		Remote:     true,
+	})
+}
+
+// connectWithDeliverEnabled returns a Conn whose deliverTracer is enabled
+// (OTEL_EXPORTER_OTLP_ENDPOINT set). Hot-path checks for deliverTracer != nil
+// will return true.
+func connectWithDeliverEnabled(t *testing.T) *otelnats.Conn {
+	t.Helper()
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317")
+	url := startServer(t)
+	tp, _ := newTestProvider()
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	t.Cleanup(conn.Close)
+	require.True(t, conn.DeliverSpanEnabled(), "deliver span must be enabled for sampling-gate tests")
+	return conn
+}
+
+// TestConsumerSpanNoLinkWhenOriginNotSampled validates the sampler-aware
+// link-gate invariant for the core NATS Subscribe path: an upstream span
+// with sampled=0 must not be linked from the consumer span (dangling-link
+// prevention).
+func TestConsumerSpanNoLinkWhenOriginNotSampled(t *testing.T) {
+	url := startServer(t)
+	tp, sr := newAlwaysSampleProvider()
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	otel.SetTracerProvider(tp)
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	t.Cleanup(conn.Close)
+
+	subject := "link.unsampled"
+	done := make(chan struct{})
+	_, err = conn.Subscribe(subject, func(_ otelnats.Msg) { close(done) })
+	require.NoError(t, err)
+
+	publishWithFlags(t, conn.NatsConn(), subject, "00")
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscribe handler did not fire")
+	}
+
+	consumerSpan := waitSpanByNameAndKind(t, sr, "process "+subject, oteltrace.SpanKindConsumer)
+	require.NotNil(t, consumerSpan)
+	assert.Empty(t, consumerSpan.Links(),
+		"consumer span must NOT carry a link when origin sampled=0 (dangling-link prevention)")
+}
+
+// TestConsumerSpanHasLinkWhenOriginSampled is the positive counterpart —
+// the link is preserved when the upstream trace is sampled.
+func TestConsumerSpanHasLinkWhenOriginSampled(t *testing.T) {
+	url := startServer(t)
+	tp, sr := newAlwaysSampleProvider()
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	otel.SetTracerProvider(tp)
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	t.Cleanup(conn.Close)
+
+	subject := "link.sampled"
+	done := make(chan struct{})
+	_, err = conn.Subscribe(subject, func(_ otelnats.Msg) { close(done) })
+	require.NoError(t, err)
+
+	publishWithFlags(t, conn.NatsConn(), subject, "01")
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscribe handler did not fire")
+	}
+
+	consumerSpan := waitSpanByNameAndKind(t, sr, "process "+subject, oteltrace.SpanKindConsumer)
+	require.NotNil(t, consumerSpan)
+	require.Len(t, consumerSpan.Links(), 1,
+		"consumer span MUST carry a link when origin sampled=1")
+	assert.True(t, consumerSpan.Links()[0].SpanContext.IsSampled())
+}
+
+// TestRecordReplyLinkRespectsSamplerFlag validates the link-gate invariant
+// for the Request/Reply path: the synthetic "receive" CONSUMER span emitted
+// on reply must respect the reply-side sampled flag the same way Subscribe
+// does.
+func TestRecordReplyLinkRespectsSamplerFlag(t *testing.T) {
+	url := startServer(t)
+	tp, sr := newAlwaysSampleProvider()
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	otel.SetTracerProvider(tp)
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	t.Cleanup(conn.Close)
+
+	subject := "link.reply"
+	rawSub, err := conn.NatsConn().Subscribe(subject, func(m *nats.Msg) {
+		hdr := nats.Header{}
+		hdr.Set("traceparent", "00-cccccccccccccccccccccccccccccccc-dddddddddddddddd-00")
+		_ = m.RespondMsg(&nats.Msg{Header: hdr, Data: []byte("reply")})
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = rawSub.Unsubscribe() })
+
+	_, err = conn.RequestWithContext(context.Background(), subject, []byte("ping"))
+	require.NoError(t, err)
+
+	// Reply subject is an _INBOX.* random subject; locate the CONSUMER span by
+	// kind + name prefix "receive ".
+	require.Eventually(t, func() bool {
+		for _, s := range sr.Ended() {
+			if s.SpanKind() == oteltrace.SpanKindConsumer && len(s.Name()) > len("receive ") && s.Name()[:8] == "receive " {
+				return assert.Empty(t, s.Links(),
+					"reply consumer span must NOT carry a link when reply sampled=0")
+			}
+		}
+		return false
+	}, 2*time.Second, 5*time.Millisecond, "wait for reply CONSUMER span")
+}
+
+// TestDeliverSpanSkippedWhenUpstreamNotSampled validates the sampler-aware
+// skip invariant for ConsumerContextWithDeliver: when origin sampled=0, the
+// function must early-return without emitting a deliverSpan.
+func TestDeliverSpanSkippedWhenUpstreamNotSampled(t *testing.T) {
+	conn := connectWithDeliverEnabled(t)
+
+	origin := makeSpanContext(t, false)
+	out := conn.ConsumerContextWithDeliver(context.Background(), "subj.test", origin)
+
+	remote := oteltrace.SpanContextFromContext(out)
+	assert.False(t, remote.IsValid(),
+		"sampled=0 upstream must NOT trigger deliverSpan (no remote span context expected)")
+}
+
+// TestDeliverSpanCreatedWhenUpstreamSampled is the positive counterpart —
+// origin sampled=1 must produce a remote span context (= deliverSpan emitted).
+func TestDeliverSpanCreatedWhenUpstreamSampled(t *testing.T) {
+	conn := connectWithDeliverEnabled(t)
+
+	origin := makeSpanContext(t, true)
+	out := conn.ConsumerContextWithDeliver(context.Background(), "subj.test", origin)
+
+	remote := oteltrace.SpanContextFromContext(out)
+	assert.True(t, remote.IsValid(),
+		"sampled=1 upstream MUST trigger deliverSpan (remote span context expected)")
+}
+
+// TestStartDeliverSpanSkippedWhenLocalNotSampled validates the producer-side
+// invariant: StartDeliverSpan must skip when the local span context is valid
+// but not sampled.
+func TestStartDeliverSpanSkippedWhenLocalNotSampled(t *testing.T) {
+	conn := connectWithDeliverEnabled(t)
+
+	notSampled := makeSpanContext(t, false)
+	parent := oteltrace.ContextWithSpanContext(context.Background(), notSampled)
+
+	out := conn.StartDeliverSpan(parent, "subj.test")
+
+	gotSC := oteltrace.SpanContextFromContext(out)
+	assert.Equal(t, notSampled.SpanID(), gotSC.SpanID(),
+		"sampled=0 local span must NOT trigger deliverSpan (span ID should be unchanged)")
+}
+
+// TestStartDeliverSpanCreatedWhenLocalSampled is the positive counterpart.
+func TestStartDeliverSpanCreatedWhenLocalSampled(t *testing.T) {
+	conn := connectWithDeliverEnabled(t)
+
+	sampled := makeSpanContext(t, true)
+	parent := oteltrace.ContextWithSpanContext(context.Background(), sampled)
+
+	out := conn.StartDeliverSpan(parent, "subj.test")
+
+	gotSC := oteltrace.SpanContextFromContext(out)
+	assert.True(t, gotSC.IsValid(), "sampled=1 local span MUST trigger deliverSpan")
+	assert.NotEqual(t, sampled.SpanID(), gotSC.SpanID(),
+		"a fresh deliverSpan should appear with a different span ID")
+}
+
+// TestConsumerSpanStillCreatedWhenDeliverSkipped verifies that skipping the
+// deliverSpan does NOT suppress the downstream consumer span — the consumer
+// wrapper still emits its own span, just without a broker-hop parent.
+// Provider order matters: AlwaysSample must be installed BEFORE Connect so
+// the conn caches the AlwaysSample-backed tracer.
+func TestConsumerSpanStillCreatedWhenDeliverSkipped(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317")
+	url := startServer(t)
+	tp, sr := newAlwaysSampleProvider()
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	t.Cleanup(conn.Close)
+	require.True(t, conn.DeliverSpanEnabled())
+
+	subject := "deliver.consumerstill"
+	done := make(chan struct{})
+	_, err = conn.Subscribe(subject, func(_ otelnats.Msg) { close(done) })
+	require.NoError(t, err)
+
+	publishWithFlags(t, conn.NatsConn(), subject, "00")
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscribe handler did not fire")
+	}
+
+	consumerSpan := waitSpanByNameAndKind(t, sr, "process "+subject, oteltrace.SpanKindConsumer)
+	require.NotNil(t, consumerSpan, "consumer span must still be emitted even when deliverSpan is skipped")
+}

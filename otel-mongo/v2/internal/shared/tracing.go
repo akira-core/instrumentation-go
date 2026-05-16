@@ -37,22 +37,65 @@ func traceMetadataFromContext(ctx context.Context, prop propagation.TextMapPropa
 
 // InjectTraceIntoDocument marshals document to bson.D and, when the span context in ctx is valid,
 // appends an "_oteltrace" field.
+//
+// Fast path: for bson.D / bson.M / map[string]any inputs the document is
+// shallow-cloned into a fresh bson.D and (optionally) appended with the trace
+// metadata entry — no BSON round-trip, no reflection. Struct and other inputs
+// fall back to the original Marshal/Unmarshal path so behaviour is unchanged
+// for callers that rely on driver-side type normalisation.
+//
+// IMPORTANT invariant: callers' original document must NOT be mutated, and the
+// returned bson.D must NOT share a backing array with the caller's slice. Both
+// requirements are enforced by always allocating a new bson.D in the fast
+// paths below.
 func InjectTraceIntoDocument(ctx context.Context, document any, prop propagation.TextMapPropagator) (bson.D, error) {
+	meta, hasMeta := traceMetadataFromContext(ctx, prop)
+
+	switch d := document.(type) {
+	case bson.D:
+		// Clone: allocate new bson.D, copy entries. Capacity +1 so append below
+		// does not trigger a grow when meta is present.
+		out := make(bson.D, len(d), len(d)+1)
+		copy(out, d)
+		if hasMeta {
+			out = append(out, bson.E{Key: TraceMetadataKey, Value: *meta})
+		}
+		return out, nil
+
+	case bson.M:
+		out := make(bson.D, 0, len(d)+1)
+		for k, v := range d {
+			out = append(out, bson.E{Key: k, Value: v})
+		}
+		if hasMeta {
+			out = append(out, bson.E{Key: TraceMetadataKey, Value: *meta})
+		}
+		return out, nil
+
+	case map[string]any:
+		out := make(bson.D, 0, len(d)+1)
+		for k, v := range d {
+			out = append(out, bson.E{Key: k, Value: v})
+		}
+		if hasMeta {
+			out = append(out, bson.E{Key: TraceMetadataKey, Value: *meta})
+		}
+		return out, nil
+	}
+
+	// Fallback: struct / pointer / custom types — preserve previous behaviour
+	// (driver-side normalisation via Marshal/Unmarshal round-trip).
 	raw, err := bson.Marshal(document)
 	if err != nil {
 		return nil, fmt.Errorf("otelmongo: marshal document: %w", err)
 	}
-
 	doc := make(bson.D, 0, 1)
 	if err := bson.Unmarshal(raw, &doc); err != nil {
 		return nil, fmt.Errorf("otelmongo: unmarshal document: %w", err)
 	}
-
-	meta, ok := traceMetadataFromContext(ctx, prop)
-	if !ok {
-		return doc, nil
+	if hasMeta {
+		doc = append(doc, bson.E{Key: TraceMetadataKey, Value: *meta})
 	}
-	doc = append(doc, bson.E{Key: TraceMetadataKey, Value: *meta})
 	return doc, nil
 }
 
@@ -89,20 +132,19 @@ func ContextFromTraceMetadata(ctx context.Context, meta *TraceMetadata, prop pro
 }
 
 // InjectTraceIntoUpdate inspects update and embeds trace metadata when ctx carries a valid span context.
+//
+// Fast path: same shape as InjectTraceIntoDocument — bson.D / bson.M /
+// map[string]any inputs are cloned before mutation so caller's update is never
+// touched and no backing array is shared with the returned slice.
 func InjectTraceIntoUpdate(ctx context.Context, update any, prop propagation.TextMapPropagator) (any, error) {
 	meta, ok := traceMetadataFromContext(ctx, prop)
 	if !ok {
 		return update, nil
 	}
 
-	raw, err := bson.Marshal(update)
+	doc, err := updateToClonedBsonD(update)
 	if err != nil {
-		return update, fmt.Errorf("otelmongo: marshal update: %w", err)
-	}
-
-	doc := make(bson.D, 0, 1)
-	if err := bson.Unmarshal(raw, &doc); err != nil {
-		return update, fmt.Errorf("otelmongo: unmarshal update: %w", err)
+		return update, err
 	}
 
 	if len(doc) > 0 && len(doc[0].Key) > 0 && doc[0].Key[0] == '$' {
@@ -117,16 +159,65 @@ func InjectTraceIntoUpdate(ctx context.Context, update any, prop propagation.Tex
 	return doc, nil
 }
 
+// updateToClonedBsonD converts update into a fresh bson.D, never reusing
+// caller-owned slice/map backing storage. Fast paths cover bson.D / bson.M /
+// map[string]any; everything else falls back to Marshal/Unmarshal so behaviour
+// is unchanged for struct callers.
+func updateToClonedBsonD(update any) (bson.D, error) {
+	switch d := update.(type) {
+	case bson.D:
+		out := make(bson.D, len(d), len(d)+1)
+		copy(out, d)
+		return out, nil
+	case bson.M:
+		out := make(bson.D, 0, len(d)+1)
+		for k, v := range d {
+			out = append(out, bson.E{Key: k, Value: v})
+		}
+		return out, nil
+	case map[string]any:
+		out := make(bson.D, 0, len(d)+1)
+		for k, v := range d {
+			out = append(out, bson.E{Key: k, Value: v})
+		}
+		return out, nil
+	}
+	raw, err := bson.Marshal(update)
+	if err != nil {
+		return nil, fmt.Errorf("otelmongo: marshal update: %w", err)
+	}
+	doc := make(bson.D, 0, 1)
+	if err := bson.Unmarshal(raw, &doc); err != nil {
+		return nil, fmt.Errorf("otelmongo: unmarshal update: %w", err)
+	}
+	return doc, nil
+}
+
 func upsertSetField(doc bson.D, meta TraceMetadata) (bson.D, error) {
 	foundSet := false
 	for i, elem := range doc {
 		if elem.Key != "$set" && elem.Key != "$setOnInsert" {
 			continue
 		}
+		// Always allocate a fresh bson.D for the sub-doc so we never mutate the
+		// caller's bson.D / bson.M sub-value (the fast path makes this load-
+		// bearing: doc may be a shallow clone of caller's update and elem.Value
+		// could still point at caller-owned storage).
 		var subDoc bson.D
 		switch v := elem.Value.(type) {
 		case bson.D:
-			subDoc = v
+			subDoc = make(bson.D, len(v), len(v)+1)
+			copy(subDoc, v)
+		case bson.M:
+			subDoc = make(bson.D, 0, len(v)+1)
+			for k, vv := range v {
+				subDoc = append(subDoc, bson.E{Key: k, Value: vv})
+			}
+		case map[string]any:
+			subDoc = make(bson.D, 0, len(v)+1)
+			for k, vv := range v {
+				subDoc = append(subDoc, bson.E{Key: k, Value: vv})
+			}
 		default:
 			raw, err := bson.Marshal(v)
 			if err != nil {

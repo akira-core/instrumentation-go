@@ -177,7 +177,10 @@ func (t *tracedConn) recordReply(parent context.Context, sendSpan trace.Span, re
 		trace.WithSpanKind(trace.SpanKindConsumer),
 		trace.WithAttributes(receiveAttrs(reply, "", "receive", t.serverAttrs)...),
 	}
-	if originSC.IsValid() {
+	// Only attach link when origin trace is sampled. A link to a dropped span
+	// would be dangling in the backend (target span never stored), wasting both
+	// hot-path alloc and OTLP wire bytes for no debugging value.
+	if originSC.IsValid() && originSC.IsSampled() {
 		opts = append(opts, trace.WithLinks(trace.Link{SpanContext: originSC}))
 	}
 	_, span := t.tracer.Start(receiveCtx, "receive "+reply.Subject, opts...)
@@ -198,7 +201,8 @@ func (t *tracedConn) wrapMsgHandler(subject, queue string, handler MsgHandler) n
 			trace.WithSpanKind(trace.SpanKindConsumer),
 			trace.WithAttributes(receiveAttrs(msg, queue, "process", t.serverAttrs)...),
 		}
-		if originSpanCtx.IsValid() {
+		// Only attach link when origin trace is sampled. See recordReply for rationale.
+		if originSpanCtx.IsValid() && originSpanCtx.IsSampled() {
 			opts = append(opts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
 		}
 		ctx, span := t.tracer.Start(consumerParentCtx, spanName, opts...)
@@ -211,8 +215,16 @@ func (t *tracedConn) wrapMsgHandler(subject, queue string, handler MsgHandler) n
 // When deliverTracer is nil (no OTEL_EXPORTER_OTLP_ENDPOINT) returns ctx unchanged —
 // this is the only remaining runtime check; the !tracingEnabled disjunct is gone
 // because directConn provides its own passthrough implementation.
+//
+// If the local span context is valid but not sampled, the surrounding trace
+// will not be stored in the backend at all — emitting a deliver span here would
+// produce an orphan broker-hop node with no enclosing trace. Skip in that case.
 func (t *tracedConn) StartDeliverSpan(ctx context.Context, subject string) context.Context {
 	if t.deliverTracer == nil {
+		return ctx
+	}
+	sc := trace.SpanContextFromContext(ctx)
+	if sc.IsValid() && !sc.IsSampled() {
 		return ctx
 	}
 	deliverCtx, span := t.deliverTracer.Start(ctx, subject+" deliver",
@@ -227,8 +239,14 @@ func (t *tracedConn) StartDeliverSpan(ctx context.Context, subject string) conte
 // linked to origin and returns a context carrying that deliver span as remote
 // parent for consumer spans. The deliverTracer-nil and origin-invalid checks
 // remain per-call concerns.
+//
+// If origin is valid but not sampled, the upstream producer span was dropped
+// and any deliver span linking to it would be a dangling reference inside a
+// consumer trace whose own backend visibility depends on the local sampler.
+// Skip the deliver span; the consumer span built downstream will simply not be
+// re-parented through a broker hop.
 func (t *tracedConn) ConsumerContextWithDeliver(ctx context.Context, subject string, origin trace.SpanContext) context.Context {
-	if t.deliverTracer == nil || !origin.IsValid() {
+	if t.deliverTracer == nil || !origin.IsValid() || !origin.IsSampled() {
 		return ctx
 	}
 	detachedCtx := trace.ContextWithSpanContext(ctx, trace.SpanContext{})

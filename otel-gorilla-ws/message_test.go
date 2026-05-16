@@ -2,6 +2,7 @@ package otelgorillaws
 
 import (
 	"encoding/json"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -119,4 +120,122 @@ func TestTryUnmarshalWire_NonObject_ReturnsFalse(t *testing.T) {
 		_, _, ok := tryUnmarshalWire([]byte(input))
 		assert.False(t, ok, "tryUnmarshalWire(%q) expected ok=false", input)
 	}
+}
+
+// TestMarshalWireRoundTripStable verifies the hand-written serializer
+// produces output that round-trips through json.Unmarshal into the legacy
+// wireEnvelope struct identically — guarantees structural compatibility with
+// the JS peer that decodes the envelope.
+func TestMarshalWireRoundTripStable(t *testing.T) {
+	cases := []struct {
+		name    string
+		carrier map[string]string
+		payload string
+	}{
+		{
+			name:    "tp_and_ts",
+			carrier: map[string]string{TraceparentHeader: "00-aaa-bbb-01", TracestateHeader: "k=v"},
+			payload: `{"x":1}`,
+		},
+		{
+			name:    "tp_only",
+			carrier: map[string]string{TraceparentHeader: "00-aaa-bbb-01"},
+			payload: `[1,2,3]`,
+		},
+		{
+			name:    "non_json_payload",
+			carrier: map[string]string{TraceparentHeader: "00-aaa-bbb-01"},
+			payload: `raw binary text`,
+		},
+		{
+			name:    "empty_carrier",
+			carrier: map[string]string{},
+			payload: `{"y":"hello"}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := marshalWire(tc.carrier, []byte(tc.payload))
+			require.NoError(t, err)
+
+			var env wireEnvelope
+			require.NoError(t, json.Unmarshal(out, &env), "output must be valid envelope JSON")
+
+			// header round-trip equality
+			if tp, ok := tc.carrier[TraceparentHeader]; ok && tp != "" {
+				assert.Equal(t, tp, env.Header[TraceparentHeader])
+			}
+			if ts, ok := tc.carrier[TracestateHeader]; ok && ts != "" {
+				assert.Equal(t, ts, env.Header[TracestateHeader])
+			}
+
+			// data round-trip: either original JSON payload preserved, or
+			// non-JSON wrapped as JSON string.
+			if json.Valid([]byte(tc.payload)) {
+				assert.JSONEq(t, tc.payload, string(env.Data))
+			} else {
+				var s string
+				require.NoError(t, json.Unmarshal(env.Data, &s))
+				assert.Equal(t, tc.payload, s)
+			}
+		})
+	}
+}
+
+// TestMarshalWirePoolReuseSafety stresses concurrent marshalWire calls — the
+// sync.Pool buffer must not leak between goroutines. Failure mode: garbled
+// output where one call's payload bleeds into another.
+func TestMarshalWirePoolReuseSafety(t *testing.T) {
+	const goroutines = 16
+	const iterations = 200
+
+	tpFor := func(g int) string {
+		// Construct a unique 32-hex traceID per goroutine so cross-pollution
+		// shows up as a header mismatch.
+		base := "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		return base + string(rune('a'+g)) + "-bbbbbbbbbbbbbbbb-01"
+	}
+
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			carrier := map[string]string{TraceparentHeader: tpFor(g)}
+			payload := []byte(`{"g":` + string(rune('0'+(g%10))) + `}`)
+			for i := 0; i < iterations; i++ {
+				out, err := marshalWire(carrier, payload)
+				if err != nil {
+					t.Errorf("g=%d i=%d: %v", g, i, err)
+					return
+				}
+				var env wireEnvelope
+				if err := json.Unmarshal(out, &env); err != nil {
+					t.Errorf("g=%d i=%d unmarshal: %v", g, i, err)
+					return
+				}
+				if env.Header[TraceparentHeader] != tpFor(g) {
+					t.Errorf("g=%d i=%d header bleed: got %q want %q", g, i, env.Header[TraceparentHeader], tpFor(g))
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+}
+
+// TestMarshalWireNonJSONPayloadStable repeats the non-JSON wrap behaviour
+// from the existing test suite but explicitly asserts the pooled path retains
+// the same string-encoding semantics.
+func TestMarshalWireNonJSONPayloadStable(t *testing.T) {
+	carrier := map[string]string{TraceparentHeader: "00-aaa-bbb-01"}
+	out, err := marshalWire(carrier, []byte("plain text"))
+	require.NoError(t, err)
+
+	var env wireEnvelope
+	require.NoError(t, json.Unmarshal(out, &env))
+	var s string
+	require.NoError(t, json.Unmarshal(env.Data, &s))
+	assert.Equal(t, "plain text", s)
 }
