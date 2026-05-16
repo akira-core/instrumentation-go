@@ -1,6 +1,7 @@
 package otelmongo
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -10,14 +11,14 @@ import (
 
 func TestMongoDeliverSpanDisabledWithoutEndpoint(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
-	tp, tracer := initMongoProvider("localhost", 27017)
+	tp, tracer := initMongoProvider(context.Background(), "localhost", 27017)
 	assert.Nil(t, tp, "expected nil TracerProvider when OTEL_EXPORTER_OTLP_ENDPOINT is unset")
 	assert.Nil(t, tracer, "expected nil Tracer when OTEL_EXPORTER_OTLP_ENDPOINT is unset")
 }
 
 func TestMongoDeliverSpanEnabledWithEndpoint(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317")
-	tp, tracer := initMongoProvider("localhost", 27017)
+	tp, tracer := initMongoProvider(context.Background(), "localhost", 27017)
 	assert.NotNil(t, tp, "expected non-nil TracerProvider when OTEL_EXPORTER_OTLP_ENDPOINT is set")
 	assert.NotNil(t, tracer, "expected non-nil Tracer when OTEL_EXPORTER_OTLP_ENDPOINT is set")
 	if tp != nil {

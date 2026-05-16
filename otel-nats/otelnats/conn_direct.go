@@ -20,6 +20,7 @@ type directConn struct {
 }
 
 func (d *directConn) TracingEnabled() bool     { return false }
+func (d *directConn) PropagationEnabled() bool { return false }
 func (d *directConn) DeliverSpanEnabled() bool { return false }
 
 // TraceContext returns a noop tracer and the global propagator. External

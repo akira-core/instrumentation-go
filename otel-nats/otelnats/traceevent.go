@@ -155,7 +155,7 @@ func buildTraceEventHandler(tracer trace.Tracer, prop propagation.TextMapPropaga
 		}
 
 		for _, hop := range event.Events {
-			emitHopSpan(tracer, parentCtx, hop, serverName, event.Server.Version, event.Hops)
+			emitHopSpan(parentCtx, tracer, hop, serverName, event.Server.Version, event.Hops)
 		}
 	}
 }
@@ -175,7 +175,7 @@ func extractTraceParent(prop propagation.TextMapPropagator, hdrs map[string][]st
 
 // emitHopSpan creates a single point-in-time OTel span for one NATS infrastructure hop.
 // The span name follows the pattern "nats.<KIND>.<type>" (e.g. "nats.CLIENT.ingress").
-func emitHopSpan(tracer trace.Tracer, parentCtx context.Context, hop TraceHop, serverName, serverVersion string, hops int) {
+func emitHopSpan(parentCtx context.Context, tracer trace.Tracer, hop TraceHop, serverName, serverVersion string, hops int) {
 	spanName := "nats." + hopKindName(hop.Kind) + "." + hopTypeName(hop.Type)
 
 	attrs := []attribute.KeyValue{

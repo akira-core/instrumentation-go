@@ -198,13 +198,13 @@ func TestMarshalWirePoolReuseSafety(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	for g := 0; g < goroutines; g++ {
+	for g := range goroutines {
 		wg.Add(1)
 		go func(g int) {
 			defer wg.Done()
 			carrier := map[string]string{TraceparentHeader: tpFor(g)}
 			payload := []byte(`{"g":` + string(rune('0'+(g%10))) + `}`)
-			for i := 0; i < iterations; i++ {
+			for i := range iterations {
 				out, err := marshalWire(carrier, payload)
 				if err != nil {
 					t.Errorf("g=%d i=%d: %v", g, i, err)

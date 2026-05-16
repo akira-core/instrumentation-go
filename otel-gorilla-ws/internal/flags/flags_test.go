@@ -48,7 +48,7 @@ func TestGate_EvaluatesResolverOnce(t *testing.T) {
 		return true
 	})
 
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		if !g.Enabled() {
 			t.Fatalf("Enabled() = false, want true at iteration %d", i)
 		}
@@ -101,11 +101,11 @@ func TestGate_ConcurrentEnabled(t *testing.T) {
 	})
 
 	var wg sync.WaitGroup
-	for i := 0; i < 64; i++ {
+	for range 64 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 100; j++ {
+			for range 100 {
 				_ = g.Enabled()
 			}
 		}()

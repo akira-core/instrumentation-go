@@ -2,6 +2,7 @@ package otelnats_test
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -29,6 +30,13 @@ func startServer(t *testing.T) string {
 	t.Helper()
 	t.Setenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED", "1")
 	t.Setenv("OTEL_NATS_TRACING_ENABLED", "1")
+	// Default propagation gate is OFF; existing tests assume v0.4.x behaviour
+	// (header inject + extract on). Opt-in explicitly so tests stay green.
+	// Tests that exercise the propagation-off path override this with t.Setenv
+	// + otelnats.ResetGatesForTest in their own setup.
+	t.Setenv("OTEL_NATS_PROPAGATION_ENABLED", "1")
+	otelnats.ResetGatesForTest()
+	t.Cleanup(otelnats.ResetGatesForTest)
 	opts := &natssrv.Options{Host: "127.0.0.1", Port: -1}
 	s, err := natssrv.NewServer(opts)
 	require.NoError(t, err)
@@ -669,4 +677,302 @@ func TestConsumerSpanStillCreatedWhenDeliverSkipped(t *testing.T) {
 
 	consumerSpan := waitSpanByNameAndKind(t, sr, "process "+subject, oteltrace.SpanKindConsumer)
 	require.NotNil(t, consumerSpan, "consumer span must still be emitted even when deliverSpan is skipped")
+}
+
+// connectWithPropagationGate connects with an explicit propagation env value.
+// Sets env BEFORE Connect so the cached gate reflects the requested state.
+func connectWithPropagationGate(t *testing.T, propagationValue string) *otelnats.Conn {
+	t.Helper()
+	url := startServer(t)
+	// startServer already set propagation=1; override here then reset gates so
+	// the override takes effect at Connect time.
+	t.Setenv("OTEL_NATS_PROPAGATION_ENABLED", propagationValue)
+	otelnats.ResetGatesForTest()
+	t.Cleanup(otelnats.ResetGatesForTest)
+	tp, _ := newTestProvider()
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	t.Cleanup(conn.Close)
+	return conn
+}
+
+// TestPublishWithPropagationOffSkipsHeaders verifies the propagation gate's
+// effect on publish: when off (default), Publish emits a wrapper span but
+// does NOT inject traceparent into the outgoing message header.
+func TestPublishWithPropagationOffSkipsHeaders(t *testing.T) {
+	conn := connectWithPropagationGate(t, "false")
+	require.False(t, conn.PropagationEnabled())
+
+	subject := "prop.off"
+	headerCh := make(chan nats.Header, 1)
+	_, err := conn.NatsConn().Subscribe(subject, func(msg *nats.Msg) {
+		headerCh <- msg.Header
+	})
+	require.NoError(t, err)
+
+	tracer := otel.GetTracerProvider().Tracer("test")
+	ctx, span := tracer.Start(context.Background(), "parent")
+	defer span.End()
+
+	require.NoError(t, conn.Publish(ctx, subject, []byte("payload")))
+
+	select {
+	case h := <-headerCh:
+		assert.Empty(t, h.Get("traceparent"),
+			"propagation off: traceparent header must NOT be injected")
+		assert.Empty(t, h.Get("tracestate"),
+			"propagation off: tracestate header must NOT be injected")
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscribe handler did not fire")
+	}
+}
+
+// TestPublishWithPropagationOnInjectsHeaders is the positive counterpart —
+// propagation explicitly on means traceparent is injected.
+func TestPublishWithPropagationOnInjectsHeaders(t *testing.T) {
+	conn := connectWithPropagationGate(t, "true")
+	require.True(t, conn.PropagationEnabled())
+
+	subject := "prop.on"
+	headerCh := make(chan nats.Header, 1)
+	_, err := conn.NatsConn().Subscribe(subject, func(msg *nats.Msg) {
+		headerCh <- msg.Header
+	})
+	require.NoError(t, err)
+
+	tracer := otel.GetTracerProvider().Tracer("test")
+	ctx, span := tracer.Start(context.Background(), "parent")
+	defer span.End()
+
+	require.NoError(t, conn.Publish(ctx, subject, []byte("payload")))
+
+	select {
+	case h := <-headerCh:
+		assert.NotEmpty(t, h.Get("traceparent"),
+			"propagation on: traceparent header MUST be injected")
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscribe handler did not fire")
+	}
+}
+
+// TestSubscribeWithPropagationOffDoesNotExtract verifies that when propagation
+// is off, the wrapper subscriber does NOT extract the publisher's traceparent —
+// consumer-side ctx contains no remote span context derived from the header.
+func TestSubscribeWithPropagationOffDoesNotExtract(t *testing.T) {
+	conn := connectWithPropagationGate(t, "false")
+	require.False(t, conn.PropagationEnabled())
+
+	subject := "prop.subscribe.off"
+	traceIDCh := make(chan oteltrace.TraceID, 1)
+	_, err := conn.Subscribe(subject, func(m otelnats.Msg) {
+		traceIDCh <- oteltrace.SpanFromContext(m.Ctx).SpanContext().TraceID()
+	})
+	require.NoError(t, err)
+
+	upstreamTraceID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	hdr := nats.Header{}
+	hdr.Set("traceparent", "00-"+upstreamTraceID+"-bbbbbbbbbbbbbbbb-01")
+	require.NoError(t, conn.NatsConn().PublishMsg(&nats.Msg{
+		Subject: subject, Header: hdr, Data: []byte("payload"),
+	}))
+	require.NoError(t, conn.NatsConn().Flush())
+
+	select {
+	case gotTraceID := <-traceIDCh:
+		assert.NotEqual(t, upstreamTraceID, gotTraceID.String(),
+			"propagation off: consumer span MUST NOT inherit upstream trace_id")
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscribe handler did not fire")
+	}
+}
+
+// TestSubscribeWithPropagationOffStillEmitsSpanWithoutLink locks in the
+// PERF_BOTTLENECK_PLAN D2 contract: when propagation is off, the consumer
+// wrapper SHALL still emit a span but SHALL NOT attach any link derived from
+// the inbound traceparent (no Extract = no origin SpanContext = no link).
+// Distinct from TestSubscribeWithPropagationOffDoesNotExtract which only
+// checks the surfaced Ctx — this test asserts the span's Links() slice
+// directly via the span recorder.
+func TestSubscribeWithPropagationOffStillEmitsSpanWithoutLink(t *testing.T) {
+	url := startServer(t)
+	tp, sr := newAlwaysSampleProvider()
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	t.Setenv("OTEL_NATS_PROPAGATION_ENABLED", "false")
+	otelnats.ResetGatesForTest()
+	t.Cleanup(otelnats.ResetGatesForTest)
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	t.Cleanup(conn.Close)
+	require.False(t, conn.PropagationEnabled())
+
+	subject := "prop.subscribe.off.nolink"
+	done := make(chan struct{})
+	_, err = conn.Subscribe(subject, func(_ otelnats.Msg) { close(done) })
+	require.NoError(t, err)
+
+	// Publish with a sampled traceparent so a link WOULD be attached under
+	// propagation-on. With propagation off the wrapper must skip the Extract
+	// step and therefore emit no link, regardless of header content.
+	hdr := nats.Header{}
+	hdr.Set("traceparent", "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01")
+	require.NoError(t, conn.NatsConn().PublishMsg(&nats.Msg{
+		Subject: subject, Header: hdr, Data: []byte("payload"),
+	}))
+	require.NoError(t, conn.NatsConn().Flush())
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscribe handler did not fire")
+	}
+
+	consumerSpan := waitSpanByNameAndKind(t, sr, "process "+subject, oteltrace.SpanKindConsumer)
+	require.NotNil(t, consumerSpan, "consumer span MUST still be emitted with propagation off")
+	assert.Empty(t, consumerSpan.Links(),
+		"propagation off MUST NOT attach a link; inbound traceparent must be ignored entirely (PERF_BOTTLENECK_PLAN D2)")
+}
+
+// TestRecordReplyWithPropagationOffStillEmitsSpanWithoutLink mirrors the
+// above guarantee on the request/reply path: the synthetic "receive" CONSUMER
+// span emitted by recordReply must skip the link attachment when propagation
+// is off, even if the reply carries a sampled traceparent.
+func TestRecordReplyWithPropagationOffStillEmitsSpanWithoutLink(t *testing.T) {
+	url := startServer(t)
+	tp, sr := newAlwaysSampleProvider()
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	t.Setenv("OTEL_NATS_PROPAGATION_ENABLED", "false")
+	otelnats.ResetGatesForTest()
+	t.Cleanup(otelnats.ResetGatesForTest)
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	t.Cleanup(conn.Close)
+	require.False(t, conn.PropagationEnabled())
+
+	subject := "prop.reply.off.nolink"
+	rawSub, err := conn.NatsConn().Subscribe(subject, func(m *nats.Msg) {
+		hdr := nats.Header{}
+		hdr.Set("traceparent", "00-cccccccccccccccccccccccccccccccc-dddddddddddddddd-01")
+		_ = m.RespondMsg(&nats.Msg{Header: hdr, Data: []byte("reply")})
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = rawSub.Unsubscribe() })
+
+	_, err = conn.RequestWithContext(context.Background(), subject, []byte("ping"))
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		for _, s := range sr.Ended() {
+			if s.SpanKind() == oteltrace.SpanKindConsumer &&
+				len(s.Name()) > len("receive ") && s.Name()[:8] == "receive " {
+				return assert.Empty(t, s.Links(),
+					"reply consumer span MUST NOT carry a link when propagation off")
+			}
+		}
+		return false
+	}, 2*time.Second, 5*time.Millisecond, "wait for reply CONSUMER span")
+}
+
+// TestSubscribeWithPropagationOnExtractsRemoteContext is the positive
+// counterpart — propagation on means the wrapper extracts the upstream
+// span context and attaches it as a link on the consumer span. (Without a
+// configured deliverTracer the upstream is surfaced via Link, not as a
+// parent — see ConsumerContextWithDeliver early-return.)
+func TestSubscribeWithPropagationOnExtractsRemoteContext(t *testing.T) {
+	url := startServer(t)
+	tp, sr := newAlwaysSampleProvider()
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	t.Setenv("OTEL_NATS_PROPAGATION_ENABLED", "true")
+	otelnats.ResetGatesForTest()
+	t.Cleanup(otelnats.ResetGatesForTest)
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	t.Cleanup(conn.Close)
+	require.True(t, conn.PropagationEnabled())
+
+	subject := "prop.subscribe.on"
+	done := make(chan struct{})
+	_, err = conn.Subscribe(subject, func(_ otelnats.Msg) { close(done) })
+	require.NoError(t, err)
+
+	upstreamTraceID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	hdr := nats.Header{}
+	hdr.Set("traceparent", "00-"+upstreamTraceID+"-bbbbbbbbbbbbbbbb-01")
+	require.NoError(t, conn.NatsConn().PublishMsg(&nats.Msg{
+		Subject: subject, Header: hdr, Data: []byte("payload"),
+	}))
+	require.NoError(t, conn.NatsConn().Flush())
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscribe handler did not fire")
+	}
+
+	consumerSpan := waitSpanByNameAndKind(t, sr, "process "+subject, oteltrace.SpanKindConsumer)
+	require.NotNil(t, consumerSpan)
+	require.Len(t, consumerSpan.Links(), 1,
+		"propagation on: consumer span MUST carry a link to the upstream span")
+	assert.Equal(t, upstreamTraceID, consumerSpan.Links()[0].SpanContext.TraceID().String(),
+		"link must point at the upstream trace_id from the inbound header")
+}
+
+// TestDefaultBehaviorIsTracingOnlyNoHeaders guards against accidentally
+// flipping the default back to "propagation on". With only the two tracing
+// env vars set and OTEL_NATS_PROPAGATION_ENABLED unset, the wrapper SHALL
+// emit a span but NOT inject traceparent.
+func TestDefaultBehaviorIsTracingOnlyNoHeaders(t *testing.T) {
+	t.Setenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED", "1")
+	t.Setenv("OTEL_NATS_TRACING_ENABLED", "1")
+	_ = os.Unsetenv("OTEL_NATS_PROPAGATION_ENABLED")
+	otelnats.ResetGatesForTest()
+	t.Cleanup(otelnats.ResetGatesForTest)
+
+	opts := &natssrv.Options{Host: "127.0.0.1", Port: -1}
+	s, err := natssrv.NewServer(opts)
+	require.NoError(t, err)
+	go s.Start()
+	require.True(t, s.ReadyForConnections(5*time.Second))
+	t.Cleanup(s.Shutdown)
+
+	tp, sr := newTestProvider()
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	conn, err := otelnats.Connect(s.ClientURL(), nil)
+	require.NoError(t, err)
+	t.Cleanup(conn.Close)
+	require.True(t, conn.TracingEnabled(), "tracing must be on")
+	require.False(t, conn.PropagationEnabled(), "default = propagation off")
+
+	subject := "default.behaviour"
+	headerCh := make(chan nats.Header, 1)
+	_, err = conn.NatsConn().Subscribe(subject, func(msg *nats.Msg) {
+		headerCh <- msg.Header
+	})
+	require.NoError(t, err)
+
+	tracer := tp.Tracer("test")
+	ctx, span := tracer.Start(context.Background(), "parent")
+	defer span.End()
+	require.NoError(t, conn.Publish(ctx, subject, []byte("payload")))
+
+	select {
+	case h := <-headerCh:
+		assert.Empty(t, h.Get("traceparent"),
+			"default behaviour MUST NOT inject traceparent (universal default-OFF)")
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscribe handler did not fire")
+	}
+
+	require.Eventually(t, func() bool {
+		return findSpanByKind(sr.Ended(), oteltrace.SpanKindProducer) != nil
+	}, 2*time.Second, 5*time.Millisecond, "PRODUCER span must still be emitted")
 }

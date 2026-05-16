@@ -162,26 +162,33 @@ func newTracedMessageBatch(conn *otelnats.Conn, consumerName string, raw jetstre
 			}
 		}()
 		tracer, prop := conn.TraceContext()
+		// Hoist the propagation gate out of the per-message loop. When off,
+		// the inbound header is treated as opaque: no Extract, no deliver
+		// span, no link consideration — the wrapper emits a standalone
+		// consumer span (per PERF_BOTTLENECK_PLAN D2 "no propagation → span
+		// emit, no link").
+		propEnabled := conn.PropagationEnabled()
 		for msg := range raw.Messages() {
 			if lastSpan != nil {
 				lastSpan.End()
 				lastSpan = nil
 			}
-			hdr := msg.Headers()
-			msgCtx := context.Background()
-			if hdr != nil && hdr.Get("traceparent") != "" {
-				msgCtx = prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: hdr})
-			}
-			originSpanCtx := trace.SpanContextFromContext(msgCtx)
-			consumerParentCtx := conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
 			attrs := append(receiveAttrs(msg, "receive", conn.ServerAttrs()), attribute.String(attrConsumerName, consumerName))
 			opts := []trace.SpanStartOption{
 				trace.WithSpanKind(trace.SpanKindConsumer),
 				trace.WithAttributes(attrs...),
 			}
-			// Only attach link when origin trace is sampled (avoid dangling link to dropped span).
-			if originSpanCtx.IsValid() && originSpanCtx.IsSampled() {
-				opts = append(opts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
+			consumerParentCtx := context.Background()
+			if propEnabled {
+				if hdr := msg.Headers(); hdr != nil && hdr.Get("traceparent") != "" {
+					msgCtx := prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: hdr})
+					originSpanCtx := trace.SpanContextFromContext(msgCtx)
+					consumerParentCtx = conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
+					// Only attach link when origin trace is sampled (avoid dangling link to dropped span).
+					if originSpanCtx.IsValid() && originSpanCtx.IsSampled() {
+						opts = append(opts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
+					}
+				}
 			}
 			ctx, span := tracer.Start(consumerParentCtx, "receive "+msg.Subject(), opts...)
 			select {

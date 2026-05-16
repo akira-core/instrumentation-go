@@ -43,14 +43,59 @@ Alternatives considered:
 - *Single Go workspace consolidating modules* — rejected: out of scope; would change release-tag layout and break consumer `replace` directives.
 - *`go:generate` + template* — rejected: extra tooling for ~80 LOC of helpers; drift-check catches the same regressions with less machinery.
 
-### D2: Per-package gate surface stays unchanged — Mongo 3-tier, NATS/WS 2-tier
+### D1.5: Performance invariants locked as SHALL requirements
 
-`otel-mongo` keeps `global AND module-tracing AND (option || module-propagation-env)`. `otel-nats` and `otel-gorilla-ws` keep `global AND module-tracing`. The shared `internal/flags/` helper is generic over the number of tiers — callers supply the env-var names; the helper handles parsing, AND-composition, and caching.
+The hot-path performance + correctness rules captured in
+`specs/performance-invariants/spec.md` graduate from review-time patches to
+spec-level SHALL requirements: future PRs that regress one of these
+invariants fail spec validation, not just code review.
 
-Rationale: The on-disk schema implication of `_oteltrace` makes Mongo's propagation a real product knob. NATS headers and WebSocket envelope frames have no equivalent disk footprint — gating wire propagation independently of spans buys nothing and adds an env knob nobody asked for. Uniformity in **pattern** (strategy split) gives the safety; uniformity in **surface** (env-var count) is not the goal — the user requirement is "disabled flag → behaves like original pkg", and that holds for both 2-tier and 3-tier shapes.
+Invariant scope vs feature-flag scope: the feature-flag specs
+(`otel-mongo-flag-wiring`, `otel-nats-flag-wiring`,
+`otel-gorilla-ws-flag-wiring`) cover **when** instrumentation runs;
+`performance-invariants` covers **how** instrumentation must behave on the
+hot path when it does run. The two layers are orthogonal — a flag-off path
+still has to honour the disabled-mode invariant, and a flag-on path still
+has to honour the perf invariants.
+
+The new `otel-nats` propagation flag inherits the consumer-link-gate
+behaviour: when propagation is off, the wrapper SHALL emit the consumer span
+but SHALL NOT attach any link derived from the inbound trace context. The
+structural form of this rule — link branch lives *inside* the propagation
+closure, never outside — is encoded in the spec so reviewers can verify
+compliance from the diff alone.
+
+### D2: Gate surface — Mongo and NATS 3-tier (uniform default-OFF), WS 2-tier
+
+`otel-mongo` keeps `global AND module-tracing AND (option || module-propagation-env)`. `otel-nats` adopts the same 3-tier shape — `global AND module-tracing AND nats-propagation-gate`. `otel-gorilla-ws` stays 2-tier — `global AND module-tracing`. **Every env var across every module defaults to OFF when unset**; there are no exceptions. Truthy = explicitly set to any non-falsy value (falsy set: `"0"`, `"false"`, `"no"`, `"off"`, case-insensitive, whitespace-trimmed).
+
+The shared `internal/flags/` helper is generic over the number of tiers — callers supply the env-var names; the helper handles parsing, AND-composition, and caching. The "default OFF when unset" semantics is the existing `flags.EnvEnabled` behaviour; no new helper variant is needed.
+
+Rationale for the universal default-OFF posture:
+- Principle: instrumentation is opt-in. A binary that links the wrapper packages but sets no env vars MUST behave indistinguishably from a binary using the unwrapped upstream client — no extra header bytes on the wire, no extra spans in the backend, no extra goroutines, no allocation. This is the contract the consolidation work was built around (see `instrumentation-feature-flags` spec).
+- Consistency: applying the same posture across the global tier, every module-tracing tier, and every module-propagation tier removes the "which knob defaults which way" cognitive overhead. Operators reading any env-var table see one rule.
+- `otel-mongo`'s `OTEL_MONGO_PROPAGATION_ENABLED` already defaults OFF (the `_oteltrace` document field is opt-in because of its on-disk schema impact). The new `OTEL_NATS_PROPAGATION_ENABLED` follows the same posture, which means the NATS and Mongo flag tables can be described by a single sentence in the README.
+
+Rationale for adding the NATS propagation knob (separate from tracing):
+- Operators want the ability to emit local wrapper spans (fan-out tracing, latency histograms, dead-letter diagnosis) without writing W3C headers onto every published message. Common cases:
+  1. Downstream consumer is a non-OTel-aware service that misinterprets unknown headers.
+  2. Wire-size sensitivity (large fan-out, header bytes dominate small payloads).
+  3. Partial rollout: enable spans first, propagation later to bound blast radius.
+- A dedicated `OTEL_NATS_PROPAGATION_ENABLED` env var captures all four useful states (tracing × propagation); the cost is one extra constant + one `flags.Gate`.
+
+Rationale for leaving `otel-gorilla-ws` at 2-tier:
+- WebSocket JSON envelope construction is inline in `marshalWire`; there is no equivalent "wrapper span without wire propagation" mode that fits the existing wire format. The envelope's `header` field IS the wire format — splitting span emission from envelope construction would require a parallel non-envelope code path.
+- No operator requests for this surface; adding it costs a CI matrix slot and provides zero current value.
+
+**Default-behaviour change disclosure (NATS only)**: prior builds implicitly injected `traceparent` whenever tracing was on. With the new propagation tier defaulting OFF, deployments that previously relied on this implicit injection MUST add `OTEL_NATS_PROPAGATION_ENABLED=true` to keep header injection working. Version remains `0.4.x` for this change — the propagation flag ships as part of the existing 0.4.x line; whether/when to bump to `0.5.0` is a release-time decision outside this artifact set. The behaviour change SHALL be documented in:
+- `otel-nats/README.md` (+ zh-TW) "Propagation flag (env-var change)" section with a copy-paste env block.
+- `otel-nats/CHANGELOG.md` entry under the existing 0.4.x heading with explicit before/after wire-output examples.
+- Root `pkg/instrumentation-go/CLAUDE.md` env-var table footnote.
 
 Alternatives considered:
-- *Force 3-tier on nats/ws* — rejected: adds env vars no consumer asks for, breaks current defaults, increases test matrix.
+- *Default-ON propagation for nats (preserve v0.3.x wire behaviour)* — rejected: violates the universal default-OFF posture and creates an exception that has to be remembered every time someone reads the flag table. The migration cost is a one-line env var, documented loudly; the long-term clarity gain outweighs the short-term upgrade surprise.
+- *Functional option only, no env var* — rejected: operators expect env-driven config for production toggles; adding only `WithNATSPropagationEnabled(true)` forces code changes per service.
+- *Force 3-tier on ws* — rejected: see ws rationale above.
 - *Force 2-tier on mongo* — rejected: would remove a real product knob (on-disk `_oteltrace` toggle) that consumers already use.
 
 ### D3: Strategy-split (`internal/{direct,traced}/`) for `otel-nats` and `otel-gorilla-ws`

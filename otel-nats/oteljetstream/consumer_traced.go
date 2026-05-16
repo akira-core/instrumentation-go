@@ -44,23 +44,26 @@ func (c *tracedConsumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (
 	if err != nil {
 		return nil, nil, err
 	}
-	hdr := msg.Headers()
 	tracer, prop := c.conn.TraceContext()
-	msgCtx := context.Background()
-	if hdr != nil && hdr.Get("traceparent") != "" {
-		msgCtx = prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: hdr})
-	}
-	originSpanCtx := trace.SpanContextFromContext(msgCtx)
-	consumerParentCtx := c.conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
 	spanName := "receive " + msg.Subject()
 	attrs := append(receiveAttrs(msg, "receive", c.conn.ServerAttrs()), attribute.String(attrConsumerName, c.consumerName))
 	startOpts := []trace.SpanStartOption{
 		trace.WithSpanKind(trace.SpanKindConsumer),
 		trace.WithAttributes(attrs...),
 	}
-	// Only attach link when origin trace is sampled (avoid dangling link to dropped span).
-	if originSpanCtx.IsValid() && originSpanCtx.IsSampled() {
-		startOpts = append(startOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
+	// Propagation closure: when off, no Extract / no deliver span / no link.
+	msgCtx := context.Background()
+	consumerParentCtx := msgCtx
+	if c.conn.PropagationEnabled() {
+		if hdr := msg.Headers(); hdr != nil && hdr.Get("traceparent") != "" {
+			msgCtx = prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: hdr})
+			originSpanCtx := trace.SpanContextFromContext(msgCtx)
+			consumerParentCtx = c.conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
+			// Only attach link when origin trace is sampled (avoid dangling link to dropped span).
+			if originSpanCtx.IsValid() && originSpanCtx.IsSampled() {
+				startOpts = append(startOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
+			}
+		}
 	}
 	_, span := tracer.Start(consumerParentCtx, spanName, startOpts...)
 	span.End()
@@ -127,23 +130,25 @@ func (c *tracedPushConsumer) CachedInfo() *ConsumerInfo {
 // trace context and starts a consumer span before invoking the user handler.
 func tracedConsumeHandler(conn *otelnats.Conn, consumerName string, handler MsgHandler) func(jetstream.Msg) {
 	tracer, prop := conn.TraceContext()
+	propEnabled := conn.PropagationEnabled()
 	return func(msg jetstream.Msg) {
-		hdr := msg.Headers()
-		msgCtx := context.Background()
-		if hdr != nil && hdr.Get("traceparent") != "" {
-			msgCtx = prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: hdr})
-		}
-		originSpanCtx := trace.SpanContextFromContext(msgCtx)
-		consumerParentCtx := conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
 		spanName := "process " + msg.Subject()
 		attrs := append(receiveAttrs(msg, "process", conn.ServerAttrs()), attribute.String(attrConsumerName, consumerName))
 		startOpts := []trace.SpanStartOption{
 			trace.WithSpanKind(trace.SpanKindConsumer),
 			trace.WithAttributes(attrs...),
 		}
-		// Only attach link when origin trace is sampled (avoid dangling link to dropped span).
-		if originSpanCtx.IsValid() && originSpanCtx.IsSampled() {
-			startOpts = append(startOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
+		// Propagation closure: when off, no Extract / no deliver span / no link.
+		consumerParentCtx := context.Background()
+		if propEnabled {
+			if hdr := msg.Headers(); hdr != nil && hdr.Get("traceparent") != "" {
+				msgCtx := prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: hdr})
+				originSpanCtx := trace.SpanContextFromContext(msgCtx)
+				consumerParentCtx = conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
+				if originSpanCtx.IsValid() && originSpanCtx.IsSampled() {
+					startOpts = append(startOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
+				}
+			}
 		}
 		ctx, span := tracer.Start(consumerParentCtx, spanName, startOpts...)
 		defer span.End()
@@ -168,23 +173,24 @@ func (m *tracedMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context
 	if err != nil {
 		return nil, nil, err
 	}
-	hdr := msg.Headers()
 	tracer, prop := m.conn.TraceContext()
-	msgCtx := context.Background()
-	if hdr != nil && hdr.Get("traceparent") != "" {
-		msgCtx = prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: hdr})
-	}
-	originSpanCtx := trace.SpanContextFromContext(msgCtx)
-	consumerParentCtx := m.conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
 	spanName := "receive " + msg.Subject()
 	attrs := append(receiveAttrs(msg, "receive", m.conn.ServerAttrs()), attribute.String(attrConsumerName, m.consumerName))
 	startOpts := []trace.SpanStartOption{
 		trace.WithSpanKind(trace.SpanKindConsumer),
 		trace.WithAttributes(attrs...),
 	}
-	// Only attach link when origin trace is sampled (avoid dangling link to dropped span).
-	if originSpanCtx.IsValid() && originSpanCtx.IsSampled() {
-		startOpts = append(startOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
+	// Propagation closure: when off, no Extract / no deliver span / no link.
+	consumerParentCtx := context.Background()
+	if m.conn.PropagationEnabled() {
+		if hdr := msg.Headers(); hdr != nil && hdr.Get("traceparent") != "" {
+			msgCtx := prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: hdr})
+			originSpanCtx := trace.SpanContextFromContext(msgCtx)
+			consumerParentCtx = m.conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
+			if originSpanCtx.IsValid() && originSpanCtx.IsSampled() {
+				startOpts = append(startOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
+			}
+		}
 	}
 	ctx, span := tracer.Start(consumerParentCtx, spanName, startOpts...)
 	m.lastSpan = span

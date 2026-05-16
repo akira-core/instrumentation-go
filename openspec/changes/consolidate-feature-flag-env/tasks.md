@@ -100,6 +100,48 @@
 - [ ] 10.7 Run `make verify-trace` against the running stack — confirm end-to-end propagation still works
 - [ ] 10.8 Run `make verify-ws-trace` for the WebSocket-only stack
 
+## 12. `otel-nats` propagation flag (3-tier upgrade)
+
+- [x] 12.1 Add `OTEL_NATS_PROPAGATION_ENABLED` constant to `otel-nats/otelnats/env_flags.go` with godoc explaining: gate consulted only when both tracing gates are on; **default OFF when unset** (consistent with universal default-OFF posture); set explicitly truthy to inject `traceparent` / `tracestate` headers
+- [x] 12.2 Add `natsPropagationGate *flags.Gate` to `env_flags.go` with resolver: `func() bool { return natsGate.Enabled() && flags.EnvEnabled("OTEL_NATS_PROPAGATION_ENABLED") }` — reuses existing `flags.EnvEnabled` default-off semantics, no new helper needed
+- [x] 12.3 Add unexported accessor `func natsPropagationEnabled() bool { return natsPropagationGate.Enabled() }`
+- [x] 12.4 Cache the resolved propagation value on `*tracedConn` at construction time (`propagationEnabled bool` field) — hot path reads field, never re-reads env
+- [x] 12.5 Plumb the cached `propagationEnabled` into `tracedConn.startSendSpan` / `startRequestSpan`: keep `tracer.Start` unconditional; gate the `propagator.Inject(...)` call behind `if t.propagationEnabled`
+- [x] 12.6 Plumb into `tracedConn.wrapMsgHandler` and `tracedConn.recordReply`: gate the `propagator.Extract(...)` call behind `if t.propagationEnabled` (when false, supply `context.Background()` as the consumer-span parent and skip `WithLinks` setup driven by the extracted span)
+- [x] 12.7 Plumb into `oteljetstream` `newTracedMessageBatch`, `tracedConsumer.Next`, `tracedMessagesContext.Next`, `tracedConsumeHandler`: same Extract-gating + parent-context fallback
+- [ ] 12.8 Document in `otel-nats/README.md` (+ zh-TW): new env var, default ON, the four-state truth table, examples of when to flip off
+- [x] 12.9 Add `natsPropagationGate.ResetForTest()` parallel-to existing `natsGate.ResetForTest()` so test files can toggle the new env var with `t.Setenv` + reset
+- [x] 12.10 Keep `otel-nats/otelnats/version.go` `instrumentationVersion` at `0.4.0` — no version bump for this change; the propagation flag ships as part of the existing 0.4.x line. (Re-evaluate when the change is archived; release-time decision lives outside this artifact set.)
+- [ ] 12.11 Add `otel-nats/CHANGELOG.md` entry under the existing 0.4.x heading: "`OTEL_NATS_PROPAGATION_ENABLED` env var introduced, default OFF. Deployments previously relying on implicit header injection (tracing-on alone) must add this env var to keep `traceparent` injection working." Include before/after wire-output examples
+- [ ] 12.12 Add migration block to `otel-nats/README.md` + `README.zh-TW.md` under a "Propagation flag (env-var change)" heading with a one-line `grep -rE "OTEL_NATS_TRACING_ENABLED" config/` recipe to locate affected deployments
+- [ ] 12.13 Update root `pkg/instrumentation-go/CLAUDE.md` env-var section with the universal default-OFF rule and a footnote pointing at the propagation env var for nats
+
+## 13. `otel-nats` propagation flag tests (all four on/off combinations)
+
+- [x] 13.1 Add `propagation_gate_test.go` table-driven test asserting `natsPropagationGate.Enabled()` value for the matrix: (tracing unset, propagation unset) → false; (tracing unset, propagation `"true"`) → false; (tracing on, propagation unset) → **false** (new default); (tracing on, propagation `"true"`) → true; (tracing on, propagation `"false"`) → false; (tracing on, propagation `"0"`) → false; (tracing on, propagation `"OFF"`) → false (case-insensitive). Each row SHALL call `natsPropagationGate.ResetForTest()` after `t.Setenv` so the cache reflects the case under test.
+- [x] 13.2 Add `conn_test.go` test `TestPublishWithPropagationOffSkipsHeaders`: tracing on + `OTEL_NATS_PROPAGATION_ENABLED` unset (default OFF), call `Conn.Publish(ctx, subj, data)` with a parent span in ctx; assert the message on `Subscribe` arrives with NO `traceparent` header but a PRODUCER span IS recorded in the test span recorder
+- [x] 13.3 Add `TestPublishWithPropagationEnabledInjectsHeaders`: tracing on + `OTEL_NATS_PROPAGATION_ENABLED=true`; assert message has `traceparent` header AND PRODUCER span recorded (positive counterpart of 13.2)
+- [ ] 13.4 Add `TestPublishWithTracingOffSkipsBoth`: leave all gates off (default state); assert no `traceparent` header AND no spans recorded
+- [ ] 13.5 Add `TestPublishWithTracingOffPropagationOnStillSkipsBoth`: tracing unset + `OTEL_NATS_PROPAGATION_ENABLED=true`; assert behaviour identical to 13.4 (tracing gate is the hard prerequisite)
+- [x] 13.6 Add `TestPublishWithPropagationExplicitlyFalseSkipsHeaders`: tracing on + `OTEL_NATS_PROPAGATION_ENABLED=false`; assert observationally identical to 13.2 (explicit falsy = unset)
+- [x] 13.7 Add `TestSubscribeWithPropagationOffDoesNotExtract`: tracing on + propagation default off; publish via raw `*nats.Conn` with `traceparent` header pre-set; assert the wrapper consumer span has no remote-parent link and the `Msg.Ctx` carries `context.Background()`-equivalent (no extracted span)
+- [x] 13.8 Add `TestSubscribeWithPropagationOnExtractsRemoteContext`: same as 13.7 but with `OTEL_NATS_PROPAGATION_ENABLED=true`; assert the consumer span has a link to the published `traceparent` span context
+- [ ] 13.9 Repeat 13.2–13.8 for `oteljetstream` consumer paths: `newTracedMessageBatch`, `tracedConsumer.Next`, `tracedConsumeHandler` — each must respect the propagation gate identically
+- [x] 13.10 Add a default-behaviour-change regression test `TestDefaultBehaviorIsTracingOnlyNoHeaders`: with only `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true` and `OTEL_NATS_TRACING_ENABLED=true` set (no propagation env), assert the new default = span recorded BUT no `traceparent` header — guards against accidentally re-flipping to implicit propagation-on
+- [x] 13.11 Add migration validation test `TestPropagationFlagRestoresFullWireOutput`: with the full tracing env set PLUS `OTEL_NATS_PROPAGATION_ENABLED=true`, assert wire output contains `traceparent` (+ `tracestate` when active span carries one) — documents the exact migration recipe in test form
+- [x] 13.12 Run `cd otel-nats && go test -race ./... && golangci-lint run ./...` — zero failures, zero issues, all 4 propagation states verified
+
+## 14. Performance invariants lock-in
+
+- [x] 14.1 Sampler-aware deliverSpan gate — producer + consumer paths in `otelnats.tracedConn` (StartDeliverSpan + ConsumerContextWithDeliver) early-return when relevant span context is not sampled
+- [x] 14.2 Sampler-aware consumer link gate — 6 hot-paths across `otelnats` + `oteljetstream` apply both `IsValid()` and `IsSampled()` guards before attaching `trace.Link`
+- [x] 14.3 Propagation-off → emit span, skip link: closure structure ensures `originSpanCtx` and the link branch live inside `if propagationEnabled` so the rule is structurally enforced, not condition-dependent
+- [x] 14.4 MessageBatch lifecycle drain — both `newDirectMessageBatch` and `newTracedMessageBatch` drain `raw.Messages()` after `Stop()` to release the upstream jetstream goroutine
+- [x] 14.5 Header sentinel — no `make(nats.Header)` for nil-header messages on jetstream consumer paths; optional-traceparent early-return precedes any allocation
+- [x] 14.6 BSON inject type-switch + clone — `InjectTraceIntoDocument` / `InjectTraceIntoUpdate` (v1 + v2) + `upsertSetField` sub-doc all clone before injecting; never alias caller's slice/map backing storage
+- [x] 14.7 `marshalWire` pool + hand-written serializer — `otelgorillaws/message.go` uses `sync.Pool` of byte buffers and a reflection-free JSON writer; output round-trips equivalently to the legacy `encoding/json` form
+- [x] 14.8 Regression tests exist for each invariant: `TestSubscribeWithPropagationOffStillEmitsSpanWithoutLink`, `TestRecordReplyWithPropagationOffStillEmitsSpanWithoutLink`, `TestDeliverSpanSkippedWhenUpstreamNotSampled`, `TestStartDeliverSpanSkippedWhenLocalNotSampled`, `TestConsumerSpanNoLinkWhenOriginNotSampled`, `TestRecordReplyLinkRespectsSamplerFlag`, `TestMessageBatchStopReleasesRawBatch`, `TestNoGoroutineLeakAfterEarlyReturn`, `TestInjectDoesNotShareBackingArray`, `TestInjectDoesNotMutateOriginalBson{D,M,Map}`, `TestInjectUpdateDoesNotShareSetBacking`, `TestMarshalWireRoundTripStable`, `TestMarshalWirePoolReuseSafety`
+
 ## 11. Final verification
 
 - [ ] 11.1 Toggle `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=false` in every service in `docker-compose.yml`; restart stack; exercise the 4 message paths (JetStream, Core NATS, HTTP, MongoDB) — confirm zero spans appear in Tempo via `curl -s "http://localhost:3200/api/search?q={}&limit=20"`

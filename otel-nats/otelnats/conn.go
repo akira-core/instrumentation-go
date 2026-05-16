@@ -62,6 +62,7 @@ type connImpl interface {
 	StartDeliverSpan(ctx context.Context, subject string) context.Context
 	ConsumerContextWithDeliver(ctx context.Context, subject string, origin trace.SpanContext) context.Context
 	TracingEnabled() bool
+	PropagationEnabled() bool
 	DeliverSpanEnabled() bool
 	TraceContext() (trace.Tracer, propagation.TextMapPropagator)
 	ServerAttrs() []attribute.KeyValue
@@ -141,12 +142,13 @@ func newConn(nc *nats.Conn, opts ...Option) *Conn {
 		nc:     nc,
 		natsTP: natsTP,
 		impl: &tracedConn{
-			nc:            nc,
-			tracer:        tracer,
-			propagator:    cfg.Propagators,
-			serverAttrs:   serverAttrs,
-			traceDest:     cfg.TraceDest,
-			deliverTracer: deliverTracer,
+			nc:                 nc,
+			tracer:             tracer,
+			propagator:         cfg.Propagators,
+			serverAttrs:        serverAttrs,
+			traceDest:          cfg.TraceDest,
+			deliverTracer:      deliverTracer,
+			propagationEnabled: natsPropagationEnabled(),
 		},
 	}
 }
@@ -208,7 +210,7 @@ func initNATSProvider(serviceName string, serverAttrs []attribute.KeyValue) (*sd
 		_ = exp.Shutdown(ctx) // avoid leaking the exporter connection
 		return nil, nil
 	}
-	slog.Debug("otelnats: deliver tracer enabled", "service", serviceName, "endpoint", endpoint) //nolint:gosec // intentional diagnostic log of internal config values
+	slog.Debug("otelnats: deliver tracer enabled", "service", serviceName, "endpoint", endpoint)
 
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exp),
@@ -236,6 +238,10 @@ func (c *Conn) DeliverSpanEnabled() bool { return c.impl.DeliverSpanEnabled() }
 
 // TracingEnabled reports whether tracing and trace propagation are enabled.
 func (c *Conn) TracingEnabled() bool { return c.impl.TracingEnabled() }
+
+// PropagationEnabled reports whether W3C header inject/extract is on for this Conn.
+// True only when both tracing gates AND OTEL_NATS_PROPAGATION_ENABLED are truthy.
+func (c *Conn) PropagationEnabled() bool { return c.impl.PropagationEnabled() }
 
 // TraceDest returns the configured Nats-Trace-Dest subject (empty if disabled).
 func (c *Conn) TraceDest() string { return c.impl.TraceDest() }

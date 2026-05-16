@@ -94,7 +94,7 @@ type JetStream interface {
 // and consumer paths. The returned impl is chosen by conn.TracingEnabled() —
 // tracedJSImpl when on, directJSImpl when off — so per-method gates disappear.
 //
-// Usage: js, err := oteljetstream.New(otelnatsConn)
+// Usage: js, err := oteljetstream.New(otelnatsConn).
 func New(conn *otelnats.Conn) (JetStream, error) {
 	js, err := jetstream.New(conn.NatsConn())
 	if err != nil {

@@ -24,9 +24,15 @@ type tracedConn struct {
 	serverAttrs   []attribute.KeyValue
 	traceDest     string
 	deliverTracer trace.Tracer // may be nil when no exporter endpoint
+	// propagationEnabled mirrors natsPropagationGate.Enabled() at
+	// construction time. When false, the wrapper still emits spans but
+	// skips W3C header inject on publish/request and skips Extract on
+	// subscribe / reply (no remote-parent link added).
+	propagationEnabled bool
 }
 
 func (t *tracedConn) TracingEnabled() bool     { return true }
+func (t *tracedConn) PropagationEnabled() bool { return t.propagationEnabled }
 func (t *tracedConn) DeliverSpanEnabled() bool { return t.deliverTracer != nil }
 func (t *tracedConn) TraceContext() (trace.Tracer, propagation.TextMapPropagator) {
 	return t.tracer, t.propagator
@@ -134,7 +140,9 @@ func (t *tracedConn) startSendSpan(parent context.Context, msg *nats.Msg) (conte
 	if t.deliverTracer != nil {
 		injectCtx = t.StartDeliverSpan(ctx, msg.Subject)
 	}
-	t.propagator.Inject(injectCtx, &HeaderCarrier{H: msg.Header})
+	if t.propagationEnabled {
+		t.propagator.Inject(injectCtx, &HeaderCarrier{H: msg.Header})
+	}
 	return ctx, span
 }
 
@@ -153,7 +161,9 @@ func (t *tracedConn) startRequestSpan(parent context.Context, msg *nats.Msg) (co
 	if t.deliverTracer != nil {
 		injectCtx = t.StartDeliverSpan(ctx, msg.Subject)
 	}
-	t.propagator.Inject(injectCtx, &HeaderCarrier{H: msg.Header})
+	if t.propagationEnabled {
+		t.propagator.Inject(injectCtx, &HeaderCarrier{H: msg.Header})
+	}
 	return ctx, span
 }
 
@@ -164,24 +174,26 @@ func (t *tracedConn) startRequestSpan(parent context.Context, msg *nats.Msg) (co
 // linked into the receive span.
 func (t *tracedConn) recordReply(parent context.Context, sendSpan trace.Span, reply *nats.Msg) {
 	sendSpan.SetAttributes(attribute.Int(string(semconv.MessagingMessageBodySizeKey), len(reply.Data)))
-	var originSC trace.SpanContext
-	receiveCtx := parent
-	if reply.Header != nil {
-		extracted := t.propagator.Extract(parent, &HeaderCarrier{H: reply.Header})
-		originSC = trace.SpanContextFromContext(extracted)
-		if originSC.IsValid() {
-			receiveCtx = extracted
-		}
-	}
 	opts := []trace.SpanStartOption{
 		trace.WithSpanKind(trace.SpanKindConsumer),
 		trace.WithAttributes(receiveAttrs(reply, "", "receive", t.serverAttrs)...),
 	}
-	// Only attach link when origin trace is sampled. A link to a dropped span
-	// would be dangling in the backend (target span never stored), wasting both
-	// hot-path alloc and OTLP wire bytes for no debugging value.
-	if originSC.IsValid() && originSC.IsSampled() {
-		opts = append(opts, trace.WithLinks(trace.Link{SpanContext: originSC}))
+	// Propagation closure: when off, the reply header is opaque — no Extract,
+	// no link consideration. Reply consumer span is still emitted, rooted at
+	// the caller's parent ctx (the request span).
+	receiveCtx := parent
+	if t.propagationEnabled && reply.Header != nil {
+		extracted := t.propagator.Extract(parent, &HeaderCarrier{H: reply.Header})
+		originSC := trace.SpanContextFromContext(extracted)
+		if originSC.IsValid() {
+			receiveCtx = extracted
+			// Only attach link when origin trace is sampled. A link to a
+			// dropped span would be dangling in the backend, wasting hot-path
+			// alloc and OTLP wire bytes for no debugging value.
+			if originSC.IsSampled() {
+				opts = append(opts, trace.WithLinks(trace.Link{SpanContext: originSC}))
+			}
+		}
 	}
 	_, span := t.tracer.Start(receiveCtx, "receive "+reply.Subject, opts...)
 	span.End()
@@ -193,17 +205,22 @@ func (t *tracedConn) traceEventHandler() nats.MsgHandler {
 
 func (t *tracedConn) wrapMsgHandler(subject, queue string, handler MsgHandler) nats.MsgHandler {
 	return func(msg *nats.Msg) {
-		msgCtx := t.propagator.Extract(context.Background(), &HeaderCarrier{H: msg.Header})
-		originSpanCtx := trace.SpanContextFromContext(msgCtx)
-		consumerParentCtx := t.ConsumerContextWithDeliver(context.Background(), subject, originSpanCtx)
 		spanName := "process " + subject
 		opts := []trace.SpanStartOption{
 			trace.WithSpanKind(trace.SpanKindConsumer),
 			trace.WithAttributes(receiveAttrs(msg, queue, "process", t.serverAttrs)...),
 		}
-		// Only attach link when origin trace is sampled. See recordReply for rationale.
-		if originSpanCtx.IsValid() && originSpanCtx.IsSampled() {
-			opts = append(opts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
+		// Propagation closure: when off, the inbound header is opaque — no
+		// Extract, no deliver span, no link consideration. Per
+		// PERF_BOTTLENECK_PLAN D2: span is still emitted, link is skipped.
+		consumerParentCtx := context.Background()
+		if t.propagationEnabled {
+			msgCtx := t.propagator.Extract(context.Background(), &HeaderCarrier{H: msg.Header})
+			originSpanCtx := trace.SpanContextFromContext(msgCtx)
+			consumerParentCtx = t.ConsumerContextWithDeliver(context.Background(), subject, originSpanCtx)
+			if originSpanCtx.IsValid() && originSpanCtx.IsSampled() {
+				opts = append(opts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
+			}
 		}
 		ctx, span := t.tracer.Start(consumerParentCtx, spanName, opts...)
 		defer span.End()

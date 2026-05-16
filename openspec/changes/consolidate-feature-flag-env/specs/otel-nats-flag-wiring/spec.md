@@ -2,18 +2,76 @@
 
 ### Requirement: `otel-nats` uses the shared `internal/flags/` helper
 
-`otel-nats/otelnats/env_flags.go` SHALL replace its local `natsTracingEnabled` resolver and the duplicated `envEnabledByDefault` helper with calls to a per-module `internal/flags/` package. The two-tier gate (`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` AND `OTEL_NATS_TRACING_ENABLED`) SHALL remain unchanged in observable behaviour.
+`otel-nats/otelnats/env_flags.go` SHALL replace its local `natsTracingEnabled` resolver and the duplicated `envEnabledByDefault` helper with calls to a per-module `internal/flags/` package. The gate SHALL be extended from two-tier (`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` AND `OTEL_NATS_TRACING_ENABLED`) to three-tier by adding a new `OTEL_NATS_PROPAGATION_ENABLED` flag that controls W3C header inject/extract independently of the wrapper-span gate.
 
-#### Scenario: Gate composes the two env vars
+#### Scenario: Tracing gate composes the two tracing env vars
 
-- **WHEN** any code path needs to know whether NATS instrumentation is enabled
+- **WHEN** any code path needs to know whether NATS wrapper spans should be emitted
 - **THEN** the result SHALL be obtained from a package-level `natsGate *flags.Gate` whose resolver is `func() bool { return flags.EnvEnabled("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED") && flags.EnvEnabled("OTEL_NATS_TRACING_ENABLED") }`
+
+#### Scenario: Propagation gate composes all three env vars with default-off semantics
+
+- **WHEN** any code path needs to know whether the NATS wrapper should inject `traceparent` / `tracestate` headers on publish and extract them on subscribe
+- **THEN** the result SHALL be obtained from a package-level `natsPropagationGate *flags.Gate` whose resolver returns `true` only when `natsGate.Enabled()` is `true` AND the `OTEL_NATS_PROPAGATION_ENABLED` env var is explicitly set to a truthy value (any string other than the falsy set `"0"`, `"false"`, `"no"`, `"off"`, case-insensitive and whitespace-trimmed)
+- **AND** the resolver SHALL return `false` when `OTEL_NATS_PROPAGATION_ENABLED` is unset (default-OFF posture, consistent with the rest of the universal flag surface)
+- **AND** the resolver SHALL return `false` when `OTEL_NATS_PROPAGATION_ENABLED` is explicitly set to a falsy value
+- **AND** the resolver SHALL return `false` whenever `natsGate.Enabled()` is `false`, regardless of the propagation env var value (the tracing gate is a hard prerequisite)
 
 #### Scenario: Local `envEnabledByDefault` is removed
 
 - **WHEN** the change lands
 - **THEN** `otel-nats/otelnats/env_flags.go` SHALL NOT define a private `envEnabledByDefault` function
-- **AND** the file SHALL only contain the gate composition
+- **AND** the file SHALL only contain the two gate compositions (tracing + propagation) and any thin accessor wrappers required for the strategy-split constructor
+
+### Requirement: Propagation gate honours all four on/off combinations
+
+The combined `(natsGate, natsPropagationGate)` decision matrix SHALL produce one of three observable behaviours on publish and one matching behaviour on subscribe, summarised below.
+
+| Tracing | Propagation env | Resulting wrapper-span behaviour | Resulting wire-propagation behaviour |
+|---|---|---|---|
+| off | any value (unset / true / false) | no wrapper span, direct delegate to upstream | no header inject, no header extract |
+| on | unset (default OFF) | wrapper span created | NO header inject on publish, NO extract on subscribe |
+| on | truthy | wrapper span created | `traceparent` / `tracestate` injected on publish, extracted on subscribe |
+| on | falsy | wrapper span created | NO header inject on publish, NO extract on subscribe |
+
+#### Scenario: Tracing off, propagation env unset
+
+- **WHEN** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is unset (or falsy) and `OTEL_NATS_PROPAGATION_ENABLED` is unset
+- **THEN** `Conn.Publish(ctx, subject, data)` SHALL delegate directly to `*nats.Conn.Publish` with the caller-supplied `Header` unchanged
+- **AND** the headers SHALL NOT contain a `traceparent` key added by the wrapper
+- **AND** no wrapper span SHALL be created
+
+#### Scenario: Tracing off, propagation env explicitly on
+
+- **WHEN** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is unset and `OTEL_NATS_PROPAGATION_ENABLED=true`
+- **THEN** propagation SHALL still be disabled (tracing gate is the hard prerequisite)
+- **AND** the behaviour SHALL match the "both off" row of the table exactly
+
+#### Scenario: Tracing on, propagation env unset (default OFF)
+
+- **WHEN** both `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true` and `OTEL_NATS_TRACING_ENABLED=true` are set, and `OTEL_NATS_PROPAGATION_ENABLED` is unset
+- **THEN** `Conn.Publish(ctx, ...)` SHALL emit a PRODUCER span via the configured `TracerProvider`
+- **AND** the outgoing `Header` SHALL NOT have `traceparent` / `tracestate` keys added by the wrapper (existing caller-supplied keys SHALL be preserved verbatim)
+- **AND** `Conn.Subscribe` callbacks SHALL receive a `Msg` whose `Ctx` is the subscriber's parent context (no extract attempted, no link added to the consumer span)
+
+#### Scenario: Tracing on, propagation env explicitly truthy
+
+- **WHEN** both tracing gates are on and `OTEL_NATS_PROPAGATION_ENABLED=true` (or any other truthy value)
+- **THEN** `Conn.Publish(ctx, ...)` SHALL emit a PRODUCER span via the configured `TracerProvider`
+- **AND** the outgoing `Header` SHALL contain `traceparent` (and `tracestate` if present in the active span context) injected by the configured `propagation.TextMapPropagator`
+- **AND** `Conn.Subscribe` callbacks SHALL receive a `Msg` whose `Ctx` carries the extracted remote span context when the incoming `Header` contains a `traceparent`
+
+#### Scenario: Tracing on, propagation env explicitly falsy
+
+- **WHEN** both tracing gates are on but `OTEL_NATS_PROPAGATION_ENABLED=false` (or `"0"`, `"no"`, `"off"`)
+- **THEN** the wrapper SHALL behave identically to the "tracing on, propagation env unset" scenario above (PRODUCER span emitted, no header inject, no consumer-side extract)
+- **AND** the explicit-falsy and unset cases SHALL be observationally indistinguishable
+
+#### Scenario: Both gates flip from off → on at runtime
+
+- **WHEN** a process starts with both gates off, then env vars are mutated and `natsPropagationGate.ResetForTest()` is called from a test
+- **THEN** subsequent calls SHALL observe the new gate values
+- **AND** in production (no ResetForTest call), the cached value from process start SHALL be retained — env mutations after the first gate read SHALL be ignored, consistent with `natsGate` semantics
 
 ### Requirement: `otelnats.Conn` uses strategy-split impls
 
@@ -25,12 +83,19 @@
 - **THEN** the returned `*Conn` SHALL hold an `impl` of concrete type `*internal/direct.Conn`
 - **AND** `Conn.Publish`, `Subscribe`, `PublishMsg`, `Request`, `Drain`, `Close`, `JetStream`, and all other public methods SHALL delegate to the underlying `*nats.Conn` with no header inject and no span creation
 
-#### Scenario: Enabled mode returns traced impl
+#### Scenario: Enabled mode with explicit propagation returns traced impl with propagation
 
-- **WHEN** `Connect(url, opts...)` is called with both gates on
-- **THEN** the returned `*Conn` SHALL hold an `impl` of concrete type `*internal/traced.Conn`
+- **WHEN** `Connect(url, opts...)` is called with both tracing gates on and `OTEL_NATS_PROPAGATION_ENABLED` explicitly truthy
+- **THEN** the returned `*Conn` SHALL hold an `impl` of concrete type `*internal/traced.Conn` whose internally-cached `propagationEnabled` is `true`
 - **AND** `Publish` SHALL inject `traceparent` / `tracestate` headers via the configured propagator
 - **AND** `Subscribe` callbacks SHALL receive a `MsgWithContext` carrying the extracted remote trace
+
+#### Scenario: Tracing on, propagation default off returns traced impl without propagation
+
+- **WHEN** `Connect(url, opts...)` is called with both tracing gates on and `OTEL_NATS_PROPAGATION_ENABLED` unset (or explicitly falsy)
+- **THEN** the returned `*Conn` SHALL hold an `impl` of concrete type `*internal/traced.Conn` whose internally-cached `propagationEnabled` is `false`
+- **AND** `Publish` SHALL emit a PRODUCER span but SHALL NOT inject `traceparent` / `tracestate` headers
+- **AND** `Subscribe` SHALL emit a CONSUMER span but SHALL NOT call `propagator.Extract` (the consumer span SHALL have no remote-parent link from header propagation)
 
 #### Scenario: No `if tracingEnabled` in public methods
 

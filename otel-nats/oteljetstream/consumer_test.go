@@ -25,6 +25,11 @@ func startJetStreamServer(t *testing.T) string {
 	t.Helper()
 	t.Setenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED", "1")
 	t.Setenv("OTEL_NATS_TRACING_ENABLED", "1")
+	// Default propagation gate is OFF. Existing tests assume v0.4.x
+	// behaviour (header inject + extract on). Opt-in via env set BEFORE
+	// the first Connect in this process; the gate caches the value on
+	// first read so all subsequent tests in this package share it.
+	t.Setenv("OTEL_NATS_PROPAGATION_ENABLED", "1")
 	opts := &natssrv.Options{
 		Host:      "127.0.0.1",
 		Port:      -1,
@@ -125,7 +130,7 @@ func TestFetchReturnsMessagesWithTraceContext(t *testing.T) {
 	// Fetch with retries until message is available
 	var received int
 	var batch oteljetstream.MessageBatch
-	for attempt := 0; attempt < 30; attempt++ {
+	for range 30 {
 		var ferr error
 		batch, ferr = cons.Fetch(5, jetstream.FetchMaxWait(300*time.Millisecond))
 		require.NoError(t, ferr)
@@ -577,7 +582,7 @@ func TestJetStreamDeliverSpanFetch(t *testing.T) {
 	pubSpan.End()
 
 	var received int
-	for attempt := 0; attempt < 30; attempt++ {
+	for range 30 {
 		batch, ferr := cons.Fetch(5, jetstream.FetchMaxWait(300*time.Millisecond))
 		require.NoError(t, ferr)
 		for m := range batch.Messages() {
@@ -738,7 +743,7 @@ func TestMessageBatchStopIdempotent(t *testing.T) {
 	pub("p3")
 
 	var batch oteljetstream.MessageBatch
-	for attempt := 0; attempt < 30; attempt++ {
+	for range 30 {
 		b, err := cons.Fetch(3, jetstream.FetchMaxWait(300*time.Millisecond))
 		require.NoError(t, err)
 		// drain at least one to confirm batch is alive, then stop early
@@ -768,14 +773,14 @@ func TestMessageBatchStopReleasesRawBatch(t *testing.T) {
 	cons, pub, _ := messageBatchFixture(t)
 	// publish enough messages so the raw batch chan still has undelivered
 	// items when we Stop().
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		pub("p")
 	}
 
 	runtime.GC()
 	before := runtime.NumGoroutine()
 
-	for round := 0; round < 5; round++ {
+	for range 5 {
 		batch, err := cons.Fetch(10, jetstream.FetchMaxWait(300*time.Millisecond))
 		require.NoError(t, err)
 		// Consume only ONE message then Stop — leaves the raw chan with
@@ -790,7 +795,7 @@ func TestMessageBatchStopReleasesRawBatch(t *testing.T) {
 		}
 		batch.Stop()
 		// Republish so next round has something to fetch.
-		for i := 0; i < 3; i++ {
+		for range 3 {
 			pub("p")
 		}
 	}
@@ -812,19 +817,19 @@ func TestMessageBatchStopReleasesRawBatch(t *testing.T) {
 // any message. Exercises the done-branch drain path.
 func TestNoGoroutineLeakAfterEarlyReturn(t *testing.T) {
 	cons, pub, _ := messageBatchFixture(t)
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		pub("p")
 	}
 
 	runtime.GC()
 	before := runtime.NumGoroutine()
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		batch, err := cons.Fetch(5, jetstream.FetchMaxWait(300*time.Millisecond))
 		require.NoError(t, err)
 		// Immediately Stop without consuming.
 		batch.Stop()
-		for i := 0; i < 2; i++ {
+		for range 2 {
 			pub("p")
 		}
 	}

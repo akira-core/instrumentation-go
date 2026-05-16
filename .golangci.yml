@@ -1,5 +1,8 @@
-# golangci-lint v2 — reference: Prometheus, maratori/golangci-lint-config
-# https://golangci-lint.run/usage/configuration/
+# golangci-lint v2 — trending config aligned with OpenTelemetry contrib,
+# Prometheus, Cilium, etcd. Curated for OTel instrumentation libs: emphasises
+# context propagation correctness, test-quality, modern Go 1.22+ idioms, and
+# allocation discipline; drops bikeshedding linters (style/whitespace noise).
+# Reference docs: https://golangci-lint.run/usage/configuration/
 version: "2"
 
 run:
@@ -13,40 +16,159 @@ issues:
 
 linters:
   enable:
+    # Core correctness — bugs / nil / type misuse.
     - errcheck
+    - errorlint            # %w wrapping + errors.Is/As discipline
     - govet
     - ineffassign
+    - nilerr               # `if err != nil { return nil }` — silently swallows
+    - nilnil               # don't return (nil, nil)
     - staticcheck
     - unused
-    - misspell
-    - unconvert
-    - unparam
-    - prealloc
-    - revive
+    - wastedassign
+
+    # Context propagation — load-bearing for an OTel instrumentation lib.
+    - contextcheck         # propagate ctx; don't drop it mid-call
+    - noctx                # HTTP / net call without context
+
+    # Security.
+    - bodyclose            # http.Response.Body must be closed
     - gosec
-    - errorlint
-    - exptostd
-    - perfsprint
-    - predeclared
-    - usestdlibvars
+    - rowserrcheck         # sql.Rows.Err must be checked
+    - sqlclosecheck        # sql.Rows / sql.Stmt must be closed
+
+    # Modern Go 1.22+ idioms.
+    - copyloopvar          # Go 1.22 loop var semantics — flag pre-1.22 patterns
+    - intrange             # for i := range N (Go 1.22)
+    - exptostd             # `golang.org/x/exp` → stdlib once moved
+    - usestdlibvars        # use http.StatusOK over magic numbers
+
+    # Performance.
+    - perfsprint           # fmt.Sprintf → strconv when possible
+    - prealloc             # pre-allocate slices with known length
+    - mirror               # strings vs []byte equivalence (avoid conversions)
+
+    # Style + readability — aligned with stdlib conventions, not bikeshedding.
+    - misspell
+    - nakedret             # naked returns in long funcs
+    - predeclared          # don't shadow predeclared identifiers
+    - reassign             # don't reassign package-level vars
+    - revive               # config below
+    - unconvert            # unnecessary type conversions
+    - unparam              # unused function parameters
     - whitespace
-    - testifylint
+    - godot                # period at end of doc comments (stdlib style)
+    - nolintlint           # //nolint directives must be specific + commented
+
+    # Code quality — broad correctness + perf catch-all.
+    - gocritic             # config below
+
+    # Test quality.
+    - testifylint          # testify API misuse
+    - thelper              # test helpers must call t.Helper()
+    - tparallel            # t.Parallel inconsistency
+    - usetesting           # prefer t.Setenv/t.Context/t.TempDir over os.Setenv etc
+
   settings:
     revive:
       rules:
         - name: exported
           severity: warning
           disabled: false
+        # Common high-signal revive rules trending in modern Go projects.
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: empty-block
+        - name: error-naming
+        - name: error-return
+        - name: error-strings
+        - name: errorf
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: range
+        - name: receiver-naming
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: time-naming
+        - name: unexported-return
+        - name: unreachable-code
+        - name: unused-parameter
+          disabled: true   # covered by unparam; revive is noisier
+        - name: var-declaration
+        - name: var-naming
+
     gosec:
       excludes:
-        - G304  # file path from variable (e.g. config) — allow where appropriate
+        - G104   # err return — covered by errcheck
+        - G304   # variable file path — allow (we have config-driven paths)
+        - G115   # int conversion overflow — too noisy for instrumentation libs
+      severity: medium
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+        - style
+      disabled-checks:
+        - ifElseChain          # overly opinionated; switch isn't always better
+        - hugeParam            # noisy for OTel context values
+        - rangeValCopy         # noisy on small struct iteration
+        - unnamedResult        # too strict for simple (T, error) returns
+        - paramTypeCombine     # opinionated; harder to extend later
+
+    nakedret:
+      max-func-lines: 0     # any naked return triggers — most explicit
+
+    perfsprint:
+      strconcat: false      # `a + b` is fine; don't force strings.Builder
+      errorf: false         # errors.New for non-formatted only (errorlint covers wrap)
+
+    testifylint:
+      enable-all: true
+      disable:
+        - require-error      # too strict for table-driven tests using assert
+
   exclusions:
     rules:
+      # Test code: allow magic numbers, unchecked errors, and minor style waivers.
       - path: _test\.go
         linters:
           - errcheck
           - gosec
           - unparam
+          - revive             # test funcs often lack godoc
+          - godot              # comments in test data are casual
+          - contextcheck       # tests often pass context.Background()
+          - noctx              # test HTTP helpers
+          - thelper            # noisy false positive on table-driven anon setup funcs
+          - bodyclose          # test Dial / HTTP helpers — short-lived, GC handles it
+          - nolintlint         # tests use //nolint freely for fixture builders
+          - gocritic           # opinionated rules misfire on test fixtures
+      # Example demos: don't lint as production code.
+      - path: examples?/
+        linters:
+          - errcheck
+          - gosec
+          - revive
+          - godot
+          - perfsprint
+      # Public constructors that take ctx as a trailing arg keep the historical
+      # API stable; new code should still put ctx first.
+      - path: internal/(direct|traced)/singleresult\.go
+        linters:
+          - revive
+        text: "context-as-argument"
+      # Intentional drain loops over channels — empty body is the point.
+      - path: oteljetstream/consumer\.go
+        linters:
+          - revive
+        text: "empty-block"
+      # Generated / internal protocol files: out of scope.
+      - path: "\\.pb\\.go$"
+        linters:
+          - all
 
 formatters:
   enable:

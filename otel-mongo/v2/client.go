@@ -161,7 +161,9 @@ func NewClient(uri string, traceOpts ...ClientOption) (*Client, error) {
 func (c *Client) Disconnect(ctx context.Context) error {
 	err := c.Client.Disconnect(ctx)
 	if c.mongoTP != nil {
-		shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		// Derive shutdown deadline from caller's ctx so cancellation propagates;
+		// fall back to a fixed 3s timeout when ctx has no deadline.
+		shutCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
 		_ = c.mongoTP.Shutdown(shutCtx) // best-effort; deliver spans may be lost on failure
 	}
@@ -247,7 +249,7 @@ func initMongoProvider(addr string, port int) (*sdktrace.TracerProvider, trace.T
 		_ = exp.Shutdown(ctx) // avoid leaking the exporter connection
 		return nil, nil
 	}
-	slog.Debug("otelmongo: deliver tracer enabled", "service", serviceName, "endpoint", endpoint) //nolint:gosec // intentional diagnostic log of internal config values
+	slog.Debug("otelmongo: deliver tracer enabled", "service", serviceName, "endpoint", endpoint)
 
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exp),

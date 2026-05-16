@@ -136,7 +136,7 @@ func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*
 		return nil, err
 	}
 	addr, port := parseServerFromClientOptions(merged)
-	mongoTP, deliverTracer := initMongoProvider(addr, port)
+	mongoTP, deliverTracer := initMongoProvider(ctx, addr, port)
 	return &Client{
 		Client:             mc,
 		serverAddr:         addr,
@@ -167,7 +167,9 @@ func NewClient(ctx context.Context, uri string, traceOpts ...ClientOption) (*Cli
 func (c *Client) Disconnect(ctx context.Context) error {
 	err := c.Client.Disconnect(ctx)
 	if c.mongoTP != nil {
-		shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		// Derive shutdown deadline from caller's ctx so cancellation propagates;
+		// fall back to a fixed 3s timeout when ctx has no deadline.
+		shutCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
 		_ = c.mongoTP.Shutdown(shutCtx) // best-effort; deliver spans may be lost on failure
 	}
@@ -221,12 +223,11 @@ func parseServerFromURI(uri string) (addr string, port int) {
 // for synthetic deliver spans. Only enabled when OTEL_EXPORTER_OTLP_ENDPOINT is set.
 // The endpoint must be a full URL (e.g. "http://otel-collector:4318") for HTTP,
 // or a host:port (e.g. "otel-collector:4317") for gRPC.
-func initMongoProvider(addr string, port int) (*sdktrace.TracerProvider, trace.Tracer) {
+func initMongoProvider(ctx context.Context, addr string, port int) (*sdktrace.TracerProvider, trace.Tracer) {
 	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 	if endpoint == "" {
 		return nil, nil
 	}
-	ctx := context.Background()
 
 	var exp sdktrace.SpanExporter
 	var err error
@@ -253,7 +254,7 @@ func initMongoProvider(addr string, port int) (*sdktrace.TracerProvider, trace.T
 		_ = exp.Shutdown(ctx) // avoid leaking the exporter connection
 		return nil, nil
 	}
-	slog.Debug("otelmongo: deliver tracer enabled", "service", serviceName, "endpoint", endpoint) //nolint:gosec // intentional diagnostic log of internal config values
+	slog.Debug("otelmongo: deliver tracer enabled", "service", serviceName, "endpoint", endpoint)
 
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exp),

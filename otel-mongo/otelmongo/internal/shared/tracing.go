@@ -145,7 +145,7 @@ func InjectTraceIntoUpdate(ctx context.Context, update any, prop propagation.Tex
 		return update, err
 	}
 
-	if len(doc) > 0 && len(doc[0].Key) > 0 && doc[0].Key[0] == '$' {
+	if len(doc) > 0 && doc[0].Key != "" && doc[0].Key[0] == '$' {
 		doc, err = upsertSetField(doc, *meta)
 		if err != nil {
 			return update, fmt.Errorf("otelmongo: upsert $set: %w", err)
