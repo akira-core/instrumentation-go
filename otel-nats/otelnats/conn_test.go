@@ -976,3 +976,133 @@ func TestDefaultBehaviorIsTracingOnlyNoHeaders(t *testing.T) {
 		return findSpanByKind(sr.Ended(), oteltrace.SpanKindProducer) != nil
 	}, 2*time.Second, 5*time.Millisecond, "PRODUCER span must still be emitted")
 }
+
+// startServerTracingOff sets up a NATS server with every tracing env var
+// unset/falsy and resets the otelnats gates so the Connect call observes
+// the disabled state. Used by the disabled-mode regression tests below
+// (task 13.4 / 13.5).
+func startServerTracingOff(t *testing.T) string {
+	t.Helper()
+	_ = os.Unsetenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED")
+	_ = os.Unsetenv("OTEL_NATS_TRACING_ENABLED")
+	_ = os.Unsetenv("OTEL_NATS_PROPAGATION_ENABLED")
+	otelnats.ResetGatesForTest()
+	t.Cleanup(otelnats.ResetGatesForTest)
+	opts := &natssrv.Options{Host: "127.0.0.1", Port: -1}
+	s, err := natssrv.NewServer(opts)
+	require.NoError(t, err)
+	go s.Start()
+	require.True(t, s.ReadyForConnections(5*time.Second), "nats-server not ready")
+	t.Cleanup(s.Shutdown)
+	return s.ClientURL()
+}
+
+// TestPublishWithTracingOffSkipsBoth verifies the disabled-mode contract:
+// when every tracing env var is unset, Publish emits zero spans AND injects
+// zero traceparent headers — the wrapper behaves identically to raw
+// *nats.Conn.Publish. Task 13.4.
+func TestPublishWithTracingOffSkipsBoth(t *testing.T) {
+	url := startServerTracingOff(t)
+
+	tp, sr := newTestProvider()
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	t.Cleanup(conn.Close)
+	require.False(t, conn.TracingEnabled(), "tracing gate must resolve false")
+	require.False(t, conn.PropagationEnabled(), "propagation gate must resolve false")
+
+	subject := "tracing.off.both"
+	headerCh := make(chan nats.Header, 1)
+	_, err = conn.NatsConn().Subscribe(subject, func(msg *nats.Msg) {
+		headerCh <- msg.Header
+	})
+	require.NoError(t, err)
+
+	tracer := tp.Tracer("test")
+	ctx, span := tracer.Start(context.Background(), "parent")
+	defer span.End()
+	require.NoError(t, conn.Publish(ctx, subject, []byte("payload")))
+
+	select {
+	case h := <-headerCh:
+		assert.Empty(t, h.Get("traceparent"),
+			"tracing off: no traceparent must be injected")
+		assert.Empty(t, h.Get("tracestate"),
+			"tracing off: no tracestate must be injected")
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscribe handler did not fire")
+	}
+
+	// Allow any in-flight span End to settle, then assert zero wrapper spans.
+	time.Sleep(50 * time.Millisecond)
+	for _, s := range sr.Ended() {
+		if s.Name() == "parent" {
+			continue // root span emitted by the test itself
+		}
+		t.Errorf("unexpected wrapper span emitted in tracing-off mode: name=%q kind=%v",
+			s.Name(), s.SpanKind())
+	}
+}
+
+// TestPublishWithTracingOffPropagationOnStillSkipsBoth asserts that the
+// tracing gate is the hard prerequisite: setting OTEL_NATS_PROPAGATION_ENABLED
+// truthy while the tracing gate is off SHALL be observationally identical to
+// the "both off" case — no header inject, no span emission. Task 13.5.
+func TestPublishWithTracingOffPropagationOnStillSkipsBoth(t *testing.T) {
+	_ = os.Unsetenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED")
+	_ = os.Unsetenv("OTEL_NATS_TRACING_ENABLED")
+	t.Setenv("OTEL_NATS_PROPAGATION_ENABLED", "true")
+	otelnats.ResetGatesForTest()
+	t.Cleanup(otelnats.ResetGatesForTest)
+
+	opts := &natssrv.Options{Host: "127.0.0.1", Port: -1}
+	s, err := natssrv.NewServer(opts)
+	require.NoError(t, err)
+	go s.Start()
+	require.True(t, s.ReadyForConnections(5*time.Second), "nats-server not ready")
+	t.Cleanup(s.Shutdown)
+
+	tp, sr := newTestProvider()
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	conn, err := otelnats.Connect(s.ClientURL(), nil)
+	require.NoError(t, err)
+	t.Cleanup(conn.Close)
+	require.False(t, conn.TracingEnabled(),
+		"tracing gate must resolve false even when propagation env is on (hard prerequisite)")
+	require.False(t, conn.PropagationEnabled(),
+		"propagation gate must resolve false when tracing gate is off")
+
+	subject := "tracing.off.propagation.on"
+	headerCh := make(chan nats.Header, 1)
+	_, err = conn.NatsConn().Subscribe(subject, func(msg *nats.Msg) {
+		headerCh <- msg.Header
+	})
+	require.NoError(t, err)
+
+	tracer := tp.Tracer("test")
+	ctx, span := tracer.Start(context.Background(), "parent")
+	defer span.End()
+	require.NoError(t, conn.Publish(ctx, subject, []byte("payload")))
+
+	select {
+	case h := <-headerCh:
+		assert.Empty(t, h.Get("traceparent"),
+			"propagation env on but tracing off: still NO traceparent (tracing is hard prerequisite)")
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscribe handler did not fire")
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	for _, s := range sr.Ended() {
+		if s.Name() == "parent" {
+			continue
+		}
+		t.Errorf("unexpected wrapper span emitted: name=%q kind=%v",
+			s.Name(), s.SpanKind())
+	}
+}

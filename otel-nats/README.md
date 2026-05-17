@@ -33,18 +33,38 @@ otel-nats/
 
 ### Tracing feature flags
 
-`otel-nats` (`otelnats` + `oteljetstream`) supports:
+`otel-nats` (`otelnats` + `oteljetstream`) reads three env vars; **all default to OFF when unset**:
 
-- `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` (global master switch)
-- `OTEL_NATS_TRACING_ENABLED` (nats module switch)
+| Variable | Tier | Default | Effect |
+|---|---|---|---|
+| `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | global master | OFF | hard prerequisite for every per-module flag |
+| `OTEL_NATS_TRACING_ENABLED` | module tracing | OFF | wrapper spans on Publish / Subscribe / Request and the JetStream consumer paths |
+| `OTEL_NATS_PROPAGATION_ENABLED` | module propagation | OFF | W3C `traceparent` / `tracestate` header inject on publish + extract on subscribe |
 
-Defaults: enabled when unset. Values `false/0/no/off` disable.
+Truthy = any value other than `0`, `false`, `no`, `off` (case-insensitive, whitespace-trimmed). Cached for the process lifetime via `sync.Once`; env changes after the first gate read are ignored.
 
-Priority:
-1. Global off disables all nats tracing regardless of module flag.
-2. Otherwise module flag controls nats tracing.
+**Four observable states:**
 
-When disabled, both span creation and W3C header propagation are turned off.
+| `OTEL_NATS_TRACING_ENABLED` | `OTEL_NATS_PROPAGATION_ENABLED` | Wrapper span | Wire `traceparent` |
+|---|---|---|---|
+| OFF (any) | (any) | — | — |
+| ON | OFF (default) | yes | **no** |
+| ON | ON | yes | yes |
+| ON | falsy | yes | no |
+
+When tracing is on but propagation is off (the new default), wrapper spans are still created — useful for local fan-out metrics / dead-letter diagnosis — but no headers are injected on publish and no Extract is performed on subscribe. Useful when the downstream consumer is non-OTel-aware or wire size dominates small payloads.
+
+#### Propagation flag (env-var change from v0.3.x)
+
+Deployments that previously enabled tracing without setting an explicit propagation flag **must add** `OTEL_NATS_PROPAGATION_ENABLED=true` to keep `traceparent` injection working — otherwise cross-service traces will fragment at every NATS hop. Find affected configs:
+
+```bash
+grep -rE 'OTEL_NATS_TRACING_ENABLED' deploy/ config/ docker-compose*.yml
+```
+
+For each match that also enables tracing, add the propagation env var alongside it. See `CHANGELOG.md` for before/after wire-output examples.
+
+Per-connection overrides via `ConnectWithOptions(..., WithTracerProvider(tp), WithPropagators(p))` are still available; they have no effect when tracing is gated off.
 
 ### 1. Initialize provider and propagator (application responsibility)
 

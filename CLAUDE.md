@@ -81,17 +81,24 @@ Applications call `otelsetup.Init()` at startup to configure the global provider
 | NATS/JetStream | Message headers | `traceparent`, `tracestate` headers via `HeaderCarrier` |
 | WebSocket | JSON message body | Top-level `traceparent`/`tracestate` fields + `payload` (base64); non-JSON passthrough |
 
-### Feature Flags (otel-mongo)
+### Feature Flags
 
-Three env vars plus optional `ConnectWithOptions` override (all default **disabled** when unset for the module-specific vars):
+**Universal default-OFF posture:** every env var across every module defaults to OFF when unset. A binary that links these wrapper packages but sets no env vars MUST behave indistinguishably from a binary using the unwrapped upstream client — no extra header bytes on the wire, no extra spans, no extra goroutines, no allocation. Truthy = any non-falsy value; falsy set = `0` / `false` / `no` / `off` (case-insensitive, whitespace-trimmed).
 
-| Env var | Scope |
-|---|---|
-| `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | global master switch (must be truthy for any mongo module flag or `WithTracePropagationEnabled` to apply) |
-| `OTEL_MONGO_TRACING_ENABLED` | gates **both** wrapper **CLIENT** spans (noop vs real tracer, deliver-span wiring) **and** `_oteltrace` document propagation for this package |
-| `OTEL_MONGO_PROPAGATION_ENABLED` | only consulted when both global and `OTEL_MONGO_TRACING_ENABLED` are on; final say on `_oteltrace` inject/extract on Collection/Cursor/ChangeStream and **ContextFromDocument** / **ContextFromRawDocument** |
+Env-var surface per module:
 
-`envEnabledByDefault()` returns `false` when a var is absent. When `OTEL_MONGO_TRACING_ENABLED` is unset/disabled, this package uses a noop tracer for its wrapper spans **and** force-disables `_oteltrace` propagation — Mongo tracing and Mongo trace propagation share a single kill switch. `WithTracePropagationEnabled` only overrides the propagation default while both tracing gates are on; it **cannot** enable propagation when global or module tracing is off.
+| Variable | Module | Tier | Default | Purpose |
+|---|---|---|---|---|
+| `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | all | global master | OFF | hard prerequisite for every per-module flag |
+| `OTEL_MONGO_TRACING_ENABLED` | otel-mongo v1+v2 | module tracing | OFF | wrapper CLIENT spans (noop vs real tracer) + deliver-span wiring; force-disables propagation when off |
+| `OTEL_MONGO_PROPAGATION_ENABLED` | otel-mongo v1+v2 | module propagation | OFF | final say on `_oteltrace` inject/extract on Collection/Cursor/ChangeStream + `ContextFromDocument` / `ContextFromRawDocument` |
+| `OTEL_NATS_TRACING_ENABLED` | otel-nats | module tracing | OFF | wrapper spans on Publish/Subscribe/Request + JetStream consumer paths |
+| `OTEL_NATS_PROPAGATION_ENABLED` | otel-nats | module propagation | OFF | final say on W3C `traceparent` / `tracestate` header inject (publish) + extract (subscribe). When OFF (default), traced impl still emits wrapper spans but skips header propagation. **Default-behaviour change from v0.3.x** — deployments previously relying on implicit injection MUST set this to a truthy value. |
+| `OTEL_GORILLA_WS_TRACING_ENABLED` | otel-gorilla-ws | module tracing | OFF | wrapper send/receive spans + envelope wrap/unwrap (subject to subprotocol negotiation) |
+
+3-tier for mongo + nats; 2-tier for ws. WS keeps 2-tier because envelope construction is inline in `marshalWire` — no "spans-on / wire-propagation-off" mode that fits the existing wire format; the subprotocol-negotiation runtime check serves the same purpose as a propagation flag.
+
+`flags.EnvEnabled(name)` (internal helper, byte-identical across all four modules' `internal/flags/flags.go`) returns `false` when a var is absent. For otel-mongo, `WithTracePropagationEnabled` only overrides the propagation default while both tracing gates are on; it **cannot** enable propagation when global or module tracing is off.
 
 ### Deliver Spans
 
@@ -156,6 +163,46 @@ Key rules:
 ### `oteljetstream.MessageBatch.Stop()`
 
 `MessageBatch` interface (`oteljetstream/consumer.go`) includes a `Stop()` method (added 0.3.0; **breaking** for custom implementations). Callers that drain `Messages()` to channel close need not call it; callers that `break` / `return` early **must** `defer batch.Stop()` to release the internal goroutine and end the in-flight span. The disabled-tracing path uses `directMessageBatch` (no spans, no attributes, but still 1 goroutine for `jetstream.Msg → Msg` type adaptation).
+
+## Module Layout
+
+Canonical directory tree shared by all four modules (`otel-mongo/otelmongo`, `otel-mongo/v2`, `otel-nats`, `otel-gorilla-ws`). Aligned with `golang-standards/project-layout` and the wider Go community convention (kubernetes, grpc-go, helm, cobra). Per-module READMEs reference this section rather than duplicate the tree.
+
+```
+<module>/                       # module root (one go.mod per module)
+├── go.mod / go.sum
+├── README.md / README.zh-TW.md
+├── CHANGELOG.md                # release notes (when module is published)
+├── doc.go                      # package overview shown by `go doc` and pkg.go.dev
+├── version.go                  # `Version()` and `instrumentationVersion` const
+├── <facade>.go                 # public types and constructors (conn.go / collection.go / ...)
+├── tracing.go                  # public tracing helpers reused by callers
+├── env_flags.go                # gate composition, calls into internal/flags
+├── options.go                  # functional `With*` options
+├── internal/                   # compiler-enforced privacy
+│   ├── flags/                  # shared gate helpers — BYTE-IDENTICAL across modules (CI drift-check)
+│   ├── shared/                 # interfaces + helpers reused by both impls
+│   ├── direct/                 # disabled-mode impls — ZERO `otel/sdk` / `otel/exporters` imports
+│   └── traced/                 # enabled-mode impls — full instrumentation
+├── examples/                   # runnable demos, plural per Go convention
+│   └── <demo>/main.go          # each demo is its own Go module (separate go.mod)
+└── tests/                      # integration tests
+    └── integration/            # separate Go module (testcontainers does not pollute root closure)
+```
+
+Subpackage names are **fixed** — `flags`, `shared`, `direct`, `traced`. No synonyms (`gate`, `common`, `disabled`, `instrumented`). Module-root `.go` files MAY only define exported identifiers consumed by users of the module; purely-internal helpers move under `internal/`.
+
+The `internal/direct/` package boundary is **load-bearing**: it MUST NOT import `go.opentelemetry.io/otel/sdk/*` or `go.opentelemetry.io/otel/exporters/*` so the compiler can prove no SDK code is reachable on the disabled call path. Enforced by the `drift-check` CI job (`.github/workflows/ci.yml`).
+
+Two pattern variants coexist for the strategy-split decision:
+
+| Variant | Used by | Rationale |
+|---|---|---|
+| **Full strategy-split** — facade holds `impl <X>Impl` interface; `internal/direct.X` + `internal/traced.X` packages | otel-mongo Collection / Cursor / SingleResult / ChangeStream; otel-gorilla-ws Conn | Many public methods diverge on instrumentation — package boundary pays its weight |
+| **Nullable traced-pointer** — facade holds `traced *traced.XState`; nil ⇔ disabled; constructor-site `if d.traced == nil { direct } else { traced }` selection | otel-mongo Client / Database | Only one truly instrumentation-divergent method per type; field-duplication of full split is overkill |
+| **File-level split (transitional)** — `conn_direct.go` / `conn_traced.go` in same package; constructor picks once | otel-nats Conn / oteljetstream Consumer / MessageBatch | Functional intent met (no per-call gate); package-boundary upgrade tracked as follow-up |
+
+See `otel-mongo-flag-wiring`, `otel-nats-flag-wiring`, `otel-gorilla-ws-flag-wiring` spec for per-module Requirement text.
 
 ## Versioning
 

@@ -2,6 +2,7 @@ package oteljetstream_test
 
 import (
 	"context"
+	"os"
 	"runtime"
 	"testing"
 	"time"
@@ -842,4 +843,238 @@ func TestNoGoroutineLeakAfterEarlyReturn(t *testing.T) {
 	delta := after - before
 	assert.Less(t, delta, 30,
 		"goroutine count grew by %d after 10 stop-without-consume rounds", delta)
+}
+
+// ─── Propagation-flag matrix for JetStream consumer paths (task 13.9) ────────
+//
+// Mirrors the core-NATS matrix in otel-nats/otelnats/conn_test.go
+// (TestPublishWithPropagationOff/On*, TestSubscribeWith*). Asserts that the
+// JetStream consumer paths (newTracedMessageBatch backing
+// `consumer.Fetch().Messages()` + `consumer.Consume()`) honour
+// `OTEL_NATS_PROPAGATION_ENABLED` identically to the core path.
+
+// startJetStreamServerWithPropagation re-runs the normal start with the
+// propagation gate overridden. Use sparingly — caller MUST call ResetGatesForTest
+// via t.Cleanup which the otelnats package already wires through this helper.
+func startJetStreamServerWithPropagation(t *testing.T, propagationValue string) string {
+	t.Helper()
+	t.Setenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED", "1")
+	t.Setenv("OTEL_NATS_TRACING_ENABLED", "1")
+	t.Setenv("OTEL_NATS_PROPAGATION_ENABLED", propagationValue)
+	otelnats.ResetGatesForTest()
+	t.Cleanup(otelnats.ResetGatesForTest)
+	opts := &natssrv.Options{
+		Host:      "127.0.0.1",
+		Port:      -1,
+		JetStream: true,
+		StoreDir:  t.TempDir(),
+	}
+	s, err := natssrv.NewServer(opts)
+	require.NoError(t, err)
+	go s.Start()
+	require.True(t, s.ReadyForConnections(5*time.Second), "nats-server not ready")
+	t.Cleanup(s.Shutdown)
+	return s.ClientURL()
+}
+
+// startJetStreamServerTracingOff brings up a JetStream server with every
+// tracing env var unset/falsy — the wrapper must behave as raw jetstream.
+func startJetStreamServerTracingOff(t *testing.T) string {
+	t.Helper()
+	_ = os.Unsetenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED")
+	_ = os.Unsetenv("OTEL_NATS_TRACING_ENABLED")
+	_ = os.Unsetenv("OTEL_NATS_PROPAGATION_ENABLED")
+	otelnats.ResetGatesForTest()
+	t.Cleanup(otelnats.ResetGatesForTest)
+	opts := &natssrv.Options{
+		Host:      "127.0.0.1",
+		Port:      -1,
+		JetStream: true,
+		StoreDir:  t.TempDir(),
+	}
+	s, err := natssrv.NewServer(opts)
+	require.NoError(t, err)
+	go s.Start()
+	require.True(t, s.ReadyForConnections(5*time.Second), "nats-server not ready")
+	t.Cleanup(s.Shutdown)
+	return s.ClientURL()
+}
+
+//nolint:nakedret // multi-return helper; named results make assertions in callers explicit
+func jetstreamFetchOne(t *testing.T, url string) (gotTraceID oteltrace.TraceID, gotHeader map[string]string, consumerSpans []trace.ReadOnlySpan, producerSpan trace.ReadOnlySpan) {
+	t.Helper()
+	sr := tracetest.NewSpanRecorder()
+	tp := trace.NewTracerProvider(trace.WithSpanProcessor(sr))
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	t.Cleanup(conn.Close)
+	js, err := oteljetstream.New(conn)
+	require.NoError(t, err)
+	ctx := context.Background()
+	_, err = js.CreateOrUpdateStream(ctx, oteljetstream.StreamConfig{
+		Name: "PROPTEST", Subjects: []string{"prop.>"},
+	})
+	require.NoError(t, err)
+	stream, err := js.Stream(ctx, "PROPTEST")
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(ctx, oteljetstream.ConsumerConfig{
+		Durable:       "prop-cons",
+		FilterSubject: "prop.test",
+		AckPolicy:     oteljetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	tracer := tp.Tracer("publisher")
+	pubCtx, pubSpan := tracer.Start(ctx, "pub-parent")
+	defer pubSpan.End()
+	_, err = js.Publish(pubCtx, "prop.test", []byte("payload"))
+	require.NoError(t, err)
+
+	for range 30 {
+		batch, ferr := cons.Fetch(1, jetstream.FetchMaxWait(300*time.Millisecond))
+		require.NoError(t, ferr)
+		for m := range batch.Messages() {
+			gotTraceID = oteltrace.SpanFromContext(m.Context()).SpanContext().TraceID()
+			hdr := m.Headers()
+			gotHeader = map[string]string{}
+			if hdr != nil {
+				if tpV := hdr.Get("traceparent"); tpV != "" {
+					gotHeader["traceparent"] = tpV
+				}
+				if tsV := hdr.Get("tracestate"); tsV != "" {
+					gotHeader["tracestate"] = tsV
+				}
+			}
+			_ = m.Ack()
+		}
+		if gotHeader != nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Settle: spans End on defer after handler returns.
+	time.Sleep(150 * time.Millisecond)
+	all := sr.Ended()
+	producerSpan = findSpanByKind(all, oteltrace.SpanKindProducer)
+	for _, s := range all {
+		if s.SpanKind() == oteltrace.SpanKindConsumer {
+			consumerSpans = append(consumerSpans, s)
+		}
+	}
+	return
+}
+
+// TestJetStreamSubscribeWithPropagationOffDoesNotExtract mirrors 13.7 for
+// JetStream consumer (Fetch path). With propagation off:
+//   - no traceparent header lands on the wire (producer side does not inject)
+//   - the consumer span SHALL carry zero links (no Extract performed)
+//
+// The consumer span always starts a fresh trace (otel-nats uses link-mode
+// propagation, not parent-child), so trace_id inequality is not a useful
+// signal — link-count is the structural signal.
+func TestJetStreamSubscribeWithPropagationOffDoesNotExtract(t *testing.T) {
+	url := startJetStreamServerWithPropagation(t, "false")
+	_, gotHeader, consumerSpans, producerSpan := jetstreamFetchOne(t, url)
+
+	require.NotNil(t, producerSpan, "producer span must still be emitted")
+	require.NotEmpty(t, consumerSpans, "consumer span must still be emitted with propagation off")
+
+	assert.Empty(t, gotHeader["traceparent"],
+		"propagation off: traceparent header MUST NOT be on the wire")
+
+	for _, c := range consumerSpans {
+		assert.Empty(t, c.Links(),
+			"propagation off: consumer span MUST carry zero header-derived links")
+	}
+}
+
+// TestJetStreamSubscribeWithPropagationOnExtractsRemoteContext mirrors 13.8 for
+// JetStream consumer. With propagation on:
+//   - traceparent header IS injected on publish
+//   - consumer span carries one link whose SpanContext matches the publish
+//     wrapper span's trace_id (otel-nats uses link-mode propagation)
+func TestJetStreamSubscribeWithPropagationOnExtractsRemoteContext(t *testing.T) {
+	url := startJetStreamServerWithPropagation(t, "true")
+	_, gotHeader, consumerSpans, producerSpan := jetstreamFetchOne(t, url)
+
+	require.NotNil(t, producerSpan)
+	require.NotEmpty(t, consumerSpans)
+	require.NotNil(t, gotHeader)
+	assert.NotEmpty(t, gotHeader["traceparent"],
+		"propagation on: traceparent header MUST be injected on the wire")
+
+	pubTraceID := producerSpan.SpanContext().TraceID()
+	var linked bool
+	for _, c := range consumerSpans {
+		for _, ln := range c.Links() {
+			if ln.SpanContext.TraceID() == pubTraceID {
+				linked = true
+				break
+			}
+		}
+		if linked {
+			break
+		}
+	}
+	assert.True(t, linked,
+		"propagation on: consumer span MUST carry a link to the producer's trace_id")
+}
+
+// TestJetStreamConsumerWithTracingOffSkipsBoth mirrors 13.4 for JetStream:
+// every gate off ⇒ no wrapper spans AND no traceparent header on the wire.
+func TestJetStreamConsumerWithTracingOffSkipsBoth(t *testing.T) {
+	url := startJetStreamServerTracingOff(t)
+	gotTraceID, gotHeader, consumerSpans, producerSpan := jetstreamFetchOne(t, url)
+
+	// Producer span is the test's own "pub-parent" — that's allowed; it's
+	// not a wrapper span. Filter to wrapper-emitted producer spans by name.
+	if producerSpan != nil && producerSpan.Name() != "pub-parent" {
+		t.Errorf("unexpected wrapper PRODUCER span in tracing-off mode: %q", producerSpan.Name())
+	}
+	for _, c := range consumerSpans {
+		t.Errorf("unexpected wrapper CONSUMER span in tracing-off mode: %q", c.Name())
+	}
+
+	assert.Empty(t, gotHeader["traceparent"],
+		"tracing off: no traceparent on the wire")
+	// The fetched message ctx carries the inherited test ctx (which had no
+	// span) so the trace_id is the zero value.
+	assert.Equal(t, "00000000000000000000000000000000", gotTraceID.String(),
+		"tracing off: consumer ctx must not carry an extracted trace_id")
+}
+
+// TestJetStreamConsumerWithTracingOffPropagationOnStillSkipsBoth mirrors 13.5
+// for JetStream: tracing gate is the hard prerequisite — propagation-only
+// truthy with tracing off SHALL behave identically to "both off".
+func TestJetStreamConsumerWithTracingOffPropagationOnStillSkipsBoth(t *testing.T) {
+	_ = os.Unsetenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED")
+	_ = os.Unsetenv("OTEL_NATS_TRACING_ENABLED")
+	t.Setenv("OTEL_NATS_PROPAGATION_ENABLED", "true")
+	otelnats.ResetGatesForTest()
+	t.Cleanup(otelnats.ResetGatesForTest)
+
+	opts := &natssrv.Options{
+		Host: "127.0.0.1", Port: -1, JetStream: true, StoreDir: t.TempDir(),
+	}
+	s, err := natssrv.NewServer(opts)
+	require.NoError(t, err)
+	go s.Start()
+	require.True(t, s.ReadyForConnections(5*time.Second), "nats-server not ready")
+	t.Cleanup(s.Shutdown)
+
+	gotTraceID, gotHeader, consumerSpans, producerSpan := jetstreamFetchOne(t, s.ClientURL())
+
+	if producerSpan != nil && producerSpan.Name() != "pub-parent" {
+		t.Errorf("propagation on but tracing off: unexpected wrapper PRODUCER span %q", producerSpan.Name())
+	}
+	for _, c := range consumerSpans {
+		t.Errorf("propagation on but tracing off: unexpected wrapper CONSUMER span %q", c.Name())
+	}
+	assert.Empty(t, gotHeader["traceparent"],
+		"propagation env on but tracing off: still no traceparent (hard prerequisite)")
+	assert.Equal(t, "00000000000000000000000000000000", gotTraceID.String())
 }

@@ -30,6 +30,11 @@ var natsURL string
 func TestMain(m *testing.M) {
 	_ = os.Setenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED", "1")
 	_ = os.Setenv("OTEL_NATS_TRACING_ENABLED", "1")
+	// Propagation gate is default-OFF starting in 0.4.x; the existing
+	// integration tests assert v0.3.x wire behaviour (traceparent on the
+	// wire, consumer span linked to producer). Opt-in explicitly so they
+	// keep passing. See otel-nats/CHANGELOG.md for the migration recipe.
+	_ = os.Setenv("OTEL_NATS_PROPAGATION_ENABLED", "1")
 
 	ctx := context.Background()
 	req := testcontainers.ContainerRequest{

@@ -5,7 +5,6 @@ import (
 	"log"
 	"os"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -24,17 +23,21 @@ import (
 // mongoURI is the connection string for the shared MongoDB container, set once in TestMain.
 var mongoURI string
 
-// TestMain starts a MongoDB replica set container, runs all tests, then stops it.
+// TestMain starts a standalone MongoDB container (no replica set), runs all
+// tests, then stops it. See v1 tests/integration/mongo_test.go TestMain for
+// rationale. If MONGO_URI is set the container is skipped.
 func TestMain(m *testing.M) {
 	_ = os.Setenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED", "1")
 	_ = os.Setenv("OTEL_MONGO_TRACING_ENABLED", "1")
 	_ = os.Setenv("OTEL_MONGO_PROPAGATION_ENABLED", "1")
 
-	ctx := context.Background()
+	if uri := os.Getenv("MONGO_URI"); uri != "" {
+		mongoURI = uri
+		os.Exit(m.Run())
+	}
 
-	container, err := tcmongo.Run(ctx, "mongo:7.0",
-		tcmongo.WithReplicaSet("rs0"),
-	)
+	ctx := context.Background()
+	container, err := tcmongo.Run(ctx, "mongo:7.0")
 	if err != nil {
 		log.Fatalf("start mongodb container: %v", err)
 	}
@@ -252,9 +255,12 @@ func TestIntegration_UpdateOneInjectsTrace(t *testing.T) {
 	assert.Equal(t, wantTraceID, sc.TraceID(), "UpdateOne should inject current span's TraceID")
 }
 
-// TestIntegration_ContextFromDocumentChangeStream verifies that change stream events
-// carry the _oteltrace field and ContextFromDocument extracts the insert span's TraceID.
-func TestIntegration_ContextFromDocumentChangeStream(t *testing.T) {
+// TestIntegration_ContextFromDocumentRoundTrip verifies that an inserted
+// document carries the _oteltrace field and that ContextFromDocument extracts
+// the insert span's TraceID from the document round-tripped via Find.
+// Replaces the prior change-stream variant — see v1 tests/integration for
+// rationale (otel-mongo doesn't touch the oplog; same BSON decode path).
+func TestIntegration_ContextFromDocumentRoundTrip(t *testing.T) {
 	tp, _ := newTestProvider()
 	setupOtel(tp)
 
@@ -262,36 +268,26 @@ func TestIntegration_ContextFromDocumentChangeStream(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
 
-	coll := client.Database("integ_v2").Collection("change_stream")
+	coll := client.Database("integ_v2").Collection("ctx_from_doc_roundtrip")
 	t.Cleanup(func() { _ = coll.Drop(context.Background()) })
 
-	streamCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	cs, err := coll.Collection.Watch(streamCtx,
-		[]bson.D{{{Key: "$match", Value: bson.D{{Key: "operationType", Value: "insert"}}}}},
-		options.ChangeStream().SetFullDocument("updateLookup"),
-	)
-	require.NoError(t, err)
-	defer cs.Close(context.Background())
-
-	tracer := tp.Tracer("change-stream-test")
-	insertCtx, insertSpan := tracer.Start(context.Background(), "insert-for-cs")
+	tracer := tp.Tracer("ctx-from-doc-test")
+	insertCtx, insertSpan := tracer.Start(context.Background(), "insert-for-extract")
 	wantTraceID := insertSpan.SpanContext().TraceID()
 
-	_, err = coll.InsertOne(insertCtx, bson.D{{Key: "msg", Value: "cs-test"}})
+	res, err := coll.InsertOne(insertCtx, bson.D{{Key: "msg", Value: "extract-test"}})
 	insertSpan.End()
 	require.NoError(t, err)
 
-	require.True(t, cs.Next(streamCtx), "expected change stream event")
+	var doc bson.M
+	require.NoError(t,
+		coll.Collection.FindOne(context.Background(), bson.D{{Key: "_id", Value: res.InsertedID}}).Decode(&doc),
+		"FindOne should round-trip the inserted document",
+	)
+	require.NotNil(t, doc["_oteltrace"], "_oteltrace should be present in round-tripped document")
 
-	var event struct {
-		FullDocument bson.M `bson:"fullDocument"`
-	}
-	require.NoError(t, cs.Decode(&event))
-	require.NotNil(t, event.FullDocument, "fullDocument should be present in change event")
-
-	sc, ok := otelmongo.ContextFromDocument(context.Background(), event.FullDocument)
-	require.True(t, ok, "ContextFromDocument should extract trace from fullDocument")
-	assert.Equal(t, wantTraceID, sc.TraceID(), "change stream event should carry insert span's TraceID")
+	sc, ok := otelmongo.ContextFromDocument(context.Background(), doc)
+	require.True(t, ok, "ContextFromDocument should extract trace from round-tripped document")
+	assert.Equal(t, wantTraceID, sc.TraceID(),
+		"extracted TraceID should match the insert span's TraceID")
 }

@@ -136,6 +136,14 @@ Every wrapper that today branches on a runtime `tracingEnabled bool` inside publ
 - **THEN** the body SHALL NOT contain `if c.tracingEnabled` or any equivalent runtime gate
 - **AND** the body SHALL contain exactly one statement of the form `return c.impl.<Method>(args...)` (modulo argument adaptation)
 
+Enforcement: this requirement is enforced by **code review backed by structural mechanisms**, not by a grep-based CI check.
+
+- A grep over `if .*tracingEnabled` is line-level and cannot distinguish public method bodies from constructor-site impl selection (the latter is explicitly exempted by the next scenario). A naive grep produces false positives on every constructor; an allowlist quickly drifts out of date.
+- The structural backing that makes accidental regression hard:
+  1. Compile-time impl-interface assertions (next scenario) — any new public method added to the interface MUST be implemented in both `direct` and `traced` flavours, so a maintainer cannot grow the API without forcing impl symmetry.
+  2. Package-boundary check on `internal/direct/` (Requirement "Disabled-mode invariant — zero OTel SDK span produced", Scenario "Compiler-enforced isolation") — even if a future PR introduced an `if tracingEnabled` branch in a public method, that branch could only call SDK code through the facade package; adding SDK code to the facade would still be caught by code review against this requirement.
+- A `go/analysis` Analyzer that walks the AST of public method bodies in the listed facade wrappers is the right tool if stronger automation is wanted later. Tracked as a follow-up issue per `design.md` Open Questions.
+
 #### Scenario: Compile-time interface assertion
 
 - **WHEN** the facade package builds

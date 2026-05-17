@@ -59,6 +59,20 @@ func TestContextFromDocumentV1(t *testing.T) {
 		assert.False(t, sc.IsValid())
 	})
 
+	t.Run("bson_D_input_returns_valid_span_context", func(t *testing.T) {
+		fullDoc := bson.D{
+			{Key: "msg", Value: "extract-test"},
+			{Key: "_oteltrace", Value: bson.D{
+				{Key: "traceparent", Value: "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"},
+			}},
+		}
+		sc, ok := ContextFromDocument(context.Background(), fullDoc)
+		require.True(t, ok)
+		assert.Equal(t, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", sc.TraceID().String())
+		assert.Equal(t, "bbbbbbbbbbbbbbbb", sc.SpanID().String())
+		assert.True(t, sc.IsSampled(), "trace flags 01 should set sampled bit")
+	})
+
 	t.Run("non_marshalable_document_returns_false", func(t *testing.T) {
 		ch := make(chan int)
 		sc, ok := ContextFromDocument(context.Background(), ch)

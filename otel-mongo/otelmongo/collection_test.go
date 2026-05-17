@@ -31,9 +31,12 @@ var testMongoURI string
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 	var container *tcmongo.MongoDBContainer
-	container, err := tcmongo.Run(ctx, "mongo:7.0",
-		tcmongo.WithReplicaSet("rs0"),
-	)
+	// Standalone mongod — no replica set. otel-mongo's tests do not exercise
+	// change streams or multi-document transactions (the only two features
+	// that need replica-set + oplog). Avoiding WithReplicaSet sidesteps the
+	// macOS Docker bridge issue where replica-set members advertise their
+	// container IP (172.17.0.x) which the macOS host cannot route to.
+	container, err := tcmongo.Run(ctx, "mongo:7.0")
 	if err != nil {
 		log.Printf("WARNING: could not start mongodb container (integration tests will be skipped unless MONGO_URI is set): %v", err)
 	} else {

@@ -45,21 +45,89 @@ jobs:
           version: latest
           working-directory: ${{ matrix.module }}
 
-      - name: Verify direct/ has no OTel SDK imports
-        # Enforces the otel-mongo disabled-mode invariant: internal/direct/
-        # packages must never import go.opentelemetry.io/otel/* so the
-        # compiler can prove no SDK code path is reachable when tracing is off.
-        # See otel-mongo/STRATEGY_REFACTOR_PLAN.html §8.
-        if: matrix.module == 'otel-mongo' || matrix.module == 'otel-mongo/v2'
+  drift-check:
+    name: Drift checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: internal/flags/flags.go drift across modules
+        # Enforces `instrumentation-feature-flags` Requirement "Shared internal
+        # `flags` package": the file MUST be byte-identical across all four
+        # module copies (excluding the package declaration line, which is
+        # identical anyway since all four declare `package flags`).
+        # Canonical: otel-mongo/otelmongo/internal/flags/flags.go.
         run: |
-          if [ -d "internal/direct" ]; then
-            if grep -rE '"go\.opentelemetry\.io/otel' internal/direct; then
-              echo "::error::internal/direct/ must not import go.opentelemetry.io/otel/* — see STRATEGY_REFACTOR_PLAN §8"
-              exit 1
+          set -euo pipefail
+          canonical="otel-mongo/otelmongo/internal/flags/flags.go"
+          files=(
+            "otel-mongo/v2/internal/flags/flags.go"
+            "otel-nats/otelnats/internal/flags/flags.go"
+            "otel-gorilla-ws/internal/flags/flags.go"
+          )
+          fail=0
+          for f in "${files[@]}"; do
+            if ! diff -q "$canonical" "$f"; then
+              echo "::error file=$f::drifted from canonical $canonical — see instrumentation-feature-flags spec"
+              fail=1
             fi
-            echo "OK: internal/direct/ has zero OTel SDK imports"
-          fi
-        working-directory: ${{ matrix.module }}
+          done
+          exit "$fail"
+
+      - name: Direct-impl trees have zero OTel SDK imports
+        # Enforces the disabled-mode invariant — direct-impl files (the
+        # passthrough side of the strategy split) MUST NOT import
+        # go.opentelemetry.io/otel/sdk/* or otel/exporters/* so the disabled
+        # call path is structurally unreachable from SDK code.
+        #
+        # Two layouts covered:
+        #   1. Package-level (otel-mongo Collection, otel-gorilla-ws Conn):
+        #      internal/direct/ Go packages — compiler-enforced by package
+        #      boundary plus this grep belt-and-braces.
+        #   2. File-level (otel-nats Conn + JetStream consumer paths):
+        #      *_direct.go files inside the facade package — same isolation
+        #      guarantee via file-name convention + this grep. See
+        #      otel-nats-flag-wiring spec Scenario "File-level variant —
+        #      direct files import zero OTel SDK".
+        run: |
+          set -euo pipefail
+          # Package-level targets — whole directory.
+          pkg_targets=(
+            "otel-mongo/otelmongo/internal/direct"
+            "otel-mongo/v2/internal/direct"
+            "otel-gorilla-ws/internal/direct"
+          )
+          # File-level targets — directories whose *_direct.go files are
+          # the strategy-split direct impls. Excludes test files.
+          file_target_dirs=(
+            "otel-nats/otelnats"
+            "otel-nats/oteljetstream"
+          )
+          fail=0
+          for d in "${pkg_targets[@]}"; do
+            if [ ! -d "$d" ]; then
+              echo "::error file=$d::expected internal/direct/ directory missing"
+              fail=1
+              continue
+            fi
+            # Match only quoted import-path strings so doc comments mentioning
+            # "go.opentelemetry.io/otel/sdk/*" by name don't false-positive.
+            if grep -rnE '"go\.opentelemetry\.io/otel/(sdk|exporters)' --include='*.go' "$d"; then
+              echo "::error file=$d::must not import otel/sdk or otel/exporters — see instrumentation-feature-flags spec"
+              fail=1
+            fi
+          done
+          for d in "${file_target_dirs[@]}"; do
+            # Iterate *_direct.go (but not *_direct_test.go) inside the
+            # facade package. Use find so empty matches don't error.
+            while IFS= read -r f; do
+              if grep -nE '"go\.opentelemetry\.io/otel/(sdk|exporters)' "$f"; then
+                echo "::error file=$f::*_direct.go must not import otel/sdk or otel/exporters — see otel-nats-flag-wiring Scenario 'File-level variant'"
+                fail=1
+              fi
+            done < <(find "$d" -maxdepth 1 -type f -name '*_direct.go' -not -name '*_test.go')
+          done
+          exit "$fail"
 
   integration-test:
     name: Integration (${{ matrix.module }})
