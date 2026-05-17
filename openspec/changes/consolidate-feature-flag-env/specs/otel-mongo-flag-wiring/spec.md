@@ -68,13 +68,13 @@ When `mongoTracingEnabled()` returns `false`, `Connect` and `Wrap` SHALL substit
 
 #### Scenario: Disabled `Client.Disconnect` performs no `TracerProvider.Shutdown`
 
-- **WHEN** tracing is disabled and a caller invokes `Client.Disconnect(ctx)` on the strategy-split direct impl
-- **THEN** the direct impl `Disconnect` SHALL NOT call `Shutdown` on any `TracerProvider`, `BatchSpanProcessor`, or `SimpleSpanProcessor`
-- **AND** the direct impl `Client` struct SHALL NOT hold a `*sdktrace.TracerProvider` field at all (no field to shut down)
-- **AND** the disabled `Disconnect` SHALL delegate straight to the upstream `*mongo.Client.Disconnect(ctx)` with no additional work
-- **AND** any `Shutdown` of an SDK `TracerProvider` SHALL live exclusively in `internal/traced/client.go` (where the deliver-tracer `mongoTP` is held)
+- **WHEN** tracing is disabled at `Connect` time (`mongoTracingEnabled()` returns `false`)
+- **THEN** the facade `*Client` SHALL hold a nil `*traced.ClientState` pointer
+- **AND** `Client.Disconnect(ctx)` SHALL NOT call `Shutdown` on any `TracerProvider`, `BatchSpanProcessor`, or `SimpleSpanProcessor` — the deliver-tracer Shutdown branch SHALL be guarded by `if c.traced != nil` so the disabled call path is structurally unreachable
+- **AND** the disabled `Disconnect` SHALL delegate straight to the upstream `*mongo.Client.Disconnect(ctx)`
+- **AND** the `*sdktrace.TracerProvider` SHALL live exclusively on `*traced.ClientState` (which is nil in this mode) so no SDK provider is reachable from the disabled call path
 
-Rationale: the disabled-mode invariant is that no OTel SDK code path runs. Holding even an unused `*sdktrace.TracerProvider` field on the disabled impl would risk a future maintainer threading a `Shutdown` call into the disabled path. The strategy-split package boundary enforces this by keeping the field on the traced impl only.
+Rationale: the disabled-mode invariant is that no OTel SDK code path runs. The nullable `*traced.ClientState` pointer enforces this — the deliver TracerProvider is owned by `traced.ClientState` and unreachable when the pointer is nil. The single `if c.traced != nil` guard in `Disconnect` is the only runtime branch on facade `Client`; it is functionally equivalent to constructor-site impl selection (the impl was chosen at `Connect` time and frozen).
 
 ### Requirement: Strategy-split layout already in place for Collection / Cursor / SingleResult / ChangeStream is preserved
 
@@ -86,21 +86,32 @@ The existing `internal/{direct,traced,shared}/` package layout in `otel-mongo/ot
 - **THEN** `otel-mongo/otelmongo/internal/direct/`, `internal/traced/`, and `internal/shared/` directories SHALL exist with the same Go files as before the change
 - **AND** the same compile-time assertions (`var _ shared.CursorImpl = (*traced.Cursor)(nil)` and equivalents) SHALL remain
 
-### Requirement: Client and Database migrate to strategy-split
+### Requirement: Client and Database isolate SDK state behind a nullable traced pointer
 
-`Client` and `Database` in both `otel-mongo/otelmongo/` and `otel-mongo/v2/` SHALL migrate from the cached-gate `tracingEnabled bool` field to the strategy-split layout (`internal/{direct,traced}.Client` / `.Database`) so the disabled-mode invariant is compiler-enforced for these types in line with Collection/Cursor.
+`Client` and `Database` in both `otel-mongo/otelmongo/` and `otel-mongo/v2/` SHALL replace the cached-gate `tracingEnabled bool` field with a single nullable `*traced.ClientState` / `*traced.DatabaseState` pointer that owns the OTel SDK state (tracer, propagator, propagation flag, deliver tracer, deliver TracerProvider, server addr/port). The pointer SHALL be nil when `mongoTracingEnabled()` returns false at `Connect` time, AND SHALL propagate its nil-ness from `Client → Database → Collection-impl-selection`.
 
-#### Scenario: `Client.Database` returns strategy-split `Database`
+Rationale: `Client` and `Database` each expose only one truly instrumentation-divergent method (`Disconnect` and `Collection`). A full strategy-split with `internal/{direct,traced}.Client` / `.Database` packages produces three layers of duplicated fields and an 8-positional constructor without proportional benefit. The nullable-pointer pattern preserves the disabled-mode invariant — the deliver TracerProvider is unreachable when `traced == nil` — with one nil-check in `Disconnect` and constructor-site impl selection in `Database` / `Collection`. `Collection` itself keeps its strategy-split layout (`internal/{direct,traced}.Collection`) because Collection's 14 public CRUD methods all diverge on instrumentation and benefit from compile-time SDK isolation per leaf method.
 
-- **WHEN** a caller invokes `client.Database(name)`
-- **THEN** the returned `*Database` SHALL hold a `databaseImpl` interface field pointing at either `internal/direct.Database` or `internal/traced.Database`
-- **AND** the choice SHALL be inherited from the parent `Client`'s gate result (set at `Connect` time)
+#### Scenario: Disabled mode holds nil traced state
 
-#### Scenario: `Database.Collection` returns strategy-split `Collection`
+- **WHEN** `mongoTracingEnabled()` returns false at `Connect` time
+- **THEN** the returned `*Client` SHALL have `traced == nil`
+- **AND** no `*sdktrace.TracerProvider` SHALL exist for this client (the field lives on `*traced.ClientState`, which is nil)
 
-- **WHEN** a caller invokes `db.Collection(name)`
-- **THEN** the returned `*Collection` SHALL hold a `collectionImpl` matching the parent `Database`'s impl flavour
-- **AND** no runtime `if tracingEnabled` check SHALL appear in `Database.Collection`
+#### Scenario: `client.Database` propagates nil-ness
+
+- **WHEN** `client.traced == nil`
+- **THEN** `client.Database(name)` SHALL return a `*Database` whose `traced` field is also nil
+- **WHEN** `client.traced != nil`
+- **THEN** `client.Database(name)` SHALL return a `*Database` whose `traced` field is a `*traced.DatabaseState` carrying the parent client's tracer / propagator / propagationEnabled / deliverTracer / serverAddr / serverPort
+
+#### Scenario: `db.Collection` picks impl from parent state
+
+- **WHEN** `db.traced == nil`
+- **THEN** `db.Collection(name)` SHALL return a `*Collection` whose impl is `*internal/direct.Collection`
+- **WHEN** `db.traced != nil`
+- **THEN** `db.Collection(name)` SHALL return a `*Collection` whose impl is `*internal/traced.Collection` inheriting the parent state's fields
+- **AND** the body of `Database.Collection` SHALL contain only constructor-site selection (`if d.traced == nil { ... } else { ... }` building the impl), exempt from the no-runtime-branch rule per `instrumentation-feature-flags` Scenario "Constructor-site impl selection is exempt from the no-branch rule"
 
 ### Requirement: `cachedPropagationEnabled` migrates to `flags.Gate`
 

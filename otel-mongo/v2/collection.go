@@ -15,36 +15,14 @@ import (
 
 // Collection wraps *mongo.Collection. Public methods delegate to a polymorphic
 // collectionImpl chosen once at construction time — *traced.Collection when
-// the tracing gate is on, *direct.Collection (passthrough) when off. The
-// facade itself stores no instrumentation state; impls live in
-// internal/{direct,traced} so the disabled-mode invariant (no OTel SDK
-// reachable from the direct path) is compiler-enforced by package boundary.
+// the tracing gate is on, *direct.Collection (passthrough) when off.
 type Collection struct {
 	*mongo.Collection
 	impl collectionImpl
 }
 
-// collectionImpl is the polymorphic core of Collection. Methods return raw
-// driver types (and shared.CursorImpl / shared.SingleResultImpl /
-// shared.ChangeStreamImpl for the streaming results) so the impl packages
-// never need to import the facade — avoids any facade ↔ internal cycle.
-type collectionImpl interface {
-	InsertOne(ctx context.Context, document any, opts ...options.Lister[options.InsertOneOptions]) (*mongo.InsertOneResult, error)
-	InsertMany(ctx context.Context, documents []any, opts ...options.Lister[options.InsertManyOptions]) (*mongo.InsertManyResult, error)
-	Find(ctx context.Context, filter any, opts ...options.Lister[options.FindOptions]) (*mongo.Cursor, shared.CursorImpl, error)
-	FindOne(ctx context.Context, filter any, opts ...options.Lister[options.FindOneOptions]) (*mongo.SingleResult, shared.SingleResultImpl)
-	UpdateOne(ctx context.Context, filter, update any, opts ...options.Lister[options.UpdateOneOptions]) (*mongo.UpdateResult, error)
-	UpdateMany(ctx context.Context, filter, update any, opts ...options.Lister[options.UpdateManyOptions]) (*mongo.UpdateResult, error)
-	ReplaceOne(ctx context.Context, filter, replacement any, opts ...options.Lister[options.ReplaceOptions]) (*mongo.UpdateResult, error)
-	DeleteOne(ctx context.Context, filter any, opts ...options.Lister[options.DeleteOneOptions]) (*mongo.DeleteResult, error)
-	DeleteMany(ctx context.Context, filter any, opts ...options.Lister[options.DeleteManyOptions]) (*mongo.DeleteResult, error)
-	CountDocuments(ctx context.Context, filter any, opts ...options.Lister[options.CountOptions]) (int64, error)
-	Distinct(ctx context.Context, fieldName string, filter any, opts ...options.Lister[options.DistinctOptions]) *mongo.DistinctResult
-	Aggregate(ctx context.Context, pipeline any, opts ...options.Lister[options.AggregateOptions]) (*mongo.Cursor, shared.CursorImpl, error)
-	UpdateByID(ctx context.Context, id, update any, opts ...options.Lister[options.UpdateOneOptions]) (*mongo.UpdateResult, error)
-	BulkWrite(ctx context.Context, models []mongo.WriteModel, opts ...options.Lister[options.BulkWriteOptions]) (*mongo.BulkWriteResult, error)
-	Watch(ctx context.Context, pipeline any, opts ...options.Lister[options.ChangeStreamOptions]) (*mongo.ChangeStream, shared.ChangeStreamImpl, error)
-}
+// collectionImpl is a facade-local alias of the shared interface.
+type collectionImpl = shared.CollectionImpl
 
 var (
 	_ collectionImpl = (*traced.Collection)(nil)
@@ -52,11 +30,6 @@ var (
 )
 
 // NewCollection wraps an existing *mongo.Collection with trace propagation.
-// Document _oteltrace injection follows the env gates:
-// OTEL_INSTRUMENTATION_GO_TRACING_ENABLED **and** OTEL_MONGO_TRACING_ENABLED
-// must both be on before OTEL_MONGO_PROPAGATION_ENABLED is consulted. When the
-// gate is off the returned wrapper is a passthrough — no spans, no
-// _oteltrace, no propagator extract.
 func NewCollection(coll *mongo.Collection, tracer trace.Tracer, propagator propagation.TextMapPropagator) *Collection {
 	if !mongoTracingEnabled() {
 		return &Collection{Collection: coll, impl: direct.NewCollection(coll)}
@@ -68,27 +41,6 @@ func NewCollection(coll *mongo.Collection, tracer trace.Tracer, propagator propa
 			Tracer:             tracer,
 			Propagator:         propagator,
 			PropagationEnabled: mongoPropagationEnabled(),
-		},
-	}
-}
-
-// newCollectionForDatabase builds the collectionImpl that Database.Collection
-// hands to its Collection facade. Uses the Database's cached gates so a single
-// Connect-time decision flows through.
-func newCollectionForDatabase(d *Database, raw *mongo.Collection) *Collection {
-	if !d.tracingEnabled {
-		return &Collection{Collection: raw, impl: direct.NewCollection(raw)}
-	}
-	return &Collection{
-		Collection: raw,
-		impl: &traced.Collection{
-			Coll:               raw,
-			Tracer:             d.tracer,
-			Propagator:         d.propagator,
-			PropagationEnabled: d.propagationEnabled,
-			DeliverTracer:      d.deliverTracer,
-			ServerAddr:         d.serverAddr,
-			ServerPort:         d.serverPort,
 		},
 	}
 }

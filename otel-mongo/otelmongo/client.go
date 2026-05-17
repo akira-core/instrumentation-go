@@ -8,7 +8,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
 
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -21,22 +20,22 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
-	"go.opentelemetry.io/otel/trace/noop"
+
+	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/traced"
 )
 
 // Client wraps *mongo.Client with OpenTelemetry instrumentation.
-// Tracer and propagator are derived once at Connect time from WithTracerProvider/WithPropagators options,
-// falling back to otel globals when not provided. The globals are never overwritten.
+//
+// Disabled-mode invariant via nullable pointer: `traced` is nil whenever
+// mongoTracingEnabled() returned false at Connect time. The
+// *traced.ClientState owns the OTel SDK state (tracer, propagator, deliver
+// TracerProvider, etc.) — a nil pointer has no Shutdown to accidentally
+// call, so the disabled call path is structurally unreachable from SDK
+// code. See `otel-mongo-flag-wiring` spec Requirement "Client and Database
+// isolate SDK state behind a nullable traced pointer" for rationale.
 type Client struct {
 	*mongo.Client
-	serverAddr         string
-	serverPort         int
-	tracer             trace.Tracer                  // derived from option or otel.GetTracerProvider()
-	propagator         propagation.TextMapPropagator // from option or otel.GetTextMapPropagator()
-	tracingEnabled     bool                          // cached mongoTracingEnabled() result; gates wrapper CLIENT spans
-	propagationEnabled bool
-	deliverTracer      trace.Tracer             // MongoDB deliver span tracer (nil when disabled)
-	mongoTP            *sdktrace.TracerProvider // independent TracerProvider for deliver spans (nil when disabled)
+	traced *traced.ClientState // nil ⇔ disabled
 }
 
 // ClientOption configures Connect/NewClient. Per OTel contrib: accept TracerProvider and Propagators.
@@ -97,28 +96,21 @@ func Connect(ctx context.Context, opts ...*options.ClientOptions) (*Client, erro
 	return ConnectWithOptions(ctx, nil, opts...)
 }
 
-// ConnectWithOptions creates a Client. When WithTracerProvider/WithPropagators are passed, they are
-// stored in the Client and used for all tracing — the otel globals are never overwritten.
-// Without options, falls back to otel.GetTracerProvider()/otel.GetTextMapPropagator() at connect time.
+// ConnectWithOptions creates a Client. The nullable *traced.ClientState pointer is
+// populated only when mongoTracingEnabled() returns true; otherwise the returned
+// *Client has `traced == nil` and the disabled call path is structurally unreachable
+// from any SDK code. The otel globals are never overwritten — TracerProvider /
+// Propagator come from options or are looked up here and stored on the state.
 func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*options.ClientOptions) (*Client, error) {
-	if !mongoTracingEnabled() {
-		merged := options.MergeClientOptions(opts...)
-		mc, err := mongo.Connect(ctx, merged)
-		if err != nil {
-			return nil, err
-		}
-		addr, port := parseServerFromClientOptions(merged)
-		tracer := noop.NewTracerProvider().Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
-		return &Client{
-			Client:             mc,
-			serverAddr:         addr,
-			serverPort:         port,
-			tracer:             tracer,
-			propagator:         otel.GetTextMapPropagator(),
-			tracingEnabled:     false,
-			propagationEnabled: false,
-		}, nil
+	merged := options.MergeClientOptions(opts...)
+	mc, err := mongo.Connect(ctx, merged)
+	if err != nil {
+		return nil, err
 	}
+	if !mongoTracingEnabled() {
+		return &Client{Client: mc}, nil
+	}
+	addr, port := parseServerFromClientOptions(merged)
 	cfg := newClientConfig(traceOpts)
 	tp := cfg.TracerProvider
 	if tp == nil {
@@ -128,25 +120,19 @@ func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*
 	if prop == nil {
 		prop = otel.GetTextMapPropagator()
 	}
-	propEnabled := resolveDocumentPropagation(cfg.PropagationEnabled)
 	tracer := tp.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
-	merged := options.MergeClientOptions(opts...)
-	mc, err := mongo.Connect(ctx, merged)
-	if err != nil {
-		return nil, err
-	}
-	addr, port := parseServerFromClientOptions(merged)
 	mongoTP, deliverTracer := initMongoProvider(ctx, addr, port)
 	return &Client{
-		Client:             mc,
-		serverAddr:         addr,
-		serverPort:         port,
-		tracer:             tracer,
-		propagator:         prop,
-		tracingEnabled:     true,
-		propagationEnabled: propEnabled,
-		mongoTP:            mongoTP,
-		deliverTracer:      deliverTracer,
+		Client: mc,
+		traced: &traced.ClientState{
+			Tracer:             tracer,
+			Propagator:         prop,
+			PropagationEnabled: resolveDocumentPropagation(cfg.PropagationEnabled),
+			DeliverTracer:      deliverTracer,
+			MongoTP:            mongoTP,
+			ServerAddr:         addr,
+			ServerPort:         port,
+		},
 	}, nil
 }
 
@@ -163,15 +149,13 @@ func NewClient(ctx context.Context, uri string, traceOpts ...ClientOption) (*Cli
 	return ConnectWithOptions(ctx, traceOpts, options.Client().ApplyURI(uri))
 }
 
-// Disconnect disconnects the MongoDB client and shuts down the deliver TracerProvider if active.
+// Disconnect disconnects the MongoDB client and (when tracing is enabled)
+// shuts down the deliver TracerProvider. The nil-guard ensures the disabled
+// path never reaches any SDK Shutdown call.
 func (c *Client) Disconnect(ctx context.Context) error {
 	err := c.Client.Disconnect(ctx)
-	if c.mongoTP != nil {
-		// Derive shutdown deadline from caller's ctx so cancellation propagates;
-		// fall back to a fixed 3s timeout when ctx has no deadline.
-		shutCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		defer cancel()
-		_ = c.mongoTP.Shutdown(shutCtx) // best-effort; deliver spans may be lost on failure
+	if c.traced != nil {
+		c.traced.ShutdownDeliver(ctx)
 	}
 	return err
 }
@@ -275,16 +259,15 @@ func mongoServiceName(addr string, port int) string {
 	return "mongodb://" + addr
 }
 
-// Database returns a wrapped Database for document-level tracing.
+// Database returns a wrapped Database for document-level tracing. The
+// `traced` pointer propagates: nil parent ⇒ nil child, non-nil parent ⇒
+// child gets a DatabaseState inheriting the client's gates. The branch is
+// constructor-site (per `instrumentation-feature-flags` exemption) and
+// frozen for the lifetime of the returned Database.
 func (c *Client) Database(name string, opts ...*options.DatabaseOptions) *Database {
-	return &Database{
-		Database:           c.Client.Database(name, opts...),
-		serverAddr:         c.serverAddr,
-		serverPort:         c.serverPort,
-		tracer:             c.tracer,
-		propagator:         c.propagator,
-		tracingEnabled:     c.tracingEnabled,
-		propagationEnabled: c.propagationEnabled,
-		deliverTracer:      c.deliverTracer,
+	raw := c.Client.Database(name, opts...)
+	if c.traced == nil {
+		return &Database{Database: raw}
 	}
+	return &Database{Database: raw, traced: c.traced.ForDatabase()}
 }

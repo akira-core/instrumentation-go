@@ -8,6 +8,15 @@
 *.so
 *.dylib
 
+# Example demo build artefacts (`go build .` emits a binary named after the
+# enclosing directory — e.g. examples/basic/basic). Keep these untracked so
+# `git status` stays clean after running the demos locally.
+otel-*/examples/*/[!.]*
+!otel-*/examples/*/*.go
+!otel-*/examples/*/go.mod
+!otel-*/examples/*/go.sum
+!otel-*/examples/*/README*
+
 # Test binary, built with `go test -c`
 *.test
 

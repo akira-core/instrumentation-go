@@ -24,27 +24,10 @@ type Collection struct {
 	impl collectionImpl
 }
 
-// collectionImpl is the polymorphic core of Collection. Methods return raw
-// driver types (and shared.CursorImpl / shared.SingleResultImpl /
-// shared.ChangeStreamImpl for the streaming results) so the impl packages
-// never need to import the facade — avoids any facade ↔ internal cycle.
-type collectionImpl interface {
-	InsertOne(ctx context.Context, document any, opts ...*options.InsertOneOptions) (*mongo.InsertOneResult, error)
-	InsertMany(ctx context.Context, documents []any, opts ...*options.InsertManyOptions) (*mongo.InsertManyResult, error)
-	Find(ctx context.Context, filter any, opts ...*options.FindOptions) (*mongo.Cursor, shared.CursorImpl, error)
-	FindOne(ctx context.Context, filter any, opts ...*options.FindOneOptions) (*mongo.SingleResult, shared.SingleResultImpl)
-	UpdateOne(ctx context.Context, filter, update any, opts ...*options.UpdateOptions) (*mongo.UpdateResult, error)
-	UpdateMany(ctx context.Context, filter, update any, opts ...*options.UpdateOptions) (*mongo.UpdateResult, error)
-	ReplaceOne(ctx context.Context, filter, replacement any, opts ...*options.ReplaceOptions) (*mongo.UpdateResult, error)
-	DeleteOne(ctx context.Context, filter any, opts ...*options.DeleteOptions) (*mongo.DeleteResult, error)
-	DeleteMany(ctx context.Context, filter any, opts ...*options.DeleteOptions) (*mongo.DeleteResult, error)
-	CountDocuments(ctx context.Context, filter any, opts ...*options.CountOptions) (int64, error)
-	Distinct(ctx context.Context, fieldName string, filter any, opts ...*options.DistinctOptions) ([]interface{}, error)
-	Aggregate(ctx context.Context, pipeline any, opts ...*options.AggregateOptions) (*mongo.Cursor, shared.CursorImpl, error)
-	UpdateByID(ctx context.Context, id, update any, opts ...*options.UpdateOptions) (*mongo.UpdateResult, error)
-	BulkWrite(ctx context.Context, models []mongo.WriteModel, opts ...*options.BulkWriteOptions) (*mongo.BulkWriteResult, error)
-	Watch(ctx context.Context, pipeline interface{}, opts ...*options.ChangeStreamOptions) (*mongo.ChangeStream, shared.ChangeStreamImpl, error)
-}
+// collectionImpl is a facade-local alias of the shared interface. Declared
+// in internal/shared so DatabaseImpl.Collection can return it without
+// importing the facade — same trick as ClientImpl / DatabaseImpl.
+type collectionImpl = shared.CollectionImpl
 
 var (
 	_ collectionImpl = (*traced.Collection)(nil)
@@ -68,27 +51,6 @@ func NewCollection(coll *mongo.Collection, tracer trace.Tracer, propagator propa
 			Tracer:             tracer,
 			Propagator:         propagator,
 			PropagationEnabled: mongoPropagationEnabled(),
-		},
-	}
-}
-
-// newCollectionForDatabase builds the collectionImpl that Database.Collection
-// hands to its Collection facade. Uses the Database's cached gates instead of
-// re-reading the env so a single Connect-time decision flows through.
-func newCollectionForDatabase(d *Database, raw *mongo.Collection) *Collection {
-	if !d.tracingEnabled {
-		return &Collection{Collection: raw, impl: direct.NewCollection(raw)}
-	}
-	return &Collection{
-		Collection: raw,
-		impl: &traced.Collection{
-			Coll:               raw,
-			Tracer:             d.tracer,
-			Propagator:         d.propagator,
-			PropagationEnabled: d.propagationEnabled,
-			DeliverTracer:      d.deliverTracer,
-			ServerAddr:         d.serverAddr,
-			ServerPort:         d.serverPort,
 		},
 	}
 }
