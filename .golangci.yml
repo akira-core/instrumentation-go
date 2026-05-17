@@ -62,6 +62,7 @@ linters:
 
     # Code quality — broad correctness + perf catch-all.
     - gocritic             # config below
+    - gocognit             # cognitive complexity; catches hard-to-follow funcs
 
     # Test quality.
     - testifylint          # testify API misuse
@@ -118,6 +119,9 @@ linters:
         - unnamedResult        # too strict for simple (T, error) returns
         - paramTypeCombine     # opinionated; harder to extend later
 
+    gocognit:
+      min-complexity: 15
+
     nakedret:
       max-func-lines: 0     # any naked return triggers — most explicit
 
@@ -146,6 +150,7 @@ linters:
           - bodyclose          # test Dial / HTTP helpers — short-lived, GC handles it
           - nolintlint         # tests use //nolint freely for fixture builders
           - gocritic           # opinionated rules misfire on test fixtures
+          - gocognit           # table-driven fixtures can be intentionally branchy
       # Example demos: don't lint as production code.
       - path: examples?/
         linters:

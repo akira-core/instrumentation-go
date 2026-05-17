@@ -75,42 +75,65 @@ func MarshalWire(carrier map[string]string, payload []byte) ([]byte, error) {
 // the original user payload. Handles envelope format (current) and legacy
 // flat format (backward compat).
 func TryUnmarshalWire(data []byte) (payload []byte, headers map[string]string, ok bool) {
-	var env WireEnvelope
-	if err := json.Unmarshal(data, &env); err == nil && env.Header != nil && env.Data != nil {
-		h := make(map[string]string)
-		if tp := env.Header[Traceparent]; tp != "" {
-			h[Traceparent] = tp
-		}
-		if ts := env.Header[Tracestate]; ts != "" {
-			h[Tracestate] = ts
-		}
-		return env.Data, h, true
+	if payload, headers, ok = tryUnmarshalEnvelope(data); ok {
+		return payload, headers, true
 	}
+	return tryUnmarshalLegacyFlat(data)
+}
 
+// tryUnmarshalEnvelope handles the current envelope format
+// `{"header":{...},"data":<payload>}`.
+func tryUnmarshalEnvelope(data []byte) (payload []byte, headers map[string]string, ok bool) {
+	var env WireEnvelope
+	if err := json.Unmarshal(data, &env); err != nil || env.Header == nil || env.Data == nil {
+		return nil, nil, false
+	}
+	h := make(map[string]string)
+	if tp := env.Header[Traceparent]; tp != "" {
+		h[Traceparent] = tp
+	}
+	if ts := env.Header[Tracestate]; ts != "" {
+		h[Tracestate] = ts
+	}
+	return env.Data, h, true
+}
+
+// tryUnmarshalLegacyFlat handles the legacy flat format where trace headers
+// live at the top level of an arbitrary JSON object. Returns ok=true for any
+// non-empty JSON object even when no trace header is present — this is the
+// historical wire contract and downstream callers depend on it.
+func tryUnmarshalLegacyFlat(data []byte) (payload []byte, headers map[string]string, ok bool) {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(data, &m); err != nil || len(m) == 0 {
 		return nil, nil, false
 	}
-
 	h := make(map[string]string)
-	if raw, exists := m[Traceparent]; exists {
-		var s string
-		if json.Unmarshal(raw, &s) == nil && s != "" {
-			h[Traceparent] = s
-		}
-		delete(m, Traceparent)
+	if s := extractStringHeader(m, Traceparent); s != "" {
+		h[Traceparent] = s
 	}
-	if raw, exists := m[Tracestate]; exists {
-		var s string
-		if json.Unmarshal(raw, &s) == nil && s != "" {
-			h[Tracestate] = s
-		}
-		delete(m, Tracestate)
+	if s := extractStringHeader(m, Tracestate); s != "" {
+		h[Tracestate] = s
 	}
-
 	out, err := json.Marshal(m)
 	if err != nil {
 		return nil, nil, false
 	}
 	return out, h, true
+}
+
+// extractStringHeader pops a JSON-encoded string header from m and returns its
+// decoded value. Returns empty string when key is missing, not a string, or
+// empty. The key is always removed from m so the residual map can be re-marshaled
+// as the user payload.
+func extractStringHeader(m map[string]json.RawMessage, key string) string {
+	raw, exists := m[key]
+	if !exists {
+		return ""
+	}
+	delete(m, key)
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		return ""
+	}
+	return s
 }

@@ -197,33 +197,9 @@ func upsertSetField(doc bson.D, meta TraceMetadata) (bson.D, error) {
 		if elem.Key != "$set" && elem.Key != "$setOnInsert" {
 			continue
 		}
-		// Always allocate a fresh bson.D for the sub-doc so we never mutate the
-		// caller's bson.D / bson.M sub-value (the fast path makes this load-
-		// bearing: doc may be a shallow clone of caller's update and elem.Value
-		// could still point at caller-owned storage).
-		var subDoc bson.D
-		switch v := elem.Value.(type) {
-		case bson.D:
-			subDoc = make(bson.D, len(v), len(v)+1)
-			copy(subDoc, v)
-		case bson.M:
-			subDoc = make(bson.D, 0, len(v)+1)
-			for k, vv := range v {
-				subDoc = append(subDoc, bson.E{Key: k, Value: vv})
-			}
-		case map[string]any:
-			subDoc = make(bson.D, 0, len(v)+1)
-			for k, vv := range v {
-				subDoc = append(subDoc, bson.E{Key: k, Value: vv})
-			}
-		default:
-			raw, err := bson.Marshal(v)
-			if err != nil {
-				return doc, fmt.Errorf("marshal %s value: %w", elem.Key, err)
-			}
-			if err := bson.Unmarshal(raw, &subDoc); err != nil {
-				return doc, fmt.Errorf("unmarshal %s value: %w", elem.Key, err)
-			}
+		subDoc, err := cloneSetValueAsBsonD(elem.Key, elem.Value)
+		if err != nil {
+			return doc, err
 		}
 		subDoc = append(subDoc, bson.E{Key: TraceMetadataKey, Value: meta})
 		doc[i].Value = subDoc
@@ -235,4 +211,42 @@ func upsertSetField(doc bson.D, meta TraceMetadata) (bson.D, error) {
 		doc = append(doc, bson.E{Key: "$set", Value: bson.D{{Key: TraceMetadataKey, Value: meta}}})
 	}
 	return doc, nil
+}
+
+// cloneSetValueAsBsonD copies the value of a $set / $setOnInsert operator into
+// a fresh bson.D with one slot of headroom for the trace metadata key. Always
+// allocates new backing storage so the returned bson.D never aliases caller-
+// owned slices, maps, or BSON documents — required because the caller may pass
+// a shallow clone whose elem.Value still points at user storage. The marshal /
+// unmarshal fallback handles arbitrary struct / map[string]string / pointer
+// shapes that the fast-path type switch cannot cover.
+func cloneSetValueAsBsonD(key string, value any) (bson.D, error) {
+	switch v := value.(type) {
+	case bson.D:
+		out := make(bson.D, len(v), len(v)+1)
+		copy(out, v)
+		return out, nil
+	case bson.M:
+		out := make(bson.D, 0, len(v)+1)
+		for k, vv := range v {
+			out = append(out, bson.E{Key: k, Value: vv})
+		}
+		return out, nil
+	case map[string]any:
+		out := make(bson.D, 0, len(v)+1)
+		for k, vv := range v {
+			out = append(out, bson.E{Key: k, Value: vv})
+		}
+		return out, nil
+	default:
+		raw, err := bson.Marshal(v)
+		if err != nil {
+			return nil, fmt.Errorf("marshal %s value: %w", key, err)
+		}
+		var out bson.D
+		if err := bson.Unmarshal(raw, &out); err != nil {
+			return nil, fmt.Errorf("unmarshal %s value: %w", key, err)
+		}
+		return out, nil
+	}
 }

@@ -12,12 +12,25 @@
 
 ```
 otel-nats/
-├── otelnats/           # Core NATS：Connect、Conn、Publish、Subscribe、HeaderCarrier
-├── oteljetstream/      # JetStream：New、JetStream、Stream、Consumer、PushConsumer、完整 consumer-manager 包裝、Consume、Messages、Fetch
-├── examples/            # 如何建立 TracerProvider、設定 global、使用 otelnats/oteljetstream
-├── go.mod
+├── otelnats/                       # Core NATS：Connect、Conn、Publish、Subscribe、HeaderCarrier
+│   ├── conn.go                     # facade Conn{impl connImpl} + connImpl interface
+│   ├── conn_direct.go              # directConn — disabled-mode passthrough（不引用 otel/sdk）
+│   ├── conn_traced.go              # tracedConn — 完整 instrumentation + propagationEnabled bool
+│   ├── connect.go propagation.go env_flags.go test_helpers.go traceevent.go doc.go version.go
+│   └── internal/
+│       └── flags/                  # 共享 gate helper（四模組 byte-identical）
+├── oteljetstream/                  # JetStream：JetStream、Stream、Consumer、PushConsumer、MessageBatch
+│   ├── jetstream.go jetstream_direct.go jetstream_traced.go    # file-level split
+│   ├── stream.go stream_direct.go stream_traced.go             # file-level split
+│   ├── consumer.go consumer_direct.go consumer_traced.go       # file-level split
+│   └── doc.go
+├── examples/                       # TracerProvider + global + otelnats/oteljetstream demo
+├── tests/integration/              # testcontainers-based；nats:alpine 啟用 JetStream
+├── CHANGELOG.md
 └── README.md
 ```
+
+`otel-nats` 採 **file-level strategy-split** 變體：`conn_direct.go` 與 `conn_traced.go` 在同一個 package 中；constructor（`Connect`）僅呼叫 `natsGate.Enabled()` 一次並挑選 `directConn` 或 `tracedConn`。Public method 皆為單行 `c.impl.<Method>(...)` 委派 — hot path 無 runtime gate 分支。CI `drift-check` job 對 `*_direct.go` 檔案 grep 禁止的 `otel/sdk` / `otel/exporters` import（與 package-level split 提供相同的隔離保證）。
 
 ---
 

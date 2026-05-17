@@ -12,20 +12,25 @@ OpenTelemetry tracing for [NATS](https://nats.io/) and [NATS JetStream](https://
 
 ```
 otel-nats/
-├── otelnats/           # Core NATS: Connect, Conn, Publish, Subscribe, HeaderCarrier
-│   ├── connect.go      # Connect, ConnectWithOptions, ConnectTLS, ConnectWithCredentials
-│   ├── conn.go         # Conn, Publish, PublishMsg, Subscribe, QueueSubscribe, WithTracerProvider, WithPropagators
-│   ├── propagation.go  # HeaderCarrier (nats.Header ↔ TextMapCarrier)
+├── otelnats/                       # Core NATS: Connect, Conn, Publish, Subscribe, HeaderCarrier
+│   ├── conn.go                     # facade Conn{impl connImpl} + connImpl interface
+│   ├── conn_direct.go              # directConn — disabled-mode passthrough (no otel/sdk import)
+│   ├── conn_traced.go              # tracedConn — full instrumentation + propagationEnabled bool
+│   ├── connect.go propagation.go env_flags.go test_helpers.go traceevent.go doc.go version.go
+│   └── internal/
+│       └── flags/                  # shared gate helper (byte-identical across all four modules)
+├── oteljetstream/                  # JetStream: JetStream, Stream, Consumer, PushConsumer, MessageBatch
+│   ├── jetstream.go jetstream_direct.go jetstream_traced.go    # file-level split
+│   ├── stream.go stream_direct.go stream_traced.go             # file-level split
+│   ├── consumer.go consumer_direct.go consumer_traced.go       # file-level split
 │   └── doc.go
-├── oteljetstream/      # JetStream: New, JetStream, Stream, Consumer, PushConsumer, full consumer-manager wrappers, Consume, Messages, Fetch
-│   ├── jetstream.go    # New(conn), Publish, CreateOrUpdateStream
-│   ├── stream.go       # Stream, Consumer/PushConsumer, CreateOrUpdateConsumer/CreateOrUpdatePushConsumer
-│   ├── consumer.go     # Consume, Messages, Fetch, MessageBatch (Messages), Msg
-│   └── doc.go
-├── examples/            # How to create TracerProvider + set global + use otelnats/oteljetstream
-├── go.mod
+├── examples/                       # TracerProvider + global + otelnats/oteljetstream demo
+├── tests/integration/              # testcontainers-based; nats:alpine with JetStream enabled
+├── CHANGELOG.md
 └── README.md
 ```
+
+`otel-nats` uses the **file-level strategy-split** variant: `conn_direct.go` and `conn_traced.go` live in the same package; constructor (`Connect`) calls `natsGate.Enabled()` once and picks `directConn` or `tracedConn`. Public methods are single-line `c.impl.<Method>(...)` delegates — zero runtime gate branches in the hot path. CI `drift-check` job greps `*_direct.go` files for forbidden `otel/sdk` / `otel/exporters` imports (same isolation guarantee as a package-level split).
 
 ---
 

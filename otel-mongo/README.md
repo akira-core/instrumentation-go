@@ -21,18 +21,23 @@ Both packages expose the same API surface (Client, Collection, Cursor, ContextFr
 
 ```
 otel-mongo/
-├── otelmongo/           # MongoDB driver v1 wrapper (root module)
-│   ├── version.go, client.go, database.go, collection.go, cursor.go
-│   ├── tracing.go, semconv.go, bulkwrite.go, results.go, filter_exporter.go
-│   └── ...
-├── v2/                  # MongoDB driver v2 wrapper (separate module, import .../v2)
-│   ├── go.mod           # module .../otel-mongo/v2, requires go.mongodb.org/mongo-driver/v2
-│   ├── version.go, client.go, database.go, collection.go, cursor.go
-│   ├── tracing.go, semconv.go, bulkwrite.go, results.go, filter_exporter.go
-│   └── *_test.go
-├── examples/             # TracerProvider + global + otelmongo (uses v2)
+├── otelmongo/                  # MongoDB driver v1 wrapper (root module)
+│   ├── client.go database.go collection.go cursor.go results.go     # facade
+│   ├── tracing.go env_flags.go version.go doc.go                    # facade helpers
+│   └── internal/
+│       ├── flags/              # shared gate helper (byte-identical across all four modules)
+│       ├── shared/             # impls.go (CursorImpl / SingleResultImpl / ChangeStreamImpl interfaces),
+│       │                       # bulkwrite.go semconv.go tracing.go — helpers used by both paths
+│       ├── direct/             # disabled-mode impls — ZERO otel/sdk or otel/exporters imports
+│       └── traced/             # enabled-mode impls — full instrumentation + ClientState / DatabaseState
+├── v2/                         # MongoDB driver v2 wrapper (separate module, import .../v2)
+│   └── (same internal/{flags,shared,direct,traced}/ layout as v1; see otel-mongo/v2/README.md)
+├── examples/                   # TracerProvider + global + otelmongo (uses v2)
+├── tests/integration/          # testcontainers-based; standalone MongoDB (no replica-set required)
 └── README.md
 ```
+
+Client + Database use the **nullable traced-pointer** variant (`facade.Client{*mongo.Client; traced *traced.ClientState}` — `nil` ⇔ disabled). Collection / Cursor / SingleResult / ChangeStream use the **full strategy-split** variant (facade holds `impl <X>Impl` interface). Compile-time assertions in `cursor.go`, `results.go`, `collection.go` (`var _ shared.CursorImpl = (*direct.Cursor)(nil)` etc.) fail the build if any impl misses a method.
 
 - **Trace storage:** Written/updated documents get a reserved **`_oteltrace`** field (W3C `traceparent` and optional `tracestate`). Use **ContextFromDocument(ctx, raw)** for raw BSON (e.g. change streams).
 - **Two layers:** (1) **Driver:** Client uses contrib `otelmongo.NewMonitor` for connection/command spans. (2) **Document:** Collection CRUD injects `_oteltrace` on write and supports span links / propagation on read.

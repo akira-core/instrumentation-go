@@ -6,6 +6,7 @@ import (
 
 	"github.com/nats-io/nats.go/jetstream"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 
@@ -138,15 +139,60 @@ func newDirectMessageBatch(raw jetstream.MessageBatch) MessageBatch {
 			select {
 			case ch <- Msg{Msg: msg, Ctx: context.Background()}:
 			case <-done:
-				// Drain remaining raw messages so the upstream goroutine
-				// can complete and close raw.Messages() cleanly.
-				for range raw.Messages() {
-				}
+				drainRawMessages(raw)
 				return
 			}
 		}
 	}()
 	return &directMessageBatch{ch: ch, raw: raw, done: done}
+}
+
+// drainRawMessages drains raw.Messages() so the upstream jetstream driver
+// goroutine can finish and close the channel — otherwise it blocks forever on
+// the chan send when the consumer aborts early via the done channel.
+func drainRawMessages(raw jetstream.MessageBatch) {
+	for range raw.Messages() {
+	}
+}
+
+// endSpanIfPresent ends span when non-nil; no-op otherwise.
+func endSpanIfPresent(span trace.Span) {
+	if span != nil {
+		span.End()
+	}
+}
+
+// startBatchReceiveSpan starts the consumer span for a single received message.
+// When propEnabled is true and the message carries a traceparent header, the
+// remote context is extracted, a deliver span is wired in, and a sampled-link
+// is attached (per PERF_BOTTLENECK_PLAN D2 "no propagation → span emit, no
+// link"). Otherwise a standalone consumer span rooted at context.Background()
+// is emitted.
+func startBatchReceiveSpan(
+	conn *otelnats.Conn,
+	consumerName string,
+	msg jetstream.Msg,
+	propEnabled bool,
+	tracer trace.Tracer,
+	prop propagation.TextMapPropagator,
+) (context.Context, trace.Span) {
+	attrs := append(receiveAttrs(msg, "receive", conn.ServerAttrs()), attribute.String(attrConsumerName, consumerName))
+	opts := []trace.SpanStartOption{
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(attrs...),
+	}
+	consumerParentCtx := context.Background()
+	if propEnabled {
+		if hdr := msg.Headers(); hdr != nil && hdr.Get("traceparent") != "" {
+			msgCtx := prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: hdr})
+			originSpanCtx := trace.SpanContextFromContext(msgCtx)
+			consumerParentCtx = conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
+			if originSpanCtx.IsValid() && originSpanCtx.IsSampled() {
+				opts = append(opts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
+			}
+		}
+	}
+	return tracer.Start(consumerParentCtx, "receive "+msg.Subject(), opts...)
 }
 
 // newTracedMessageBatch wraps a raw jetstream.MessageBatch with the instrumented variant.
@@ -156,52 +202,21 @@ func newTracedMessageBatch(conn *otelnats.Conn, consumerName string, raw jetstre
 	go func() {
 		defer close(ch)
 		var lastSpan trace.Span
-		defer func() {
-			if lastSpan != nil {
-				lastSpan.End()
-			}
-		}()
+		defer func() { endSpanIfPresent(lastSpan) }()
 		tracer, prop := conn.TraceContext()
-		// Hoist the propagation gate out of the per-message loop. When off,
-		// the inbound header is treated as opaque: no Extract, no deliver
-		// span, no link consideration — the wrapper emits a standalone
-		// consumer span (per PERF_BOTTLENECK_PLAN D2 "no propagation → span
-		// emit, no link").
+		// Hoist the propagation gate out of the per-message loop — see
+		// startBatchReceiveSpan for the no-propagation contract.
 		propEnabled := conn.PropagationEnabled()
 		for msg := range raw.Messages() {
-			if lastSpan != nil {
-				lastSpan.End()
-				lastSpan = nil
-			}
-			attrs := append(receiveAttrs(msg, "receive", conn.ServerAttrs()), attribute.String(attrConsumerName, consumerName))
-			opts := []trace.SpanStartOption{
-				trace.WithSpanKind(trace.SpanKindConsumer),
-				trace.WithAttributes(attrs...),
-			}
-			consumerParentCtx := context.Background()
-			if propEnabled {
-				if hdr := msg.Headers(); hdr != nil && hdr.Get("traceparent") != "" {
-					msgCtx := prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: hdr})
-					originSpanCtx := trace.SpanContextFromContext(msgCtx)
-					consumerParentCtx = conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
-					// Only attach link when origin trace is sampled (avoid dangling link to dropped span).
-					if originSpanCtx.IsValid() && originSpanCtx.IsSampled() {
-						opts = append(opts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
-					}
-				}
-			}
-			ctx, span := tracer.Start(consumerParentCtx, "receive "+msg.Subject(), opts...)
+			endSpanIfPresent(lastSpan)
+			lastSpan = nil
+			ctx, span := startBatchReceiveSpan(conn, consumerName, msg, propEnabled, tracer, prop)
 			select {
 			case ch <- Msg{Msg: msg, Ctx: ctx}:
 				lastSpan = span
 			case <-done:
 				span.End()
-				// Lifecycle invariant: drain remaining raw messages so the
-				// upstream jetstream driver goroutine can finish and close
-				// raw.Messages() — otherwise it blocks forever on chan send.
-				// See newDirectMessageBatch for the full rationale.
-				for range raw.Messages() {
-				}
+				drainRawMessages(raw)
 				return
 			}
 		}

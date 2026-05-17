@@ -16,11 +16,23 @@
 
 ```
 otel-mongo/
-├── otelmongo/     # MongoDB driver v1 包裝（root module）
-├── v2/             # MongoDB driver v2 包裝（import .../v2）
-├── examples/        # 使用 v2 的範例
+├── otelmongo/                  # MongoDB driver v1 wrapper (root module)
+│   ├── client.go database.go collection.go cursor.go results.go     # facade
+│   ├── tracing.go env_flags.go version.go doc.go                    # facade 輔助
+│   └── internal/
+│       ├── flags/              # 共享 gate helper（四模組 byte-identical）
+│       ├── shared/             # impls.go（CursorImpl / SingleResultImpl / ChangeStreamImpl interfaces）、
+│       │                       # bulkwrite.go semconv.go tracing.go — direct/traced 共用 helper
+│       ├── direct/             # disabled-mode 實作 — ZERO otel/sdk 與 otel/exporters import
+│       └── traced/             # enabled-mode 實作 — 完整 instrumentation + ClientState / DatabaseState
+├── v2/                         # MongoDB driver v2 wrapper（獨立 module，import .../v2）
+│   └── （internal/{flags,shared,direct,traced}/ 結構與 v1 相同；見 otel-mongo/v2/README.md）
+├── examples/                   # TracerProvider + global + otelmongo（使用 v2）
+├── tests/integration/          # testcontainers-based；standalone MongoDB（無需 replica-set）
 └── README.md
 ```
+
+Client + Database 採 **nullable traced-pointer** 變體（`facade.Client{*mongo.Client; traced *traced.ClientState}` — `nil` ⇔ disabled）。Collection / Cursor / SingleResult / ChangeStream 採 **full strategy-split** 變體（facade 持有 `impl <X>Impl` interface）。`cursor.go`、`results.go`、`collection.go` 內的編譯期斷言（`var _ shared.CursorImpl = (*direct.Cursor)(nil)` 等）確保新方法在兩種 impl 都實作。
 
 - **Trace 儲存：** 寫入/更新的文件會有保留欄位 **`_oteltrace`**。對 raw BSON（例如 change stream）可使用 **ContextFromDocument(ctx, raw)** 還原 context。
 - **兩層：** (1) **Driver** 使用 contrib otelmongo Monitor 產生連線/指令 span。(2) **Document** 層在 CRUD 寫入時注入 `_oteltrace`，讀取時支援 span link 與傳播。
