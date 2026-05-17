@@ -5,7 +5,6 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
-	"go.opentelemetry.io/otel/trace/noop"
 )
 
 // Option configures a Conn.
@@ -36,27 +35,28 @@ func WithTracerProvider(tp trace.TracerProvider) Option {
 	}
 }
 
-func applyOptions(c *Conn, opts []Option) {
+// resolveOptions materialises the tracer + propagator the traced impl uses.
+// Only called from the env-enabled branch of newConn — the env-disabled
+// branch picks direct.NewConn which holds no tracer at all, so caller-
+// supplied TracerProvider is never touched in the disabled-mode path.
+func resolveOptions(opts []Option) (trace.Tracer, propagation.TextMapPropagator) {
 	cfg := connOptions{}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
 
-	if cfg.propagator != nil {
-		c.propagator = cfg.propagator
-	} else {
-		c.propagator = otel.GetTextMapPropagator()
-	}
-
-	if !c.featureEnabled {
-		// Feature flag off ⇒ no OTel SDK call on caller's TracerProvider; use noop tracer.
-		c.tracer = noop.NewTracerProvider().Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
-		return
+	prop := cfg.propagator
+	if prop == nil {
+		prop = otel.GetTextMapPropagator()
 	}
 
 	tp := cfg.tracerProvider
 	if tp == nil {
 		tp = otel.GetTracerProvider()
 	}
-	c.tracer = tp.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()), trace.WithSchemaURL(semconv.SchemaURL))
+	tr := tp.Tracer(ScopeName,
+		trace.WithInstrumentationVersion(Version()),
+		trace.WithSchemaURL(semconv.SchemaURL),
+	)
+	return tr, prop
 }

@@ -142,6 +142,15 @@ Every wrapper that today branches on a runtime `tracingEnabled bool` inside publ
 - **THEN** assertions of the form `var _ <X>Impl = (*direct.X)(nil)` and `var _ <X>Impl = (*traced.X)(nil)` SHALL be present in the facade
 - **AND** adding a method to the interface without implementing it in both impls SHALL fail compilation
 
+#### Scenario: Constructor-site impl selection is exempt from the no-branch rule
+
+- **WHEN** a constructor (e.g. `Connect`, `Wrap`, `NewConn`, `Database(name)`, `Collection(name)`, or a private factory helper that builds a strategy-split wrapper such as `newCollectionForDatabase`) reads `gate.Enabled()` (or the parent wrapper's already-cached gate result) and writes `if gateValue { return &traced.X{...} } else { return direct.NewX(...) }`
+- **THEN** the construct SHALL NOT count as a "runtime `if tracingEnabled` branch" violation
+- **AND** the prohibition SHALL apply ONLY to public method bodies of the facade wrapper types listed above
+- **AND** the constructor SHALL still observe the "exactly once based on `gate.Enabled()`" rule — the cached gate value (or parent's cached impl flavour) is read at construction time, never re-evaluated per call
+
+Rationale: strategy-mode pattern requires SOME site to pick the impl. The cost the original rule targets is per-call branch overhead and the risk of a developer adding a new public method that bypasses the impl. Constructor-site selection runs once per wrapper instance and the chosen impl is immutable for the lifetime of the wrapper, so neither cost applies.
+
 ### Requirement: No new public functional options on `otel-nats` / `otel-gorilla-ws`
 
 This change SHALL NOT add new exported `With*` options to `otel-nats` or `otel-gorilla-ws`. Existing options (`WithTracerProvider`, `WithPropagators`, etc.) keep current semantics.

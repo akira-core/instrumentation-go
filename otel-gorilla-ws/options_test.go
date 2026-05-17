@@ -4,13 +4,16 @@ import (
 	"context"
 	"testing"
 
+	"github.com/gorilla/websocket"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	"github.com/Marz32onE/instrumentation-go/otel-gorilla-ws/internal/direct"
+	"github.com/Marz32onE/instrumentation-go/otel-gorilla-ws/internal/traced"
 )
 
 func newRecorderTP(t *testing.T) (*sdktrace.TracerProvider, *tracetest.SpanRecorder) {
@@ -21,37 +24,22 @@ func newRecorderTP(t *testing.T) (*sdktrace.TracerProvider, *tracetest.SpanRecor
 	return tp, recorder
 }
 
-func TestApplyOptions_GlobalFallback(t *testing.T) {
+func TestResolveOptions_GlobalFallback(t *testing.T) {
 	globalTP, globalRecorder := newRecorderTP(t)
 	otel.SetTracerProvider(globalTP)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 
-	c := &Conn{featureEnabled: true}
-	applyOptions(c, nil)
+	tracer, prop := resolveOptions(nil)
 
-	_, span := c.tracer.Start(context.Background(), "global-fallback")
+	_, span := tracer.Start(context.Background(), "global-fallback")
 	span.End()
 
 	require.Len(t, globalRecorder.Ended(), 1)
 	assert.Equal(t, "global-fallback", globalRecorder.Ended()[0].Name())
-	assert.Equal(t, propagation.TraceContext{}.Fields(), c.propagator.Fields())
+	assert.Equal(t, propagation.TraceContext{}.Fields(), prop.Fields())
 }
 
-func TestApplyOptions_FeatureDisabled_UsesNoopTracer(t *testing.T) {
-	globalTP, globalRecorder := newRecorderTP(t)
-	otel.SetTracerProvider(globalTP)
-	otel.SetTextMapPropagator(propagation.TraceContext{})
-
-	c := &Conn{featureEnabled: false}
-	applyOptions(c, nil)
-
-	_, span := c.tracer.Start(context.Background(), "should-not-be-recorded")
-	span.End()
-
-	assert.Empty(t, globalRecorder.Ended(), "no spans should be recorded on caller's TracerProvider when feature flag is off")
-}
-
-func TestApplyOptions_UsesProvidedOptionsWithoutMutatingGlobals(t *testing.T) {
+func TestResolveOptions_UsesProvidedOptionsWithoutMutatingGlobals(t *testing.T) {
 	globalTP, globalRecorder := newRecorderTP(t)
 	otel.SetTracerProvider(globalTP)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
@@ -59,18 +47,54 @@ func TestApplyOptions_UsesProvidedOptionsWithoutMutatingGlobals(t *testing.T) {
 	customTP, customRecorder := newRecorderTP(t)
 	customProp := propagation.NewCompositeTextMapPropagator(propagation.Baggage{})
 
-	c := &Conn{featureEnabled: true}
-	applyOptions(c, []Option{
+	tracer, prop := resolveOptions([]Option{
 		WithTracerProvider(customTP),
 		WithPropagators(customProp),
 	})
 
-	_, span := c.tracer.Start(context.Background(), "custom-provider")
+	_, span := tracer.Start(context.Background(), "custom-provider")
 	span.End()
 
 	require.Len(t, customRecorder.Ended(), 1)
 	assert.Equal(t, "custom-provider", customRecorder.Ended()[0].Name())
 	assert.Empty(t, globalRecorder.Ended(), "custom option should not write to global recorder")
-	assert.Equal(t, customProp.Fields(), c.propagator.Fields())
-	assert.Equal(t, propagation.TraceContext{}.Fields(), otel.GetTextMapPropagator().Fields(), "global propagator must remain unchanged")
+	assert.Equal(t, customProp.Fields(), prop.Fields())
+	assert.Equal(t, propagation.TraceContext{}.Fields(), otel.GetTextMapPropagator().Fields(),
+		"global propagator must remain unchanged")
+}
+
+func TestNewConn_FeatureDisabled_PicksDirectImpl(t *testing.T) {
+	t.Setenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED", "0")
+	t.Setenv("OTEL_GORILLA_WS_TRACING_ENABLED", "0")
+	wsGate.ResetForTest()
+	t.Cleanup(wsGate.ResetForTest)
+
+	c := newConn(&websocket.Conn{}, true)
+	_, ok := c.impl.(*direct.Conn)
+	assert.True(t, ok, "env-off must select internal/direct.Conn; got %T", c.impl)
+}
+
+func TestNewConn_FeatureEnabled_PicksTracedImpl(t *testing.T) {
+	t.Setenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED", "1")
+	t.Setenv("OTEL_GORILLA_WS_TRACING_ENABLED", "1")
+	wsGate.ResetForTest()
+	t.Cleanup(wsGate.ResetForTest)
+
+	c := newConn(&websocket.Conn{}, true)
+	tc, ok := c.impl.(*traced.Conn)
+	require.True(t, ok, "env-on must select internal/traced.Conn; got %T", c.impl)
+	assert.True(t, tc.PropagationEnabled, "negotiated=true must propagate to traced.Conn.PropagationEnabled")
+}
+
+func TestNewConn_FeatureOn_NegotiatedOff_PropagationDisabled(t *testing.T) {
+	t.Setenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED", "1")
+	t.Setenv("OTEL_GORILLA_WS_TRACING_ENABLED", "1")
+	wsGate.ResetForTest()
+	t.Cleanup(wsGate.ResetForTest)
+
+	c := newConn(&websocket.Conn{}, false)
+	tc, ok := c.impl.(*traced.Conn)
+	require.True(t, ok, "env-on must select internal/traced.Conn; got %T", c.impl)
+	assert.False(t, tc.PropagationEnabled,
+		"negotiated=false must leave traced.Conn.PropagationEnabled=false (spans-only mode)")
 }

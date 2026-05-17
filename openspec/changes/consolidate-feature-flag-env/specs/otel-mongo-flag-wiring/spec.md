@@ -66,6 +66,16 @@ When `mongoTracingEnabled()` returns `false`, `Connect` and `Wrap` SHALL substit
 - **THEN** the deliver-tracer initialiser (`initMongoProvider`) SHALL NOT run
 - **AND** no `BatchSpanProcessor` or `otlptracegrpc` / `otlptracehttp` exporter SHALL be created by the module
 
+#### Scenario: Disabled `Client.Disconnect` performs no `TracerProvider.Shutdown`
+
+- **WHEN** tracing is disabled and a caller invokes `Client.Disconnect(ctx)` on the strategy-split direct impl
+- **THEN** the direct impl `Disconnect` SHALL NOT call `Shutdown` on any `TracerProvider`, `BatchSpanProcessor`, or `SimpleSpanProcessor`
+- **AND** the direct impl `Client` struct SHALL NOT hold a `*sdktrace.TracerProvider` field at all (no field to shut down)
+- **AND** the disabled `Disconnect` SHALL delegate straight to the upstream `*mongo.Client.Disconnect(ctx)` with no additional work
+- **AND** any `Shutdown` of an SDK `TracerProvider` SHALL live exclusively in `internal/traced/client.go` (where the deliver-tracer `mongoTP` is held)
+
+Rationale: the disabled-mode invariant is that no OTel SDK code path runs. Holding even an unused `*sdktrace.TracerProvider` field on the disabled impl would risk a future maintainer threading a `Shutdown` call into the disabled path. The strategy-split package boundary enforces this by keeping the field on the traced impl only.
+
 ### Requirement: Strategy-split layout already in place for Collection / Cursor / SingleResult / ChangeStream is preserved
 
 The existing `internal/{direct,traced,shared}/` package layout in `otel-mongo/otelmongo/` and `otel-mongo/v2/` SHALL NOT be reorganised by this change. Only the env-flag plumbing inside `env_flags.go` and `tracing.go` is replaced.
