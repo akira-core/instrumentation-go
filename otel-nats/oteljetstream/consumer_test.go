@@ -208,61 +208,6 @@ func TestConsumeTraceContext(t *testing.T) {
 	}
 }
 
-func TestPushConsumeTraceContext(t *testing.T) {
-	url := startJetStreamServer(t)
-	sr := tracetest.NewSpanRecorder()
-	tp := trace.NewTracerProvider(trace.WithSpanProcessor(sr))
-	prop := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{})
-
-	otel.SetTracerProvider(tp)
-	otel.SetTextMapPropagator(prop)
-	conn, err := otelnats.Connect(url, nil)
-	require.NoError(t, err)
-	defer conn.Close()
-
-	js, err := oteljetstream.New(conn)
-	require.NoError(t, err)
-	ctx := context.Background()
-	_, err = js.CreateOrUpdateStream(ctx, oteljetstream.StreamConfig{
-		Name:     "PUSHTEST",
-		Subjects: []string{"push.>"},
-	})
-	require.NoError(t, err)
-
-	pushCons, err := js.CreateOrUpdatePushConsumer(ctx, "PUSHTEST", oteljetstream.ConsumerConfig{
-		Durable:        "push-consumer",
-		DeliverSubject: "_INBOX.push.deliver.trace",
-		FilterSubject:  "push.msg",
-		AckPolicy:      oteljetstream.AckExplicitPolicy,
-	})
-	require.NoError(t, err)
-
-	done := make(chan struct{}, 1)
-	cc, err := pushCons.Consume(func(m oteljetstream.Msg) {
-		if oteltrace.SpanFromContext(m.Context()).SpanContext().TraceID().IsValid() {
-			done <- struct{}{}
-		}
-		_ = m.Ack()
-	})
-	require.NoError(t, err)
-	defer cc.Stop()
-
-	tracer := tp.Tracer("push-pub")
-	pubCtx, pubSpan := tracer.Start(ctx, "push-parent")
-	defer pubSpan.End()
-	_, err = js.Publish(pubCtx, "push.msg", []byte("hello push"))
-	require.NoError(t, err)
-
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("Push Consume handler did not receive trace context")
-	}
-
-	consumer := waitSpanByNameAndKind(t, sr, "process "+"push.msg", oteltrace.SpanKindConsumer)
-	assertAttr(t, consumer.Attributes(), "messaging.consumer.name", "push-consumer")
-}
-
 func TestMessagesNextTraceContext(t *testing.T) {
 	url := startJetStreamServer(t)
 	tp := trace.NewTracerProvider()
@@ -412,7 +357,6 @@ func TestOrderedConsumerTraceContext(t *testing.T) {
 
 	orderedCons, err := stream.OrderedConsumer(ctx, oteljetstream.OrderedConsumerConfig{
 		FilterSubjects: []string{"ordered.msg"},
-		NamePrefix:     "ordered-test",
 	})
 	require.NoError(t, err)
 
@@ -439,7 +383,7 @@ func TestOrderedConsumerTraceContext(t *testing.T) {
 	}
 
 	consumer := waitSpanByNameAndKind(t, sr, "process ordered.msg", oteltrace.SpanKindConsumer)
-	assertAttr(t, consumer.Attributes(), "messaging.consumer.name", "ordered-test")
+	assertAttr(t, consumer.Attributes(), "messaging.consumer.name", "ordered-consumer")
 }
 
 func TestConsumerInfo(t *testing.T) {

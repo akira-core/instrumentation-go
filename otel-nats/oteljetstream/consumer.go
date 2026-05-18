@@ -25,7 +25,7 @@ type ConsumeContext interface {
 // MessagesContext is the iterator from Messages(). Same as jetstream.MessagesContext but
 // Next() returns (ctx, msg, error) with ctx carrying extracted trace.
 type MessagesContext interface {
-	Next(opts ...jetstream.NextOpt) (context.Context, jetstream.Msg, error)
+	Next() (context.Context, jetstream.Msg, error)
 	Stop()
 	Drain()
 }
@@ -61,13 +61,6 @@ type Consumer interface {
 	Fetch(batch int, opts ...jetstream.FetchOpt) (MessageBatch, error)
 	FetchBytes(maxBytes int, opts ...jetstream.FetchOpt) (MessageBatch, error)
 	FetchNoWait(batch int) (MessageBatch, error)
-	Info(ctx context.Context) (*ConsumerInfo, error)
-	CachedInfo() *ConsumerInfo
-}
-
-// PushConsumer mirrors jetstream.PushConsumer.
-type PushConsumer interface {
-	Consume(handler MsgHandler, opts ...jetstream.PushConsumeOpt) (ConsumeContext, error)
 	Info(ctx context.Context) (*ConsumerInfo, error)
 	CachedInfo() *ConsumerInfo
 }

@@ -2,7 +2,6 @@ package oteljetstream
 
 import (
 	"context"
-	"time"
 
 	nats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -52,12 +51,6 @@ type ConsumerInfoLister = jetstream.ConsumerInfoLister
 // OrderedConsumerConfig mirrors jetstream.OrderedConsumerConfig.
 type OrderedConsumerConfig = jetstream.OrderedConsumerConfig
 
-// ConsumerPauseResponse mirrors jetstream.ConsumerPauseResponse.
-type ConsumerPauseResponse = jetstream.ConsumerPauseResponse
-
-// PushConsumeOpt mirrors jetstream.PushConsumeOpt for PushConsumer.Consume options.
-type PushConsumeOpt = jetstream.PushConsumeOpt
-
 // AckPolicy and ack policies mirror jetstream (so callers need not import jetstream).
 type AckPolicy = jetstream.AckPolicy
 
@@ -79,12 +72,6 @@ type JetStream interface {
 	UpdateConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (Consumer, error)
 	OrderedConsumer(ctx context.Context, stream string, cfg OrderedConsumerConfig) (Consumer, error)
 	DeleteConsumer(ctx context.Context, stream string, consumer string) error
-	PauseConsumer(ctx context.Context, stream string, consumer string, pauseUntil time.Time) (*ConsumerPauseResponse, error)
-	ResumeConsumer(ctx context.Context, stream string, consumer string) (*ConsumerPauseResponse, error)
-	PushConsumer(ctx context.Context, stream string, consumer string) (PushConsumer, error)
-	CreatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error)
-	CreateOrUpdatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error)
-	UpdatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error)
 	Stream(ctx context.Context, name string) (Stream, error)
 	CreateOrUpdateStream(ctx context.Context, cfg StreamConfig) (Stream, error)
 	DeleteStream(ctx context.Context, name string) error
@@ -105,6 +92,11 @@ func New(conn *otelnats.Conn) (JetStream, error) {
 	}
 	return &directJSImpl{js: js}, nil
 }
+
+// orderedConsumerName is the fixed consumer-name attribute applied to ordered
+// consumer spans. OrderedConsumerConfig in nats.go v1.38.0 has no NamePrefix
+// field, so the wrapper cannot vary this per-call.
+const orderedConsumerName = "ordered-consumer"
 
 func consumerNameFromConfig(cfg ConsumerConfig) string {
 	name := cfg.Durable

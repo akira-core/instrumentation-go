@@ -102,12 +102,11 @@ func Connect(ctx context.Context, opts ...*options.ClientOptions) (*Client, erro
 // Without options, falls back to otel.GetTracerProvider()/otel.GetTextMapPropagator() at connect time.
 func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*options.ClientOptions) (*Client, error) {
 	if !mongoTracingEnabled() {
-		merged := options.MergeClientOptions(opts...)
-		mc, err := mongo.Connect(ctx, merged)
+		mc, err := mongo.Connect(ctx, opts...)
 		if err != nil {
 			return nil, err
 		}
-		addr, port := parseServerFromClientOptions(merged)
+		addr, port := parseServerFromURI(lastNonEmptyURI(opts))
 		tracer := noop.NewTracerProvider().Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
 		return &Client{
 			Client:             mc,
@@ -130,12 +129,11 @@ func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*
 	}
 	propEnabled := resolveDocumentPropagation(cfg.PropagationEnabled)
 	tracer := tp.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
-	merged := options.MergeClientOptions(opts...)
-	mc, err := mongo.Connect(ctx, merged)
+	mc, err := mongo.Connect(ctx, opts...)
 	if err != nil {
 		return nil, err
 	}
-	addr, port := parseServerFromClientOptions(merged)
+	addr, port := parseServerFromURI(lastNonEmptyURI(opts))
 	mongoTP, deliverTracer := initMongoProvider(addr, port)
 	return &Client{
 		Client:             mc,
@@ -150,6 +148,24 @@ func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*
 	}, nil
 }
 
+// lastNonEmptyURI walks the ClientOptions slice in reverse and returns the URI
+// from the most recently-applied options struct. mongo.Connect already merges
+// the slice internally, so the wrapper only needs the effective URI to derive
+// semconv server.* attributes.
+func lastNonEmptyURI(opts []*options.ClientOptions) string {
+	for i := len(opts) - 1; i >= 0; i-- {
+		if opts[i] == nil {
+			continue
+		}
+		if uri := opts[i].GetURI(); uri != "" {
+			return uri
+		}
+	}
+	return ""
+}
+
+// parseServerFromClientOptions is retained for tests that exercise URI parsing.
+// It mirrors lastNonEmptyURI for the single-options case.
 func parseServerFromClientOptions(opts *options.ClientOptions) (addr string, port int) {
 	if opts == nil {
 		return "", 0
