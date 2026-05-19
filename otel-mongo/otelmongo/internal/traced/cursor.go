@@ -41,8 +41,7 @@ func (c *Cursor) DecodeWithContext(ctx context.Context, val any) (context.Contex
 	var originSpanCtx trace.SpanContext
 	if c.propagationEnabled {
 		if meta, ok := shared.ExtractMetadataFromRaw(raw); ok {
-			originCtx := shared.ContextFromTraceMetadata(context.Background(), meta, c.propagator)
-			originSpanCtx = trace.SpanContextFromContext(originCtx)
+			originSpanCtx = shared.SpanContextFromMetadata(meta, c.propagator)
 		}
 	}
 

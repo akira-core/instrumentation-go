@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
@@ -26,7 +27,11 @@ func TestBuildConsumerCtx_NewTraceIDAndLinksOriginTrace(t *testing.T) {
 	originSpanCtx := originSpan.SpanContext()
 	originSpan.End()
 
-	newCtx, span := buildConsumerCtx(originCtx, tracer, nil, "", nil, "test-decode-span", nil, originSpanCtx)
+	cs := NewChangeStream(nil, ChangeStreamConfig{
+		Tracer:   tracer,
+		SpanName: "test-decode-span",
+	})
+	newCtx, span := cs.buildConsumerCtx(originCtx, originSpanCtx)
 	span.End()
 
 	recovered := trace.SpanContextFromContext(newCtx)
@@ -69,7 +74,14 @@ func TestBuildConsumerCtx_WithDeliverTracer_ChildOfDeliver(t *testing.T) {
 	originSpanCtx := originSpan.SpanContext()
 	originSpan.End()
 
-	newCtx, span := buildConsumerCtx(context.Background(), tracer, deliverTracer, "test deliver", nil, "test-consumer-span", nil, originSpanCtx)
+	cs := NewChangeStream(nil, ChangeStreamConfig{
+		Tracer:          tracer,
+		SpanName:        "test-consumer-span",
+		DeliverTracer:   deliverTracer,
+		DeliverSpanName: "test deliver",
+		DeliverAttrs:    []attribute.KeyValue{},
+	})
+	newCtx, span := cs.buildConsumerCtx(context.Background(), originSpanCtx)
 	span.End()
 
 	consumerSpanCtx := trace.SpanContextFromContext(newCtx)

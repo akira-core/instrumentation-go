@@ -53,7 +53,6 @@ func Test_extractMetadataFromRaw(t *testing.T) {
 
 		meta, ok := extractMetadataFromRaw(raw)
 		require.True(t, ok)
-		require.NotNil(t, meta)
 		assert.Equal(t, "00-trace123456789012345678901234-0123456789012345-01", meta.Traceparent)
 		assert.Equal(t, "k=v", meta.Tracestate)
 	})
@@ -65,7 +64,7 @@ func Test_extractMetadataFromRaw(t *testing.T) {
 
 		meta, ok := extractMetadataFromRaw(raw)
 		assert.False(t, ok)
-		assert.Nil(t, meta)
+		assert.Empty(t, meta.Traceparent)
 	})
 
 	t.Run("oteltrace_not_document_returns_false", func(t *testing.T) {
@@ -75,7 +74,7 @@ func Test_extractMetadataFromRaw(t *testing.T) {
 
 		meta, ok := extractMetadataFromRaw(raw)
 		assert.False(t, ok)
-		assert.Nil(t, meta)
+		assert.Empty(t, meta.Traceparent)
 	})
 
 	t.Run("empty_traceparent_returns_false", func(t *testing.T) {
@@ -90,7 +89,7 @@ func Test_extractMetadataFromRaw(t *testing.T) {
 
 		meta, ok := extractMetadataFromRaw(raw)
 		assert.False(t, ok)
-		assert.Nil(t, meta)
+		assert.Empty(t, meta.Traceparent)
 	})
 }
 
@@ -254,6 +253,35 @@ func Test_ContextFromDocument(t *testing.T) {
 		sc, ok := ContextFromDocument(context.Background(), fullDoc)
 		require.False(t, ok)
 		assert.False(t, sc.IsValid())
+	})
+
+	// Regression: fast paths must validate SpanContext, matching the raw/slow
+	// path. A non-empty but malformed traceparent must yield ok=false on every
+	// input type (bson.M, map[string]any, bson.D, and the bson.Marshal slow
+	// path) — not only the raw path.
+	t.Run("malformed_traceparent_returns_false_across_input_types", func(t *testing.T) {
+		const bad = "not-a-valid-traceparent"
+		cases := map[string]any{
+			"bson_M": bson.M{
+				"_oteltrace": bson.M{"traceparent": bad},
+			},
+			"map_string_any": map[string]any{
+				"_oteltrace": map[string]any{"traceparent": bad},
+			},
+			"bson_D": bson.D{
+				{Key: "_oteltrace", Value: bson.D{{Key: "traceparent", Value: bad}}},
+			},
+			"struct_slow_path": struct {
+				Trace TraceMetadata `bson:"_oteltrace"`
+			}{Trace: TraceMetadata{Traceparent: bad}},
+		}
+		for name, doc := range cases {
+			t.Run(name, func(t *testing.T) {
+				sc, ok := ContextFromDocument(context.Background(), doc)
+				assert.False(t, ok, "malformed traceparent must yield ok=false")
+				assert.False(t, sc.IsValid())
+			})
+		}
 	})
 }
 

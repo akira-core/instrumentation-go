@@ -15,6 +15,11 @@ import (
 // ChangeStream is the enabled-path impl of the otelmongo.ChangeStream
 // strategy. DecodeWithContext extracts _oteltrace from fullDocument and
 // builds a CONSUMER span linked to the origin trace.
+//
+// Performance: deliverStartOpts is pre-built once at construction (kind +
+// attributes); per-event work in DecodeWithContext only appends an
+// optional link, avoiding repeated variadic slice allocation on the hot
+// read path.
 type ChangeStream struct {
 	cs                 *mongo.ChangeStream
 	tracer             trace.Tracer
@@ -24,7 +29,7 @@ type ChangeStream struct {
 	baseSpanOpts       []trace.SpanStartOption
 	deliverTracer      trace.Tracer
 	deliverSpanName    string
-	deliverAttrs       []attribute.KeyValue
+	deliverStartOpts   []trace.SpanStartOption
 }
 
 // ChangeStreamConfig groups construction parameters for NewChangeStream.
@@ -41,8 +46,10 @@ type ChangeStreamConfig struct {
 }
 
 // NewChangeStream wraps cs with the enabled-path ChangeStream impl.
+// Pre-builds the deliver-span start options once so DecodeWithContext does
+// not re-construct the kind + attribute slice on every event.
 func NewChangeStream(cs *mongo.ChangeStream, cfg ChangeStreamConfig) *ChangeStream {
-	return &ChangeStream{
+	c := &ChangeStream{
 		cs:                 cs,
 		tracer:             cfg.Tracer,
 		propagator:         cfg.Propagator,
@@ -51,8 +58,14 @@ func NewChangeStream(cs *mongo.ChangeStream, cfg ChangeStreamConfig) *ChangeStre
 		baseSpanOpts:       cfg.BaseSpanOpts,
 		deliverTracer:      cfg.DeliverTracer,
 		deliverSpanName:    cfg.DeliverSpanName,
-		deliverAttrs:       cfg.DeliverAttrs,
 	}
+	if cfg.DeliverTracer != nil {
+		c.deliverStartOpts = []trace.SpanStartOption{
+			trace.WithSpanKind(trace.SpanKindProducer),
+			trace.WithAttributes(cfg.DeliverAttrs...),
+		}
+	}
+	return c
 }
 
 // DecodeWithContext decodes the current change document and returns a
@@ -64,13 +77,12 @@ func (c *ChangeStream) DecodeWithContext(ctx context.Context, val any) (context.
 		docRaw, ok := fullDoc.DocumentOK()
 		if ok {
 			if meta, ok := shared.ExtractMetadataFromRaw(docRaw); ok {
-				originCtx := shared.ContextFromTraceMetadata(context.Background(), meta, c.propagator)
-				originSpanCtx = trace.SpanContextFromContext(originCtx)
+				originSpanCtx = shared.SpanContextFromMetadata(meta, c.propagator)
 			}
 		}
 	}
 
-	newCtx, span := buildConsumerCtx(ctx, c.tracer, c.deliverTracer, c.deliverSpanName, c.deliverAttrs, c.spanName, c.baseSpanOpts, originSpanCtx)
+	newCtx, span := c.buildConsumerCtx(ctx, originSpanCtx)
 
 	if err := c.cs.Decode(val); err != nil {
 		span.RecordError(err)
@@ -87,28 +99,22 @@ func (c *ChangeStream) DecodeWithContext(ctx context.Context, val any) (context.
 func (c *ChangeStream) Decode(val any) error { return c.cs.Decode(val) }
 
 // buildConsumerCtx creates a detached context with a consumer span linked to
-// originSpanCtx. When deliverTracer is non-nil and originSpanCtx is valid, a
-// consumer-side deliver span (SpanKindProducer) is created first and the
-// consumer span becomes its child.
-func buildConsumerCtx(ctx context.Context, tracer trace.Tracer, deliverTracer trace.Tracer, deliverSpanName string, deliverAttrs []attribute.KeyValue, spanName string, baseSpanOpts []trace.SpanStartOption, originSpanCtx trace.SpanContext) (context.Context, trace.Span) {
+// originSpanCtx. Uses the pre-built deliverStartOpts when a deliver span is
+// required, only appending the per-event link.
+func (c *ChangeStream) buildConsumerCtx(ctx context.Context, originSpanCtx trace.SpanContext) (context.Context, trace.Span) {
 	detachedCtx := trace.ContextWithSpanContext(ctx, trace.SpanContext{})
 	consumerCtx := detachedCtx
 
-	if deliverTracer != nil && originSpanCtx.IsValid() {
-		_, deliverSpan := deliverTracer.Start(detachedCtx,
-			deliverSpanName,
-			trace.WithSpanKind(trace.SpanKindProducer),
-			trace.WithAttributes(deliverAttrs...),
-			trace.WithLinks(trace.Link{SpanContext: originSpanCtx}),
-		)
+	if c.deliverTracer != nil && originSpanCtx.IsValid() {
+		deliverOpts := append(c.deliverStartOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx})) //nolint:gocritic // intentional new slice to avoid mutating prebuilt opts
+		_, deliverSpan := c.deliverTracer.Start(detachedCtx, c.deliverSpanName, deliverOpts...)
 		deliverSpan.End()
 		consumerCtx = trace.ContextWithRemoteSpanContext(detachedCtx, deliverSpan.SpanContext())
 	}
 
-	spanOpts := append([]trace.SpanStartOption{}, baseSpanOpts...)
-	if originSpanCtx.IsValid() {
-		spanOpts = append(spanOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
+	if !originSpanCtx.IsValid() {
+		return c.tracer.Start(consumerCtx, c.spanName, c.baseSpanOpts...)
 	}
-
-	return tracer.Start(consumerCtx, spanName, spanOpts...)
+	spanOpts := append(c.baseSpanOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx})) //nolint:gocritic // intentional new slice to avoid mutating prebuilt opts
+	return c.tracer.Start(consumerCtx, c.spanName, spanOpts...)
 }

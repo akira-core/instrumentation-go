@@ -49,8 +49,7 @@ func (r *SingleResult) Decode(v any) error {
 	}
 	if r.propagationEnabled {
 		if meta, ok := shared.ExtractMetadataFromRaw(raw); ok {
-			originCtx := shared.ContextFromTraceMetadata(context.Background(), meta, r.propagator)
-			originSpanCtx := trace.SpanContextFromContext(originCtx)
+			originSpanCtx := shared.SpanContextFromMetadata(meta, r.propagator)
 			if originSpanCtx.IsValid() {
 				r.span.AddLink(trace.Link{SpanContext: originSpanCtx})
 			}

@@ -3,17 +3,32 @@ package shared
 import (
 	"context"
 	"fmt"
-	"reflect"
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.opentelemetry.io/otel/propagation"
 )
 
 // BuildBulkWriteModelsWithTrace returns a new slice of WriteModels with _oteltrace injected.
+//
+// Performance:
+//   - Calls traceMetadataFromContext ONCE (propagator.Inject runs once, not
+//     once per model). When ctx has no valid span context, returns models
+//     unchanged with zero allocations beyond the result slice header.
+//   - Reads InsertOneModel.Document / UpdateOneModel.Update / UpdateManyModel.Update
+//     via direct type-assertion field access; the previous reflect.ValueOf
+//     path is removed.
 func BuildBulkWriteModelsWithTrace(ctx context.Context, models []mongo.WriteModel, prop propagation.TextMapPropagator) ([]mongo.WriteModel, error) {
+	meta, hasMeta := traceMetadataFromContext(ctx, prop)
+	if !hasMeta {
+		// Short-circuit: no span context → no work to do. Original slice
+		// returned as-is so callers can keep the zero-alloc disabled-path
+		// invariant when no live span is present.
+		return models, nil
+	}
+
 	out := make([]mongo.WriteModel, 0, len(models))
 	for _, m := range models {
-		traced, err := buildSingleModelWithTrace(ctx, m, prop)
+		traced, err := buildSingleModelWithTrace(m, meta)
 		if err != nil {
 			return nil, err
 		}
@@ -25,37 +40,35 @@ func BuildBulkWriteModelsWithTrace(ctx context.Context, models []mongo.WriteMode
 // buildSingleModelWithTrace dispatches one WriteModel to the matching
 // per-kind helper. Non-traced kinds (DeleteOne, ReplaceOne, etc.) are
 // passed through unchanged.
-func buildSingleModelWithTrace(ctx context.Context, m mongo.WriteModel, prop propagation.TextMapPropagator) (mongo.WriteModel, error) {
+func buildSingleModelWithTrace(m mongo.WriteModel, meta TraceMetadata) (mongo.WriteModel, error) {
 	switch vm := m.(type) {
 	case *mongo.InsertOneModel:
-		return buildInsertOneModelWithTrace(ctx, vm, prop)
+		return buildInsertOneModelWithTrace(vm, meta)
 	case *mongo.UpdateOneModel:
-		return buildUpdateOneModelWithTrace(ctx, vm, prop)
+		return buildUpdateOneModelWithTrace(vm, meta)
 	case *mongo.UpdateManyModel:
-		return buildUpdateManyModelWithTrace(ctx, vm, prop)
+		return buildUpdateManyModelWithTrace(vm, meta)
 	default:
 		return m, nil
 	}
 }
 
-func buildInsertOneModelWithTrace(ctx context.Context, vm *mongo.InsertOneModel, prop propagation.TextMapPropagator) (mongo.WriteModel, error) {
-	doc, ok := getInsertOneModelDocument(vm)
-	if !ok {
+func buildInsertOneModelWithTrace(vm *mongo.InsertOneModel, meta TraceMetadata) (mongo.WriteModel, error) {
+	if vm == nil || vm.Document == nil {
 		return vm, nil
 	}
-	docWithTrace, err := InjectTraceIntoDocument(ctx, doc, prop)
+	docWithTrace, err := injectMetadataIntoDocument(vm.Document, meta)
 	if err != nil {
 		return nil, fmt.Errorf("otelmongo: bulk insert inject trace: %w", err)
 	}
 	return mongo.NewInsertOneModel().SetDocument(docWithTrace), nil
 }
 
-func buildUpdateOneModelWithTrace(ctx context.Context, vm *mongo.UpdateOneModel, prop propagation.TextMapPropagator) (mongo.WriteModel, error) {
-	update, ok := getUpdateModelFilterUpdate(vm)
-	if !ok {
+func buildUpdateOneModelWithTrace(vm *mongo.UpdateOneModel, meta TraceMetadata) (mongo.WriteModel, error) {
+	if vm == nil || vm.Update == nil {
 		return vm, nil
 	}
-	updateWithTrace, err := InjectTraceIntoUpdate(ctx, update, prop)
+	updateWithTrace, err := injectMetadataIntoUpdate(vm.Update, meta)
 	if err != nil {
 		return nil, fmt.Errorf("otelmongo: bulk updateOne inject trace: %w", err)
 	}
@@ -64,52 +77,15 @@ func buildUpdateOneModelWithTrace(ctx context.Context, vm *mongo.UpdateOneModel,
 	return &newModel, nil
 }
 
-func buildUpdateManyModelWithTrace(ctx context.Context, vm *mongo.UpdateManyModel, prop propagation.TextMapPropagator) (mongo.WriteModel, error) {
-	update, ok := getUpdateManyModelFilterUpdate(vm)
-	if !ok {
+func buildUpdateManyModelWithTrace(vm *mongo.UpdateManyModel, meta TraceMetadata) (mongo.WriteModel, error) {
+	if vm == nil || vm.Update == nil {
 		return vm, nil
 	}
-	updateWithTrace, err := InjectTraceIntoUpdate(ctx, update, prop)
+	updateWithTrace, err := injectMetadataIntoUpdate(vm.Update, meta)
 	if err != nil {
 		return nil, fmt.Errorf("otelmongo: bulk updateMany inject trace: %w", err)
 	}
 	newModel := *vm
 	newModel.Update = updateWithTrace
 	return &newModel, nil
-}
-
-func getInsertOneModelDocument(m *mongo.InsertOneModel) (any, bool) {
-	if m == nil {
-		return nil, false
-	}
-	v := reflect.ValueOf(m).Elem()
-	f := v.FieldByName("Document")
-	if !f.IsValid() || !f.CanInterface() {
-		return nil, false
-	}
-	return f.Interface(), true
-}
-
-func getUpdateModelFilterUpdate(m *mongo.UpdateOneModel) (update any, ok bool) {
-	if m == nil {
-		return nil, false
-	}
-	v := reflect.ValueOf(m).Elem()
-	updateF := v.FieldByName("Update")
-	if !updateF.IsValid() || !updateF.CanInterface() {
-		return nil, false
-	}
-	return updateF.Interface(), true
-}
-
-func getUpdateManyModelFilterUpdate(m *mongo.UpdateManyModel) (update any, ok bool) {
-	if m == nil {
-		return nil, false
-	}
-	v := reflect.ValueOf(m).Elem()
-	updateF := v.FieldByName("Update")
-	if !updateF.IsValid() || !updateF.CanInterface() {
-		return nil, false
-	}
-	return updateF.Interface(), true
 }

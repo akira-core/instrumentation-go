@@ -33,9 +33,8 @@ func TestBuildBulkWriteModelsWithTrace_InsertOneModel(t *testing.T) {
 	require.Len(t, out, 1)
 	ins, ok := out[0].(*mongo.InsertOneModel)
 	require.True(t, ok)
-	doc, ok := getInsertOneModelDocument(ins)
-	require.True(t, ok)
-	docD, ok := doc.(bson.D)
+	require.NotNil(t, ins.Document)
+	docD, ok := ins.Document.(bson.D)
 	require.True(t, ok)
 	hasTrace := false
 	for _, e := range docD {
@@ -62,9 +61,8 @@ func TestBuildBulkWriteModelsWithTrace_UpdateOneModel(t *testing.T) {
 	require.Len(t, out, 1)
 	upd, ok := out[0].(*mongo.UpdateOneModel)
 	require.True(t, ok)
-	update, ok := getUpdateOneModelFilterUpdate(upd)
-	require.True(t, ok)
-	updateD, ok := update.(bson.D)
+	require.NotNil(t, upd.Update)
+	updateD, ok := upd.Update.(bson.D)
 	require.True(t, ok)
 	hasSetTrace := false
 	for _, e := range updateD {
