@@ -192,8 +192,13 @@ func newTracerProvider() (*sdktrace.TracerProvider, error) {
 		return nil, err
 	}
 
+	// AlwaysSample() is required for this demo to embed _oteltrace in every
+	// MongoDB write: otel-mongo only injects propagation metadata when the
+	// active SpanContext.IsSampled() is true. In production, replace with
+	// your real sampler (e.g. ParentBased(TraceIDRatioBased(0.01))).
 	return sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exp),
 		sdktrace.WithResource(res),
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
 	), nil
 }

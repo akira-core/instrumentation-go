@@ -100,11 +100,17 @@ Client + Database use the **nullable traced-pointer** variant (`facade.Client{*m
 
 ### `_oteltrace` field in documents
 
-Every `InsertOne`, `InsertMany`, `ReplaceOne`, and `UpdateOne` / `UpdateMany` / `UpdateByID` call injects a reserved `_oteltrace` subdocument into the document (or into `$set` for operator updates) when an active OTel span is present in the context AND propagation gates are on:
+Every `InsertOne`, `InsertMany`, `ReplaceOne`, and `UpdateOne` / `UpdateMany` / `UpdateByID` call injects a reserved `_oteltrace` subdocument into the document (or into `$set` for operator updates) when **all** of the following hold:
+
+1. propagation gates are on (`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` + `OTEL_MONGO_TRACING_ENABLED` + `OTEL_MONGO_PROPAGATION_ENABLED`), and
+2. `ctx` carries a valid `SpanContext`, and
+3. that `SpanContext.IsSampled() == true`.
 
 ```bson
 { "traceparent": "00-<traceId>-<spanId>-01", "tracestate": "" }
 ```
+
+Unsampled writes do **not** embed `_oteltrace` — the document goes to MongoDB unchanged and avoids the ~100-byte propagation overhead. If your deployment uses tail-based sampling or forced sampling via debug headers, ensure your sampler decides at the write site, not after.
 
 ~100–120 bytes per document. Add `_oteltrace` to your projection allowlist if you use strict schema validation.
 

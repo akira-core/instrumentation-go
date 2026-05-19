@@ -172,3 +172,93 @@ func TestInjectUpdateDoesNotShareSetBacking(t *testing.T) {
 	// outSet[1] must remain _oteltrace untouched.
 	assert.Equal(t, TraceMetadataKey, outSet[1].Key, "$set backing array must not be shared with caller")
 }
+
+// ctxWithUnsampledSpan returns a context whose active span has Sampled=false.
+// Used to assert that the inject pipeline omits _oteltrace under
+// head-sampling-denied scenarios.
+func ctxWithUnsampledSpan(t *testing.T) (context.Context, propagation.TextMapPropagator) {
+	t.Helper()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.NeverSample()))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	ctx, span := tp.Tracer("sampled-gate-test").Start(context.Background(), "root")
+	t.Cleanup(func() { span.End() })
+	return ctx, propagation.TraceContext{}
+}
+
+func hasOteltraceField(d bson.D) bool {
+	for _, e := range d {
+		if e.Key == TraceMetadataKey {
+			return true
+		}
+	}
+	return false
+}
+
+// TestInjectTraceIntoDocument_SamplingGate verifies the sampled-aware contract:
+// _oteltrace is appended only when the active SpanContext is both valid and
+// sampled. Unsampled and no-trace contexts skip the metadata entirely.
+func TestInjectTraceIntoDocument_SamplingGate(t *testing.T) {
+	t.Run("sampled_ctx_injects_oteltrace", func(t *testing.T) {
+		ctx, prop := ctxWithSampledSpan(t)
+		out, err := InjectTraceIntoDocument(ctx, bson.D{{Key: "x", Value: 1}}, prop)
+		require.NoError(t, err)
+		assert.True(t, hasOteltraceField(out), "sampled writes must embed _oteltrace")
+	})
+
+	t.Run("unsampled_ctx_omits_oteltrace", func(t *testing.T) {
+		ctx, prop := ctxWithUnsampledSpan(t)
+		out, err := InjectTraceIntoDocument(ctx, bson.D{{Key: "x", Value: 1}}, prop)
+		require.NoError(t, err)
+		assert.False(t, hasOteltraceField(out), "unsampled writes must not embed _oteltrace")
+	})
+
+	t.Run("no_span_ctx_omits_oteltrace", func(t *testing.T) {
+		out, err := InjectTraceIntoDocument(context.Background(), bson.D{{Key: "x", Value: 1}}, propagation.TraceContext{})
+		require.NoError(t, err)
+		assert.False(t, hasOteltraceField(out))
+	})
+}
+
+// TestInjectTraceIntoUpdate_SamplingGate mirrors the document gate on the
+// update path: $set / $setOnInsert receive metadata only for sampled writes.
+func TestInjectTraceIntoUpdate_SamplingGate(t *testing.T) {
+	update := bson.D{{Key: "$set", Value: bson.D{{Key: "x", Value: 1}}}}
+
+	innerHasOteltrace := func(out any) bool {
+		d, ok := out.(bson.D)
+		if !ok {
+			return false
+		}
+		for _, e := range d {
+			if e.Key != "$set" {
+				continue
+			}
+			setDoc, ok := e.Value.(bson.D)
+			if !ok {
+				return false
+			}
+			return hasOteltraceField(setDoc)
+		}
+		return false
+	}
+
+	t.Run("sampled_ctx_injects_oteltrace_into_set", func(t *testing.T) {
+		ctx, prop := ctxWithSampledSpan(t)
+		out, err := InjectTraceIntoUpdate(ctx, update, prop)
+		require.NoError(t, err)
+		assert.True(t, innerHasOteltrace(out))
+	})
+
+	t.Run("unsampled_ctx_omits_oteltrace", func(t *testing.T) {
+		ctx, prop := ctxWithUnsampledSpan(t)
+		out, err := InjectTraceIntoUpdate(ctx, update, prop)
+		require.NoError(t, err)
+		assert.False(t, innerHasOteltrace(out), "unsampled updates must not embed _oteltrace")
+	})
+
+	t.Run("no_span_ctx_omits_oteltrace", func(t *testing.T) {
+		out, err := InjectTraceIntoUpdate(context.Background(), update, propagation.TraceContext{})
+		require.NoError(t, err)
+		assert.False(t, innerHasOteltrace(out))
+	})
+}

@@ -77,7 +77,7 @@ Applications call `otelsetup.Init()` at startup to configure the global provider
 
 | Transport | Carrier | Where context lives |
 |---|---|---|
-| MongoDB | Document field `_oteltrace` | `{ traceparent, tracestate }` injected on every write; stripped on read |
+| MongoDB | Document field `_oteltrace` | `{ traceparent, tracestate }` injected on every **sampled** write (skipped when `SpanContext.IsSampled() == false`); stripped on read |
 | NATS/JetStream | Message headers | `traceparent`, `tracestate` headers via `HeaderCarrier` |
 | WebSocket | JSON message body | Top-level `traceparent`/`tracestate` fields + `payload` (base64); non-JSON passthrough |
 
@@ -91,7 +91,7 @@ Env-var surface per module:
 |---|---|---|---|---|
 | `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | all | global master | OFF | hard prerequisite for every per-module flag |
 | `OTEL_MONGO_TRACING_ENABLED` | otel-mongo v1+v2 | module tracing | OFF | wrapper CLIENT spans (noop vs real tracer) + deliver-span wiring; force-disables propagation when off |
-| `OTEL_MONGO_PROPAGATION_ENABLED` | otel-mongo v1+v2 | module propagation | OFF | final say on `_oteltrace` inject/extract on Collection/Cursor/ChangeStream + `ContextFromDocument` / `ContextFromRawDocument` |
+| `OTEL_MONGO_PROPAGATION_ENABLED` | otel-mongo v1+v2 | module propagation | OFF | final say on `_oteltrace` inject/extract on Collection/Cursor/ChangeStream + `ContextFromDocument` / `ContextFromRawDocument`. Inject additionally requires `SpanContext.IsSampled() == true` — unsampled writes skip `_oteltrace` entirely (v0.5.2+) |
 | `OTEL_NATS_TRACING_ENABLED` | otel-nats | module tracing | OFF | wrapper spans on Publish/Subscribe/Request + JetStream consumer paths |
 | `OTEL_NATS_PROPAGATION_ENABLED` | otel-nats | module propagation | OFF | final say on W3C `traceparent` / `tracestate` header inject (publish) + extract (subscribe). When OFF (default), traced impl still emits wrapper spans but skips header propagation. **Default-behaviour change from v0.3.x** — deployments previously relying on implicit injection MUST set this to a truthy value. |
 | `OTEL_GORILLA_WS_TRACING_ENABLED` | otel-gorilla-ws | module tracing | OFF | wrapper send/receive spans + envelope wrap/unwrap (subject to subprotocol negotiation) |

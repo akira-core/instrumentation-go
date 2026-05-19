@@ -217,11 +217,13 @@ api ──► mongodb ──► dbwatcher
 
 ### `_oteltrace` field in documents
 
-Every `InsertOne`, `InsertMany`, `ReplaceOne`, and `UpdateOne`/`UpdateMany`/`UpdateByID` call injects a reserved **`_oteltrace`** field into the document (or into `$set` for operator updates) when an active OTel span is present in the context. This field is a subdocument:
+Every `InsertOne`, `InsertMany`, `ReplaceOne`, and `UpdateOne`/`UpdateMany`/`UpdateByID` call injects a reserved **`_oteltrace`** field into the document (or into `$set` for operator updates) when **all** of the following hold: propagation gates are on, `ctx` carries a valid `SpanContext`, and that `SpanContext.IsSampled() == true`. The field is a subdocument:
 
 ```bson
 { "traceparent": "00-<traceId>-<spanId>-01", "tracestate": "" }
 ```
+
+**Sampling gate:** unsampled writes (sampler decided `Sampled=false`) do **not** embed `_oteltrace`. The document goes to MongoDB unchanged and avoids the ~100-byte propagation overhead. Deployments using tail-based sampling or debug-header forced sampling must decide at the write site, not after.
 
 **Impact on your schema:** any application or query that uses strict schema validation or projects specific fields will see this extra field. Add `_oteltrace` to your allowlist or projection if needed.
 

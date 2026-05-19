@@ -22,11 +22,19 @@ type TraceMetadata struct {
 }
 
 // traceMetadataFromContext extracts W3C trace context from ctx into TraceMetadata using prop.
+// Returns ok=false when ctx carries no valid SpanContext, or when the parent
+// SpanContext is not sampled — unsampled writes do not embed _oteltrace so
+// downstream consumers see "no trace" rather than "trace present but inert",
+// and the document avoids the ~100 byte propagation overhead.
+//
 // Uses a stack-allocated fixedCarrier so the hot path performs zero map
 // allocations and the returned value need not escape to the heap.
 func traceMetadataFromContext(ctx context.Context, prop propagation.TextMapPropagator) (TraceMetadata, bool) {
 	spanCtx := trace.SpanFromContext(ctx).SpanContext()
 	if !spanCtx.IsValid() {
+		return TraceMetadata{}, false
+	}
+	if !spanCtx.IsSampled() {
 		return TraceMetadata{}, false
 	}
 	var c fixedCarrier

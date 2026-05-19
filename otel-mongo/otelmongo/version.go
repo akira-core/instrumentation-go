@@ -3,7 +3,7 @@ package otelmongo
 // ScopeName is the instrumentation scope name for Tracer creation (OTel contrib guideline).
 const ScopeName = "instrumentation-go/otel-mongo/otelmongo"
 
-const instrumentationVersion = "0.5.1"
+const instrumentationVersion = "0.5.2"
 
 // Version returns the instrumentation module version (OTel contrib guideline).
 func Version() string {
