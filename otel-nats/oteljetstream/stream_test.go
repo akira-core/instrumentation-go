@@ -3,7 +3,6 @@ package oteljetstream_test
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
@@ -231,14 +230,6 @@ func TestStreamConsumerManagerParityMethods(t *testing.T) {
 	}
 	require.NoError(t, lister.Err())
 	require.Contains(t, seen, "stream-mgr")
-
-	_, err = stream.PauseConsumer(ctx, "stream-mgr", time.Now().Add(2*time.Second))
-	require.NoError(t, err)
-	_, err = stream.ResumeConsumer(ctx, "stream-mgr")
-	require.NoError(t, err)
-
-	err = stream.UnpinConsumer(ctx, "stream-mgr", "non-existing-group")
-	require.Error(t, err)
 }
 
 func TestJetStreamStreamConsumerManagerParityMethods(t *testing.T) {
@@ -287,11 +278,6 @@ func TestJetStreamStreamConsumerManagerParityMethods(t *testing.T) {
 	_, err = js.OrderedConsumer(ctx, streamName, oteljetstream.OrderedConsumerConfig{
 		FilterSubjects: []string{"jsmgr.b"},
 	})
-	require.NoError(t, err)
-
-	_, err = js.PauseConsumer(ctx, streamName, "js-upsert", time.Now().Add(2*time.Second))
-	require.NoError(t, err)
-	_, err = js.ResumeConsumer(ctx, streamName, "js-upsert")
 	require.NoError(t, err)
 
 	err = js.DeleteConsumer(ctx, streamName, "js-create")

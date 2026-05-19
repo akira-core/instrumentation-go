@@ -102,15 +102,14 @@ func Connect(ctx context.Context, opts ...*options.ClientOptions) (*Client, erro
 // from any SDK code. The otel globals are never overwritten — TracerProvider /
 // Propagator come from options or are looked up here and stored on the state.
 func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*options.ClientOptions) (*Client, error) {
-	merged := options.MergeClientOptions(opts...)
-	mc, err := mongo.Connect(ctx, merged)
+	mc, err := mongo.Connect(ctx, opts...)
 	if err != nil {
 		return nil, err
 	}
 	if !mongoTracingEnabled() {
 		return &Client{Client: mc}, nil
 	}
-	addr, port := parseServerFromClientOptions(merged)
+	addr, port := parseServerFromURI(lastNonEmptyURI(opts))
 	cfg := newClientConfig(traceOpts)
 	tp := cfg.TracerProvider
 	if tp == nil {
@@ -134,6 +133,22 @@ func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*
 			ServerPort:         port,
 		},
 	}, nil
+}
+
+// lastNonEmptyURI walks the ClientOptions slice in reverse and returns the URI
+// from the most recently-applied options struct. mongo.Connect already merges
+// the slice internally, so the wrapper only needs the effective URI to derive
+// semconv server.* attributes.
+func lastNonEmptyURI(opts []*options.ClientOptions) string {
+	for i := len(opts) - 1; i >= 0; i-- {
+		if opts[i] == nil {
+			continue
+		}
+		if uri := opts[i].GetURI(); uri != "" {
+			return uri
+		}
+	}
+	return ""
 }
 
 func parseServerFromClientOptions(opts *options.ClientOptions) (addr string, port int) {

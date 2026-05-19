@@ -2,7 +2,6 @@ package oteljetstream
 
 import (
 	"context"
-	"time"
 
 	nats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -10,8 +9,8 @@ import (
 
 // directJSImpl is the passthrough JetStream impl used when tracing is off.
 // Publish/PublishMsg call the underlying driver directly with no
-// instrumentation; Consumer/Stream/PushConsumer constructors return direct
-// variants so the entire chain stays branch-free.
+// instrumentation; Consumer/Stream constructors return direct variants so the
+// entire chain stays branch-free.
 type directJSImpl struct {
 	js jetstream.JetStream
 }
@@ -74,46 +73,6 @@ func (j *directJSImpl) OrderedConsumer(ctx context.Context, stream string, cfg O
 
 func (j *directJSImpl) DeleteConsumer(ctx context.Context, stream string, consumer string) error {
 	return j.js.DeleteConsumer(ctx, stream, consumer)
-}
-
-func (j *directJSImpl) PauseConsumer(ctx context.Context, stream string, consumer string, pauseUntil time.Time) (*ConsumerPauseResponse, error) {
-	return j.js.PauseConsumer(ctx, stream, consumer, pauseUntil)
-}
-
-func (j *directJSImpl) ResumeConsumer(ctx context.Context, stream string, consumer string) (*ConsumerPauseResponse, error) {
-	return j.js.ResumeConsumer(ctx, stream, consumer)
-}
-
-func (j *directJSImpl) PushConsumer(ctx context.Context, stream string, consumer string) (PushConsumer, error) {
-	cons, err := j.js.PushConsumer(ctx, stream, consumer)
-	if err != nil {
-		return nil, err
-	}
-	return &directPushConsumer{c: cons}, nil
-}
-
-func (j *directJSImpl) CreatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error) {
-	cons, err := j.js.CreatePushConsumer(ctx, stream, cfg)
-	if err != nil {
-		return nil, err
-	}
-	return &directPushConsumer{c: cons}, nil
-}
-
-func (j *directJSImpl) CreateOrUpdatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error) {
-	cons, err := j.js.CreateOrUpdatePushConsumer(ctx, stream, cfg)
-	if err != nil {
-		return nil, err
-	}
-	return &directPushConsumer{c: cons}, nil
-}
-
-func (j *directJSImpl) UpdatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error) {
-	cons, err := j.js.UpdatePushConsumer(ctx, stream, cfg)
-	if err != nil {
-		return nil, err
-	}
-	return &directPushConsumer{c: cons}, nil
 }
 
 func (j *directJSImpl) CreateOrUpdateStream(ctx context.Context, cfg StreamConfig) (Stream, error) {

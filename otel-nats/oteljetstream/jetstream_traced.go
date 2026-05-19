@@ -2,7 +2,6 @@ package oteljetstream
 
 import (
 	"context"
-	"time"
 
 	nats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -14,7 +13,7 @@ import (
 
 // tracedJSImpl is the fully-instrumented JetStream impl: Publish/PublishMsg
 // open producer spans and inject trace headers; all child wrappers
-// (Consumer/Stream/PushConsumer) returned are also traced variants.
+// (Consumer/Stream) returned are also traced variants.
 type tracedJSImpl struct {
 	conn *otelnats.Conn
 	js   jetstream.JetStream
@@ -106,58 +105,11 @@ func (j *tracedJSImpl) OrderedConsumer(ctx context.Context, stream string, cfg O
 	if err != nil {
 		return nil, err
 	}
-	name := cfg.NamePrefix
-	if name == "" {
-		name = "ordered-consumer"
-	}
-	return &tracedConsumer{conn: j.conn, streamName: stream, consumerName: name, c: cons}, nil
+	return &tracedConsumer{conn: j.conn, streamName: stream, consumerName: orderedConsumerName, c: cons}, nil
 }
 
 func (j *tracedJSImpl) DeleteConsumer(ctx context.Context, stream string, consumer string) error {
 	return j.js.DeleteConsumer(ctx, stream, consumer)
-}
-
-func (j *tracedJSImpl) PauseConsumer(ctx context.Context, stream string, consumer string, pauseUntil time.Time) (*ConsumerPauseResponse, error) {
-	return j.js.PauseConsumer(ctx, stream, consumer, pauseUntil)
-}
-
-func (j *tracedJSImpl) ResumeConsumer(ctx context.Context, stream string, consumer string) (*ConsumerPauseResponse, error) {
-	return j.js.ResumeConsumer(ctx, stream, consumer)
-}
-
-func (j *tracedJSImpl) PushConsumer(ctx context.Context, stream string, consumer string) (PushConsumer, error) {
-	cons, err := j.js.PushConsumer(ctx, stream, consumer)
-	if err != nil {
-		return nil, err
-	}
-	return &tracedPushConsumer{conn: j.conn, streamName: stream, consumerName: consumer, c: cons}, nil
-}
-
-func (j *tracedJSImpl) CreatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error) {
-	cons, err := j.js.CreatePushConsumer(ctx, stream, cfg)
-	if err != nil {
-		return nil, err
-	}
-	name := consumerNameFromConfig(cfg)
-	return &tracedPushConsumer{conn: j.conn, streamName: stream, consumerName: name, c: cons}, nil
-}
-
-func (j *tracedJSImpl) CreateOrUpdatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error) {
-	cons, err := j.js.CreateOrUpdatePushConsumer(ctx, stream, cfg)
-	if err != nil {
-		return nil, err
-	}
-	name := consumerNameFromConfig(cfg)
-	return &tracedPushConsumer{conn: j.conn, streamName: stream, consumerName: name, c: cons}, nil
-}
-
-func (j *tracedJSImpl) UpdatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error) {
-	cons, err := j.js.UpdatePushConsumer(ctx, stream, cfg)
-	if err != nil {
-		return nil, err
-	}
-	name := consumerNameFromConfig(cfg)
-	return &tracedPushConsumer{conn: j.conn, streamName: stream, consumerName: name, c: cons}, nil
 }
 
 func (j *tracedJSImpl) CreateOrUpdateStream(ctx context.Context, cfg StreamConfig) (Stream, error) {
