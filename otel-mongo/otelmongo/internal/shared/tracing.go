@@ -31,10 +31,7 @@ type TraceMetadata struct {
 // allocations and the returned value need not escape to the heap.
 func traceMetadataFromContext(ctx context.Context, prop propagation.TextMapPropagator) (TraceMetadata, bool) {
 	spanCtx := trace.SpanFromContext(ctx).SpanContext()
-	if !spanCtx.IsValid() {
-		return TraceMetadata{}, false
-	}
-	if !spanCtx.IsSampled() {
+	if !spanCtx.IsValid() || !spanCtx.IsSampled() {
 		return TraceMetadata{}, false
 	}
 	var c fixedCarrier
