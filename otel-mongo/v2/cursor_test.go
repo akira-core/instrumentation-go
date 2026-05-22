@@ -308,3 +308,55 @@ func TestSingleResultDecodeSpanEndedOnce(t *testing.T) {
 	}
 	assert.Equal(t, 1, count, "span must be ended exactly once")
 }
+
+// TestCursorDecode_DirectPathEmitsNoSpanV2 mirrors the v1 sibling test.
+// Asserts the passthrough Cursor.Decode does not record any span on the
+// caller's recorder when constructed via the disabled-mode impl. Together
+// with the existing TestCursorDecodeWithContext_NoFlagsNoSpan this locks in
+// the byte-identical-with-native-driver invariant for v2.
+func TestCursorDecode_DirectPathEmitsNoSpanV2(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+
+	raw, err := bson.Marshal(bson.D{{Key: "field", Value: "v"}})
+	require.NoError(t, err)
+	cursor, err := mongo.NewCursorFromDocuments([]any{raw}, nil, nil)
+	require.NoError(t, err)
+	defer func() { _ = cursor.Close(context.Background()) }()
+	require.True(t, cursor.Next(context.Background()))
+
+	c := &Cursor{Cursor: cursor, impl: direct.NewCursor(cursor)}
+	var out bson.D
+	require.NoError(t, c.Decode(&out))
+
+	assert.Empty(t, sr.Ended(), "passthrough Cursor.Decode must emit zero spans")
+}
+
+// TestSingleResultDirectPath_TraceContextUnchangedV2 mirrors the v1 sibling
+// test. The disabled-path SingleResult must return the parent context
+// unchanged (no propagation, no span).
+func TestSingleResultDirectPath_TraceContextUnchangedV2(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+
+	raw, err := bson.Marshal(bson.D{{Key: "value", Value: "test"}})
+	require.NoError(t, err)
+	mongoSR := mongo.NewSingleResultFromDocument(raw, nil, nil)
+
+	type key struct{}
+	parent := context.WithValue(context.Background(), key{}, "sentinel")
+
+	wrapped := &SingleResult{
+		SingleResult: mongoSR,
+		impl:         direct.NewSingleResult(mongoSR, parent),
+	}
+
+	got := wrapped.TraceContext()
+	assert.Equal(t, "sentinel", got.Value(key{}), "passthrough must return parent ctx unchanged")
+	assert.False(t, trace.SpanFromContext(got).SpanContext().IsValid(), "passthrough must not embed a span context")
+	assert.Empty(t, sr.Ended(), "passthrough must emit zero spans")
+}

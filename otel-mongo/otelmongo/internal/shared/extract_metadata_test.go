@@ -86,3 +86,75 @@ func BenchmarkExtractMetadataFromRaw(b *testing.B) {
 		}
 	}
 }
+
+// TestExtractMetadataFromBsonD_PositionInvariance asserts the function finds
+// the _oteltrace key at any position in the bson.D — head, middle, or tail.
+func TestExtractMetadataFromBsonD_PositionInvariance(t *testing.T) {
+	otel := bson.E{Key: TraceMetadataKey, Value: bson.D{
+		{Key: "traceparent", Value: "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"},
+	}}
+	cases := map[string]bson.D{
+		"head_position":   {otel, {Key: "a", Value: 1}, {Key: "b", Value: 2}, {Key: "c", Value: 3}},
+		"middle_position": {{Key: "a", Value: 1}, otel, {Key: "b", Value: 2}, {Key: "c", Value: 3}},
+		"tail_position":   {{Key: "a", Value: 1}, {Key: "b", Value: 2}, {Key: "c", Value: 3}, otel},
+	}
+	for name, d := range cases {
+		t.Run(name, func(t *testing.T) {
+			meta, ok := ExtractMetadataFromBsonD(d)
+			require.True(t, ok)
+			assert.Equal(t, "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01", meta.Traceparent)
+		})
+	}
+}
+
+// TestExtractMetadataFromBsonD_ReverseScanFindsLast documents (and locks in)
+// the reverse-scan optimisation: when the same key appears more than once
+// the LAST occurrence wins. Wrapper-injected docs always append the entry
+// last, so reverse scan keeps inject/extract symmetric. Any future flip to
+// forward scan breaks this assertion.
+func TestExtractMetadataFromBsonD_ReverseScanFindsLast(t *testing.T) {
+	first := bson.E{Key: TraceMetadataKey, Value: bson.D{
+		{Key: "traceparent", Value: "00-1111111111111111111111111111111a-1111111111111111-01"},
+	}}
+	second := bson.E{Key: TraceMetadataKey, Value: bson.D{
+		{Key: "traceparent", Value: "00-2222222222222222222222222222222a-2222222222222222-01"},
+	}}
+	d := bson.D{first, {Key: "value", Value: "x"}, second}
+	meta, ok := ExtractMetadataFromBsonD(d)
+	require.True(t, ok)
+	assert.Equal(t, "00-2222222222222222222222222222222a-2222222222222222-01", meta.Traceparent,
+		"reverse scan must return the last occurrence")
+}
+
+func BenchmarkExtractMetadataFromBsonD_TailVsHead(b *testing.B) {
+	const n = 32
+	make1 := func(otelAt int) bson.D {
+		out := make(bson.D, 0, n+1)
+		for i := range n {
+			if i == otelAt {
+				out = append(out, bson.E{Key: TraceMetadataKey, Value: bson.D{{Key: "traceparent", Value: "00-deadbeefdeadbeefdeadbeefdeadbeef-1111111111111111-01"}}})
+				continue
+			}
+			out = append(out, bson.E{Key: "field", Value: i})
+		}
+		if otelAt >= n {
+			out = append(out, bson.E{Key: TraceMetadataKey, Value: bson.D{{Key: "traceparent", Value: "00-deadbeefdeadbeefdeadbeefdeadbeef-1111111111111111-01"}}})
+		}
+		return out
+	}
+	tail := make1(n)
+	head := make1(0)
+
+	b.Run("Tail", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			_, _ = ExtractMetadataFromBsonD(tail)
+		}
+	})
+	b.Run("Head", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			_, _ = ExtractMetadataFromBsonD(head)
+		}
+	})
+}

@@ -3,7 +3,10 @@ package otelmongo
 import (
 	"context"
 	"testing"
+	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 
@@ -100,5 +103,103 @@ func TestStartDeliverSpanEnabledV2(t *testing.T) {
 		if !ro.IsRecording() {
 			t.Error("deliver span should still be recording before End() is called")
 		}
+	}
+}
+
+// TestShutdownDeliverNilMongoTPNoopV2 — locks in that ShutdownDeliver is a
+// no-op when no deliver TracerProvider was created (i.e. OTEL_EXPORTER_OTLP_ENDPOINT
+// was unset at Connect time).
+func TestShutdownDeliverNilMongoTPNoopV2(t *testing.T) {
+	state := &traced.ClientState{}
+	done := make(chan struct{})
+	go func() {
+		state.ShutdownDeliver(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("ShutdownDeliver with nil MongoTP did not return promptly")
+	}
+}
+
+func TestShutdownDeliverShutsRealProviderV2(t *testing.T) {
+	sp := &shutdownObservingProcessorV2{}
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sp))
+	state := &traced.ClientState{MongoTP: tp}
+
+	state.ShutdownDeliver(context.Background())
+
+	assert.True(t, sp.shutdownCalled, "expected MongoTP.Shutdown to be invoked")
+}
+
+func TestShutdownDeliverHonoursTimeoutV2(t *testing.T) {
+	parent, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+
+	sp := &shutdownObservingProcessorV2{block: 5 * time.Second}
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sp))
+	state := &traced.ClientState{MongoTP: tp}
+
+	start := time.Now()
+	done := make(chan struct{})
+	go func() {
+		state.ShutdownDeliver(parent)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ShutdownDeliver did not return within timeout cap")
+	}
+	require.Less(t, time.Since(start), 2*time.Second, "ShutdownDeliver must respect inherited ctx deadline")
+}
+
+type shutdownObservingProcessorV2 struct {
+	shutdownCalled bool
+	block          time.Duration
+}
+
+func (p *shutdownObservingProcessorV2) OnStart(_ context.Context, _ sdktrace.ReadWriteSpan) {}
+func (p *shutdownObservingProcessorV2) OnEnd(_ sdktrace.ReadOnlySpan)                       {}
+func (p *shutdownObservingProcessorV2) ForceFlush(_ context.Context) error                  { return nil }
+func (p *shutdownObservingProcessorV2) Shutdown(ctx context.Context) error {
+	p.shutdownCalled = true
+	if p.block > 0 {
+		select {
+		case <-time.After(p.block):
+		case <-ctx.Done():
+		}
+	}
+	return nil
+}
+
+// TestTracedStateShutdownDeliverInvokesProcessorShutdownV2 — locks in the inner
+// call only; the wiring Client.Disconnect → c.traced.ShutdownDeliver lives at
+// client.go:178–183 and is enforced by inspection.
+func TestTracedStateShutdownDeliverInvokesProcessorShutdownV2(t *testing.T) {
+	sp := &shutdownObservingProcessorV2{}
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sp))
+
+	state := &traced.ClientState{MongoTP: tp}
+	state.ShutdownDeliver(context.Background())
+
+	assert.True(t, sp.shutdownCalled, "ShutdownDeliver must invoke MongoTP.Shutdown")
+}
+
+// TestClientDisabledPathHasNoDeliverStateV2 mirrors the v1 sibling: with all
+// three Mongo tracing env vars off, mongoTracingEnabled() must resolve false
+// so the Connect path takes the early-return branch that constructs
+// Client{traced: nil}. The full Connect path requires a live mongod and is
+// covered by TestConnectGlobalOff_ZeroWrapperSpans in collection_test.go.
+func TestClientDisabledPathHasNoDeliverStateV2(t *testing.T) {
+	t.Setenv(envGlobalTracingEnabled, "0")
+	t.Setenv(envMongoTracingEnabled, "0")
+	t.Setenv(envMongoPropagationEnabled, "0")
+	resetPropEnabledCacheForTest()
+	t.Cleanup(resetPropEnabledCacheForTest)
+
+	if mongoTracingEnabled() {
+		t.Fatal("tracing gate must resolve false with all envs explicitly off")
 	}
 }

@@ -15,6 +15,12 @@ Four independent Go modules providing OpenTelemetry instrumentation for MongoDB,
 
 Each module also has `example/` and `tests/integration/` sub-modules with their own `go.mod`. Integration tests use **testcontainers-go** (require Docker/Podman running).
 
+When working inside a specific module, also consult `<module>/CLAUDE.md` for module-local conventions (`otel-mongo/CLAUDE.md`, `otel-nats/CLAUDE.md`, `otel-gorilla-ws/CLAUDE.md`); this top-level file covers cross-module invariants only.
+
+## Specs (OpenSpec)
+
+Specs are stored in `openspec/` (config in `openspec/config.yaml`, change artifacts under `openspec/changes/`). Use `opsx-*` (or `openspec-*`) slash commands to propose / continue / apply / verify / archive changes. Requirement names referenced throughout this file (`instrumentation-feature-flags`, `otel-mongo-flag-wiring`, `otel-nats-flag-wiring`, `otel-gorilla-ws-flag-wiring`) resolve to artifacts under `openspec/changes/`.
+
 ## Common Commands
 
 All commands must be run **inside the module directory** being changed.
@@ -118,7 +124,7 @@ When any feature flag returns false, **no OTel SDK code path may run**: no `trac
 
 **1. Strategy split (preferred — otel-mongo Collection / Cursor / SingleResult / ChangeStream).** The facade type holds an `impl` interface satisfied by either `internal/direct.X` (passthrough) or `internal/traced.X` (instrumented). Construction picks the impl once; per-method runtime gates disappear. `internal/direct/*.go` imports no `go.opentelemetry.io/otel/sdk/*` and no `otel/exporters/*` — the disabled path is **compiler-enforced** by package boundary.
 
-**2. Cached gate (otel-nats, otel-gorilla-ws, and otel-mongo Client/Database).** Connect/constructor reads env once → caches `tracingEnabled bool` on the wrapper struct. Every public method starts with `if !c.tracingEnabled { /* delegate to native */ }`. Reviewer-enforced. Planned migration to strategy split tracked in `DIRECTORY_LAYOUT_PLAN.html` at module root.
+**2. Cached gate (otel-nats, otel-gorilla-ws, and otel-mongo Client/Database).** Connect/constructor reads env once → caches `tracingEnabled bool` on the wrapper struct. Every public method starts with `if !c.tracingEnabled { /* delegate to native */ }`. Reviewer-enforced.
 
 Independent of pattern:
 - For otel-mongo, `Connect` substitutes `noop.NewTracerProvider()` when disabled so any stray `tracer.Start` is inert.
@@ -154,7 +160,7 @@ Key rules:
 - `internal/shared/impls.go` declares the polymorphic interfaces (`CursorImpl`, `SingleResultImpl`, `ChangeStreamImpl`) satisfied by both `internal/direct.X` and `internal/traced.X`. Facade `Cursor` / `SingleResult` / `ChangeStream` hold an `impl shared.XImpl` field.
 - Facade `collectionImpl` interface returns raw driver types (`*mongo.Cursor`, `*mongo.SingleResult`, `*mongo.ChangeStream`) + `shared.XImpl` — the impl packages never need to import the facade, preventing any facade ↔ internal cycle. Facade methods wrap raw types into facade wrappers (`&Cursor{Cursor: raw, impl: cImpl}`).
 - `internal/traced.Collection` has **exported fields** (`Coll`, `Tracer`, `Propagator`, `PropagationEnabled`, `DeliverTracer`, `ServerAddr`, `ServerPort`) and exported `StartDeliverSpan` so facade-package tests can build literals and call them directly.
-- v1/v2 parity extends to `internal/{direct,traced,shared}/`. The helpers in `internal/shared/{bulkwrite.go,semconv.go,tracing.go,impls.go}` are intentionally duplicated across modules (separate `internal/` trees cannot share). Drift-check CI step planned (`DIRECTORY_LAYOUT_PLAN.html` §6).
+- v1/v2 parity extends to `internal/{direct,traced,shared}/`. The helpers in `internal/shared/{bulkwrite.go,semconv.go,tracing.go,impls.go}` are intentionally duplicated across modules (separate `internal/` trees cannot share). Enforced by `drift-check` CI job (`.github/workflows/ci.yml`).
 
 ### Propagation flag caching (otel-mongo)
 
@@ -237,6 +243,31 @@ Bump on any code change to a module before pushing release tag. Module pre-1.0 (
 - `NewConn` wraps an already-dialed `*websocket.Conn`; `Conn.Dial` dials and wraps in one step.
 - The JSON envelope is an internal wire format — applications see the original payload from `ReadMessage`.
 
+## Diagnostic Logging
+
+Packages emit diagnostics via `log/slog` with prefixes `otelnats:` / `otelmongo:` and structured fields (`reason`, `error`, `service`, `endpoint`). With the default handler nothing prints.
+
+| Package | Level | Events |
+|---|---|---|
+| `otel-nats` | `DEBUG` | Server address parse failure, deliver tracer init success |
+| `otel-nats` | `WARN` | Deliver tracer init failure (endpoint missing or unreachable) |
+| `otel-mongo` | `DEBUG` | Deliver tracer init success |
+| `otel-mongo` | `WARN` | OTLP exporter / resource creation failure |
+
+Raise to `slog.LevelDebug` to see deliver-tracer init events:
+
+```go
+slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+    Level: slog.LevelDebug,
+})))
+```
+
 ## CI
 
-`.github/workflows/ci.yml` runs a matrix job for all four modules on every push/PR to `main`, `master`, or `feat/*`. Each job: `go build`, `go test -race`, `golangci-lint`. Go 1.24, Ubuntu.
+`.github/workflows/ci.yml` runs three jobs on every push/PR to `main`, `master`, or `feat/*` (Go 1.24, Ubuntu):
+
+1. **`test-and-lint`** — matrix over the four modules (`otel-mongo`, `otel-mongo/v2`, `otel-nats`, `otel-gorilla-ws`). Steps: `go build`, `go test -race`, `golangci-lint`.
+2. **`drift-check`** — two structural invariants:
+   - **`internal/flags/flags.go` byte-identical** across all four module copies. Canonical: `otel-mongo/otelmongo/internal/flags/flags.go`; any diff fails the job (enforces `instrumentation-feature-flags` Requirement).
+   - **Direct-impl trees import zero OTel SDK**. Greps for `"go.opentelemetry.io/otel/(sdk|exporters)` in (a) `internal/direct/` packages (otel-mongo v1/v2, otel-gorilla-ws) and (b) `*_direct.go` files inside `otel-nats/{otelnats,oteljetstream}` facade packages. Quoted-import-string match avoids false positives from doc comments.
+3. **`integration-test`** — matrix over each module's `tests/integration/` sub-module; runs after `test-and-lint`; `go test -race -timeout 120s` with testcontainers (Docker required in the runner).

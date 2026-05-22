@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
@@ -116,4 +117,208 @@ func TestIntegration_Handshake_SubprotocolNegotiation(t *testing.T) {
 	assert.Equal(t, input, got)
 
 	assert.GreaterOrEqual(t, len(recorder.Ended()), 2)
+}
+
+// TestHandshakeScenarios_All consolidates the 8 subprotocol-negotiation
+// scenarios into a single table-driven suite. Scenario letters align with the
+// sibling unit-level tests in otel-gorilla-ws/conn_test.go:
+//
+//   A) client offers "otel-ws" only (no app)    → negotiated "otel-ws"
+//      [no direct conn_test equivalent; JS otel-rxjs-ws default]
+//   B) OTel client offers "json"                → negotiated "otel-ws+json"
+//      [≈ TestRoundTrip + TestSpanAttributes in conn_test.go]
+//   C) OTel client offers "json" + plain srv    → negotiated "json", passthrough
+//      [= TestDial_ScenarioC]
+//   D) OTel client offers "json" + server ""    → negotiated "", passthrough
+//      [= TestDial_ScenarioD]
+//   E) OTel client offers nil                   → negotiated "", passthrough
+//      [= TestDial_ScenarioE]
+//   F) plain client no proto + OTel server      → negotiated "", passthrough
+//      [= TestUpgrader_ScenarioF]
+//   G) plain client offers "otel-ws+json"       → negotiated "otel-ws+json", traced
+//      [= TestUpgrader_ScenarioG_FromPrefixedClientToken]
+//   H) plain client offers "json" + OTel server → negotiated "json", passthrough
+//      [= TestUpgrader_ScenarioH]
+//
+// Each row asserts: (1) negotiated subprotocol on the client side and (2)
+// whether the outgoing payload was wrapped in the otel envelope.
+func TestHandshakeScenarios_All(t *testing.T) {
+	t.Setenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED", "1")
+	t.Setenv("OTEL_GORILLA_WS_TRACING_ENABLED", "1")
+
+	type role int
+	const (
+		roleOTelServer role = iota
+		rolePlainServerWithProtos
+		rolePlainServerNoProtos
+	)
+
+	cases := []struct {
+		name             string
+		serverRole       role
+		serverAppProtos  []string
+		clientProtos     []string
+		useOTelClient    bool
+		wantClientProto  string
+		wantPayloadEnvel bool
+		scenario         string
+	}{
+		{
+			name: "ScenarioA_OtelWSOnlyNoApp", scenario: "A",
+			serverRole: roleOTelServer, serverAppProtos: nil,
+			clientProtos: []string{"otel-ws"}, useOTelClient: false,
+			wantClientProto: "otel-ws", wantPayloadEnvel: true,
+		},
+		{
+			name: "ScenarioB_OtelClientNegotiatesJSON", scenario: "B",
+			serverRole: roleOTelServer, serverAppProtos: []string{"json"},
+			clientProtos: []string{"json"}, useOTelClient: true,
+			wantClientProto: "json", wantPayloadEnvel: false,
+		},
+		{
+			name: "ScenarioC_PlainServerReturnsJSON", scenario: "C",
+			serverRole: rolePlainServerWithProtos, serverAppProtos: []string{"json"},
+			clientProtos: []string{"json"}, useOTelClient: true,
+			wantClientProto: "json", wantPayloadEnvel: false,
+		},
+		{
+			name: "ScenarioD_ServerReturnsEmptyProto", scenario: "D",
+			serverRole: rolePlainServerNoProtos, serverAppProtos: nil,
+			clientProtos: []string{"json"}, useOTelClient: true,
+			wantClientProto: "", wantPayloadEnvel: false,
+		},
+		{
+			name: "ScenarioE_ClientProposesNoSubprotocol", scenario: "E",
+			serverRole: rolePlainServerNoProtos, serverAppProtos: nil,
+			clientProtos: nil, useOTelClient: true,
+			wantClientProto: "", wantPayloadEnvel: false,
+		},
+		{
+			name: "ScenarioF_PlainClientToOTelServer", scenario: "F",
+			serverRole: roleOTelServer, serverAppProtos: []string{"json"},
+			clientProtos: nil, useOTelClient: false,
+			wantClientProto: "", wantPayloadEnvel: false,
+		},
+		{
+			// Matches conn_test.go::TestUpgrader_ScenarioG_FromPrefixedClientToken
+			name: "ScenarioG_LegacyPrefixedClientToken", scenario: "G",
+			serverRole: roleOTelServer, serverAppProtos: []string{"json"},
+			clientProtos: []string{"otel-ws+json"}, useOTelClient: false,
+			wantClientProto: "otel-ws+json", wantPayloadEnvel: true,
+		},
+		{
+			// Matches conn_test.go::TestUpgrader_ScenarioH
+			name: "ScenarioH_PlainClientJSONOnly", scenario: "H",
+			serverRole: roleOTelServer, serverAppProtos: []string{"json"},
+			clientProtos: []string{"json"}, useOTelClient: false,
+			wantClientProto: "json", wantPayloadEnvel: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sr := tracetest.NewSpanRecorder()
+			tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+			otel.SetTracerProvider(tp)
+			otel.SetTextMapPropagator(
+				propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}),
+			)
+			t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+
+			var handler http.HandlerFunc
+			switch tc.serverRole {
+			case roleOTelServer:
+				up := &otelgorillaws.Upgrader{
+					CheckOrigin:  func(r *http.Request) bool { return true },
+					Subprotocols: tc.serverAppProtos,
+				}
+				handler = func(w http.ResponseWriter, r *http.Request) {
+					c, err := up.Upgrade(w, r, nil)
+					if err != nil {
+						t.Errorf("upgrade: %v", err)
+						return
+					}
+					defer c.Close()
+					ctx, typ, data, err := c.ReadMessage(context.Background())
+					if err != nil {
+						return
+					}
+					_ = c.WriteMessage(ctx, typ, data)
+				}
+			case rolePlainServerWithProtos:
+				up := websocket.Upgrader{
+					CheckOrigin:  func(r *http.Request) bool { return true },
+					Subprotocols: tc.serverAppProtos,
+				}
+				handler = func(w http.ResponseWriter, r *http.Request) {
+					c, err := up.Upgrade(w, r, nil)
+					if err != nil {
+						return
+					}
+					defer c.Close()
+					_, data, err := c.ReadMessage()
+					if err != nil {
+						return
+					}
+					_ = c.WriteMessage(websocket.TextMessage, data)
+				}
+			case rolePlainServerNoProtos:
+				up := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+				handler = func(w http.ResponseWriter, r *http.Request) {
+					c, err := up.Upgrade(w, r, nil)
+					if err != nil {
+						return
+					}
+					defer c.Close()
+					_, data, err := c.ReadMessage()
+					if err != nil {
+						return
+					}
+					_ = c.WriteMessage(websocket.TextMessage, data)
+				}
+			}
+
+			srv := httptest.NewServer(handler)
+			defer srv.Close()
+			payload := []byte(`{"scenario":"` + tc.scenario + `"}`)
+
+			if tc.useOTelClient {
+				c, _, err := otelgorillaws.Dial(context.Background(), wsURL(srv), nil, tc.clientProtos)
+				require.NoError(t, err)
+				defer c.Close()
+				assert.Equal(t, tc.wantClientProto, c.Subprotocol(),
+					"Scenario %s: client must report negotiated app subprotocol with prefix stripped", tc.scenario)
+
+				require.NoError(t, c.WriteMessage(context.Background(), websocket.TextMessage, payload))
+				_, _, got, err := c.ReadMessage(context.Background())
+				require.NoError(t, err)
+				assert.Equal(t, payload, got,
+					"Scenario %s: OTel client must see unwrapped payload after ReadMessage", tc.scenario)
+			} else {
+				d := &websocket.Dialer{Subprotocols: tc.clientProtos}
+				c, _, err := d.Dial(wsURL(srv), nil)
+				require.NoError(t, err)
+				defer c.Close()
+				assert.Equal(t, tc.wantClientProto, c.Subprotocol(),
+					"Scenario %s: raw client must observe raw negotiated subprotocol token", tc.scenario)
+
+				require.NoError(t, c.WriteMessage(websocket.TextMessage, payload))
+				_, got, err := c.ReadMessage()
+				require.NoError(t, err)
+				if tc.wantPayloadEnvel {
+					assert.Contains(t, string(got), `"data"`,
+						"Scenario %s: server must wrap echo in OTel envelope when tracing negotiated", tc.scenario)
+					assert.Contains(t, string(got), `"header"`,
+						"Scenario %s: server envelope must contain header field", tc.scenario)
+				} else {
+					assert.Equal(t, payload, got,
+						"Scenario %s: server must echo unwrapped payload in passthrough mode", tc.scenario)
+				}
+			}
+
+			time.Sleep(20 * time.Millisecond)
+			assert.NotEmpty(t, sr.Ended(),
+				"Scenario %s: at least one wrapper span must be recorded server-side", tc.scenario)
+		})
+	}
 }
