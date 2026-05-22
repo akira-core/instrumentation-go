@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<title>otel-nats — 測試詳細報告</title>
+<style>
+  :root { --bg:#fafbfc; --fg:#24292e; --muted:#6a737d; --border:#e1e4e8; --accent:#0366d6; --ok:#28a745; --warn:#f9a825; --bad:#d73a49; --header-bg:#f6f8fa; --code-bg:#f0f3f6; }
+  body { font-family:-apple-system,"Helvetica Neue","PingFang TC","Microsoft JhengHei",sans-serif; background:var(--bg); color:var(--fg); line-height:1.55; max-width:1500px; margin:0 auto; padding:32px 24px; }
+  h1 { font-size:28px; margin:0 0 4px; }
+  h2 { font-size:20px; margin:32px 0 12px; padding-bottom:6px; border-bottom:2px solid var(--accent); }
+  h3 { font-size:16px; margin:18px 0 8px; color:var(--accent); }
+  .subtitle { color:var(--muted); margin-bottom:20px; font-size:14px; }
+  code { font-family:"JetBrains Mono","SF Mono",Menlo,Consolas,monospace; font-size:12.5px; background:var(--code-bg); padding:1px 5px; border-radius:3px; }
+  table { width:100%; border-collapse:collapse; margin:8px 0 20px; font-size:13px; background:white; box-shadow:0 1px 2px rgba(0,0,0,0.04); }
+  th, td { border:1px solid var(--border); padding:8px 10px; text-align:left; vertical-align:top; }
+  th { background:var(--header-bg); font-weight:600; }
+  tr:nth-child(even) td { background:#fdfdfd; }
+  td.center { text-align:center; }
+  td.file { white-space:nowrap; font-family:"JetBrains Mono","SF Mono",Menlo,Consolas,monospace; font-size:12px; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:12px; font-size:11px; font-weight:600; color:white; white-space:nowrap; }
+  .b-ok { background:var(--ok); } .b-part { background:var(--warn); color:#333; } .b-info { background:var(--accent); }
+  .coverage-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:12px 0 24px; }
+  .card { background:white; border:1px solid var(--border); border-radius:6px; padding:14px 16px; }
+  .card h4 { margin:0 0 6px; font-size:13px; color:var(--muted); font-weight:600; letter-spacing:0.5px; }
+  .card .num { font-size:24px; font-weight:700; color:var(--accent); }
+  .card .sub { color:var(--muted); font-size:12px; margin-top:4px; }
+  .lang-toggle { background:#eef; padding:8px 14px; border-radius:6px; font-size:13px; margin-bottom:18px; }
+  .lang-toggle a { text-decoration:none; color:var(--accent); font-weight:600; }
+</style>
+</head>
+<body>
+
+<div class="lang-toggle">🌐 <strong>語言：</strong> <a href="test-report.html">English</a> · <a href="test-report.zh-TW.html">繁體中文</a></div>
+
+<h1>otel-nats — 測試詳細報告</h1>
+<div class="subtitle">
+  單一模組下兩個套件：<code>otelnats/</code>（core NATS — Connect、Conn、Publish/Subscribe/Request、HeaderCarrier）
+  與 <code>oteljetstream/</code>（JetStream — Stream、Consumer、MessageBatch）。共享 Tracer/Propagator 解析
+  與 cached <code>natsGate</code> / <code>natsPropagationGate</code>。<br>
+  生成日期 2026-05-22 · <code>go test -count=1 -race ./...</code>：<strong>130</strong> 通過 ·
+  <code>golangci-lint v2</code>：0 issue。
+</div>
+
+<h2>覆蓋率摘要</h2>
+<div class="coverage-grid">
+  <div class="card"><h4>otelnats（core）</h4><div class="num">72.1%</div><div class="sub">單模組</div></div>
+  <div class="card"><h4>oteljetstream</h4><div class="num">58.4%</div><div class="sub">單模組</div></div>
+  <div class="card"><h4>internal/flags</h4><div class="num">100%</div><div class="sub">與 sibling 模組 byte-identical</div></div>
+  <div class="card"><h4>整合覆蓋</h4><div class="num">66.0%</div><div class="sub"><code>-coverpkg=./...</code></div></div>
+</div>
+
+<h2>測試檔案 — 測什麼 / 怎麼測 / 為何測</h2>
+
+<h3>套件 <code>otelnats/</code>（core NATS）</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th style="width:200px">檔案</th>
+      <th style="width:50px">測試數</th>
+      <th>測什麼</th>
+      <th style="width:240px">怎麼測</th>
+      <th style="width:240px">為何測</th>
+    </tr>
+  </thead>
+  <tbody>
+
+    <tr>
+      <td class="file">env_flags_test.go</td>
+      <td class="center">2</td>
+      <td>兩個 gate 的真值表：(1) 兩層 tracing（<code>OTEL_INSTRUMENTATION_GO_TRACING_ENABLED</code> × <code>OTEL_NATS_TRACING_ENABLED</code>）與 (2) 三層 propagation（× <code>OTEL_NATS_PROPAGATION_ENABLED</code>）。涵蓋 truthy/falsy 同義詞（true/1/on/yes/""/任意；false/0/no/off/含空白）。</td>
+      <td>每列 <code>t.Setenv</code> + <code>os.Unsetenv</code>；每列後呼叫 <code>resetNATSGateForTest()</code> 重新啟動 sync.Once cache。</td>
+      <td>traced impl 的每個 per-call 決策最終都查這兩個 gate。真值表回歸則整個 disabled-mode invariant 靜默失效。</td>
+    </tr>
+
+    <tr>
+      <td class="file">propagation_test.go</td>
+      <td class="center">2</td>
+      <td><code>HeaderCarrier.Get/Set/Keys</code> 對 nil <code>nats.Header</code> 與已填值兩種情況。</td>
+      <td>直接 struct 建構；不需 NATS server。</td>
+      <td>HeaderCarrier 是 OTel TextMapPropagator 與 NATS message header 的轉接器 — 這裡回歸則所有 Publish 注入與 Subscribe 萃取都壞。</td>
+    </tr>
+
+    <tr>
+      <td class="file">conn_test.go</td>
+      <td class="center">27</td>
+      <td>套件主體：W3C round-trip、Publish/PublishMsg/Request producer spans、Subscribe/QueueSubscribe consumer spans、三層 sampling gate（upstream sampled / local sampled / endpoint 設定）下的 deliver span emission、tracing-off 同時跳過 spans 與 headers、propagation-off 保留 spans 但跳過 headers、deliver-TP service name 解析、reply-link 跟隨 sampler。</td>
+      <td>透過 <code>natssrv.NewServer</code> 在 <code>127.0.0.1:-1</code>（隨機 port）啟動真 NATS server。記憶體內的 <code>tracetest.SpanRecorder</code>。Helper <code>waitSpanByNameAndKind</code> 用 <code>require.Eventually</code> 輪詢，容忍 async End() 競賽。</td>
+      <td>NATS 是 TCP 上的線路協定 — 只有端到端 server 測試能證明 (a) headers 確實出現在 wire bytes 與 (b) subscribe handler 確實帶著萃取出的 context 觸發。這是整個模組的負重檔。</td>
+    </tr>
+
+    <tr>
+      <td class="file">flag_matrix_test.go</td>
+      <td class="center">1 (8 sub-rows)</td>
+      <td>所有 8 個 (global × tracing × propagation) 組合 × 真 NATS server 端到端。每列：斷言 <code>Conn.TracingEnabled()</code> + <code>PropagationEnabled()</code> 解析為預期 gate 值；驗證 subscribe handler 在 propagation on 時才收到 traceparent header；驗證 caller TP 在 tracing on 時至少一個 wrapper span（否則零）。</td>
+      <td>每列獨立 <code>natssrv</code> 實例，table-driven；每列後 <code>otelnats.ResetGatesForTest()</code>。Span quiet-window 斷言改用 <code>assert.Never(300ms, 10ms tick)</code> 取代固定 sleep — 首個觀察到 span 即 fail-fast。</td>
+      <td>這是把 env 真值表與線路可觀察行為對接起來的唯一橋梁。沒有它，gate 函式可能正確但 Publish 仍注入 headers（v0.4.x <code>tracedJSImpl.PublishMsg</code> 無視 propagation gate 的回歸正是這類 bug）。</td>
+    </tr>
+
+    <tr>
+      <td class="file">connect_test.go</td>
+      <td class="center">7</td>
+      <td>(1) Connect 對無法連線 URL 回傳錯誤；(2) nil <code>nats.Option</code> 被過濾；(3) Close 在無 deliver-TP 時是 noop；(4) Close 遵守 3 秒 deliver-TP shutdown 上限；(5) Drain 不阻塞於慢 exporter；(6) <code>WithTraceDestination</code> 在 tracing-on 時保留且 (7) 在 disabled mode 被丟棄。</td>
+      <td>真 natssrv + 用 closed port（<code>127.0.0.1:1</code>）作 OTLP endpoint 模擬慢 exporter，無需架設 mock OTLP receiver。</td>
+      <td>連線生命週期 bug 浮現得很慢 — 失敗 shutdown 的 deliver-TP 每個 <code>*Conn</code> 洩漏一個 exporter batch goroutine。Bounded-time 斷言在 CI 5 秒內就抓到，而不是 production OOM 才發現。</td>
+    </tr>
+
+    <tr>
+      <td class="file">traceevent_test.go</td>
+      <td class="center">4</td>
+      <td><code>SubscribeTraceEvents</code>（NATS 2.11+ infrastructure events）：(1) 為合成 TraceEvent payload emit 2 個 hop spans（ingress + egress）；(2) disabled mode 不發 span；(3) 損壞的 JSON payload 不會 crash 也不 emit；(4) <code>WithTraceDestination</code> option 透過 <code>conn.TraceDest()</code> round-trip。</td>
+      <td>合成 <code>TraceEvent</code> JSON payload 直接透過 <code>conn.NatsConn().Publish</code> 發送（測試夾具繞過 wrapper）。Quiet-window 負向斷言用 <code>assert.Never(300ms)</code>。</td>
+      <td>Infrastructure trace events 是 opt-in 功能且需要 NATS 2.11+；無此測試則唯一驅動方式是對真實 cluster 做完整 e2e。直接 payload 注入是 unit 測試 hop-emission 邏輯的唯一方法。</td>
+    </tr>
+
+  </tbody>
+</table>
+
+<h3>套件 <code>oteljetstream/</code></h3>
+
+<table>
+  <thead>
+    <tr><th style="width:200px">檔案</th><th style="width:50px">測試數</th><th>測什麼</th><th style="width:240px">怎麼測</th><th style="width:240px">為何測</th></tr>
+  </thead>
+  <tbody>
+
+    <tr>
+      <td class="file">consumer_test.go</td>
+      <td class="center">18</td>
+      <td>所有 consumer 模式：Fetch / FetchBytes / FetchNoWait / Consume / MessagesNext / OrderedConsumer；Consume + Fetch 的 deliver-span emission；consumer Info/CachedInfo。<strong>關鍵</strong>：<code>TestNoGoroutineLeakAfterEarlyReturn</code> 守 v0.3.0 加入的 <code>MessageBatch.Stop()</code> 契約；<code>TestMessageBatchStopIdempotent</code> + <code>StopReleasesRawBatch</code> 鎖住 cleanup 語義。<code>TestJetStreamConsumerManagerConsumerKeepsTraceWrapper</code> 守 Consumer-Manager 重新取得的 consumer 仍保留 trace wrapper。Propagation off / tracing off 矩陣鏡像 core-NATS 測試。</td>
+      <td>真 natssrv 開啟 JetStream（<code>JetStream: true</code> option）。每個測試建立自己的 stream + consumer。</td>
+      <td>JetStream 是最難的 async case — 長時間運作的 consumer 有內部狀態。Early return 洩漏的 goroutine 除非明確計數（<code>runtime.NumGoroutine</code>）否則在 unit test 不可見。無此守護則 v0.3.0 的破壞性變更會悄悄再次回歸。</td>
+    </tr>
+
+    <tr>
+      <td class="file">stream_test.go</td>
+      <td class="center">8</td>
+      <td><code>Stream.Info</code>、<code>CachedInfo</code>、<code>ConsumerNames</code>、<code>CreateConsumer</code>、<code>DeleteConsumer</code>、<code>JetStream.DeleteStream</code>、ConsumerManager parity methods（同時存在於 <code>Stream</code> 與 <code>JetStream</code> 的平行方法）。</td>
+      <td>真 natssrv + JetStream；每測試建立 stream。</td>
+      <td>Stream 生命週期方法是 CRUD passthrough — 但每個方法都得穿過 traced wrapper，所以每個都是一行的 span-emission gate，會回歸。</td>
+    </tr>
+
+  </tbody>
+</table>
+
+<h2>測試守護的橫切 Invariants</h2>
+
+<table>
+  <thead><tr><th style="width:340px">Invariant</th><th>由哪個測試守護</th></tr></thead>
+  <tbody>
+    <tr><td>四模組 env 全部 default-OFF</td><td><code>env_flags_test.go</code> 真值表</td></tr>
+    <tr><td>Flag off ⇒ 零 spans + 零 header inject（wire byte-identical with native <code>nats.Conn</code>）</td><td><code>flag_matrix_test.go</code> + <code>TestPublishWithTracingOffSkipsBoth</code> + <code>TestPublishWithTracingOffPropagationOnStillSkipsBoth</code></td></tr>
+    <tr><td>Propagation off ⇒ spans 仍 emit 但無 header bytes（v0.4.x 回歸測試）</td><td><code>TestPublishWithPropagationOffSkipsHeaders</code> + <code>TestSubscribeWithPropagationOffStillEmitsSpanWithoutLink</code> + JetStream sibling</td></tr>
+    <tr><td>MessageBatch.Stop() 釋放 goroutine + 結束 span 恰好一次</td><td><code>TestNoGoroutineLeakAfterEarlyReturn</code>、<code>TestMessageBatchStopIdempotent</code></td></tr>
+    <tr><td>Sampling gate：producer/consumer span link 跟隨 upstream 與 local sampler</td><td><code>TestConsumerSpanNoLinkWhenOriginNotSampled</code>、<code>TestRecordReplyLinkRespectsSamplerFlag</code>、<code>TestDeliverSpanSkippedWhenUpstreamNotSampled</code></td></tr>
+    <tr><td>Conn.Close 即使 exporter 慢也在 3 秒內釋放 deliver-TP</td><td><code>TestCloseShutdownTimeoutIsBounded</code></td></tr>
+    <tr><td>SubscribeTraceEvents 對損壞 payload 容錯</td><td><code>TestSubscribeTraceEventsIgnoresMalformedPayload</code></td></tr>
+  </tbody>
+</table>
+
+<h2>覆蓋率缺口（已知 + 設計使然）</h2>
+
+<table>
+  <thead><tr><th style="width:240px">套件 / 區域</th><th>%</th><th>低的原因</th></tr></thead>
+  <tbody>
+    <tr><td>otelnats <code>conn_direct.go</code> / <code>conn_traced.go</code></td><td class="center">透過 facade</td><td>檔案層級的 strategy split；兩個 impl 都透過 <code>Conn.Publish</code> 等間接執行 — impl 檔上的 direct unit 測試僅對代表性方法</td></tr>
+    <tr><td>oteljetstream facade method delegation</td><td class="center">~58%</td><td>許多單行 <code>impl.X</code> delegate；未覆蓋部分多為 variadic option 處理與較少用的 management 方法</td></tr>
+    <tr><td>oteljetstream <code>jetstream_direct.go</code> / <code>_traced.go</code></td><td class="center">透過 facade</td><td>同 core NATS — strategy split 檔案對，透過 facade 執行</td></tr>
+    <tr><td>internal/flags</td><td class="center">100%</td><td>必要：四個 sibling 模組之間 BYTE-IDENTICAL（CI drift-check job 強制）</td></tr>
+  </tbody>
+</table>
+
+<p style="margin-top:32px;color:var(--muted);font-size:12px">資料來源：<code>go test -count=1 -coverpkg=./... ./...</code> + <code>go tool cover -func</code>；每檔測試數來自 <code>grep -c '^func Test' &lt;file&gt;</code>。生成日期 2026-05-22。</p>
+
+</body>
+</html>

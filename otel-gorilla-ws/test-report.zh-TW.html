@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<title>otel-gorilla-ws — 測試詳細報告</title>
+<style>
+  :root { --bg:#fafbfc; --fg:#24292e; --muted:#6a737d; --border:#e1e4e8; --accent:#0366d6; --ok:#28a745; --warn:#f9a825; --bad:#d73a49; --header-bg:#f6f8fa; --code-bg:#f0f3f6; }
+  body { font-family:-apple-system,"Helvetica Neue","PingFang TC","Microsoft JhengHei",sans-serif; background:var(--bg); color:var(--fg); line-height:1.55; max-width:1500px; margin:0 auto; padding:32px 24px; }
+  h1 { font-size:28px; margin:0 0 4px; }
+  h2 { font-size:20px; margin:32px 0 12px; padding-bottom:6px; border-bottom:2px solid var(--accent); }
+  h3 { font-size:16px; margin:18px 0 8px; color:var(--accent); }
+  .subtitle { color:var(--muted); margin-bottom:20px; font-size:14px; }
+  code { font-family:"JetBrains Mono","SF Mono",Menlo,Consolas,monospace; font-size:12.5px; background:var(--code-bg); padding:1px 5px; border-radius:3px; }
+  table { width:100%; border-collapse:collapse; margin:8px 0 20px; font-size:13px; background:white; box-shadow:0 1px 2px rgba(0,0,0,0.04); }
+  th, td { border:1px solid var(--border); padding:8px 10px; text-align:left; vertical-align:top; }
+  th { background:var(--header-bg); font-weight:600; }
+  tr:nth-child(even) td { background:#fdfdfd; }
+  td.center { text-align:center; }
+  td.file { white-space:nowrap; font-family:"JetBrains Mono","SF Mono",Menlo,Consolas,monospace; font-size:12px; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:12px; font-size:11px; font-weight:600; color:white; white-space:nowrap; }
+  .b-ok { background:var(--ok); } .b-part { background:var(--warn); color:#333; } .b-info { background:var(--accent); }
+  .coverage-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:12px 0 24px; }
+  .card { background:white; border:1px solid var(--border); border-radius:6px; padding:14px 16px; }
+  .card h4 { margin:0 0 6px; font-size:13px; color:var(--muted); font-weight:600; letter-spacing:0.5px; }
+  .card .num { font-size:24px; font-weight:700; color:var(--accent); }
+  .card .sub { color:var(--muted); font-size:12px; margin-top:4px; }
+  .lang-toggle { background:#eef; padding:8px 14px; border-radius:6px; font-size:13px; margin-bottom:18px; }
+  .lang-toggle a { text-decoration:none; color:var(--accent); font-weight:600; }
+</style>
+</head>
+<body>
+
+<div class="lang-toggle">🌐 <strong>語言：</strong> <a href="test-report.html">English</a> · <a href="test-report.zh-TW.html">繁體中文</a></div>
+
+<h1>otel-gorilla-ws — 測試詳細報告</h1>
+<div class="subtitle">
+  單一套件模組，wrap <code>github.com/gorilla/websocket</code>，把 W3C trace propagation 放進 WebSocket 訊息 body（JSON envelope）。
+  Wire format 與 JS 套件 <code>@marz32one/otel-ws</code> 和 <code>@marz32one/otel-rxjs-ws</code> 共用跨語言契約。<br>
+  生成日期 2026-05-22 · <code>go test -count=1 -race ./...</code>：<strong>116</strong> 通過（unit）+ <strong>13</strong>（整合）·
+  <code>golangci-lint v2</code>：0 issue。
+</div>
+
+<h2>覆蓋率摘要</h2>
+<div class="coverage-grid">
+  <div class="card"><h4>facade（otelgorillaws）</h4><div class="num">91.3%</div><div class="sub">單模組</div></div>
+  <div class="card"><h4>整合覆蓋</h4><div class="num">92.1%</div><div class="sub"><code>-coverpkg=./...</code></div></div>
+  <div class="card"><h4>internal/flags</h4><div class="num">100%</div><div class="sub">與 sibling 模組 byte-identical</div></div>
+  <div class="card"><h4>純函式</h4><div class="num">100%</div><div class="sub">splitClientProtocols / selectFirst / cloneHeader / appProtocolFromRaw / isOTelWireProtocol</div></div>
+</div>
+
+<h2>測試檔案 — 測什麼 / 怎麼測 / 為何測</h2>
+
+<h3>Unit 測試（root package）</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th style="width:200px">檔案</th>
+      <th style="width:50px">測試數</th>
+      <th>測什麼</th>
+      <th style="width:240px">怎麼測</th>
+      <th style="width:240px">為何測</th>
+    </tr>
+  </thead>
+  <tbody>
+
+    <tr>
+      <td class="file">env_flags_test.go</td>
+      <td class="center">1</td>
+      <td>2-tier flag gate 真值表：<code>OTEL_INSTRUMENTATION_GO_TRACING_ENABLED</code> × <code>OTEL_GORILLA_WS_TRACING_ENABLED</code>。約 20 列涵蓋 truthy/falsy 同義詞。無 propagation flag（設計如此 — envelope 是 inline；subprotocol negotiation 替代該角色）。</td>
+      <td>直接呼叫 <code>wsTracingEnabled()</code>；每列 <code>t.Setenv</code> + <code>os.Unsetenv</code>；每列後 <code>resetWSGateForTest()</code>。</td>
+      <td>這是 <code>newConn</code> 中 per-connection impl 選擇所依賴的承重 gate。回歸會讓每個新建 Conn 走錯路徑（或走對但不該 tracing）。</td>
+    </tr>
+
+    <tr>
+      <td class="file">message_test.go</td>
+      <td class="center">9</td>
+      <td><strong>跨語言 wire format 契約</strong>：<code>MarshalWire</code> 產生 JS 端所期待的精確 <code>{"header":{...},"data":...}</code> 形狀；<code>TryUnmarshalWire</code> 同時接受 envelope 與 legacy flat format（向後相容）；非 JSON payload 包成 JSON-encoded 字串；<code>sync.Pool</code> buffer 跨 goroutine 重用安全。</td>
+      <td>手工 byte 陣列用 <code>assert.JSONEq</code> 比對；goroutine fan-out 對 pool reuse 壓測。</td>
+      <td>這個檔是跨語言 wire 契約的<strong>唯一守護者</strong>。任何 envelope 形狀改動都會悄悄破壞 JS 客戶 — 不架設 JS test rig 的話，唯一抓得到的方法是 Go 端的精確 byte-level 斷言。</td>
+    </tr>
+
+    <tr>
+      <td class="file">options_test.go</td>
+      <td class="center">5</td>
+      <td><code>resolveOptions</code> 在未傳 option 時 fallback 到全域 Tracer/Propagator；自訂 option 不污染全域；<code>NewConn</code> 在 feature disabled 時選 <code>internal/direct.Conn</code>，enabled 時選 <code>internal/traced.Conn</code>；negotiated=false（passthrough subprotocol）保留 tracing 但關閉 PropagationEnabled。</td>
+      <td>Recorder-based：斷言自訂 option tracer.Start 寫到哪個 TP vs 全域 TP。</td>
+      <td>Functional option 是呼叫者客製 wrapper 而不 monkeypatch 全域的<strong>唯一</strong>方法。若 <code>resolveOptions</code> 錯誤地 mutate 全域，用不同 propagator 同時 instrument 多條連線會有順序依賴行為。</td>
+    </tr>
+
+    <tr>
+      <td class="file">helpers_test.go</td>
+      <td class="center">4</td>
+      <td>錯誤型別判定（close error 偵測、normal vs abnormal closure）、format helper。</td>
+      <td>直接呼叫 <code>helpers.go</code> 中的 helper。</td>
+      <td>這些 helper 在錯誤路徑執行 — bug 在真實 disconnect 發生前看不見。直接 unit 覆蓋抓到 close-code 分類的 off-by-one。</td>
+    </tr>
+
+    <tr>
+      <td class="file">conn_test.go</td>
+      <td class="center">9</td>
+      <td>(1) <code>TestRoundTrip</code> + <code>TestSpanAttributes</code> — 端到端 envelope round-trip 與 span 屬性驗證；(2) Scenarios C、D、E（client-side dial 情境 — 見 <code>tests/integration/handshake_test.go</code> 的完整 A–H 表）；(3) Scenarios F、G、G_FromPrefixedClientToken、H（server-side upgrader 情境）。</td>
+      <td><code>httptest.NewServer</code> 配合 <code>otelgorillaws.Upgrader</code> 與原生 <code>websocket.Upgrader</code> 兩種 handler；<code>tracetest.SpanRecorder</code> 觀察 span。</td>
+      <td>Subprotocol negotiation 是這個 wrapper <strong>最核心的正確性議題</strong> — 共有 8 種獨立情境（A–H per README）。每個都是 upgrade path 中的一個決策。沒有 per-scenario 測試的話，某個分支的回歸要等到特定客戶組合在 production 命中才會浮現。</td>
+    </tr>
+
+    <tr>
+      <td class="file">upgrader_test.go</td>
+      <td class="center">5（30 個 sub-cases）</td>
+      <td>Upgrader 內部 helper 的純函式 unit 測試：<code>splitClientProtocols</code>（9 cases 含 bare otel-ws、prefixed、mixed）、<code>selectFirst</code>（7 cases 含 accept-any 語義）、<code>cloneHeader</code>（3 cases 含 nil-safe + 獨立性）、<code>appProtocolFromRaw</code>（5 cases 處理前綴剝除）、<code>isOTelWireProtocol</code>（6 cases 含大小寫敏感）。</td>
+      <td>Internal-package 測試（無 _test 套件後綴）— 純函式，無 I/O，無 goroutine。</td>
+      <td>conn_test.go 的高層 Scenario 測試已間接覆蓋，但每個純函式一個 9 case 表寫起來更便宜、跑得更快、bug 直接定位到具體函式而非整個 handshake 路徑。</td>
+    </tr>
+
+    <tr>
+      <td class="file">flag_matrix_test.go</td>
+      <td class="center">4</td>
+      <td>(1) <code>TestWSFlagMatrix_AllCombinations</code> — 6 個 env 組合 × 端到端 client/server 配 envelope-or-not 斷言；(2) <code>TestWriteMessageDisabled_ByteIdenticalWithNative</code> — 同一個 payload 並列跑過 <code>otelgorillaws.Dial</code>（disabled 模式）與原生 <code>websocket.Dialer</code>，斷言 server 收到的 byte 完全相同；(3) <code>TestWriteMessageEnabled_NonNegotiatedStillByteIdentical</code> — 即使 env on，若 subprotocol negotiation 失敗則 envelope 必須被抑制；(4) <code>TestSubprotocolStripsOTelPrefix</code> — <code>Conn.Subprotocol()</code> 剝除 <code>otel-ws+</code> 前綴。</td>
+      <td>Internal-package test 才能直接 reset 未匯出的 <code>wsGate</code>。<code>httptest</code> server 同時用 gorilla 與 otelgorillaws upgrader。Cleanup 順序精心安排（LIFO 下 gate reset 最後跑）讓 hijacked WebSocket handler goroutine 不與 gate reset 競賽。</td>
+      <td><strong>Byte-identical 斷言是 disabled-mode invariant 最強的可能證明</strong> — 兩條路徑同時跑然後比對 wire bytes。若 disabled 路徑哪天意外開始包 payload（即使非預期），這個測試立即報錯。</td>
+    </tr>
+
+  </tbody>
+</table>
+
+<h3>整合測試（<code>tests/integration/</code>）</h3>
+
+<table>
+  <thead>
+    <tr><th style="width:240px">檔案</th><th style="width:50px">測試數</th><th>測什麼</th><th style="width:240px">怎麼測</th><th style="width:240px">為何測</th></tr>
+  </thead>
+  <tbody>
+
+    <tr>
+      <td class="file">handshake_test.go</td>
+      <td class="center">3（含 8 sub-cases）</td>
+      <td>(1) <code>TestIntegration_Handshake_OtelWSOnlyNoAppProtocol</code> — Scenario A；(2) <code>TestIntegration_Handshake_SubprotocolNegotiation</code> — Scenario B 含完整訊息 round-trip；(3) <strong>TestHandshakeScenarios_All</strong> — table-driven 全部 8 Scenarios A–H 並交叉參照 <code>conn_test.go</code> 中的 sibling unit 測試。</td>
+      <td>獨立 Go 模組在 <code>tests/integration/</code> 下。用真實 <code>httptest.NewServer</code> + 各種 raw/wrapped client+server 組合。</td>
+      <td>Matrix 檔把 8 個散落的 unit 測試合進一個正式參考。任何人在程式碼任何地方看到「Scenario G」都能找到精確預期行為。</td>
+    </tr>
+
+    <tr>
+      <td class="file">message_propagation_test.go</td>
+      <td class="center">1</td>
+      <td>透過 envelope 的 trace context round-trip：producer span context 在 consumer 端萃取後出現。</td>
+      <td>端到端兩端都 wrap，單一訊息穿過。</td>
+      <td>Envelope 是整個 propagation 通道 — 這裡破了整個 wrapper 就失去意義。</td>
+    </tr>
+
+    <tr>
+      <td class="file">error_fallback_test.go</td>
+      <td class="center">1</td>
+      <td>非 envelope payload + close message 不會 crash wrapper — <code>TryUnmarshalWire</code> 優雅回傳 false，ReadMessage 把 raw bytes 透傳。</td>
+      <td>Server 送非 JSON payload 然後關閉；斷言 client 不錯不 panic。</td>
+      <td>真實 WebSocket 流量包含 ping/pong/close frame，客戶端也可能送未包裝 payload — 這裡的健壯性是「會崩 lib」與「能用 lib」之間的差別。</td>
+    </tr>
+
+  </tbody>
+</table>
+
+<h2>測試守護的橫切 Invariants</h2>
+
+<table>
+  <thead><tr><th style="width:340px">Invariant</th><th>由哪個測試守護</th></tr></thead>
+  <tbody>
+    <tr><td>四模組 env 全部 default-OFF</td><td><code>env_flags_test.go</code> 真值表</td></tr>
+    <tr><td>Flag off ⇒ wire byte-identical 與 native gorilla/websocket</td><td><code>TestWriteMessageDisabled_ByteIdenticalWithNative</code>（並列客戶端比對）</td></tr>
+    <tr><td>Per-connection gate 透過 subprotocol negotiation</td><td>conn_test.go Scenarios C/D/E/F + flag_matrix <code>TestWriteMessageEnabled_NonNegotiatedStillByteIdentical</code></td></tr>
+    <tr><td>跨語言 wire envelope 契約</td><td>message_test.go（byte-exact MarshalWire 斷言 + legacy flat-format 向後相容）</td></tr>
+    <tr><td>8 個 handshake 情境（A–H）在 unit + integration 兩端一致</td><td>conn_test.go (C–H) + tests/integration/handshake_test.go (A + B + table-driven A–H matrix)</td></tr>
+    <tr><td>Subprotocol() 剝除 otel-ws+ 前綴</td><td><code>TestSubprotocolStripsOTelPrefix</code> 配安全 cleanup 順序</td></tr>
+    <tr><td>純 helper（split/selectFirst/cloneHeader/appProtocolFromRaw/isOTelWireProtocol）</td><td><code>upgrader_test.go</code> 30 個 sub-cases，100% 覆蓋</td></tr>
+    <tr><td>resolveOptions 不污染全域狀態</td><td><code>TestResolveOptions_UsesProvidedOptionsWithoutMutatingGlobals</code></td></tr>
+  </tbody>
+</table>
+
+<h2>覆蓋率缺口（已知 + 設計使然）</h2>
+
+<table>
+  <thead><tr><th style="width:200px">套件</th><th>%</th><th>低的原因</th></tr></thead>
+  <tbody>
+    <tr><td><code>internal/direct</code> + <code>internal/traced</code></td><td class="center">0%</td><td><strong>設計使然</strong> — strategy-split impl 透過 facade 層測試覆蓋（root package 的 unit test 透過 <code>NewConn</code>/<code>Dial</code> 同時執行兩個 impl）；<code>go test -cover</code> 報 0 因為這兩個套件本身無 <code>_test.go</code></td></tr>
+    <tr><td><code>internal/shared</code></td><td class="center">0%</td><td>同上 — wire format helper（<code>MarshalWire</code>、<code>TryUnmarshalWire</code>）由 facade 套件的 message_test.go 覆蓋</td></tr>
+    <tr><td><code>upgrader.go::Upgrade</code></td><td class="center">75.8%</td><td>未覆蓋部分為錯誤恢復分支（negotiation 失敗回應），只能透過 malformed client handshake 觸發 — 沒有 wire-level client harness 就無法 unit 測</td></tr>
+  </tbody>
+</table>
+
+<p style="margin-top:32px;color:var(--muted);font-size:12px">資料來源：<code>go test -count=1 -coverpkg=./... ./...</code> + <code>go tool cover -func</code>；每檔測試數來自 <code>grep -c '^func Test' &lt;file&gt;</code>。生成日期 2026-05-22。</p>
+
+</body>
+</html>

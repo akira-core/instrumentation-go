@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>otel-nats — Test Detail Report</title>
+<style>
+  :root { --bg:#fafbfc; --fg:#24292e; --muted:#6a737d; --border:#e1e4e8; --accent:#0366d6; --ok:#28a745; --warn:#f9a825; --bad:#d73a49; --header-bg:#f6f8fa; --code-bg:#f0f3f6; }
+  body { font-family:-apple-system,"Helvetica Neue","PingFang TC","Microsoft JhengHei",sans-serif; background:var(--bg); color:var(--fg); line-height:1.55; max-width:1500px; margin:0 auto; padding:32px 24px; }
+  h1 { font-size:28px; margin:0 0 4px; }
+  h2 { font-size:20px; margin:32px 0 12px; padding-bottom:6px; border-bottom:2px solid var(--accent); }
+  .subtitle { color:var(--muted); margin-bottom:20px; font-size:14px; }
+  code { font-family:"JetBrains Mono","SF Mono",Menlo,Consolas,monospace; font-size:12.5px; background:var(--code-bg); padding:1px 5px; border-radius:3px; }
+  table { width:100%; border-collapse:collapse; margin:8px 0 20px; font-size:13px; background:white; box-shadow:0 1px 2px rgba(0,0,0,0.04); }
+  th, td { border:1px solid var(--border); padding:8px 10px; text-align:left; vertical-align:top; }
+  th { background:var(--header-bg); font-weight:600; }
+  tr:nth-child(even) td { background:#fdfdfd; }
+  td.center { text-align:center; }
+  td.file { white-space:nowrap; font-family:"JetBrains Mono","SF Mono",Menlo,Consolas,monospace; font-size:12px; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:12px; font-size:11px; font-weight:600; color:white; white-space:nowrap; }
+  .b-ok { background:var(--ok); } .b-part { background:var(--warn); color:#333; } .b-info { background:var(--accent); }
+  .coverage-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:12px 0 24px; }
+  .card { background:white; border:1px solid var(--border); border-radius:6px; padding:14px 16px; }
+  .card h4 { margin:0 0 6px; font-size:13px; color:var(--muted); font-weight:600; letter-spacing:0.5px; }
+  .card .num { font-size:24px; font-weight:700; color:var(--accent); }
+  .card .sub { color:var(--muted); font-size:12px; margin-top:4px; }
+  .lang-toggle { background:#eef; padding:8px 14px; border-radius:6px; font-size:13px; margin-bottom:18px; }
+  .lang-toggle a { text-decoration:none; color:var(--accent); font-weight:600; }
+</style>
+</head>
+<body>
+
+<div class="lang-toggle">🌐 <strong>Language:</strong> <a href="test-report.html">English</a> · <a href="test-report.zh-TW.html">繁體中文</a></div>
+
+<h1>otel-nats — Test Detail Report</h1>
+<div class="subtitle">
+  Two packages under one module: <code>otelnats/</code> (core NATS — Connect, Conn, Publish/Subscribe/Request, HeaderCarrier)
+  and <code>oteljetstream/</code> (JetStream — Stream, Consumer, MessageBatch). They share Tracer/Propagator
+  resolution and the cached <code>natsGate</code> / <code>natsPropagationGate</code>.<br>
+  Generated 2026-05-22 · <code>go test -count=1 -race ./...</code>: <strong>130</strong> passed ·
+  <code>golangci-lint v2</code>: 0 issues.
+</div>
+
+<h2>Coverage Summary</h2>
+<div class="coverage-grid">
+  <div class="card"><h4>otelnats (core)</h4><div class="num">72.1%</div><div class="sub">module-only</div></div>
+  <div class="card"><h4>oteljetstream</h4><div class="num">58.4%</div><div class="sub">module-only</div></div>
+  <div class="card"><h4>internal/flags</h4><div class="num">100%</div><div class="sub">byte-identical w/ sibling modules</div></div>
+  <div class="card"><h4>Aggregate</h4><div class="num">66.0%</div><div class="sub"><code>-coverpkg=./...</code></div></div>
+</div>
+
+<h2>Test Files — What / How / Why</h2>
+
+<h3>Package <code>otelnats/</code> (core NATS)</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th style="width:200px">File</th>
+      <th style="width:50px">Tests</th>
+      <th>What's tested</th>
+      <th style="width:240px">How</th>
+      <th style="width:240px">Why</th>
+    </tr>
+  </thead>
+  <tbody>
+
+    <tr>
+      <td class="file">env_flags_test.go</td>
+      <td class="center">2</td>
+      <td>Truth tables for both gates: (1) two-tier tracing (<code>OTEL_INSTRUMENTATION_GO_TRACING_ENABLED</code> × <code>OTEL_NATS_TRACING_ENABLED</code>) and (2) three-tier propagation (× <code>OTEL_NATS_PROPAGATION_ENABLED</code>). Covers truthy/falsy synonyms (true/1/on/yes/""/arbitrary; false/0/no/off/padded).</td>
+      <td>Per-row <code>t.Setenv</code> + <code>os.Unsetenv</code>; calls <code>resetNATSGateForTest()</code> after each row to re-arm sync.Once cache.</td>
+      <td>Every per-call decision in the traced impl ultimately consults one of these two gates. If the truth table regresses, the entire disabled-mode invariant fails silently.</td>
+    </tr>
+
+    <tr>
+      <td class="file">propagation_test.go</td>
+      <td class="center">2</td>
+      <td><code>HeaderCarrier.Get/Set/Keys</code> against both nil <code>nats.Header</code> and a populated one.</td>
+      <td>Direct struct construction; no NATS server needed.</td>
+      <td>HeaderCarrier is the adapter between OTel's TextMapPropagator and NATS message headers — a regression here breaks every Publish header inject and every Subscribe extract.</td>
+    </tr>
+
+    <tr>
+      <td class="file">conn_test.go</td>
+      <td class="center">27</td>
+      <td>The bulk of the package: W3C round-trip, Publish/PublishMsg/Request producer spans, Subscribe/QueueSubscribe consumer spans, deliver span emission with the three-tier sampling gate (upstream sampled / local sampled / endpoint set), tracing-off skips both spans and headers, propagation-off keeps spans but skips headers, deliver-TP service name resolution, reply-link respects sampler.</td>
+      <td>Real NATS server via <code>natssrv.NewServer</code> on <code>127.0.0.1:-1</code> (random port). In-memory <code>tracetest.SpanRecorder</code>. Helper <code>waitSpanByNameAndKind</code> polls with <code>require.Eventually</code> so async End() races are tolerated.</td>
+      <td>NATS is wire-protocol over TCP — only an end-to-end server test can prove (a) headers actually appear on wire bytes and (b) subscribe handlers actually fire with the extracted context. This is the load-bearing file for the whole module.</td>
+    </tr>
+
+    <tr>
+      <td class="file">flag_matrix_test.go</td>
+      <td class="center">1 (8 sub-rows)</td>
+      <td>All 8 combinations of (global × tracing × propagation) end-to-end against a real NATS server. For each: assert <code>Conn.TracingEnabled()</code> + <code>PropagationEnabled()</code> resolve to expected gate values; verify subscribe handler receives traceparent header iff propagation on; verify caller TP has at least one wrapper span iff tracing on (zero otherwise).</td>
+      <td>Fresh <code>natssrv</code> instance per row, table-driven; <code>otelnats.ResetGatesForTest()</code> after each row. Span quiet-window assertion uses <code>assert.Never(300ms, 10ms tick)</code> instead of fixed sleep — fast-fail on first observed span.</td>
+      <td>This file is the single bridge that ties the env truth tables to wire-observable behaviour. Without it, the gate functions could be correct but Publish could still inject headers (the v0.4.x regression that <code>tracedJSImpl.PublishMsg</code> ignored the propagation gate was exactly this class of bug).</td>
+    </tr>
+
+    <tr>
+      <td class="file">connect_test.go</td>
+      <td class="center">7</td>
+      <td>(1) Connect returns error on unreachable URL; (2) nil <code>nats.Option</code>s are filtered; (3) Close is noop without deliver-TP; (4) Close honours bounded 3-second deliver-TP shutdown cap; (5) Drain doesn't block on slow exporter; (6) <code>WithTraceDestination</code> survives in tracing-on mode and (7) is dropped in disabled mode.</td>
+      <td>Real natssrv + closed port (<code>127.0.0.1:1</code>) as OTLP endpoint to simulate slow exporter without setting up a mock OTLP receiver.</td>
+      <td>Connection lifecycle bugs are slow to surface — a deliver-TP that fails to shutdown leaks an exporter batch goroutine per <code>*Conn</code>. Bounded-time assertions catch this within 5 seconds during CI rather than at production OOM.</td>
+    </tr>
+
+    <tr>
+      <td class="file">traceevent_test.go</td>
+      <td class="center">4</td>
+      <td><code>SubscribeTraceEvents</code> (NATS 2.11+ infrastructure events): (1) emits 2 hop spans (ingress + egress) for a synthetic TraceEvent payload; (2) disabled-mode emits zero spans regardless; (3) malformed JSON payload does NOT crash or emit; (4) <code>WithTraceDestination</code> option round-trips through <code>conn.TraceDest()</code>.</td>
+      <td>Synthetic <code>TraceEvent</code> JSON payload published directly via <code>conn.NatsConn().Publish</code> (bypassing the wrapper for the test fixture). Quiet-window negative assertions use <code>assert.Never(300ms)</code>.</td>
+      <td>Infrastructure trace events are an opt-in feature requiring NATS 2.11+; without these tests the only way to exercise them is full e2e against a real cluster. Direct payload injection is the only way to unit-test the hop-emission logic.</td>
+    </tr>
+
+  </tbody>
+</table>
+
+<h3>Package <code>oteljetstream/</code></h3>
+
+<table>
+  <thead>
+    <tr><th style="width:200px">File</th><th style="width:50px">Tests</th><th>What's tested</th><th style="width:240px">How</th><th style="width:240px">Why</th></tr>
+  </thead>
+  <tbody>
+
+    <tr>
+      <td class="file">consumer_test.go</td>
+      <td class="center">18</td>
+      <td>Every consumer mode: Fetch / FetchBytes / FetchNoWait / Consume / MessagesNext / OrderedConsumer; deliver-span emission on Consume + Fetch; consumer Info/CachedInfo. <strong>Critical</strong>: <code>TestNoGoroutineLeakAfterEarlyReturn</code> guards the <code>MessageBatch.Stop()</code> contract added in v0.3.0; <code>TestMessageBatchStopIdempotent</code> + <code>StopReleasesRawBatch</code> lock in the cleanup semantics. <code>TestJetStreamConsumerManagerConsumerKeepsTraceWrapper</code> guards that Consumer-Manager re-fetched consumers retain the trace wrapper. Propagation off / tracing off matrices mirror core-NATS tests.</td>
+      <td>Real natssrv with JetStream enabled (<code>JetStream: true</code> option). Each test creates its own stream + consumer.</td>
+      <td>JetStream is the hardest async case — long-running consumers with internal state. A leaked goroutine on early return is invisible in unit tests unless explicitly counted (<code>runtime.NumGoroutine</code>). Without these guards the v0.3.0 breaking change would silently re-regress.</td>
+    </tr>
+
+    <tr>
+      <td class="file">stream_test.go</td>
+      <td class="center">8</td>
+      <td><code>Stream.Info</code>, <code>CachedInfo</code>, <code>ConsumerNames</code>, <code>CreateConsumer</code>, <code>DeleteConsumer</code>, <code>JetStream.DeleteStream</code>, ConsumerManager parity methods (the parallel methods that exist on both <code>Stream</code> and <code>JetStream</code>).</td>
+      <td>Real natssrv + JetStream; per-test stream creation.</td>
+      <td>Stream lifecycle methods are CRUD passthrough — but every method must go through the traced wrapper, so each one is a one-line span-emission gate that can regress.</td>
+    </tr>
+
+  </tbody>
+</table>
+
+<h2>Cross-cutting Invariants Locked By Tests</h2>
+
+<table>
+  <thead><tr><th style="width:340px">Invariant</th><th>Guarded By</th></tr></thead>
+  <tbody>
+    <tr><td>Universal default-OFF env posture</td><td><code>env_flags_test.go</code> truth tables</td></tr>
+    <tr><td>Flag off ⇒ zero spans + zero header inject (wire byte-identical with native <code>nats.Conn</code>)</td><td><code>flag_matrix_test.go</code> + <code>TestPublishWithTracingOffSkipsBoth</code> + <code>TestPublishWithTracingOffPropagationOnStillSkipsBoth</code></td></tr>
+    <tr><td>Propagation off ⇒ spans still emitted but no header bytes (v0.4.x regression test)</td><td><code>TestPublishWithPropagationOffSkipsHeaders</code> + <code>TestSubscribeWithPropagationOffStillEmitsSpanWithoutLink</code> + JetStream sibling</td></tr>
+    <tr><td>MessageBatch.Stop() releases goroutine + ends span exactly once</td><td><code>TestNoGoroutineLeakAfterEarlyReturn</code>, <code>TestMessageBatchStopIdempotent</code></td></tr>
+    <tr><td>Sampling gate: producer/consumer span links respect upstream and local sampler</td><td><code>TestConsumerSpanNoLinkWhenOriginNotSampled</code>, <code>TestRecordReplyLinkRespectsSamplerFlag</code>, <code>TestDeliverSpanSkippedWhenUpstreamNotSampled</code></td></tr>
+    <tr><td>Conn.Close releases deliver-TP within 3 seconds even on slow exporter</td><td><code>TestCloseShutdownTimeoutIsBounded</code></td></tr>
+    <tr><td>SubscribeTraceEvents tolerates malformed payloads</td><td><code>TestSubscribeTraceEventsIgnoresMalformedPayload</code></td></tr>
+  </tbody>
+</table>
+
+<h2>Coverage Gaps (Known + Intentional)</h2>
+
+<table>
+  <thead><tr><th style="width:240px">Package / area</th><th>%</th><th>Why low</th></tr></thead>
+  <tbody>
+    <tr><td>otelnats <code>conn_direct.go</code> / <code>conn_traced.go</code></td><td class="center">via facade</td><td>file-level strategy split; both impls are exercised indirectly through <code>Conn.Publish</code> etc — direct unit tests on impl files exist for representative methods only</td></tr>
+    <tr><td>oteljetstream facade method delegation</td><td class="center">~58%</td><td>Many one-line <code>impl.X</code> delegates; uncovered statements are mostly variadic option processing and management methods less exercised in typical workflows</td></tr>
+    <tr><td>oteljetstream <code>jetstream_direct.go</code> / <code>_traced.go</code></td><td class="center">via facade</td><td>Same as core NATS — strategy split file pair, exercised via the facade</td></tr>
+    <tr><td>internal/flags</td><td class="center">100%</td><td>Required: BYTE-IDENTICAL across all four sibling modules (CI drift-check job enforces this)</td></tr>
+  </tbody>
+</table>
+
+<p style="margin-top:32px;color:var(--muted);font-size:12px">Sources: <code>go test -count=1 -coverpkg=./... ./...</code> + <code>go tool cover -func</code>; per-file test counts from <code>grep -c '^func Test' &lt;file&gt;</code>. Generated 2026-05-22.</p>
+
+</body>
+</html>

@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<title>otel-mongo — 測試詳細報告（v1 + v2）</title>
+<style>
+  :root { --bg:#fafbfc; --fg:#24292e; --muted:#6a737d; --border:#e1e4e8; --accent:#0366d6; --ok:#28a745; --warn:#f9a825; --bad:#d73a49; --header-bg:#f6f8fa; --code-bg:#f0f3f6; }
+  body { font-family:-apple-system,"Helvetica Neue","PingFang TC","Microsoft JhengHei",sans-serif; background:var(--bg); color:var(--fg); line-height:1.55; max-width:1500px; margin:0 auto; padding:32px 24px; }
+  h1 { font-size:28px; margin:0 0 4px; }
+  h2 { font-size:20px; margin:32px 0 12px; padding-bottom:6px; border-bottom:2px solid var(--accent); }
+  h3 { font-size:16px; margin:18px 0 8px; color:var(--accent); }
+  .subtitle { color:var(--muted); margin-bottom:20px; font-size:14px; }
+  code, .mono { font-family:"JetBrains Mono","SF Mono",Menlo,Consolas,monospace; font-size:12.5px; background:var(--code-bg); padding:1px 5px; border-radius:3px; }
+  table { width:100%; border-collapse:collapse; margin:8px 0 20px; font-size:13px; background:white; box-shadow:0 1px 2px rgba(0,0,0,0.04); }
+  th, td { border:1px solid var(--border); padding:8px 10px; text-align:left; vertical-align:top; }
+  th { background:var(--header-bg); font-weight:600; }
+  tr:nth-child(even) td { background:#fdfdfd; }
+  td.center { text-align:center; }
+  td.file { white-space:nowrap; font-family:"JetBrains Mono","SF Mono",Menlo,Consolas,monospace; font-size:12px; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:12px; font-size:11px; font-weight:600; color:white; white-space:nowrap; }
+  .b-ok { background:var(--ok); } .b-part { background:var(--warn); color:#333; } .b-gap { background:var(--bad); } .b-info { background:var(--accent); }
+  .coverage-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:12px 0 24px; }
+  .card { background:white; border:1px solid var(--border); border-radius:6px; padding:14px 16px; }
+  .card h4 { margin:0 0 6px; font-size:13px; color:var(--muted); font-weight:600; letter-spacing:0.5px; }
+  .card .num { font-size:24px; font-weight:700; color:var(--accent); }
+  .card .sub { color:var(--muted); font-size:12px; margin-top:4px; }
+  .lang-toggle { background:#eef; padding:8px 14px; border-radius:6px; font-size:13px; margin-bottom:18px; }
+  .lang-toggle a { text-decoration:none; color:var(--accent); font-weight:600; }
+</style>
+</head>
+<body>
+
+<div class="lang-toggle">🌐 <strong>語言：</strong> <a href="test-report.html">English</a> · <a href="test-report.zh-TW.html">繁體中文</a></div>
+
+<h1>otel-mongo — 測試詳細報告</h1>
+<div class="subtitle">
+  涵蓋 <code>otelmongo/</code>（v1，mongo-driver 1.17.x）與 <code>v2/</code>（v2，mongo-driver 2.6.x）。
+  兩模組共享嚴格 v1↔v2 parity invariant — 下表每個測試檔在另一版本都有對應檔（見 <strong>Parity</strong> 欄）。<br>
+  生成日期 2026-05-22 · <code>go test -count=1 -race ./...</code>：<strong>v1 181 / v2 191</strong> 通過 ·
+  <code>golangci-lint v2</code>：0 issue。
+</div>
+
+<h2>覆蓋率摘要</h2>
+<div class="coverage-grid">
+  <div class="card"><h4>v1 facade 套件</h4><div class="num">72.2%</div><div class="sub"><code>otelmongo</code>（單模組）</div></div>
+  <div class="card"><h4>v2 facade 套件</h4><div class="num">72.2%</div><div class="sub"><code>v2</code>（單模組）</div></div>
+  <div class="card"><h4>v1 整合覆蓋</h4><div class="num">66.2%</div><div class="sub"><code>-coverpkg=./...</code> 含 internal/</div></div>
+  <div class="card"><h4>v2 整合覆蓋</h4><div class="num">64.3%</div><div class="sub"><code>-coverpkg=./...</code> 含 internal/</div></div>
+</div>
+
+<table>
+  <thead><tr><th>子套件</th><th>覆蓋率</th><th>備註</th></tr></thead>
+  <tbody>
+    <tr><td><code>otelmongo</code> / <code>v2</code>（facade）</td><td class="center">72.2%</td><td>Strategy facade — 未覆蓋部分多為需要 <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> + 真實 OTLP collector 的 deliver-span 分支</td></tr>
+    <tr><td><code>internal/flags</code></td><td class="center"><span class="badge b-ok">100%</span></td><td>四模組 byte-identical — <code>EnvEnabled</code> + <code>Gate</code> 所有分支全覆蓋</td></tr>
+    <tr><td><code>internal/shared</code></td><td class="center">44.9% / 45.2%</td><td>Inject/extract helper — 未覆蓋為 bulk-write / upsert-set $set 路徑（由整合測試覆蓋，非單元）</td></tr>
+    <tr><td><code>internal/traced</code></td><td class="center">5.3% / 5.0%</td><td><strong>設計使然</strong> — 這些 stmt 只能透過真實 mongod 執行（整合套件）；strategy-split 讓 disabled-mode 在此套件不可達，所以單元覆蓋率天生低</td></tr>
+    <tr><td><code>internal/direct</code></td><td class="center"><span class="badge b-info">0%</span></td><td><strong>設計使然</strong> — Passthrough impl 只在 env gate OFF 時建構；覆蓋率 = 0 因為 <code>go test -cover</code> 量已執行 stmt；正確性由 facade 層 <code>TestFlagMatrix_*</code> 斷言 impl <em>型別</em>守護，不靠執行 direct 路徑</td></tr>
+  </tbody>
+</table>
+
+<h2>測試檔案 — 測什麼 / 怎麼測 / 為何測</h2>
+
+<p>下表列出 v1 與 v2 中每個 <code>*_test.go</code> 及其理由。<strong>Parity</strong> 欄表示另一版本是否有對應檔。</p>
+
+<table>
+  <thead>
+    <tr>
+      <th style="width:240px">檔案（v1 + v2 都有，除非註明）</th>
+      <th style="width:50px">測試數</th>
+      <th style="width:160px">Parity</th>
+      <th>測什麼</th>
+      <th style="width:240px">怎麼測</th>
+      <th style="width:240px">為何測</th>
+    </tr>
+  </thead>
+  <tbody>
+
+    <tr>
+      <td class="file">env_flags_test.go</td>
+      <td class="center">4</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td>三層 flag gate 真值表：<code>OTEL_INSTRUMENTATION_GO_TRACING_ENABLED</code> × <code>OTEL_MONGO_TRACING_ENABLED</code> × <code>OTEL_MONGO_PROPAGATION_ENABLED</code>。約 30 列涵蓋 truthy / falsy 同義詞（true / 1 / on / yes / "" / 任意字串；false / 0 / no / off / 含空白）。</td>
+      <td>直接呼叫 <code>mongoTracingEnabled()</code>、<code>mongoPropagationEnabled()</code>、<code>resolveFlag()</code>、<code>resolveDocumentPropagation()</code>，每列用 <code>t.Setenv</code> + <code>os.Unsetenv</code>。</td>
+      <td>「flag off → 零 spans、零 wire 影響」的 invariant 從這三個 gate 散開。若任一列回歸，下游 wrapper 程式碼就會誤入 SDK 路徑。</td>
+    </tr>
+
+    <tr>
+      <td class="file">env_flags_testhelper_test.go</td>
+      <td class="center">0</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td>定義 <code>resetPropEnabledCacheForTest()</code> — 重新啟動 <code>sync.Once</code>-cached propagation gate 的測試專用 helper。</td>
+      <td><code>_test.go</code> 內的普通函式（套件範圍，未匯出）。</td>
+      <td>Cached gate 會把 env 在首次讀取時凍結，若無此 helper，後續 <code>t.Setenv</code> 都失效。</td>
+    </tr>
+
+    <tr>
+      <td class="file">flag_matrix_test.go</td>
+      <td class="center">2</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td>8 個 (global × tracing × propagation) 組合的端到端 matrix：(1) <code>NewCollection</code> 回傳正確 impl 型別 — 任何 gate off → <code>*direct.Collection</code>，全 on → <code>*traced.Collection</code> 且 <code>PropagationEnabled</code> bit 正確；(2) <code>ContextFromDocument</code> 在任何 gate off 時拒絕有效的 <code>_oteltrace</code> 內容。</td>
+      <td>Table-driven 8 列 × strategy-impl 型別斷言 + 透過 <code>cachedPropagationEnabled()</code> 驗證 cache。</td>
+      <td>單獨的 gate 函式測試無法證明「WRAPPER 真的有跟著 gate 走」。這個檔是從真值表通往可觀察 wrapper 行為的橋梁 — 唯一鎖住「flag off ⇒ 無 SDK 可達」的測試。</td>
+    </tr>
+
+    <tr>
+      <td class="file">tracing_test.go</td>
+      <td class="center">6 / 7</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td>公開 API <code>ContextFromDocument</code> / <code>ContextFromRawDocument</code> 對所有 BSON 形狀（<code>bson.M</code> / <code>map[string]any</code> / <code>bson.D</code> / struct 慢路徑）；跨型別 malformed traceparent 拒絕；disabled <code>traced.Collection</code> 的 <code>StartDeliverSpan</code>。含 <code>$setOnInsert</code> 內 dot-notation key 保留回歸測試（<code>"u._id"</code> 必須能完整通過 marshal/unmarshal round-trip）。</td>
+      <td>用 <code>bson.Marshal</code> 建構 raw document，呼叫公開 extractor，搭配 <code>enableDocumentPropagation</code> helper + <code>resetPropEnabledCacheForTest</code> cleanup 切換 flag 組合。</td>
+      <td>這是 <code>_oteltrace</code> propagation 的讀取側。所有 trace context 消費者（change-stream reader、MongoDB → NATS bridge、下游服務）都走這些 helper。回歸會悄悄破壞端到端 trace 連續性。</td>
+    </tr>
+
+    <tr>
+      <td class="file">client_test.go</td>
+      <td class="center">4 / 1</td>
+      <td><span class="badge b-part">v1 較廣</span></td>
+      <td>v1：<code>initMongoProvider</code> 有/無 <code>OTEL_EXPORTER_OTLP_ENDPOINT</code>、<code>mongoServiceName</code> 格式、<code>parseServerFromClientOptions</code> 對 nil / 無 URI / 有 URI 輸入。v2：精簡版（URI 解析發生在 <code>options.Client()</code> 層，較單純）。</td>
+      <td>直接呼叫套件私有 helper；不需真實 mongod。</td>
+      <td>Connect 時的 semconv 屬性（<code>server.address</code>、<code>server.port</code>）與 deliver-TP gate 決策都在這裡做。若 <code>mongoServiceName</code> 格式化錯誤，整個 <strong>service graph</strong> 顯示錯誤 broker 標籤。</td>
+    </tr>
+
+    <tr>
+      <td class="file">client_deliver_test.go</td>
+      <td class="center">5 / 10</td>
+      <td><span class="badge b-ok">v1 ≡ v2（佈局不同）</span></td>
+      <td>(1) <code>traced.ClientState.ShutdownDeliver</code> 對 nil <code>MongoTP</code>（noop）、真 provider（呼叫 processor Shutdown）、processor 阻塞時的 3 秒 timeout cap；(2) <code>TestClientDisabledPathHasNoDeliverState</code> 斷言 env=0 時 <code>mongoTracingEnabled()</code> 解析為 false；(3) v2 額外含 <code>initMongoProvider</code> + <code>StartDeliverSpan</code> 測試（合在同檔）。</td>
+      <td>客製化 <code>shutdownObservingProcessor</code> 帶可選 block 時間，滿足 <code>SpanProcessor</code> 介面；直接呼叫 <code>state.ShutdownDeliver</code> 斷言。</td>
+      <td>若 <code>Disconnect</code> 沒乾淨關掉 deliver-TP，每個建立短命 <code>*Client</code> 的長期服務都會每連線洩漏一個 exporter batch goroutine — 在 production OOM 前都看不到。</td>
+    </tr>
+
+    <tr>
+      <td class="file">cursor_test.go</td>
+      <td class="center">7 / 10</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td><code>Cursor.Decode</code> direct/traced 路徑；<code>SingleResult.Decode</code> / <code>Raw</code> / <code>TraceContext</code> 的 first-touch-ends-span 契約 6 個交叉排列 sub-cases（decode×2、decode→raw、raw→decode、decode→tracectx、tracectx→raw、三者全來）；passthrough impl 不發 span。</td>
+      <td>透過 <code>mongo.NewCursorFromDocuments</code> / <code>mongo.NewSingleResultFromDocument</code> 建構 cursor — 不需真實 mongod。用 <code>injectTraceIntoDocument</code> helper 建有 <code>_oteltrace</code> 的 document。</td>
+      <td>「Decode/Raw/TraceContext 首觸即終結 span」的契約很容易被悄悄破壞 — 未來重構加入早期 return 路徑可能讓 span 結束兩次（panic）或零次（洩漏）。交叉排列 cases 把這個釘死。</td>
+    </tr>
+
+    <tr>
+      <td class="file">cursor_decodewithcontext_test.go（僅 v1）</td>
+      <td class="center">2</td>
+      <td><span class="badge b-info">僅 v1</span></td>
+      <td>v1 專屬行為：<code>DecodeWithContext</code> 創一個帶新 TraceID 的 INTERNAL span 並 link 到原始 trace（legacy 語義）。也斷言 disabled 路徑不發 span。</td>
+      <td>Recorder-based：建有 <code>_oteltrace</code> 的 cursor → decode → 檢視 <code>tracetest.SpanRecorder.Ended()</code> 的 <code>mongo.cursor.decode</code> span 與其 link。</td>
+      <td>v2 把 <code>DecodeWithContext</code> 改為純 context 增強（不再 emit 額外 span）。這個檔是唯一守住 v1 legacy 契約的測試；若無此檔，v1 會悄悄回歸為 v2 行為而無任何其他測試報錯。</td>
+    </tr>
+
+    <tr>
+      <td class="file">collection_test.go</td>
+      <td class="center">14</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td>整合套件（testcontainers MongoDB）：InsertOne/InsertMany/ReplaceOne/UpdateOne/DeleteOne/CountDocuments/UpdateByID/DeleteOneByID/FindOneByID/FindByIDs/BulkWrite，全都斷言寫入時 <code>_oteltrace</code> 存在 + global-off 零 spans 路徑。含 <code>TestNewCollection</code> 驗證 strategy-split 決策。</td>
+      <td><code>tcmongo.Run(ctx, "mongo:7.0")</code> 在 <code>TestMain</code> 啟動單機 MongoDB container，所有測試共用。<code>requireMongoDB</code> fallback 到 <code>MONGO_URI</code> 環境變數，Docker 不可用時 skip。</td>
+      <td>若無整合測試，wrapper 沒有端到端信心 — driver 行為太微妙（projection 規則、原子 op、write concern 等）無法忠實 mock。真實讀取時 <code>_oteltrace</code> 欄位的存在是 wrapper 確實穿越 MongoDB BSON 序列化的唯一有意義證據。</td>
+    </tr>
+
+    <tr>
+      <td class="file">database_test.go</td>
+      <td class="center">3</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td>Gate 繼承鏈：<code>ClientState.ForDatabase()</code> → <code>DatabaseState.NewCollection()</code> 完整傳遞 Tracer / Propagator / PropagationEnabled / DeliverTracer / ServerAddr / ServerPort。也驗證 <code>PropagationEnabled=false</code> 沿鏈傳遞。</td>
+      <td>直接 struct 建構；不需真實 mongod。斷言 interface 值相等。</td>
+      <td>若繼承鏈漏一個欄位，透過 Client 建出的 Database/Collection 中途可能丟掉 propagation 設定，造成 Client/Collection 直接用 vs 經 Database.Collection 行為不一致。</td>
+    </tr>
+
+    <tr>
+      <td class="file">internal/shared/extract_metadata_test.go</td>
+      <td class="center">7 + 1 bench</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td><code>ExtractMetadataFromRaw</code> 直接 lookup 與舊反射路徑 parity、缺欄位、錯誤型別 subdocument、空 traceparent；<strong>bson.D 反向掃描</strong>：位置不變（head/middle/tail）、reverse-scan 取最後一個（鎖住優化）、tail vs head benchmark。</td>
+      <td>用 <code>bson.Marshal</code> 建 <code>bson.D</code> 與 <code>bson.Raw</code>；直接呼叫底層 extractor。</td>
+      <td>這是最熱讀取路徑（change-stream 迭代）。若 reverse 改成 forward scan 會悄悄拖慢讀取，並破壞「wrapper 注入最後一個 entry 勝出」契約 — 這是 <code>injectTraceIntoDocument</code> 的 inject/extract 對稱性所依賴的。</td>
+    </tr>
+
+    <tr>
+      <td class="file">internal/shared/inject_trace_test.go</td>
+      <td class="center">14+</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td><strong>v0.5.2 sampling gate</strong>：14 個 case 證明 unsampled 寫入完全跳過 <code>_oteltrace</code>。加上呼叫者 document 不被 mutate（immutability）、所有四種輸入型別（bson.D / bson.M / map / struct）。</td>
+      <td>用明確 sampler 選擇建 context；呼叫 <code>InjectTraceIntoDocument</code>；斷言結果中 <code>_oteltrace</code> 的存在/缺席。</td>
+      <td>v0.5.2 新增 sampling gate 是破壞性預設變更。這個檔是負責證明新契約在所有輸入形狀都成立的關鍵測試。</td>
+    </tr>
+
+    <tr>
+      <td class="file">internal/shared/inspect_writemodel_test.go</td>
+      <td class="center">多個</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td>BulkWrite 操作：<code>InsertOneModel</code>、<code>UpdateOneModel</code>、<code>$setOnInsert</code>、model 不可變性。</td>
+      <td>對 driver bulk-write model 型別的 reflection 風格 helper。</td>
+      <td>BulkWrite 是單一 round-trip 包多 op — model 中途丟掉 <code>_oteltrace</code> 會悄悄讓一半操作失去 trace 連續性。</td>
+    </tr>
+
+    <tr>
+      <td class="file">internal/shared/bulkwrite_test.go</td>
+      <td class="center">多個</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td>BulkWrite 端到端 inject 行為；與 model 檢視器配合。</td>
+      <td>直接呼叫 internal helper；不需真實 mongod。</td>
+      <td>Bulk 操作是最容易因 per-model 處理而丟掉 trace context 的路徑 — 明確覆蓋避免靜默丟失。</td>
+    </tr>
+
+    <tr>
+      <td class="file">internal/shared/upsertset_test.go（僅 v2）</td>
+      <td class="center">1</td>
+      <td><span class="badge b-info">僅 v2</span></td>
+      <td>v2 專屬 <code>upsertSetField</code> helper 處理 mongo-driver 2.x 的 <code>SetOptions</code> pattern。</td>
+      <td>直接 unit test。</td>
+      <td>v2 driver 引入新的 option-builder pattern；無此測試則 v1 與 v2 upsert 路徑行為漂移無法被偵測。</td>
+    </tr>
+
+    <tr>
+      <td class="file">internal/traced/changestream_test.go</td>
+      <td class="center">2</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td><code>buildConsumerCtx</code>：建立新 TraceID 並透過 span-link 連到原始 trace；當 <code>DeliverTracer</code> 設置時，deliver-tracer 成為 change-stream span 的父節點。</td>
+      <td>直接用 tracer + deliver tracer 建構 <code>traced.ChangeStream</code>；透過 recorder 斷言 span links 與 parentage。</td>
+      <td>Change stream 是最微妙的 propagation case — 生產者（writer）與消費者（watcher）在時間與行程上都解耦。Span links 而非 parent-child 保留 causality 而不暗示同步巢狀。</td>
+    </tr>
+
+    <tr>
+      <td class="file">internal/flags/flags_test.go</td>
+      <td class="center">5</td>
+      <td><span class="badge b-ok">v1 ≡ v2（byte-identical）</span></td>
+      <td><code>EnvEnabled</code> truthy/falsy 同義詞；<code>Gate.Enabled</code> 透過 sync.Once 確保 resolver 只跑一次；<code>ResetForTest</code> 重新啟動；併發 <code>Enabled</code> 讀取安全。</td>
+      <td>直接 unit test 打 <code>flags</code> 原語 — 不在 <code>t.Setenv</code> 範圍外動 env。</td>
+      <td>此檔在四個 sibling module 之間 BYTE-IDENTICAL（CI drift-check job 強制）。守護每個 wrapper 依賴的核心 flag 原語；這裡回歸就是四模組同時回歸。</td>
+    </tr>
+
+    <tr>
+      <td class="file">internal_aliases_test.go</td>
+      <td class="center">0</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td>把 internal 型別（<code>injectTraceIntoDocument</code> 等）重匯出到 facade <code>_test.go</code> namespace，讓測試可以呼叫而不打破 <code>internal/</code> 套件邊界。</td>
+      <td>型別 alias + 函式 variable 重綁定。</td>
+      <td>無此檔則 facade 套件的測試無法直接驅動 internal helper — 每個測試都要透過公開 API 建構，無法快速 unit test。</td>
+    </tr>
+
+  </tbody>
+</table>
+
+<h2>測試守護的橫切 Invariants</h2>
+
+<table>
+  <thead><tr><th style="width:340px">Invariant</th><th>由哪個測試守護</th></tr></thead>
+  <tbody>
+    <tr><td>四模組 env 全部 default-OFF</td><td>v1 + v2 的 <code>env_flags_test.go</code> 真值表</td></tr>
+    <tr><td>Flag off ⇒ 零 wrapper spans + 零 <code>_oteltrace</code></td><td><code>flag_matrix_test.go</code> 8 組合 + collection_test.go 的 <code>TestConnectGlobalOff_ZeroWrapperSpans</code>（真 mongod）</td></tr>
+    <tr><td>Unsampled 寫入跳過 <code>_oteltrace</code>（v0.5.2）</td><td><code>internal/shared/inject_trace_test.go</code> 14 個 sampling-gate cases</td></tr>
+    <tr><td>v1 ↔ v2 嚴格 parity</td><td>每個測試檔都有 sibling（見 Parity 欄）；internal/shared/* byte-identical</td></tr>
+    <tr><td>bson.D reverse-scan 優化</td><td><code>TestExtractMetadataFromBsonD_ReverseScanFindsLast</code> + benchmark</td></tr>
+    <tr><td>Disabled-mode SDK 結構不可達</td><td><code>flag_matrix_test</code> 斷言 impl 型別為 <code>*direct.Collection</code>；<code>internal/direct/</code> 編譯時無 otel/sdk import（CI drift-check）</td></tr>
+    <tr><td>Disconnect / Close 在 3 秒內釋放 deliver-TP goroutine</td><td>client_deliver_test.go 的 <code>TestShutdownDeliverHonoursTimeout</code></td></tr>
+    <tr><td>SingleResult 首觸即終結 span</td><td><code>TestSingleResultDecodeSpanEndedOnce</code> 6 個交叉排列 sub-cases</td></tr>
+  </tbody>
+</table>
+
+<h2>覆蓋率缺口（已知 + 設計使然）</h2>
+
+<table>
+  <thead><tr><th style="width:200px">套件</th><th>%</th><th>低的原因</th></tr></thead>
+  <tbody>
+    <tr><td><code>internal/direct</code></td><td class="center">0%</td><td>Passthrough impl — 只在 disabled mode 建構；正確性由結構（flag matrix 中的 impl 型別斷言）守護，非透過直接執行</td></tr>
+    <tr><td><code>internal/traced</code></td><td class="center">~5%</td><td>多數 stmt 只透過真 mongod 整合測試才能到達；unit 層級可對狹義 case（state.go、changestream）建 literal，但完整 <code>Collection.InsertOne</code> 路徑需要 driver</td></tr>
+    <tr><td><code>internal/shared</code> bulkwrite/upsert 分支</td><td class="center">~45%</td><td>Bulk-write 與 upsert 路徑由真 mongod 整合套件（TestCollectionBulkWrite 等）覆蓋，非 internal unit</td></tr>
+  </tbody>
+</table>
+
+<p style="margin-top:32px;color:var(--muted);font-size:12px">資料來源：<code>go test -count=1 -coverpkg=./... ./...</code> + <code>go tool cover -func</code>；每檔測試數來自 <code>grep -c '^func Test' &lt;file&gt;</code>。生成日期 2026-05-22。</p>
+
+</body>
+</html>

@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>otel-gorilla-ws — Test Detail Report</title>
+<style>
+  :root { --bg:#fafbfc; --fg:#24292e; --muted:#6a737d; --border:#e1e4e8; --accent:#0366d6; --ok:#28a745; --warn:#f9a825; --bad:#d73a49; --header-bg:#f6f8fa; --code-bg:#f0f3f6; }
+  body { font-family:-apple-system,"Helvetica Neue","PingFang TC","Microsoft JhengHei",sans-serif; background:var(--bg); color:var(--fg); line-height:1.55; max-width:1500px; margin:0 auto; padding:32px 24px; }
+  h1 { font-size:28px; margin:0 0 4px; }
+  h2 { font-size:20px; margin:32px 0 12px; padding-bottom:6px; border-bottom:2px solid var(--accent); }
+  h3 { font-size:16px; margin:18px 0 8px; color:var(--accent); }
+  .subtitle { color:var(--muted); margin-bottom:20px; font-size:14px; }
+  code { font-family:"JetBrains Mono","SF Mono",Menlo,Consolas,monospace; font-size:12.5px; background:var(--code-bg); padding:1px 5px; border-radius:3px; }
+  table { width:100%; border-collapse:collapse; margin:8px 0 20px; font-size:13px; background:white; box-shadow:0 1px 2px rgba(0,0,0,0.04); }
+  th, td { border:1px solid var(--border); padding:8px 10px; text-align:left; vertical-align:top; }
+  th { background:var(--header-bg); font-weight:600; }
+  tr:nth-child(even) td { background:#fdfdfd; }
+  td.center { text-align:center; }
+  td.file { white-space:nowrap; font-family:"JetBrains Mono","SF Mono",Menlo,Consolas,monospace; font-size:12px; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:12px; font-size:11px; font-weight:600; color:white; white-space:nowrap; }
+  .b-ok { background:var(--ok); } .b-part { background:var(--warn); color:#333; } .b-info { background:var(--accent); }
+  .coverage-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:12px 0 24px; }
+  .card { background:white; border:1px solid var(--border); border-radius:6px; padding:14px 16px; }
+  .card h4 { margin:0 0 6px; font-size:13px; color:var(--muted); font-weight:600; letter-spacing:0.5px; }
+  .card .num { font-size:24px; font-weight:700; color:var(--accent); }
+  .card .sub { color:var(--muted); font-size:12px; margin-top:4px; }
+  .lang-toggle { background:#eef; padding:8px 14px; border-radius:6px; font-size:13px; margin-bottom:18px; }
+  .lang-toggle a { text-decoration:none; color:var(--accent); font-weight:600; }
+</style>
+</head>
+<body>
+
+<div class="lang-toggle">🌐 <strong>Language:</strong> <a href="test-report.html">English</a> · <a href="test-report.zh-TW.html">繁體中文</a></div>
+
+<h1>otel-gorilla-ws — Test Detail Report</h1>
+<div class="subtitle">
+  Single-package module wrapping <code>github.com/gorilla/websocket</code> with W3C trace propagation inside the
+  WebSocket message body (JSON envelope). Wire format is a cross-language contract with the JS
+  <code>@marz32one/otel-ws</code> and <code>@marz32one/otel-rxjs-ws</code> packages.<br>
+  Generated 2026-05-22 · <code>go test -count=1 -race ./...</code>: <strong>116</strong> passed (unit) + <strong>13</strong> (integration) ·
+  <code>golangci-lint v2</code>: 0 issues.
+</div>
+
+<h2>Coverage Summary</h2>
+<div class="coverage-grid">
+  <div class="card"><h4>facade (otelgorillaws)</h4><div class="num">91.3%</div><div class="sub">module-only</div></div>
+  <div class="card"><h4>Aggregate</h4><div class="num">92.1%</div><div class="sub"><code>-coverpkg=./...</code></div></div>
+  <div class="card"><h4>internal/flags</h4><div class="num">100%</div><div class="sub">byte-identical w/ sibling modules</div></div>
+  <div class="card"><h4>Pure functions</h4><div class="num">100%</div><div class="sub">splitClientProtocols / selectFirst / cloneHeader / appProtocolFromRaw / isOTelWireProtocol</div></div>
+</div>
+
+<h2>Test Files — What / How / Why</h2>
+
+<h3>Unit Tests (root package)</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th style="width:200px">File</th>
+      <th style="width:50px">Tests</th>
+      <th>What's tested</th>
+      <th style="width:240px">How</th>
+      <th style="width:240px">Why</th>
+    </tr>
+  </thead>
+  <tbody>
+
+    <tr>
+      <td class="file">env_flags_test.go</td>
+      <td class="center">1</td>
+      <td>2-tier flag gate truth table: <code>OTEL_INSTRUMENTATION_GO_TRACING_ENABLED</code> × <code>OTEL_GORILLA_WS_TRACING_ENABLED</code>. ~20 rows covering truthy/falsy synonyms. No propagation flag (intentional — envelope is inline; subprotocol negotiation serves that role).</td>
+      <td>Direct calls to <code>wsTracingEnabled()</code>; per-row <code>t.Setenv</code> + <code>os.Unsetenv</code>; <code>resetWSGateForTest()</code> after each row.</td>
+      <td>This is the load-bearing gate for the per-connection impl selection in <code>newConn</code>. A regression flips every newly-created Conn into the wrong (or right but should-not-be-tracing) path.</td>
+    </tr>
+
+    <tr>
+      <td class="file">message_test.go</td>
+      <td class="center">9</td>
+      <td><strong>Cross-language wire format contract</strong>: <code>MarshalWire</code> produces the exact <code>{"header":{...},"data":...}</code> shape JS clients expect; <code>TryUnmarshalWire</code> accepts both the envelope AND the legacy flat format for backward compat; non-JSON payloads are wrapped as JSON-encoded strings; <code>sync.Pool</code> buffer reuse safety across goroutines.</td>
+      <td>Hand-built byte arrays compared with <code>assert.JSONEq</code>; goroutine fan-out for pool reuse stress.</td>
+      <td>This file is the SINGLE GUARDIAN of the cross-language wire contract. Any change to the envelope shape breaks JS clients silently — the only way to catch this without a JS test rig is exact byte-level assertions in Go.</td>
+    </tr>
+
+    <tr>
+      <td class="file">options_test.go</td>
+      <td class="center">5</td>
+      <td><code>resolveOptions</code> falls back to global Tracer/Propagator when no options passed; custom options don't mutate globals; <code>NewConn</code> selects <code>internal/direct.Conn</code> when feature disabled, <code>internal/traced.Conn</code> when enabled; negotiated=false (passthrough subprotocol) keeps tracing on but disables PropagationEnabled.</td>
+      <td>Recorder-based: assert which TP a custom-option tracer.Start writes to vs the global TP.</td>
+      <td>Functional options are the ONLY way callers customise the wrapper without monkeypatching globals. If <code>resolveOptions</code> wrongly mutated globals, instrumenting multiple connections with different propagators would have ordering-dependent behaviour.</td>
+    </tr>
+
+    <tr>
+      <td class="file">helpers_test.go</td>
+      <td class="center">4</td>
+      <td>Error type predicates (close error detection, normal vs abnormal closures), formatting helpers.</td>
+      <td>Direct calls to helpers in <code>helpers.go</code>.</td>
+      <td>These helpers run in error paths — bugs are invisible until a real disconnect happens in production. Direct unit coverage catches off-by-one in close-code classification.</td>
+    </tr>
+
+    <tr>
+      <td class="file">conn_test.go</td>
+      <td class="center">9</td>
+      <td>(1) <code>TestRoundTrip</code> + <code>TestSpanAttributes</code> — end-to-end envelope round-trip with span attributes verification; (2) Scenarios C, D, E (client-side dial scenarios — see <code>tests/integration/handshake_test.go</code> for the full A–H table); (3) Scenarios F, G, G_FromPrefixedClientToken, H (server-side upgrader scenarios).</td>
+      <td><code>httptest.NewServer</code> with both <code>otelgorillaws.Upgrader</code> and plain <code>websocket.Upgrader</code> handler variants; <code>tracetest.SpanRecorder</code> for span observation.</td>
+      <td>Subprotocol negotiation is THE central correctness concern of this wrapper — there are 8 distinct scenarios (A–H per README). Each is a different decision in the upgrade path. Without per-scenario tests, regressions in one branch don't surface until a specific client mix hits it in production.</td>
+    </tr>
+
+    <tr>
+      <td class="file">upgrader_test.go</td>
+      <td class="center">5 (30 sub-cases)</td>
+      <td>Pure-function unit tests for the upgrader's internal helpers: <code>splitClientProtocols</code> (9 cases including bare otel-ws, prefixed, mixed), <code>selectFirst</code> (7 cases including accept-any semantics), <code>cloneHeader</code> (3 cases including nil-safety + independence), <code>appProtocolFromRaw</code> (5 cases for prefix stripping), <code>isOTelWireProtocol</code> (6 cases including case-sensitivity).</td>
+      <td>Internal-package tests (no _test suffix on package) — these are pure functions, no I/O, no goroutines.</td>
+      <td>The high-level Scenario tests in conn_test.go indirectly cover these but a 9-case table per pure function is cheaper to write, faster to run, and pinpoints the bug to a specific function rather than a whole handshake path.</td>
+    </tr>
+
+    <tr>
+      <td class="file">flag_matrix_test.go</td>
+      <td class="center">4</td>
+      <td>(1) <code>TestWSFlagMatrix_AllCombinations</code> — 6 env combinations × end-to-end client/server with envelope-or-not assertion; (2) <code>TestWriteMessageDisabled_ByteIdenticalWithNative</code> — runs the SAME payload through both <code>otelgorillaws.Dial</code> (disabled mode) and raw <code>websocket.Dialer</code>, asserts the server receives byte-identical bytes from both; (3) <code>TestWriteMessageEnabled_NonNegotiatedStillByteIdentical</code> — envelope MUST be suppressed when subprotocol negotiation fails even if env is on; (4) <code>TestSubprotocolStripsOTelPrefix</code> — <code>Conn.Subprotocol()</code> strips <code>otel-ws+</code> prefix.</td>
+      <td>Internal-package test so we can reset the unexported <code>wsGate</code> directly. <code>httptest</code> server with both gorilla and otelgorillaws upgraders. Cleanup ordered carefully (gate reset last via LIFO) so hijacked WebSocket handler goroutines don't race with the gate reset.</td>
+      <td><strong>The byte-identical assertion is the strongest possible disabled-mode invariant proof</strong> — it runs both paths and compares wire bytes. If anything in the disabled path ever started wrapping payloads (even accidentally), this test fails immediately.</td>
+    </tr>
+
+  </tbody>
+</table>
+
+<h3>Integration Tests (<code>tests/integration/</code>)</h3>
+
+<table>
+  <thead>
+    <tr><th style="width:240px">File</th><th style="width:50px">Tests</th><th>What's tested</th><th style="width:240px">How</th><th style="width:240px">Why</th></tr>
+  </thead>
+  <tbody>
+
+    <tr>
+      <td class="file">handshake_test.go</td>
+      <td class="center">3 (incl. 8 sub-cases)</td>
+      <td>(1) <code>TestIntegration_Handshake_OtelWSOnlyNoAppProtocol</code> — Scenario A; (2) <code>TestIntegration_Handshake_SubprotocolNegotiation</code> — Scenario B with full message round-trip; (3) <strong>TestHandshakeScenarios_All</strong> — table-driven all 8 Scenarios A–H with cross-references to <code>conn_test.go</code> sibling unit tests.</td>
+      <td>Separate Go module under <code>tests/integration/</code>. Uses real <code>httptest.NewServer</code> + various raw/wrapped client+server combinations.</td>
+      <td>The matrix file consolidates 8 scattered unit tests into a single canonical reference. Anyone reading "Scenario G" anywhere in the codebase can find the exact behaviour expected.</td>
+    </tr>
+
+    <tr>
+      <td class="file">message_propagation_test.go</td>
+      <td class="center">1</td>
+      <td>Trace context round-trip across the envelope: producer span context appears on the consumer side after extraction.</td>
+      <td>End-to-end with both ends wrapped, single message through.</td>
+      <td>The envelope is the entire propagation channel — any breakage here breaks the whole point of this wrapper.</td>
+    </tr>
+
+    <tr>
+      <td class="file">error_fallback_test.go</td>
+      <td class="center">1</td>
+      <td>Non-envelope payloads + close messages don't crash the wrapper — <code>TryUnmarshalWire</code> gracefully returns false and ReadMessage passes the raw bytes through.</td>
+      <td>Server sends a non-JSON payload then closes; assert client doesn't error or panic.</td>
+      <td>Real-world WebSocket traffic includes ping/pong/close frames and clients may send unwrapped payloads — robustness here is the difference between a crashy library and a useful one.</td>
+    </tr>
+
+  </tbody>
+</table>
+
+<h2>Cross-cutting Invariants Locked By Tests</h2>
+
+<table>
+  <thead><tr><th style="width:340px">Invariant</th><th>Guarded By</th></tr></thead>
+  <tbody>
+    <tr><td>Universal default-OFF env posture</td><td><code>env_flags_test.go</code> truth table</td></tr>
+    <tr><td>Flag off ⇒ wire byte-identical with native gorilla/websocket</td><td><code>TestWriteMessageDisabled_ByteIdenticalWithNative</code> (parallel-client comparison)</td></tr>
+    <tr><td>Per-connection gate via subprotocol negotiation</td><td>conn_test.go Scenarios C/D/E/F + flag_matrix <code>TestWriteMessageEnabled_NonNegotiatedStillByteIdentical</code></td></tr>
+    <tr><td>Cross-language wire envelope contract</td><td>message_test.go (byte-exact MarshalWire assertions + legacy flat-format backward compat)</td></tr>
+    <tr><td>8 handshake scenarios (A–H) coherent across unit + integration</td><td>conn_test.go (C–H) + tests/integration/handshake_test.go (A + B + table-driven A–H matrix)</td></tr>
+    <tr><td>Subprotocol() strips otel-ws+ prefix</td><td><code>TestSubprotocolStripsOTelPrefix</code> with safe cleanup-ordering</td></tr>
+    <tr><td>Pure helpers (split/selectFirst/cloneHeader/appProtocolFromRaw/isOTelWireProtocol)</td><td><code>upgrader_test.go</code> 30 sub-cases, 100% coverage</td></tr>
+    <tr><td>resolveOptions doesn't mutate global state</td><td><code>TestResolveOptions_UsesProvidedOptionsWithoutMutatingGlobals</code></td></tr>
+  </tbody>
+</table>
+
+<h2>Coverage Gaps (Known + Intentional)</h2>
+
+<table>
+  <thead><tr><th style="width:200px">Package</th><th>%</th><th>Why low</th></tr></thead>
+  <tbody>
+    <tr><td><code>internal/direct</code> + <code>internal/traced</code></td><td class="center">0%</td><td><strong>Intentional</strong> — strategy-split impls covered via facade-level tests (the unit tests in the root package exercise both impls through <code>NewConn</code>/<code>Dial</code>); <code>go test -cover</code> reports 0 because these packages have no own <code>_test.go</code> files</td></tr>
+    <tr><td><code>internal/shared</code></td><td class="center">0%</td><td>Same — wire format helpers (<code>MarshalWire</code>, <code>TryUnmarshalWire</code>) covered by message_test.go in the facade package</td></tr>
+    <tr><td><code>upgrader.go::Upgrade</code></td><td class="center">75.8%</td><td>Uncovered statements are error-recovery branches (negotiation failure responses) only reachable via malformed client handshake — not unit-testable without a wire-level client harness</td></tr>
+  </tbody>
+</table>
+
+<p style="margin-top:32px;color:var(--muted);font-size:12px">Sources: <code>go test -count=1 -coverpkg=./... ./...</code> + <code>go tool cover -func</code>; per-file test counts from <code>grep -c '^func Test' &lt;file&gt;</code>. Generated 2026-05-22.</p>
+
+</body>
+</html>

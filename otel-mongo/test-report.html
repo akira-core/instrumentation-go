@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>otel-mongo — Test Detail Report (v1 + v2)</title>
+<style>
+  :root { --bg:#fafbfc; --fg:#24292e; --muted:#6a737d; --border:#e1e4e8; --accent:#0366d6; --ok:#28a745; --warn:#f9a825; --bad:#d73a49; --header-bg:#f6f8fa; --code-bg:#f0f3f6; }
+  body { font-family:-apple-system,"Helvetica Neue","PingFang TC","Microsoft JhengHei",sans-serif; background:var(--bg); color:var(--fg); line-height:1.55; max-width:1500px; margin:0 auto; padding:32px 24px; }
+  h1 { font-size:28px; margin:0 0 4px; }
+  h2 { font-size:20px; margin:32px 0 12px; padding-bottom:6px; border-bottom:2px solid var(--accent); }
+  h3 { font-size:16px; margin:18px 0 8px; color:var(--accent); }
+  .subtitle { color:var(--muted); margin-bottom:20px; font-size:14px; }
+  code, .mono { font-family:"JetBrains Mono","SF Mono",Menlo,Consolas,monospace; font-size:12.5px; background:var(--code-bg); padding:1px 5px; border-radius:3px; }
+  table { width:100%; border-collapse:collapse; margin:8px 0 20px; font-size:13px; background:white; box-shadow:0 1px 2px rgba(0,0,0,0.04); }
+  th, td { border:1px solid var(--border); padding:8px 10px; text-align:left; vertical-align:top; }
+  th { background:var(--header-bg); font-weight:600; }
+  tr:nth-child(even) td { background:#fdfdfd; }
+  td.center { text-align:center; }
+  td.file { white-space:nowrap; font-family:"JetBrains Mono","SF Mono",Menlo,Consolas,monospace; font-size:12px; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:12px; font-size:11px; font-weight:600; color:white; white-space:nowrap; }
+  .b-ok { background:var(--ok); } .b-part { background:var(--warn); color:#333; } .b-gap { background:var(--bad); } .b-info { background:var(--accent); }
+  .coverage-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:12px 0 24px; }
+  .card { background:white; border:1px solid var(--border); border-radius:6px; padding:14px 16px; }
+  .card h4 { margin:0 0 6px; font-size:13px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:0.5px; }
+  .card .num { font-size:24px; font-weight:700; color:var(--accent); }
+  .card .sub { color:var(--muted); font-size:12px; margin-top:4px; }
+  .lang-toggle { background:#eef; padding:8px 14px; border-radius:6px; font-size:13px; margin-bottom:18px; }
+  .lang-toggle a { text-decoration:none; color:var(--accent); font-weight:600; }
+</style>
+</head>
+<body>
+
+<div class="lang-toggle">🌐 <strong>Language:</strong> <a href="test-report.html">English</a> · <a href="test-report.zh-TW.html">繁體中文</a></div>
+
+<h1>otel-mongo — Test Detail Report</h1>
+<div class="subtitle">
+  Covers both <code>otelmongo/</code> (v1, mongo-driver 1.17.x) and <code>v2/</code> (v2, mongo-driver 2.6.x).
+  Both modules share a strict v1↔v2 parity invariant — every test file below has a counterpart in the sibling module
+  (see <strong>Parity</strong> column).<br>
+  Generated 2026-05-22 · <code>go test -count=1 -race ./...</code>: <strong>v1 181 / v2 191</strong> passed ·
+  <code>golangci-lint v2</code>: 0 issues.
+</div>
+
+<h2>Coverage Summary</h2>
+<div class="coverage-grid">
+  <div class="card"><h4>v1 facade pkg</h4><div class="num">72.2%</div><div class="sub"><code>otelmongo</code> (module-only)</div></div>
+  <div class="card"><h4>v2 facade pkg</h4><div class="num">72.2%</div><div class="sub"><code>v2</code> (module-only)</div></div>
+  <div class="card"><h4>v1 aggregate</h4><div class="num">66.2%</div><div class="sub"><code>-coverpkg=./...</code> incl. internal/</div></div>
+  <div class="card"><h4>v2 aggregate</h4><div class="num">64.3%</div><div class="sub"><code>-coverpkg=./...</code> incl. internal/</div></div>
+</div>
+
+<table>
+  <thead><tr><th>Sub-package</th><th>Coverage</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><code>otelmongo</code> / <code>v2</code> (facade)</td><td class="center">72.2%</td><td>Strategy facade — uncovered statements are mostly deliver-span branches that require <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> + live OTLP collector</td></tr>
+    <tr><td><code>internal/flags</code></td><td class="center"><span class="badge b-ok">100%</span></td><td>Byte-identical across all four sibling modules — every branch of <code>EnvEnabled</code> + <code>Gate</code> covered</td></tr>
+    <tr><td><code>internal/shared</code></td><td class="center">44.9% / 45.2%</td><td>Inject/extract helpers — uncovered code is the bulk-write / upsert-set $set path (covered via integration tests, not unit)</td></tr>
+    <tr><td><code>internal/traced</code></td><td class="center">5.3% / 5.0%</td><td><strong>Intentional</strong> — these stmts only execute against a live mongod (integration suite); strategy-split keeps disabled-mode unreachable from this pkg, so unit coverage is low by design</td></tr>
+    <tr><td><code>internal/direct</code></td><td class="center"><span class="badge b-info">0%</span></td><td><strong>Intentional</strong> — passthrough impl only constructed when env gate is OFF; coverage = 0 because <code>go test -cover</code> measures executed statements; correctness is enforced by the facade-level <code>TestFlagMatrix_*</code> tests asserting the impl <em>type</em>, not by exercising direct calls</td></tr>
+  </tbody>
+</table>
+
+<h2>Test Files — What / How / Why</h2>
+
+<p>The table below lists every <code>*_test.go</code> in both v1 and v2 with the rationale behind each. <strong>Parity</strong> column shows whether the test has a matching sibling in the other version.</p>
+
+<table>
+  <thead>
+    <tr>
+      <th style="width:240px">File (both v1 + v2 unless noted)</th>
+      <th style="width:50px">Tests</th>
+      <th style="width:160px">Parity</th>
+      <th>What's tested</th>
+      <th style="width:240px">How</th>
+      <th style="width:240px">Why</th>
+    </tr>
+  </thead>
+  <tbody>
+
+    <tr>
+      <td class="file">env_flags_test.go</td>
+      <td class="center">4</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td>Truth-table of the three-tier flag gate: <code>OTEL_INSTRUMENTATION_GO_TRACING_ENABLED</code> × <code>OTEL_MONGO_TRACING_ENABLED</code> × <code>OTEL_MONGO_PROPAGATION_ENABLED</code>. ~30 rows covering truthy / falsy synonyms (true / 1 / on / yes / "" / arbitrary; false / 0 / no / off / padded).</td>
+      <td>Direct calls to <code>mongoTracingEnabled()</code>, <code>mongoPropagationEnabled()</code>, <code>resolveFlag()</code>, <code>resolveDocumentPropagation()</code> with table-driven <code>t.Setenv</code> + <code>os.Unsetenv</code> per row.</td>
+      <td>The disabled-mode invariant ("flag off → zero spans, zero wire effect") fans out from these three gates. If any row regresses, downstream wrapper code accidentally runs SDK paths it shouldn't.</td>
+    </tr>
+
+    <tr>
+      <td class="file">env_flags_testhelper_test.go</td>
+      <td class="center">0</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td>Defines <code>resetPropEnabledCacheForTest()</code> — a private test-only helper that re-arms the <code>sync.Once</code>-cached propagation gate.</td>
+      <td>Plain function in a <code>_test.go</code> file (package-scoped, not exported).</td>
+      <td>The cached gate would freeze the value of the env vars at first read, breaking any subsequent test that flips env via <code>t.Setenv</code>. This helper lets tests force re-evaluation.</td>
+    </tr>
+
+    <tr>
+      <td class="file">flag_matrix_test.go</td>
+      <td class="center">2</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td>End-to-end matrix asserting all 8 combinations of (global × tracing × propagation): (1) <code>NewCollection</code> returns the right impl type — <code>*direct.Collection</code> when any gate is off, <code>*traced.Collection</code> with the right <code>PropagationEnabled</code> bit when all are on; (2) <code>ContextFromDocument</code> rejects valid <code>_oteltrace</code> data when any gate is off.</td>
+      <td>Table-driven 8 rows × strategy-impl type-assertion + cache verification via <code>cachedPropagationEnabled()</code>.</td>
+      <td>The gate function tests alone don't prove the WRAPPER follows the gate. This file is the bridge between the truth table and observable wrapper behaviour — the single test that locks in "flag off ⇒ no SDK code reachable".</td>
+    </tr>
+
+    <tr>
+      <td class="file">tracing_test.go</td>
+      <td class="center">6 / 7</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td>Public API <code>ContextFromDocument</code> / <code>ContextFromRawDocument</code> on every BSON shape (<code>bson.M</code> / <code>map[string]any</code> / <code>bson.D</code> / struct-slow-path), plus malformed traceparent rejection across types, plus <code>StartDeliverSpan</code> on disabled <code>traced.Collection</code>. Includes regression test for dot-notation key preservation in <code>$setOnInsert</code> updates (<code>"u._id"</code> must survive marshal/unmarshal round-trip).</td>
+      <td>Build raw documents with <code>bson.Marshal</code>, call public extractors with various flag combinations using <code>enableDocumentPropagation</code> helper + <code>resetPropEnabledCacheForTest</code> cleanup.</td>
+      <td>This is the read-path side of <code>_oteltrace</code> propagation. Every consumer of trace context (change-stream readers, MongoDB → NATS bridges, downstream services) goes through these helpers. Regressions silently break trace continuity end-to-end.</td>
+    </tr>
+
+    <tr>
+      <td class="file">client_test.go</td>
+      <td class="center">4 / 1</td>
+      <td><span class="badge b-part">v1 wider</span></td>
+      <td>v1: <code>initMongoProvider</code> with/without <code>OTEL_EXPORTER_OTLP_ENDPOINT</code>, <code>mongoServiceName</code> formatting, <code>parseServerFromClientOptions</code> with nil / no-URI / with-URI inputs. v2: subset (URI parsing happens at <code>options.Client()</code> layer, drier).</td>
+      <td>Direct calls to package-private helpers; no live mongod required.</td>
+      <td>Connect-time semconv attributes (<code>server.address</code>, <code>server.port</code>) and deliver-TP gate decisions are made here. If <code>mongoServiceName</code> mis-formats, the entire <strong>service graph</strong> shows wrong broker labels.</td>
+    </tr>
+
+    <tr>
+      <td class="file">client_deliver_test.go</td>
+      <td class="center">5 / 10</td>
+      <td><span class="badge b-ok">v1 ≡ v2 (different layout)</span></td>
+      <td>(1) <code>traced.ClientState.ShutdownDeliver</code> with nil <code>MongoTP</code> (noop), real provider (invokes processor Shutdown), with bounded 3-second timeout when processor blocks; (2) <code>TestClientDisabledPathHasNoDeliverState</code> asserts <code>mongoTracingEnabled()</code> resolves false with explicit env=0; (3) v2 has additional <code>initMongoProvider</code> + <code>StartDeliverSpan</code> tests folded into the same file.</td>
+      <td>Custom <code>shutdownObservingProcessor</code> with optional block duration that satisfies the <code>SpanProcessor</code> interface; assertion via direct call to <code>state.ShutdownDeliver</code>.</td>
+      <td>If <code>Disconnect</code> doesn't shut down the deliver-TP cleanly, every long-running service that creates short-lived <code>*Client</code>s leaks an exporter batch goroutine per connection — invisible until production OOMs.</td>
+    </tr>
+
+    <tr>
+      <td class="file">cursor_test.go</td>
+      <td class="center">7 / 10</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td><code>Cursor.Decode</code> direct/traced paths, <code>SingleResult.Decode</code> / <code>Raw</code> / <code>TraceContext</code> first-touch-ends-span contract with 6 cross-permutation sub-cases (decode×2, decode→raw, raw→decode, decode→tracectx, tracectx→raw, all-three), passthrough impl emits no spans.</td>
+      <td>Construct cursors via <code>mongo.NewCursorFromDocuments</code> / <code>mongo.NewSingleResultFromDocument</code> — no live mongod needed. Build documents carrying <code>_oteltrace</code> with <code>injectTraceIntoDocument</code> helper.</td>
+      <td>The "span ends exactly once on first of Decode/Raw/TraceContext" contract is easy to break silently — a future refactor that adds an early-return path could end the span twice (panic) or zero times (leak). The cross-permutation cases nail this down.</td>
+    </tr>
+
+    <tr>
+      <td class="file">cursor_decodewithcontext_test.go (v1 only)</td>
+      <td class="center">2</td>
+      <td><span class="badge b-info">v1 only</span></td>
+      <td>v1-specific behaviour: <code>DecodeWithContext</code> creates an INTERNAL span with a new TraceID linked to the origin trace (legacy semantic). Also asserts disabled path emits no span.</td>
+      <td>Recorder-based: build cursor with <code>_oteltrace</code>, decode, inspect <code>tracetest.SpanRecorder.Ended()</code> for the <code>mongo.cursor.decode</code> span and verify its links.</td>
+      <td>v2 changed <code>DecodeWithContext</code> to pure context enrichment (no extra span). This file is the only place where the legacy v1 contract is enforced; without it, v1 silently regresses to v2 behaviour without breaking any other test.</td>
+    </tr>
+
+    <tr>
+      <td class="file">collection_test.go</td>
+      <td class="center">14</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td>Integration suite (testcontainers MongoDB): InsertOne/InsertMany/ReplaceOne/UpdateOne/DeleteOne/CountDocuments/UpdateByID/DeleteOneByID/FindOneByID/FindByIDs/BulkWrite, all asserting <code>_oteltrace</code> presence on writes + the global-off zero-spans path. Includes <code>TestNewCollection</code> for the strategy-split decision.</td>
+      <td><code>tcmongo.Run(ctx, "mongo:7.0")</code> starts a standalone MongoDB container in <code>TestMain</code>; all tests share it. <code>requireMongoDB</code> falls back to <code>MONGO_URI</code> env var or skips when Docker is unavailable.</td>
+      <td>Without integration tests the wrapper has no end-to-end confidence — driver behaviour is too subtle (e.g., projection rules, atomic ops, write concerns) to be faithfully mocked. <code>_oteltrace</code> field presence on real reads is the only meaningful proof that the wrapper actually round-trips through MongoDB BSON serialisation.</td>
+    </tr>
+
+    <tr>
+      <td class="file">database_test.go</td>
+      <td class="center">3</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td>Gate inheritance chain: <code>ClientState.ForDatabase()</code> → <code>DatabaseState.NewCollection()</code> propagates Tracer / Propagator / PropagationEnabled / DeliverTracer / ServerAddr / ServerPort verbatim. Also verifies <code>PropagationEnabled=false</code> propagates through the chain.</td>
+      <td>Direct struct construction; no live mongod. Asserts interface-value equality across the chain.</td>
+      <td>If the inheritance chain drops a field, a Database/Collection constructed via a Client could lose its propagation setting partway through, producing inconsistent <code>_oteltrace</code> behaviour between Client/Collection used directly vs via Database.Collection.</td>
+    </tr>
+
+    <tr>
+      <td class="file">internal/shared/extract_metadata_test.go</td>
+      <td class="center">7 + 1 bench</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td><code>ExtractMetadataFromRaw</code> direct-lookup parity with old reflection path, missing field, wrong-type subdocument, empty traceparent; <strong>bson.D reverse-scan</strong>: position invariance (head/middle/tail), reverse-scan finds LAST occurrence (locks in the optimisation), benchmark comparing tail vs head lookup cost.</td>
+      <td>Construct <code>bson.D</code> and <code>bson.Raw</code> with <code>bson.Marshal</code>; call low-level extractors directly.</td>
+      <td>This is the hottest read path (change-stream iteration). A regression that turned the reverse scan into a forward scan would silently slow down read paths and break the "wrapper-injected last entry wins" semantic that <code>injectTraceIntoDocument</code> relies on for consistent inject/extract.</td>
+    </tr>
+
+    <tr>
+      <td class="file">internal/shared/inject_trace_test.go</td>
+      <td class="center">14+</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td><strong>v0.5.2 sampling gate</strong>: 14 cases proving that unsampled writes skip <code>_oteltrace</code> entirely. Plus immutability of caller's document, all four input types (bson.D / bson.M / map / struct).</td>
+      <td>Build contexts with explicit sampler choices; call <code>InjectTraceIntoDocument</code>; assert presence/absence of <code>_oteltrace</code> in the result.</td>
+      <td>The v0.5.2 release added the sampling gate as a breaking-default change. This file is the load-bearing test that proves the new contract holds across every input shape.</td>
+    </tr>
+
+    <tr>
+      <td class="file">internal/shared/inspect_writemodel_test.go</td>
+      <td class="center">multiple</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td>BulkWrite operations: <code>InsertOneModel</code>, <code>UpdateOneModel</code>, <code>$setOnInsert</code>, model preservation (immutability).</td>
+      <td>Reflection-style helpers on driver bulk-write model types.</td>
+      <td>BulkWrite is a single round-trip with many operations — a model that loses <code>_oteltrace</code> mid-batch would silently drop trace continuity for half the operations.</td>
+    </tr>
+
+    <tr>
+      <td class="file">internal/shared/bulkwrite_test.go</td>
+      <td class="center">multiple</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td>BulkWrite end-to-end inject behaviour; cooperation with the model inspector.</td>
+      <td>Direct calls to internal helpers; no live mongod.</td>
+      <td>Bulk operations are the path most likely to drop trace context due to per-model handling — explicit coverage prevents silent drops.</td>
+    </tr>
+
+    <tr>
+      <td class="file">internal/shared/upsertset_test.go (v2 only)</td>
+      <td class="center">1</td>
+      <td><span class="badge b-info">v2 only</span></td>
+      <td>v2-specific <code>upsertSetField</code> helper for the mongo-driver 2.x <code>SetOptions</code> pattern.</td>
+      <td>Direct unit test.</td>
+      <td>v2 driver introduces a new option-builder pattern; without this test, behavioural drift between v1 and v2 upsert paths goes uncaught.</td>
+    </tr>
+
+    <tr>
+      <td class="file">internal/traced/changestream_test.go</td>
+      <td class="center">2</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td><code>buildConsumerCtx</code>: creates new TraceID linked to origin via span-link; deliver tracer makes the change-stream span a child of a synthetic deliver span when <code>DeliverTracer</code> is set.</td>
+      <td>Construct <code>traced.ChangeStream</code> directly with a tracer + deliver tracer; assert span links and parentage via recorder.</td>
+      <td>Change streams are the most subtle propagation case — the producer (writer) and consumer (watcher) are decoupled in time and process. Span links rather than parent-child preserve causality without implying synchronous nesting.</td>
+    </tr>
+
+    <tr>
+      <td class="file">internal/flags/flags_test.go</td>
+      <td class="center">5</td>
+      <td><span class="badge b-ok">v1 ≡ v2 (byte-identical)</span></td>
+      <td><code>EnvEnabled</code> truthy/falsy synonyms; <code>Gate.Enabled</code> evaluates resolver exactly once via sync.Once; <code>ResetForTest</code> re-arms; concurrent <code>Enabled</code> reads are safe.</td>
+      <td>Direct unit tests against <code>flags</code> primitives — no env vars touched outside of <code>t.Setenv</code> scoped subtests.</td>
+      <td>This file is BYTE-IDENTICAL across all four sibling modules (CI drift-check job enforces this). It guards the core flag primitive that every wrapper depends on; a regression here is a regression in all four modules.</td>
+    </tr>
+
+    <tr>
+      <td class="file">internal_aliases_test.go</td>
+      <td class="center">0</td>
+      <td><span class="badge b-ok">v1 ≡ v2</span></td>
+      <td>Re-exports internal types (<code>injectTraceIntoDocument</code>, etc.) into the facade <code>_test.go</code> namespace so tests can call them without breaking the <code>internal/</code> package boundary.</td>
+      <td>Type aliases + function variable re-binds.</td>
+      <td>Without this, the facade package's tests couldn't drive internal helpers directly — every test would have to construct via the public API, making fast unit tests impossible.</td>
+    </tr>
+
+  </tbody>
+</table>
+
+<h2>Cross-cutting Invariants Locked By Tests</h2>
+
+<table>
+  <thead><tr><th style="width:340px">Invariant</th><th>Guarded By</th></tr></thead>
+  <tbody>
+    <tr><td>Universal default-OFF env posture</td><td><code>env_flags_test.go</code> truth tables (v1 + v2)</td></tr>
+    <tr><td>Flag off ⇒ zero wrapper spans + zero <code>_oteltrace</code></td><td><code>flag_matrix_test.go</code> 8 combinations + <code>TestConnectGlobalOff_ZeroWrapperSpans</code> in collection_test.go (live mongod)</td></tr>
+    <tr><td>Unsampled writes skip <code>_oteltrace</code> (v0.5.2)</td><td><code>internal/shared/inject_trace_test.go</code> 14 sampling-gate cases</td></tr>
+    <tr><td>v1 ↔ v2 strict parity</td><td>Every test file above has a sibling (see Parity column); internal/shared/* are byte-identical</td></tr>
+    <tr><td>bson.D reverse-scan optimisation</td><td><code>TestExtractMetadataFromBsonD_ReverseScanFindsLast</code> + benchmark</td></tr>
+    <tr><td>Disabled-mode SDK unreachability (structural)</td><td><code>flag_matrix_test</code> asserts impl type is <code>*direct.Collection</code>; <code>internal/direct/</code> compiles without otel/sdk import (CI drift-check)</td></tr>
+    <tr><td>Disconnect / Close releases deliver-TP goroutine within 3s</td><td><code>TestShutdownDeliverHonoursTimeout</code> in client_deliver_test.go</td></tr>
+    <tr><td>SingleResult first-touch-ends-span</td><td><code>TestSingleResultDecodeSpanEndedOnce</code> 6 cross-permutation sub-cases</td></tr>
+  </tbody>
+</table>
+
+<h2>Coverage Gaps (Known + Intentional)</h2>
+
+<table>
+  <thead><tr><th style="width:200px">Package</th><th>%</th><th>Why low</th></tr></thead>
+  <tbody>
+    <tr><td><code>internal/direct</code></td><td class="center">0%</td><td>Passthrough impl — only constructed in disabled mode; correctness is enforced structurally (impl-type assertion in flag matrix) not via direct execution</td></tr>
+    <tr><td><code>internal/traced</code></td><td class="center">~5%</td><td>Most statements are reached only through live-mongod integration tests; unit-level can build literals for narrow cases (state.go, changestream) but the full <code>Collection.InsertOne</code> path requires the driver</td></tr>
+    <tr><td><code>internal/shared</code> bulkwrite/upsert branches</td><td class="center">~45%</td><td>Bulk-write and upsert paths covered via the live-mongod integration suite (TestCollectionBulkWrite et al.) rather than internal unit tests</td></tr>
+  </tbody>
+</table>
+
+<p style="margin-top:32px;color:var(--muted);font-size:12px">Sources: <code>go test -count=1 -coverpkg=./... ./...</code> + <code>go tool cover -func</code>; per-file test counts from <code>grep -c '^func Test' &lt;file&gt;</code>. Generated 2026-05-22.</p>
+
+</body>
+</html>
