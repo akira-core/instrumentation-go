@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -25,28 +26,37 @@ import (
 // testMongoURI is populated by TestMain from the container. Zero value = Docker unavailable.
 var testMongoURI string
 
-// TestMain starts a single MongoDB container for all integration tests in this
-// package and tears it down after the suite completes. If the container cannot
-// be started (e.g. Docker is unavailable), integration tests fall back to the
-// MONGO_URI environment variable and are skipped if that is also unset.
+// TestMain starts a single MongoDB container for all tests in this package and
+// tears it down after the suite completes. If MONGO_URI is set it is used
+// directly; otherwise tests fall back to the container and are skipped if Docker
+// is unavailable.
 func TestMain(m *testing.M) {
-	ctx := context.Background()
+	if uri := os.Getenv("MONGO_URI"); uri != "" {
+		testMongoURI = uri
+		os.Exit(m.Run())
+	}
+
+	startCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	var container *tcmongo.MongoDBContainer
-	container, err := tcmongo.Run(ctx, "mongo:7.0",
+	container, err := tcmongo.Run(startCtx, "mongo:7.0",
 		tcmongo.WithReplicaSet("rs0"),
 	)
 	if err != nil {
 		log.Printf("WARNING: could not start mongodb container (integration tests will be skipped unless MONGO_URI is set): %v", err)
 	} else {
-		testMongoURI, err = container.ConnectionString(ctx)
+		testMongoURI, err = container.ConnectionString(startCtx)
 		if err != nil {
 			log.Printf("WARNING: could not get mongodb connection string: %v", err)
 		}
 		testMongoURI = forceDirectConnection(testMongoURI)
 	}
+	cancel()
+
 	code := m.Run()
 	if container != nil {
-		_ = container.Terminate(ctx)
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_ = container.Terminate(shutdownCtx)
+		shutdownCancel()
 	}
 	os.Exit(code)
 }
