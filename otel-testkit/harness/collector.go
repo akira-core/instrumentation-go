@@ -15,7 +15,7 @@ import (
 // defaultCollectorImage is the OpenTelemetry Collector (core) image used to
 // receive spans from the SDK and re-export them to the in-process sink.
 // Override with OTEL_COLLECTOR_IMAGE.
-const defaultCollectorImage = "otel/opentelemetry-collector:0.119.0"
+const defaultCollectorImage = "otel/opentelemetry-collector:0.147.0"
 
 // collectorConfig is the collector pipeline: OTLP/gRPC in, OTLP/gRPC out to the
 // host sink (reachable via host.testcontainers.internal), plus a debug exporter.
