@@ -52,7 +52,7 @@ make test-integration-http-direct
 
 綠燈 = sink、collector 容器、OTLP 鏈路、consistent sampler 全部就緒。接著打開
 [`examples/httpdirect/http_test.go`](examples/httpdirect/http_test.go),它就是一個最小可執行範本 ——
-對照三段:**setup**(`StartSink`/`StartCollector`)→ **drive**(種 rv、跑流程)→ **assert**(`AssertConsistentRV`/`AssertPresence`)。
+對照三段:**setup**(`StartSink`/`StartCollector`)→ **drive**(種 rv、跑流程)→ **assert**(`AssertConsistentRV`/`AssertAppSpanCounts`)。
 
 ### 先讀這 3 節,其餘按需再讀
 
@@ -201,8 +201,14 @@ go test -race -timeout 600s ./sampling/
 - **一定要 `WithSingleLinkSeed` 包起來**(`ConsistentSampler` 已內含):否則 (a) span-link consumer 會自生 rv(`ProbabilitySampler` 無視 links)→ 不一致;(b) root 不會寫 `ot=rv:` → 匯出的 span 沒有 rv,`AssertConsistentRV` 找不到值。harness 不強制 sampler,但你的服務該用這顆。
 
 **rv 與取樣**
+> `rv`(randomness value)是 consistent probabilistic sampling 寫在 `tracestate` 裡的 56-bit 隨機數;一個 span 被取樣 iff `rv ≥ threshold(rate)`。它是什麼、為何讓不同 rate 的 service 對同一條 trace 做出一致決策,見 [otel-sampler](../otel-sampler)。
 - `SeedContextRV(rv) context.Context` — 回一個帶 `ot=rv:` tracestate 的 remote root context,當流程的頭(等同正常 inbound 載體帶 rv)。
 - `RandomRV() uint64`、`ExpectedSampled(rate, rv) bool`、`EnvSamplerArg(def) float64`。
+
+**驅動一條 run**
+- `RunAttrOption(runID) trace.SpanStartOption` — `tracer.Start(ctx, name, harness.RunAttrOption(runID))` 的簡寫,把 `RunAttr` 蓋上你的 app span。
+- `CountSampled(rates, rv) int` — 預測該 rv 下有幾個 service 會被取樣(= 該等幾個 app span)。
+- `WaitForAppSpans(t, sink, runID, want, timeout) []Span` — 等到 `want` 個帶 `RunAttr` 的 app span 到齊才回;**逾時會 dump 全部 span 並 `t.Fatalf`**(取代靜默回 partial)。
 
 **分組 / 切片**
 - `SpansByAttr(spans, attr, val)`、`SpansByService(spans, name)`、`SpansByScope(spans, scope)`、`SpansByServicePrefix(spans, prefix)`。
@@ -262,15 +268,13 @@ client, _ := otelmongo.NewClient(uri, otelmongo.WithTracerProvider(tp))
 coll := client.Database("testkit").Collection("chain")
 
 // svc0 produce(從種下的 rv 起頭)
-c0, s0 := tp0.Tracer("chain").Start(harness.SeedContextRV(rv), "svc0",
-    trace.WithAttributes(attribute.String(harness.RunAttr, runID)))
+c0, s0 := tp0.Tracer("chain").Start(harness.SeedContextRV(rv), "svc0", harness.RunAttrOption(runID))
 coll0.InsertOne(c0, bson.D{{Key: "run", Value: runID}, {Key: "hop", Value: 0}})
 s0.End()
 
 // svc1 consume:讀回文件、用 library 取出遠端 trace、續接
 sr := coll1.FindOne(ctx, bson.D{{Key: "run", Value: runID}, {Key: "hop", Value: 0}})
-_, s1 := tp1.Tracer("chain").Start(sr.TraceContext(), "svc1",
-    trace.WithAttributes(attribute.String(harness.RunAttr, runID)))
+_, s1 := tp1.Tracer("chain").Start(sr.TraceContext(), "svc1", harness.RunAttrOption(runID))
 s1.End()
 
 // 斷言
@@ -296,8 +300,7 @@ chain 由各 handler **往前呼叫**串起來。測試只對頭發一個帶 see
 ```go
 func (s *service) handle(w http.ResponseWriter, r *http.Request) {
     ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
-    ctx, span := s.tracer.Start(ctx, s.name,
-        trace.WithAttributes(attribute.String(harness.RunAttr, r.URL.Query().Get("run"))))
+    ctx, span := s.tracer.Start(ctx, s.name, harness.RunAttrOption(r.URL.Query().Get("run")))
     defer span.End()
     if s.next != "" { // 往前呼叫後繼 service
         req, _ := http.NewRequestWithContext(ctx, r.Method, s.next+"/?run="+/*runID*/"", nil)
@@ -326,8 +329,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 
 	"github.com/akira-core/instrumentation-go/otel-testkit/harness"
 	// TODO: import 你的 instrumentation library
@@ -336,13 +337,14 @@ import (
 func TestMyLibSamplingConsistency(t *testing.T) {
 	// 1) 基礎設施:in-process sink + collector 容器,並把 exporter 指過去
 	sink := harness.StartSink(t)
+	harness.DumpOnFailure(t, sink) // 失敗時自動印出收到的全部 span
 	endpoint := harness.StartCollector(context.Background(), t, sink.Port())
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint)
-	harness.DumpOnFailure(t, sink) // 失敗時自動印出收到的全部 span
 
 	// 2) 每個 service 一個 TracerProvider(務必用 ConsistentSampler)
-	tp0 := harness.BuildTracerProvider(t, "svc0", harness.ConsistentSampler(0.9), endpoint)
-	tp1 := harness.BuildTracerProvider(t, "svc1", harness.ConsistentSampler(0.5), endpoint)
+	rates := []float64{0.9, 0.5}
+	tp0 := harness.BuildTracerProvider(t, "svc0", harness.ConsistentSampler(rates[0]), endpoint)
+	tp1 := harness.BuildTracerProvider(t, "svc1", harness.ConsistentSampler(rates[1]), endpoint)
 	// TODO: 用 tp0 / tp1 建你的 library client/server(WithTracerProvider(tpN))
 
 	// 3) 種一個已知 rv,驅動「一條 run」
@@ -350,27 +352,22 @@ func TestMyLibSamplingConsistency(t *testing.T) {
 	runID := uuid.NewString()
 
 	// 頭:從 seeded rv 起 svc0 的 application span
-	c0, s0 := tp0.Tracer("chain").Start(harness.SeedContextRV(rv), "svc0",
-		trace.WithAttributes(attribute.String(harness.RunAttr, runID)))
+	c0, s0 := tp0.Tracer("chain").Start(harness.SeedContextRV(rv), "svc0", harness.RunAttrOption(runID))
 	// TODO: producer 用你的 library 送出(inject 由 library 自動做)
 	s0.End()
 	_ = c0
 
 	// 對端:consumer 用你的 library 收 + extract,續接成 svc1 的 application span
 	// ctx := <library 從載體 extract 出的 context>
-	// _, s1 := tp1.Tracer("chain").Start(ctx, "svc1",
-	//     trace.WithAttributes(attribute.String(harness.RunAttr, runID)))
+	// _, s1 := tp1.Tracer("chain").Start(ctx, "svc1", harness.RunAttrOption(runID))
 	// TODO: 上面兩行換成你的 consume 流程; s1.End()
 
-	// 4) 等齊這條 run 的 app span,再斷言
-	const wantApp = 2 // svc0 + svc1(依你的流程調整)
-	run := sink.WaitFor(15*time.Second, func(ss []harness.Span) bool {
-		return len(harness.SpansByAttr(ss, harness.RunAttr, runID)) >= wantApp
-	})
-	run = harness.SpansByAttr(run, harness.RunAttr, runID)
+	// 4) 等齊這條 run 的 app span(逾時會自動 dump + Fatalf),再斷言
+	want := harness.CountSampled(rates, rv) // 預測該 rv 下幾個 service 會出現
+	run := harness.WaitForAppSpans(t, sink, runID, want, 15*time.Second)
 
-	harness.AssertConsistentRV(t, run)                                          // 跨 service rv 一致
-	harness.AssertPresence(t, run, map[string]float64{"svc0": 0.9, "svc1": 0.5}, rv) // 取樣/drop 正確
+	harness.AssertConsistentRV(t, run) // 跨 service rv 一致
+	harness.AssertAppSpanCounts(t, run, map[string]float64{"svc0": rates[0], "svc1": rates[1]}, rv, 1)
 }
 ```
 
@@ -505,6 +502,8 @@ harness.AssertConsistentRV(t, full)             // 三者 rv 全相同
    ```
 2. **`harness.ExpectationFromEnv(gate)`** 把當前 env 轉成 `{TracingEnabled, PropagationEnabled}`,你的測試據此**分流**該跑哪組斷言。
 3. **flag gate 每個 process 只快取一次** → 每個 flag 組合要用**不同 env 各跑一次 `go test`**(別在單一 run 內切換)。
+
+> **把 sampling 測試放在獨立 package**:很多模組的 `tests/integration` 有 `TestMain` 會**強制設好所有 flag**(force-enable)。若你把 flag 矩陣測試放進那個 package,env 會被 `TestMain` 蓋掉、矩陣失效。參考做法:mongo 的 sampling 測試自成一個 `sampling` package(見 [`chain.go`](../otel-mongo/v2/tests/integration/sampling/chain.go) 開頭註解),讓 Makefile/CI 從外部用 env 控制旗標軸。
 
 依 expectation 該驗什麼(通用):
 

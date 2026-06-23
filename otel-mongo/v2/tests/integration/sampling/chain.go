@@ -27,7 +27,6 @@ import (
 	tcmongo "github.com/testcontainers/testcontainers-go/modules/mongodb"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
@@ -53,6 +52,7 @@ func setup(t *testing.T) (*harness.Sink, string, string) {
 
 	ctx := context.Background()
 	sink := harness.StartSink(t)
+	harness.DumpOnFailure(t, sink) // dump every collected span if the test fails
 	endpoint := harness.StartCollector(ctx, t, sink.Port())
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint)
 	// The harness collector speaks plaintext gRPC. The wrapper's deliver-span
@@ -122,9 +122,8 @@ func buildServices(t *testing.T, uri, endpoint string, rates []float64) ([]servi
 	return svcs, want
 }
 
-func runAttr(runID string) trace.SpanStartOption {
-	return trace.WithAttributes(attribute.String(harness.RunAttr, runID))
-}
+// runAttr tags an application span so the harness can group one logical run.
+func runAttr(runID string) trace.SpanStartOption { return harness.RunAttrOption(runID) }
 
 // topo selects how a consumer attaches its span to the previous hop. The choice
 // reflects how the consuming application uses the library (continue vs link); the
@@ -189,21 +188,10 @@ func driveFindChain(t *testing.T, sink *harness.Sink, svcs []service, rates []fl
 }
 
 // waitRun blocks until at least wantCount application spans for runID arrive,
-// then returns them.
+// then returns them (failing with a span dump on timeout).
 func waitRun(t *testing.T, sink *harness.Sink, runID string, wantCount int) []harness.Span {
 	t.Helper()
-	spans := sink.WaitFor(20*time.Second, func(ss []harness.Span) bool {
-		return len(harness.SpansByAttr(ss, harness.RunAttr, runID)) >= wantCount
-	})
-	return harness.SpansByAttr(spans, harness.RunAttr, runID)
+	return harness.WaitForAppSpans(t, sink, runID, wantCount, 20*time.Second)
 }
 
-func countSampled(rates []float64, rv uint64) int {
-	n := 0
-	for _, r := range rates {
-		if harness.ExpectedSampled(r, rv) {
-			n++
-		}
-	}
-	return n
-}
+func countSampled(rates []float64, rv uint64) int { return harness.CountSampled(rates, rv) }

@@ -26,7 +26,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
@@ -51,8 +50,7 @@ func (s *service) handle(w http.ResponseWriter, r *http.Request) {
 	ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
 
 	// Start this service's application span as a continuation (parent-child).
-	ctx, span := s.tracer.Start(ctx, s.name,
-		trace.WithAttributes(attribute.String(harness.RunAttr, runID)))
+	ctx, span := s.tracer.Start(ctx, s.name, harness.RunAttrOption(runID))
 	defer span.End()
 
 	if s.next != "" {
@@ -100,10 +98,7 @@ func drive(t *testing.T, sink *harness.Sink, headURL, path string, rv uint64, wa
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
 
-	spans := sink.WaitFor(15*time.Second, func(ss []harness.Span) bool {
-		return len(harness.SpansByAttr(ss, harness.RunAttr, runID)) >= wantCount
-	})
-	return harness.SpansByAttr(spans, harness.RunAttr, runID)
+	return harness.WaitForAppSpans(t, sink, runID, wantCount, 15*time.Second)
 }
 
 func startSinkAndCollector(t *testing.T) (*harness.Sink, string) {
@@ -111,6 +106,7 @@ func startSinkAndCollector(t *testing.T) (*harness.Sink, string) {
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{}, propagation.Baggage{}))
 	sink := harness.StartSink(t)
+	harness.DumpOnFailure(t, sink) // dump every collected span if the test fails
 	endpoint := harness.StartCollector(context.Background(), t, sink.Port())
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint)
 	return sink, endpoint
@@ -152,12 +148,4 @@ func TestHTTPDifferentEndpoint(t *testing.T) {
 	harness.AssertSameTrace(t, run)
 }
 
-func countSampled(rates []float64, rv uint64) int {
-	n := 0
-	for _, r := range rates {
-		if harness.ExpectedSampled(r, rv) {
-			n++
-		}
-	}
-	return n
-}
+func countSampled(rates []float64, rv uint64) int { return harness.CountSampled(rates, rv) }

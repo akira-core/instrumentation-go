@@ -94,7 +94,8 @@ func TestMongoAggregateDelivery(t *testing.T) {
 
 	run := waitRun(t, sink, runID, 2)
 	harness.AssertPresence(t, run, want, rv)
-	harness.AssertConsistentRV(t, run) // rv survives the aggregate/decode link path
+	harness.AssertConsistentRV(t, run)                            // rv survives the aggregate/decode link path
+	harness.AssertLinkedTrace(t, run, svcs[0].name, svcs[1].name) // DecodeWithContext links svc1 to svc0's trace
 }
 
 // TestMongoSpanLinkConsistency shows the span-link delivery topology: a consumer
