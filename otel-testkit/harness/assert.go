@@ -231,6 +231,60 @@ func AssertLinkedTrace(t *testing.T, spans []Span, fromService, toService string
 	t.Errorf("%q has no span link to %q's trace %s", toService, fromService, fromTrace)
 }
 
+// TraceIDOf returns the TraceID of the first application span belonging to
+// service. The bool is false when service has no span in the set. Handy when an
+// assertion or a failure message needs a service's trace ID directly.
+func TraceIDOf(spans []Span, service string) (string, bool) {
+	for _, s := range SpansByService(spans, service) {
+		if s.TraceID != "" {
+			return s.TraceID, true
+		}
+	}
+	return "", false
+}
+
+// AssertTraceContinued asserts the upstream and downstream services' spans live
+// in the same trace — i.e. trace context propagated across the hop (parent-child
+// continuation). Unlike AssertSameTrace, it is scoped to the named service pair,
+// so an unrelated span-link hop elsewhere in the run does not make it fail. This
+// is the sampler-agnostic propagation check: it reads only TraceID, never the
+// "ot=rv:" tracestate, so it works for any sampler (TraceIDRatioBased,
+// ParentBased, …), not just the consistent sampler.
+func AssertTraceContinued(t *testing.T, spans []Span, upstream, downstream string) {
+	t.Helper()
+	up, okUp := TraceIDOf(spans, upstream)
+	down, okDown := TraceIDOf(spans, downstream)
+	require.Truef(t, okUp, "AssertTraceContinued: no spans for upstream %q", upstream)
+	require.Truef(t, okDown, "AssertTraceContinued: no spans for downstream %q", downstream)
+	require.Equalf(t, up, down,
+		"%q (trace %s) did not continue %q's trace %s — expected propagation", downstream, down, upstream, up)
+}
+
+// AssertTraceNotContinued asserts trace context did NOT propagate from upstream
+// to downstream: the downstream span lives in a different trace and carries no
+// link back to the upstream trace (ruling out the span-link topology, which is a
+// legitimate cross-trace connection). Use it for the propagation-disabled case.
+// Like AssertTraceContinued it is sampler-agnostic (TraceID only), replacing the
+// rv-based DistinctRVs check for libraries whose sampler does not write "ot=rv:".
+// Both services must have produced a span (run them at sampling rate 1.0 so the
+// sampler cannot drop the spans under test).
+func AssertTraceNotContinued(t *testing.T, spans []Span, upstream, downstream string) {
+	t.Helper()
+	up, okUp := TraceIDOf(spans, upstream)
+	require.Truef(t, okUp, "AssertTraceNotContinued: no spans for upstream %q", upstream)
+	down := SpansByService(spans, downstream)
+	require.NotEmptyf(t, down, "AssertTraceNotContinued: no spans for downstream %q", downstream)
+
+	for _, s := range down {
+		require.NotEqualf(t, up, s.TraceID,
+			"%q shares upstream %q's trace %s — propagation was not disabled", downstream, upstream, up)
+		for _, l := range s.Links {
+			require.NotEqualf(t, up, l.TraceID,
+				"%q links to upstream %q's trace %s — that is span-link propagation, not a severed trace", downstream, upstream, up)
+		}
+	}
+}
+
 func traceIDKeys(m map[string]bool) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

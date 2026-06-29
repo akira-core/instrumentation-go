@@ -27,11 +27,13 @@ INTEGRATION_MODULES := \
 SAMPLING_DIR := otel-mongo/v2/tests/integration
 SAMPLING_PKG := ./sampling/
 HTTP_DIRECT_DIR := otel-testkit/examples/httpdirect
+HTTP_STDLIB_DIR := otel-testkit/examples/httpdirect-stdlib
 
 .PHONY: help modules examples integration \
 	build test lint verify \
 	build-examples test-examples lint-examples verify-examples \
 	test-integration test-integration-sampling test-integration-http-direct \
+	test-integration-http-stdlib \
 	test-sampler test-gorilla-ws test-mongo test-mongo-v2 test-nats
 
 help:
@@ -49,7 +51,8 @@ help:
 		'  make test-examples     Run tests in example modules' \
 		'  make test-integration  Run integration tests (requires Docker/Podman)' \
 		'  make test-integration-sampling  Run consistent-sampling E2E flag matrix (Docker)' \
-		'  make test-integration-http-direct  Run direct-mode (HTTP) sampling demo (Docker)' \
+		'  make test-integration-http-direct  Run direct-mode (HTTP) consistent-sampling demo (Docker)' \
+		'  make test-integration-http-stdlib  Run Core (stdlib TraceIDRatioBased) demo (Docker)' \
 		'' \
 		'Variables:' \
 		'  GO_TEST_FLAGS="-v -race"   Override go test flags' \
@@ -114,6 +117,11 @@ test-integration-sampling:
 # HTTP transport. No broker container; requires Docker for the OTel Collector.
 test-integration-http-direct:
 	cd $(HTTP_DIRECT_DIR) && $(GO) test -race -timeout 600s -run TestHTTP ./...
+
+# Core (sampler-agnostic) demonstration: the same harness over a stdlib
+# TraceIDRatioBased sampler that never writes ot=rv:. Requires Docker (Collector).
+test-integration-http-stdlib:
+	cd $(HTTP_STDLIB_DIR) && $(GO) test -race -timeout 600s ./...
 
 test-sampler:
 	$(call run_in_modules,otel-sampler,go test,$(GO) test $(GO_TEST_FLAGS) $(GO_PACKAGES))

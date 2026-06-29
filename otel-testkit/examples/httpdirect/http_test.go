@@ -17,7 +17,6 @@
 package httpdirect
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -103,13 +102,11 @@ func drive(t *testing.T, sink *harness.Sink, headURL, path string, rv uint64, wa
 
 func startSinkAndCollector(t *testing.T) (*harness.Sink, string) {
 	t.Helper()
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
-		propagation.TraceContext{}, propagation.Baggage{}))
-	sink := harness.StartSink(t)
-	harness.DumpOnFailure(t, sink) // dump every collected span if the test fails
-	endpoint := harness.StartCollector(context.Background(), t, sink.Port())
-	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint)
-	return sink, endpoint
+	// StartTelemetryEnv installs the composite (TraceContext+Baggage) propagator,
+	// starts the sink with DumpOnFailure, launches the collector, and points
+	// OTEL_EXPORTER_OTLP_ENDPOINT at it.
+	env := harness.StartTelemetryEnv(t)
+	return env.Sink, env.Endpoint
 }
 
 // TestHTTPSamplingConsistency drives an rv ladder through a 3-service HTTP chain

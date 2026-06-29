@@ -65,6 +65,44 @@ func TestAssertLinkedTrace(t *testing.T) {
 	AssertLinkedTrace(t, spans, "svc0", "svc1")
 }
 
+// TestTraceIDOf checks lookup of a service's trace ID, present and absent.
+func TestTraceIDOf(t *testing.T) {
+	spans := []Span{
+		{ServiceName: "svc0", TraceID: "aaaa"},
+		{ServiceName: "svc1", TraceID: ""}, // no trace ID — skipped
+		{ServiceName: "svc1", TraceID: "bbbb"},
+	}
+	if id, ok := TraceIDOf(spans, "svc0"); !ok || id != "aaaa" {
+		t.Errorf("TraceIDOf(svc0) = %q,%v want aaaa,true", id, ok)
+	}
+	if id, ok := TraceIDOf(spans, "svc1"); !ok || id != "bbbb" {
+		t.Errorf("TraceIDOf(svc1) = %q,%v want bbbb,true (first non-empty)", id, ok)
+	}
+	if _, ok := TraceIDOf(spans, "missing"); ok {
+		t.Errorf("TraceIDOf(missing) ok = true, want false")
+	}
+}
+
+// TestAssertTraceContinued checks the happy path: upstream and downstream share
+// a trace ID (propagation continued the trace).
+func TestAssertTraceContinued(t *testing.T) {
+	spans := []Span{
+		{ServiceName: "svc0", TraceID: "aaaa", SpanID: "a1"},
+		{ServiceName: "svc1", TraceID: "aaaa", SpanID: "a2", ParentSpanID: "a1"},
+	}
+	AssertTraceContinued(t, spans, "svc0", "svc1")
+}
+
+// TestAssertTraceNotContinued checks the happy path: downstream is in a different
+// trace with no link back to upstream (propagation severed).
+func TestAssertTraceNotContinued(t *testing.T) {
+	spans := []Span{
+		{ServiceName: "svc0", TraceID: "aaaa", SpanID: "a1"},
+		{ServiceName: "svc1", TraceID: "bbbb", SpanID: "b1"}, // fresh root, no link
+	}
+	AssertTraceNotContinued(t, spans, "svc0", "svc1")
+}
+
 func names(spans []Span) []string {
 	out := make([]string, 0, len(spans))
 	for _, s := range spans {
