@@ -4,7 +4,7 @@
 
 ---
 
-OpenTelemetry tracing for [NATS](https://nats.io/) and [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream), aligned with the official `nats.go` / `nats.go/jetstream` APIs. Propagates W3C Trace Context in message headers. `oteljetstream` now fully wraps JetStream consumer management APIs (`StreamConsumerManager` on `JetStream` and `ConsumerManager` on `Stream`) while keeping message publish/consume tracing behavior unchanged. Per [OTel Go Contrib](https://github.com/open-telemetry/opentelemetry-go-contrib/tree/main/instrumentation): packages accept **TracerProvider** and **Propagators** via options; they do **not** provide InitTracer. Set the global provider and propagator at process startup (see **example/**).
+OpenTelemetry tracing for [NATS](https://nats.io/) and [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream), aligned with the official `nats.go` / `nats.go/jetstream` APIs. Propagates W3C Trace Context in message headers. `oteljetstream` now fully wraps JetStream consumer management APIs (`StreamConsumerManager` on `JetStream` and `ConsumerManager` on `Stream`) while keeping message publish/consume tracing behavior unchanged. Per [OTel Go Contrib](https://github.com/open-telemetry/opentelemetry-go-contrib/tree/main/instrumentation): packages accept **TracerProvider** and **Propagators** via options; they do **not** provide InitTracer. Set the global provider and propagator at process startup (see **examples/**).
 
 ---
 
@@ -12,17 +12,28 @@ OpenTelemetry tracing for [NATS](https://nats.io/) and [NATS JetStream](https://
 
 ```
 otel-nats/
-├── otelnats/           # Core NATS: Connect, Conn, Publish, Subscribe, HeaderCarrier
-│   ├── connect.go      # Connect, ConnectWithOptions, ConnectTLS, ConnectWithCredentials
-│   ├── conn.go         # Conn, Publish, PublishMsg, Subscribe, QueueSubscribe, WithTracerProvider, WithPropagators
-│   ├── propagation.go  # HeaderCarrier (nats.Header ↔ TextMapCarrier)
+├── otelnats/               # Core NATS: Connect, Conn, Publish, Subscribe, Request, HeaderCarrier
+│   ├── connect.go          # Connect, ConnectWithOptions, ConnectTLS, ConnectWithCredentials
+│   ├── conn.go             # Conn, connImpl interface, Options (WithTracerProvider, WithPropagators, WithTraceDestination)
+│   ├── conn_traced.go      # tracedConn: instrumented connImpl (spans, propagation, deliver spans)
+│   ├── conn_direct.go      # directConn: passthrough connImpl used when tracing is disabled
+│   ├── traceevent.go       # WithTraceDestination / SubscribeTraceEvents / TraceEvent / TraceHop (NATS 2.11+ trace events)
+│   ├── propagation.go      # HeaderCarrier (nats.Header ↔ TextMapCarrier)
+│   ├── env_flags.go        # tracing feature-flag gate (OTEL_INSTRUMENTATION_GO_TRACING_ENABLED + OTEL_NATS_TRACING_ENABLED)
+│   ├── internal/flags/     # shared EnvEnabled/Gate helpers (byte-identical across instrumentation modules)
 │   └── doc.go
-├── oteljetstream/      # JetStream: New, JetStream, Stream, Consumer, PushConsumer, full consumer-manager wrappers, Consume, Messages, Fetch
-│   ├── jetstream.go    # New(conn), Publish, CreateOrUpdateStream
-│   ├── stream.go       # Stream, Consumer/PushConsumer, CreateOrUpdateConsumer/CreateOrUpdatePushConsumer
-│   ├── consumer.go     # Consume, Messages, Fetch, MessageBatch (Messages), Msg
+├── oteljetstream/          # JetStream: New, JetStream, Stream, Consumer, Consume, Messages, Fetch
+│   ├── jetstream.go        # New(conn), JetStream interface, shared types (ConsumerConfig, StreamConfig, ...)
+│   ├── jetstream_traced.go # tracedJSImpl: instrumented JetStream impl
+│   ├── jetstream_direct.go # directJSImpl: passthrough JetStream impl
+│   ├── stream.go           # Stream interface (consumer-manager methods)
+│   ├── stream_traced.go    # tracedStream: instrumented Stream impl
+│   ├── stream_direct.go    # directStream: passthrough Stream impl
+│   ├── consumer.go         # Consumer interface, Msg, MessageBatch, MessagesContext
+│   ├── consumer_traced.go  # tracedConsumer: Consume/Messages/Next/Fetch with spans
+│   ├── consumer_direct.go  # directConsumer: passthrough Consumer impl
 │   └── doc.go
-├── example/            # How to create TracerProvider + set global + use otelnats/oteljetstream
+├── examples/            # How to create TracerProvider + set global + use otelnats/oteljetstream
 ├── go.mod
 └── README.md
 ```
@@ -38,7 +49,7 @@ otel-nats/
 - `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` (global master switch)
 - `OTEL_NATS_TRACING_ENABLED` (nats module switch)
 
-Defaults: enabled when unset. Values `false/0/no/off` disable.
+Defaults: **DISABLED** when unset — both vars must be explicitly set to a truthy value to enable tracing. Values `false/0/no/off` (case-insensitive) disable; any other set value is truthy.
 
 Priority:
 1. Global off disables all nats tracing regardless of module flag.
@@ -48,7 +59,7 @@ When disabled, both span creation and W3C header propagation are turned off.
 
 ### 1. Initialize provider and propagator (application responsibility)
 
-Create a TracerProvider (e.g. OTLP) and set the global provider and propagator once at startup. See **example/main.go** for a full runnable.
+Create a TracerProvider (e.g. OTLP) and set the global provider and propagator once at startup. See **examples/main.go** for a full runnable.
 
 ```go
 import (
@@ -76,7 +87,7 @@ otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 
 ```go
 import (
-    "github.com/Marz32onE/instrumentation-go/otel-nats/otelnats"
+    "github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 )
 
 conn, err := otelnats.Connect(natsURL, nil)
@@ -92,12 +103,25 @@ conn.QueueSubscribe("subject", "queue", handler)
 
 Optional: pass **WithTracerProvider(tp)** or **WithPropagators(p)** to **ConnectWithOptions** for per-connection overrides.
 
-### 3. JetStream
+### 3. Request/Reply
+
+`Conn.Request` / `RequestWithContext` / `RequestMsg` / `RequestMsgWithContext` mirror the equivalent `nats.Conn` methods exactly, but open a CLIENT span for the RPC and a CONSUMER span for the reply:
+
+```go
+reply, err := conn.RequestWithContext(ctx, "subject", []byte("ping"))
+if err != nil { log.Fatal(err) }
+// reply.Data — trace context for the request/reply pair is recorded on the CLIENT span;
+// the reply itself is recorded as a linked CONSUMER span.
+```
+
+`Request` / `RequestMsg` have no `context.Context` parameter (mirroring `nats.Conn`), so their producer span is rooted at `context.Background()` — use `RequestWithContext` / `RequestMsgWithContext` to chain into an existing trace.
+
+### 4. JetStream
 
 ```go
 import (
-    "github.com/Marz32onE/instrumentation-go/otel-nats/oteljetstream"
-    "github.com/Marz32onE/instrumentation-go/otel-nats/otelnats"
+    "github.com/akira-core/instrumentation-go/otel-nats/oteljetstream"
+    "github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 )
 
 conn, _ := otelnats.Connect(natsURL, nil)
@@ -108,20 +132,26 @@ js, err := oteljetstream.New(conn)
 cons.Consume(func(m oteljetstream.Msg) {
     // m.Data(), m.Ack(), m.Context() — trace from message headers
 })
-
-// Push consumer is also wrapped:
-pushCons, _ := js.CreateOrUpdatePushConsumer(ctx, "MYSTREAM", oteljetstream.ConsumerConfig{
-    Durable:        "push-consumer",
-    DeliverSubject: "push.deliver",
-    FilterSubject:  "events.push",
-})
-pushCons.Consume(func(m oteljetstream.Msg) {
-    // same trace extraction behavior
-    _ = m.Ack()
-})
 ```
 
-### 4. Tests
+Or iterate manually with `Messages()`:
+
+```go
+iter, err := cons.Messages()
+if err != nil { log.Fatal(err) }
+defer iter.Stop() // release the iterator goroutine and end any in-flight span
+
+for {
+    ctx, msg, err := iter.Next()
+    if err != nil { break } // iterator stopped/drained
+    _ = ctx // trace context extracted from msg headers
+    _ = msg.Ack()
+}
+```
+
+> **Not supported:** push consumers, `PauseConsumer`/`ResumeConsumer`, and `UnpinConsumer` are not wrapped — the underlying `nats.go` v1.38.0 dependency does not expose these APIs at all. Async publish (`PublishAsync`/`PublishMsgAsync`) is also not wrapped: these exist in `nats.go` v1.38.0, but take no `context.Context` and return a non-blocking `PubAckFuture` instead of a synchronous ack, which doesn't fit this wrapper's context-propagation model (see `oteljetstream/doc.go`).
+
+### 5. Tests
 
 Set the global provider (and optionally propagator) before Connect; no InitTracer.
 
@@ -142,7 +172,9 @@ conn, err := otelnats.Connect(url, nil)
 | **ConnectTLS** | `ConnectTLS(url, certFile, keyFile, caFile string, natsOpts ...nats.Option)`. Connects with mutual TLS. |
 | **ConnectWithCredentials** | `ConnectWithCredentials(url, credFile string, natsOpts ...nats.Option)`. Connects with JWT/NKey credentials. |
 | **ScopeName / Version()** | Used when creating Tracer (OTel contrib guideline). |
-| **JetStream consumer managers** | `JetStream` fully wraps `StreamConsumerManager`; `Stream` fully wraps `ConsumerManager`. Methods returning `Consumer`/`PushConsumer` remain trace-enabled wrappers. |
+| **Request / RequestWithContext / RequestMsg / RequestMsgWithContext** | RPC helpers mirroring `nats.Conn`; open a CLIENT span for the request and a linked CONSUMER span for the reply. |
+| **JetStream consumer managers** | `JetStream` fully wraps `StreamConsumerManager`; `Stream` fully wraps `ConsumerManager`. Methods returning `Consumer` remain trace-enabled wrappers. Push consumers are not supported (see JetStream section). |
+| **WithTraceDestination / SubscribeTraceEvents** | Convert NATS 2.11+ infrastructure trace events into OTel spans (see **NATS 2.11+ Trace Events**). |
 | **Tests** | Use `otel.SetTracerProvider(tp)` (and `otel.SetTextMapPropagator(prop)` if needed) before Connect. |
 
 ---
@@ -170,6 +202,36 @@ Deliver spans use an independent TracerProvider with `service.name = "nats://{co
 
 The endpoint must be a **full URL** for HTTP (e.g. `http://otel-collector:4318`) or **host:port** for gRPC (e.g. `otel-collector:4317`). Bare hostnames without scheme or port are not supported.
 
+Deliver spans additionally require tracing itself to be enabled: both `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` and `OTEL_NATS_TRACING_ENABLED` must be truthy (see **Tracing feature flags**). When tracing is disabled, `Connect` never initialises the deliver-span TracerProvider, regardless of `OTEL_EXPORTER_OTLP_ENDPOINT`.
+
+---
+
+## NATS 2.11+ Trace Events
+
+NATS server 2.11+ can publish infrastructure-level trace events (ingress, egress, JetStream store, subject-mapping, stream-export, service-import) for any message carrying a `Nats-Trace-Dest` header. `otel-nats` can consume these events and convert each hop into an OTel span.
+
+### Producer: set the trace destination
+
+```go
+conn, err := otelnats.ConnectWithOptions(natsURL, nil,
+    otelnats.WithTraceDestination("nats.trace.events"),
+)
+```
+
+While tracing is enabled, every message sent via `conn.Publish`/`conn.PublishMsg` carries the `Nats-Trace-Dest` header, so the server emits a `TraceEvent` payload to `nats.trace.events` for each hop the message takes.
+
+### Consumer: convert events into spans
+
+```go
+sub, err := otelnats.SubscribeTraceEvents(conn, "nats.trace.events")
+if err != nil { log.Fatal(err) }
+defer sub.Unsubscribe()
+```
+
+Each `otelnats.TraceEvent` payload covers one server and carries a list of `otelnats.TraceHop`s. `SubscribeTraceEvents` emits one point-in-time span per hop (named `nats.<KIND>.<type>`, e.g. `nats.CLIENT.ingress`), linked to the original publisher span via the `traceparent` header embedded in the event's request headers.
+
+Requires NATS server 2.11+. `SubscribeTraceEvents` only emits spans when the connection's tracing gate is on; with tracing disabled it discards events instead (subscription still succeeds so `Unsubscribe` lifecycle works either way).
+
 ---
 
 ## MessageBatch (`Fetch` / `FetchBytes` / `FetchNoWait`)
@@ -186,6 +248,22 @@ for m := range batch.Messages() {
 if err := batch.Error(); err != nil { ... }
 ```
 
+`MessageBatch.Stop()` releases the internal goroutine and ends any in-flight span. Callers that fully drain the channel until it closes need not call it; callers that `break`/`return` before the channel closes **must** call it (typically via `defer`) to avoid leaking the goroutine and the last consumer span:
+
+```go
+batch, err := consumer.Fetch(10)
+if err != nil { ... }
+defer batch.Stop()
+
+for m := range batch.Messages() {
+    if shouldStopEarly(m) {
+        break // deferred batch.Stop() ends the in-flight span and stops the goroutine
+    }
+    _ = m.Context()
+    _ = m.Ack()
+}
+```
+
 ---
 
 ## Diagnostic logging
@@ -194,8 +272,8 @@ Uses [`log/slog`](https://pkg.go.dev/log/slog) — no output by default.
 
 | Level | Events |
 |-------|--------|
-| `DEBUG` | Server address parse failure in `serverAttrsFromConn`; deliver tracer initialised successfully |
-| `WARN` | Deliver tracer init failure (exporter or resource creation error) |
+| `DEBUG` | Server address parse failure in `serverAttrsFromConn`; deliver tracer initialised successfully; trace event received (`traceevent.go`) |
+| `WARN` | Deliver tracer init failure (exporter or resource creation error); trace event JSON unmarshal failure (`traceevent.go`) |
 
 Enable with a debug-level slog handler at startup:
 
@@ -205,7 +283,7 @@ slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 })))
 ```
 
-Log entries use the `otelnats:` prefix with `error`, `reason`, `service`, and `endpoint` key-value pairs.
+Log entries use the `otelnats:` prefix. Connection/deliver-span log lines (`conn.go`) use `error`, `reason`, `service`, and `endpoint` key-value pairs; trace-event log lines (`traceevent.go`) additionally use `raw`, `server`, `hops`, `events`, and `request_headers`.
 
 ---
 

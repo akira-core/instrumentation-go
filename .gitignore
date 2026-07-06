@@ -20,6 +20,12 @@ profile.cov
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
+# Compiled example binaries (extensionless go build output)
+/*/examples/example
+/*/examples/examples
+/*/example/example
+/*/example/examples
+
 # Go workspace file
 go.work
 go.work.sum

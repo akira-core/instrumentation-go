@@ -12,6 +12,8 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/traced"
 )
 
 func init() {
@@ -22,13 +24,19 @@ func enableTracing(t *testing.T) {
 	t.Helper()
 	t.Setenv(envGlobalTracingEnabled, "1")
 	t.Setenv(envMongoTracingEnabled, "1")
+	resetPropEnabledCacheForTest()
+	t.Cleanup(resetPropEnabledCacheForTest)
 }
 
 // enableDocumentPropagation sets the same env gates as Collection / ContextFrom* for _oteltrace.
+// Propagation requires both the global and module tracing flags to be on.
 func enableDocumentPropagation(t *testing.T) {
 	t.Helper()
 	t.Setenv(envGlobalTracingEnabled, "1")
+	t.Setenv(envMongoTracingEnabled, "1")
 	t.Setenv(envMongoPropagationEnabled, "1")
+	resetPropEnabledCacheForTest()
+	t.Cleanup(resetPropEnabledCacheForTest)
 }
 
 func TestContextFromDocumentV1(t *testing.T) {
@@ -72,6 +80,8 @@ func TestContextFromDocumentV1(t *testing.T) {
 	t.Run("propagation_disabled_returns_false_despite_metadata", func(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "true")
 		t.Setenv(envMongoPropagationEnabled, "false")
+		resetPropEnabledCacheForTest()
+		t.Cleanup(resetPropEnabledCacheForTest)
 		fullDoc := bson.M{
 			"_oteltrace": bson.M{
 				"traceparent": "00-12345678901234567890123456789012-0123456789012345-01",
@@ -102,6 +112,8 @@ func TestContextFromRawDocumentV1(t *testing.T) {
 func TestContextFromRawDocumentV1_PropagationDisabled(t *testing.T) {
 	t.Setenv(envGlobalTracingEnabled, "true")
 	t.Setenv(envMongoPropagationEnabled, "false")
+	resetPropEnabledCacheForTest()
+	t.Cleanup(resetPropEnabledCacheForTest)
 	traceparent := "00-12345678901234567890123456789012-0123456789012345-01"
 	doc := bson.D{
 		{Key: TraceMetadataKey, Value: bson.D{
@@ -117,28 +129,30 @@ func TestContextFromRawDocumentV1_PropagationDisabled(t *testing.T) {
 }
 
 func TestStartDeliverSpanDisabled(t *testing.T) {
-	coll := &Collection{deliverTracer: nil}
+	// StartDeliverSpan now lives on *traced.Collection (the only impl that creates
+	// deliver spans). When DeliverTracer is nil the helper must return ctx unchanged.
+	impl := &traced.Collection{DeliverTracer: nil}
 	ctx := context.Background()
-	got, span := coll.startDeliverSpan(ctx, "testdb", "testcoll")
+	got, span := impl.StartDeliverSpan(ctx, "testdb", "testcoll")
 	defer span.End()
-	assert.Equal(t, ctx, got, "expected unchanged ctx when deliverTracer is nil")
-	assert.False(t, trace.SpanFromContext(got).SpanContext().IsValid(), "expected no span in ctx when deliverTracer is nil")
+	assert.Equal(t, ctx, got, "expected unchanged ctx when DeliverTracer is nil")
+	assert.False(t, trace.SpanFromContext(got).SpanContext().IsValid(), "expected no span in ctx when DeliverTracer is nil")
 }
 
 func TestStartDeliverSpanEnabled(t *testing.T) {
 	tp := sdktrace.NewTracerProvider()
 	tracer := tp.Tracer(ScopeName)
-	coll := &Collection{
-		deliverTracer: tracer,
-		serverAddr:    "localhost",
-		serverPort:    27017,
+	impl := &traced.Collection{
+		DeliverTracer: tracer,
+		ServerAddr:    "localhost",
+		ServerPort:    27017,
 	}
 
 	// Establish a parent span so we can verify the deliver span is a child.
 	parentCtx, parentSpan := tp.Tracer(ScopeName).Start(context.Background(), "parent")
 	defer parentSpan.End()
 
-	got, deliverSpan := coll.startDeliverSpan(parentCtx, "testdb", "testcoll")
+	got, deliverSpan := impl.StartDeliverSpan(parentCtx, "testdb", "testcoll")
 	defer deliverSpan.End()
 
 	deliverSC := trace.SpanFromContext(got).SpanContext()

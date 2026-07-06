@@ -54,16 +54,27 @@ func TestMongoPropagationEnabled(t *testing.T) {
 		}
 	})
 
-	t.Run("global on and propagation unset -> false", func(t *testing.T) {
+	t.Run("global on tracing off propagation on -> false", func(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "true")
+		t.Setenv(envMongoTracingEnabled, "false")
+		t.Setenv(envMongoPropagationEnabled, "true")
+		if mongoPropagationEnabled() {
+			t.Fatal("expected propagation disabled when mongo tracing is off")
+		}
+	})
+
+	t.Run("global on tracing on propagation unset -> false", func(t *testing.T) {
+		t.Setenv(envGlobalTracingEnabled, "true")
+		t.Setenv(envMongoTracingEnabled, "true")
 		_ = os.Unsetenv(envMongoPropagationEnabled)
 		if mongoPropagationEnabled() {
 			t.Fatal("expected propagation disabled when module flag is unset")
 		}
 	})
 
-	t.Run("global on and propagation on -> true", func(t *testing.T) {
+	t.Run("global on tracing on propagation on -> true", func(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "true")
+		t.Setenv(envMongoTracingEnabled, "true")
 		t.Setenv(envMongoPropagationEnabled, "true")
 		if !mongoPropagationEnabled() {
 			t.Fatal("expected propagation enabled")
@@ -90,6 +101,7 @@ func TestResolveFlag(t *testing.T) {
 func TestConnectPropagationResolution(t *testing.T) {
 	t.Run("global off cannot enable propagation via WithTracePropagationEnabled", func(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "false")
+		t.Setenv(envMongoTracingEnabled, "true")
 		t.Setenv(envMongoPropagationEnabled, "true")
 		cfg := newClientConfig([]ClientOption{WithTracePropagationEnabled(true)})
 		if resolveDocumentPropagation(cfg.PropagationEnabled) {
@@ -97,8 +109,19 @@ func TestConnectPropagationResolution(t *testing.T) {
 		}
 	})
 
-	t.Run("global on option false wins over env propagation true", func(t *testing.T) {
+	t.Run("mongo tracing off cannot enable propagation via WithTracePropagationEnabled", func(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "true")
+		t.Setenv(envMongoTracingEnabled, "false")
+		t.Setenv(envMongoPropagationEnabled, "true")
+		cfg := newClientConfig([]ClientOption{WithTracePropagationEnabled(true)})
+		if resolveDocumentPropagation(cfg.PropagationEnabled) {
+			t.Fatal("expected propagation disabled when mongo tracing is off")
+		}
+	})
+
+	t.Run("tracing on option false wins over env propagation true", func(t *testing.T) {
+		t.Setenv(envGlobalTracingEnabled, "true")
+		t.Setenv(envMongoTracingEnabled, "true")
 		t.Setenv(envMongoPropagationEnabled, "true")
 		cfg := newClientConfig([]ClientOption{WithTracePropagationEnabled(false)})
 		if resolveDocumentPropagation(cfg.PropagationEnabled) {
@@ -106,12 +129,13 @@ func TestConnectPropagationResolution(t *testing.T) {
 		}
 	})
 
-	t.Run("global on option true enables when env propagation unset", func(t *testing.T) {
+	t.Run("tracing on option true enables when env propagation unset", func(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "true")
+		t.Setenv(envMongoTracingEnabled, "true")
 		_ = os.Unsetenv(envMongoPropagationEnabled)
 		cfg := newClientConfig([]ClientOption{WithTracePropagationEnabled(true)})
 		if !resolveDocumentPropagation(cfg.PropagationEnabled) {
-			t.Fatal("expected WithTracePropagationEnabled(true) to enable propagation when global is on")
+			t.Fatal("expected WithTracePropagationEnabled(true) to enable propagation when tracing is on")
 		}
 	})
 }

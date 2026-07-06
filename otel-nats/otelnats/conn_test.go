@@ -16,7 +16,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
-	otelnats "github.com/Marz32onE/instrumentation-go/otel-nats/otelnats"
+	otelnats "github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 )
 
 func newTestProvider() (*trace.TracerProvider, *tracetest.SpanRecorder) {
@@ -272,7 +272,7 @@ func TestSubscribeConsumerSpanLinkedToProducer(t *testing.T) {
 	assert.Equal(t, producer.SpanContext().SpanID(), linkCtx.SpanID())
 }
 
-func TestRequestCreatesProducerSpanAndReturnsReply(t *testing.T) {
+func TestRequestCreatesClientSpanAndReturnsReply(t *testing.T) {
 	url := startServer(t)
 	tp, sr := newTestProvider()
 	otel.SetTracerProvider(tp)
@@ -286,14 +286,16 @@ func TestRequestCreatesProducerSpanAndReturnsReply(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	reply, err := conn.Request(context.Background(), subject, []byte("ping"), 2*time.Second)
+	reply, err := conn.Request(subject, []byte("ping"), 2*time.Second)
 	require.NoError(t, err)
 	assert.Equal(t, "pong", string(reply.Data))
 
 	spans := sr.Ended()
-	producer := findSpanByKind(spans, oteltrace.SpanKindProducer)
-	require.NotNil(t, producer, "no producer span")
-	assert.Equal(t, "send "+subject, producer.Name())
+	client := findSpanByKind(spans, oteltrace.SpanKindClient)
+	require.NotNil(t, client, "no client span for request")
+	assert.Equal(t, subject+" request", client.Name())
+	consumer := findSpanByKind(spans, oteltrace.SpanKindConsumer)
+	require.NotNil(t, consumer, "no consumer span for reply")
 }
 
 func TestTraceContextReturnsTracerAndPropagator(t *testing.T) {

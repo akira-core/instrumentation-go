@@ -19,7 +19,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 )
@@ -33,6 +33,7 @@ type Client struct {
 	serverPort         int
 	tracer             trace.Tracer                  // derived from option or otel.GetTracerProvider()
 	propagator         propagation.TextMapPropagator // from option or otel.GetTextMapPropagator()
+	tracingEnabled     bool                          // cached mongoTracingEnabled() result; gates wrapper CLIENT spans
 	propagationEnabled bool
 	deliverTracer      trace.Tracer             // MongoDB deliver span tracer (nil when disabled)
 	mongoTP            *sdktrace.TracerProvider // independent TracerProvider for deliver spans (nil when disabled)
@@ -72,9 +73,10 @@ func WithPropagators(p propagation.TextMapPropagator) ClientOption {
 }
 
 // WithTracePropagationEnabled sets whether _oteltrace propagation is enabled for this client
-// when the global switch OTEL_INSTRUMENTATION_GO_TRACING_ENABLED is truthy.
+// when both OTEL_INSTRUMENTATION_GO_TRACING_ENABLED and OTEL_MONGO_TRACING_ENABLED are truthy.
 // It overrides OTEL_MONGO_PROPAGATION_ENABLED for the module default only; it cannot enable
-// propagation while the global switch is unset or false.
+// propagation while either tracing gate is unset or false (propagation is force-disabled
+// whenever Mongo tracing is off, so callers get a single kill switch).
 func WithTracePropagationEnabled(v bool) ClientOption {
 	return clientOptionFunc(func(c *clientConfig) {
 		c.PropagationEnabled = &v
@@ -99,6 +101,23 @@ func Connect(ctx context.Context, opts ...*options.ClientOptions) (*Client, erro
 // stored in the Client and used for all tracing — the otel globals are never overwritten.
 // Without options, falls back to otel.GetTracerProvider()/otel.GetTextMapPropagator() at connect time.
 func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*options.ClientOptions) (*Client, error) {
+	if !mongoTracingEnabled() {
+		mc, err := mongo.Connect(ctx, opts...)
+		if err != nil {
+			return nil, err
+		}
+		addr, port := parseServerFromURI(lastNonEmptyURI(opts))
+		tracer := noop.NewTracerProvider().Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
+		return &Client{
+			Client:             mc,
+			serverAddr:         addr,
+			serverPort:         port,
+			tracer:             tracer,
+			propagator:         otel.GetTextMapPropagator(),
+			tracingEnabled:     false,
+			propagationEnabled: false,
+		}, nil
+	}
 	cfg := newClientConfig(traceOpts)
 	tp := cfg.TracerProvider
 	if tp == nil {
@@ -109,34 +128,44 @@ func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*
 		prop = otel.GetTextMapPropagator()
 	}
 	propEnabled := resolveDocumentPropagation(cfg.PropagationEnabled)
-	tracerProvider := tp
-	if !mongoTracingEnabled() {
-		tracerProvider = noop.NewTracerProvider()
-	}
-	tracer := tracerProvider.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
-	merged := options.MergeClientOptions(opts...)
-	mc, err := mongo.Connect(ctx, merged)
+	tracer := tp.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
+	mc, err := mongo.Connect(ctx, opts...)
 	if err != nil {
 		return nil, err
 	}
-	addr, port := parseServerFromClientOptions(merged)
-	var mongoTP *sdktrace.TracerProvider
-	var deliverTracer trace.Tracer
-	if mongoTracingEnabled() {
-		mongoTP, deliverTracer = initMongoProvider(addr, port)
-	}
+	addr, port := parseServerFromURI(lastNonEmptyURI(opts))
+	mongoTP, deliverTracer := initMongoProvider(addr, port)
 	return &Client{
 		Client:             mc,
 		serverAddr:         addr,
 		serverPort:         port,
 		tracer:             tracer,
 		propagator:         prop,
+		tracingEnabled:     true,
 		propagationEnabled: propEnabled,
 		mongoTP:            mongoTP,
 		deliverTracer:      deliverTracer,
 	}, nil
 }
 
+// lastNonEmptyURI walks the ClientOptions slice in reverse and returns the URI
+// from the most recently-applied options struct. mongo.Connect already merges
+// the slice internally, so the wrapper only needs the effective URI to derive
+// semconv server.* attributes.
+func lastNonEmptyURI(opts []*options.ClientOptions) string {
+	for i := len(opts) - 1; i >= 0; i-- {
+		if opts[i] == nil {
+			continue
+		}
+		if uri := opts[i].GetURI(); uri != "" {
+			return uri
+		}
+	}
+	return ""
+}
+
+// parseServerFromClientOptions is retained for tests that exercise URI parsing.
+// It mirrors lastNonEmptyURI for the single-options case.
 func parseServerFromClientOptions(opts *options.ClientOptions) (addr string, port int) {
 	if opts == nil {
 		return "", 0
@@ -269,6 +298,7 @@ func (c *Client) Database(name string, opts ...*options.DatabaseOptions) *Databa
 		serverPort:         c.serverPort,
 		tracer:             c.tracer,
 		propagator:         c.propagator,
+		tracingEnabled:     c.tracingEnabled,
 		propagationEnabled: c.propagationEnabled,
 		deliverTracer:      c.deliverTracer,
 	}

@@ -7,26 +7,21 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// Database wraps *mongo.Database for document-level tracing.
+// Database wraps *mongo.Database for document-level tracing. Holds the
+// Client's resolved gates so Collection() can pick the right collectionImpl
+// without re-reading env.
 type Database struct {
 	*mongo.Database
 	serverAddr         string
 	serverPort         int
 	tracer             trace.Tracer
 	propagator         propagation.TextMapPropagator
+	tracingEnabled     bool
 	propagationEnabled bool
 	deliverTracer      trace.Tracer
 }
 
 // Collection returns a Collection with document-level trace propagation.
 func (d *Database) Collection(name string, opts ...options.Lister[options.CollectionOptions]) *Collection {
-	return &Collection{
-		Collection:         d.Database.Collection(name, opts...),
-		tracer:             d.tracer,
-		propagator:         d.propagator,
-		propagationEnabled: d.propagationEnabled,
-		serverAddr:         d.serverAddr,
-		serverPort:         d.serverPort,
-		deliverTracer:      d.deliverTracer,
-	}
+	return newCollectionForDatabase(d, d.Database.Collection(name, opts...))
 }

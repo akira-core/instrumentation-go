@@ -4,7 +4,7 @@
 
 共有 **四個獨立的 Go 模組**（各目錄自有 `go.mod`），**版本與 Git tag 分開管理**。模組使用 **Go 1.24**。CI 會對每個模組執行 `go build`、`go test -race`、**golangci-lint**，通過後再跑需 Docker 的 **整合測試**（testcontainers）— 見 [.github/workflows/ci.yml](.github/workflows/ci.yml)。
 
-封裝**不會**自行建立全域 `TracerProvider`，預設使用 `otel.GetTracerProvider()` / `otel.GetTextMapPropagator()`；需要時可透過 `WithTracerProvider`、`WithPropagators` 覆寫。**應用程式**須在啟動時安裝 TracerProvider 與 W3C 傳播器（各模組的 **example/** 有完整範例）。
+封裝**不會**自行建立全域 `TracerProvider`，預設使用 `otel.GetTracerProvider()` / `otel.GetTextMapPropagator()`；需要時可透過 `WithTracerProvider`、`WithPropagators` 覆寫。**應用程式**須在啟動時安裝 TracerProvider 與 W3C 傳播器（各模組的 **examples/** 有完整範例）。
 
 **English:** [README.md](README.md)
 
@@ -12,23 +12,23 @@
 
 | 套件 | Import 路徑 | 原始碼版本 | 說明 |
 |------|-------------|------------|------|
-| **otel-mongo** (v1) | `github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo` | 0.2.11 | MongoDB driver v1 封裝；寫入時注入 `_oteltrace`；`ContextFromDocument` 與解碼輔助；可選 deliver span。 |
-| **otel-mongo/v2** | `github.com/Marz32onE/instrumentation-go/otel-mongo/v2` | 0.2.11 | MongoDB driver v2 封裝；與 v1 行為對齊。 |
-| **otel-nats** | `github.com/Marz32onE/instrumentation-go/otel-nats/otelnats` | 0.2.11 | 核心 NATS；W3C 脈絡在訊息標頭；deliver span。 |
-| **otel-nats** | `github.com/Marz32onE/instrumentation-go/otel-nats/oteljetstream` | 0.2.11 | JetStream 發布／消費／fetch；deliver span。 |
-| **otel-gorilla-ws** | `github.com/Marz32onE/instrumentation-go/otel-gorilla-ws` | 0.2.11 | 在 JSON 訊息本文內傳遞 trace context（信封格式）；`NewConn` / `Conn.Dial`。 |
+| **otel-mongo** (v1) | `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | 0.5.0 | MongoDB driver v1 封裝；寫入時注入 `_oteltrace`；`ContextFromDocument` 與解碼輔助；可選 deliver span。 |
+| **otel-mongo/v2** | `github.com/akira-core/instrumentation-go/otel-mongo/v2` | 0.5.0 | MongoDB driver v2 封裝；與 v1 行為對齊。 |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.5.0 | 核心 NATS；W3C 脈絡在訊息標頭；deliver span。 |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.5.0 | JetStream 發布／消費／fetch；deliver span。 |
+| **otel-gorilla-ws** | `github.com/akira-core/instrumentation-go/otel-gorilla-ws` | 0.5.0 | 在 JSON 訊息本文內傳遞 trace context（信封格式）；`NewConn` / `Dial`。 |
 
-各模組詳細文件：[otel-mongo/README.md](otel-mongo/README.md)、[otel-nats/README.md](otel-nats/README.md)、[otel-gorilla-ws/README.md](otel-gorilla-ws/README.md)；Mongo 與 NATS 另有繁中：[otel-mongo/README.zh-TW.md](otel-mongo/README.zh-TW.md)、[otel-nats/README.zh-TW.md](otel-nats/README.zh-TW.md)。
+各模組詳細文件：[otel-mongo/README.md](otel-mongo/README.md)、[otel-nats/README.md](otel-nats/README.md)、[otel-gorilla-ws/README.md](otel-gorilla-ws/README.md)；三個模組皆另有繁中版：[otel-mongo/README.zh-TW.md](otel-mongo/README.zh-TW.md)、[otel-nats/README.zh-TW.md](otel-nats/README.zh-TW.md)、[otel-gorilla-ws/README.zh-TW.md](otel-gorilla-ws/README.zh-TW.md)。
 
 ## 安裝
 
-依模組路徑搭配對應 **Git tag**（前綴與模組一致，例如 `otel-mongo/v0.2.11`）：
+依模組路徑搭配對應 **Git tag**（前綴與模組一致，例如 `otel-mongo/v0.5.0`）：
 
 ```bash
-go get github.com/Marz32onE/instrumentation-go/otel-mongo@otel-mongo/v0.2.11
-go get github.com/Marz32onE/instrumentation-go/otel-mongo/v2@otel-mongo/v2/v0.2.11
-go get github.com/Marz32onE/instrumentation-go/otel-nats@otel-nats/v0.2.11
-go get github.com/Marz32onE/instrumentation-go/otel-gorilla-ws@otel-gorilla-ws/v0.2.11
+go get github.com/akira-core/instrumentation-go/otel-mongo@otel-mongo/v0.5.0
+go get github.com/akira-core/instrumentation-go/otel-mongo/v2@otel-mongo/v2/v0.5.0
+go get github.com/akira-core/instrumentation-go/otel-nats@otel-nats/v0.5.0
+go get github.com/akira-core/instrumentation-go/otel-gorilla-ws@otel-gorilla-ws/v0.5.0
 ```
 
 程式中再 import 子套件（`.../otelmongo`、`.../otelnats`、`.../oteljetstream`；WebSocket 為根套件）。
@@ -53,19 +53,20 @@ go get github.com/Marz32onE/instrumentation-go/otel-gorilla-ws@otel-gorilla-ws/v
 instrumentation-go/
 ├── otel-mongo/
 │   ├── otelmongo/           # v1 封裝（模組根）
-│   ├── v2/                  # v2 封裝（獨立 go.mod）
-│   ├── example/
-│   ├── tests/integration/   # Docker：testcontainers
+│   ├── v2/                  # v2 封裝（獨立 go.mod，另有自己的 tests/integration/）
+│   │   └── tests/integration/
+│   ├── examples/
+│   ├── tests/integration/   # Docker：testcontainers（v1）
 │   └── README.md
 ├── otel-nats/
 │   ├── otelnats/
 │   ├── oteljetstream/
-│   ├── example/
+│   ├── examples/
 │   ├── tests/integration/
 │   ├── go.mod
 │   └── README.md
 ├── otel-gorilla-ws/
-│   ├── example/
+│   ├── examples/
 │   ├── tests/integration/
 │   ├── go.mod
 │   └── README.md
@@ -79,7 +80,7 @@ instrumentation-go/
 1. **應用程式**建立 `TracerProvider`（例如 OTLP），呼叫 `otel.SetTracerProvider(tp)` 與 `otel.SetTextMapPropagator(...)`，並在結束時 shutdown。
 2. **應用程式**以封裝建立連線：`otelnats.Connect(url, nil)`、`otelmongo.Connect(ctx, opts...)`、`otelgorillaws.NewConn(raw, opts...)` 等。
 
-可執行範例：**otel-nats/example**、**otel-mongo/example**、**otel-gorilla-ws/example**。
+可執行範例：**otel-nats/examples**、**otel-mongo/examples**、**otel-gorilla-ws/examples**。
 
 ## 診斷日誌
 

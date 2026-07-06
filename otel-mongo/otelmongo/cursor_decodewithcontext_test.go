@@ -14,11 +14,13 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
+
+	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/direct"
+	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/traced"
 )
 
 func TestCursorDecodeWithContext_NewTraceIDAndLinksOriginTrace(t *testing.T) {
 	enableTracing(t)
-	// Ensure the document trace metadata encoding/decoding is deterministic in tests.
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
 
 	sr := tracetest.NewSpanRecorder()
@@ -47,7 +49,10 @@ func TestCursorDecodeWithContext_NewTraceIDAndLinksOriginTrace(t *testing.T) {
 	defer func() { _ = cur.Close(context.Background()) }()
 	require.True(t, cur.Next(context.Background()), "expected cursor.Next=true")
 
-	wrapped := &Cursor{Cursor: cur, parentCtx: context.Background(), tracer: tracer, propagator: prop, propagationEnabled: true}
+	wrapped := &Cursor{
+		Cursor: cur,
+		impl:   traced.NewCursor(cur, tracer, prop, true),
+	}
 
 	var out bson.D
 	enrichedCtx, err := wrapped.DecodeWithContext(context.Background(), &out)
@@ -98,18 +103,19 @@ func TestCursorDecodeWithContext_NoFlagsNoSpan(t *testing.T) {
 	defer func() { _ = cur.Close(context.Background()) }()
 	require.True(t, cur.Next(context.Background()))
 
+	// Disabled path: direct.NewCursor is the passthrough impl. noop tracer and
+	// propagator stay unused but kept for parity with the prior test setup.
+	_ = noop.NewTracerProvider()
+	_ = prop
 	wrapped := &Cursor{
-		Cursor:             cur,
-		parentCtx:          context.Background(),
-		tracer:             noop.NewTracerProvider().Tracer(""),
-		propagator:         prop,
-		propagationEnabled: true,
+		Cursor: cur,
+		impl:   direct.NewCursor(cur),
 	}
 
 	var out bson.D
 	enrichedCtx, err := wrapped.DecodeWithContext(context.Background(), &out)
 	require.NoError(t, err)
-	assert.False(t, trace.SpanContextFromContext(enrichedCtx).IsValid(), "expected noop tracer to avoid creating span context")
+	assert.False(t, trace.SpanContextFromContext(enrichedCtx).IsValid(), "expected passthrough path to avoid creating span context")
 
 	for _, s := range sr.Ended() {
 		assert.NotEqual(t, "mongo.cursor.decode", s.Name(), "no decode span should be recorded when flags are disabled")

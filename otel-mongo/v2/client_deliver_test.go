@@ -6,6 +6,8 @@ import (
 
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/traced"
 )
 
 func TestMongoDeliverSpanDisabledWithoutEndpointV2(t *testing.T) {
@@ -53,31 +55,33 @@ func TestMongoServiceNameV2(t *testing.T) {
 }
 
 func TestStartDeliverSpanDisabledV2(t *testing.T) {
-	coll := &Collection{deliverTracer: nil}
+	// StartDeliverSpan now lives on *traced.Collection (the only impl that creates
+	// deliver spans). When DeliverTracer is nil the helper must return ctx unchanged.
+	impl := &traced.Collection{DeliverTracer: nil}
 	ctx := context.Background()
-	got, span := coll.startDeliverSpan(ctx, "testdb", "testcoll")
+	got, span := impl.StartDeliverSpan(ctx, "testdb", "testcoll")
 	defer span.End()
 	if got != ctx {
-		t.Error("expected unchanged ctx when deliverTracer is nil")
+		t.Error("expected unchanged ctx when DeliverTracer is nil")
 	}
 	if trace.SpanFromContext(got).SpanContext().IsValid() {
-		t.Error("expected no span in ctx when deliverTracer is nil")
+		t.Error("expected no span in ctx when DeliverTracer is nil")
 	}
 }
 
 func TestStartDeliverSpanEnabledV2(t *testing.T) {
 	tp := sdktrace.NewTracerProvider()
 	tracer := tp.Tracer(ScopeName)
-	coll := &Collection{
-		deliverTracer: tracer,
-		serverAddr:    "localhost",
-		serverPort:    27017,
+	impl := &traced.Collection{
+		DeliverTracer: tracer,
+		ServerAddr:    "localhost",
+		ServerPort:    27017,
 	}
 
 	parentCtx, parentSpan := tp.Tracer(ScopeName).Start(context.Background(), "parent")
 	defer parentSpan.End()
 
-	got, deliverSpan := coll.startDeliverSpan(parentCtx, "testdb", "testcoll")
+	got, deliverSpan := impl.StartDeliverSpan(parentCtx, "testdb", "testcoll")
 	defer deliverSpan.End()
 
 	deliverSC := trace.SpanFromContext(got).SpanContext()

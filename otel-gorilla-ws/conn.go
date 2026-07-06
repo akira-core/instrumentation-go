@@ -13,7 +13,7 @@
 // that manage the WebSocket handshake themselves (backwards compatibility).
 //
 // Tracer initialization: Set the global TracerProvider and TextMapPropagator at
-// process startup (see example/) or pass WithTracerProvider/WithPropagators when
+// process startup (see examples/) or pass WithTracerProvider/WithPropagators when
 // creating a Conn. If options are omitted, each Conn falls back to
 // otel.GetTracerProvider() and otel.GetTextMapPropagator().
 package otelgorillaws
@@ -31,7 +31,7 @@ import (
 )
 
 // ScopeName is the instrumentation scope name for Tracer creation (OTel contrib guideline).
-const ScopeName = "github.com/Marz32onE/instrumentation-go/otel-gorilla-ws"
+const ScopeName = "instrumentation-go/otel-gorilla-ws"
 
 // otelWSProtocol is the subprotocol token injected during the WebSocket handshake
 // to negotiate otel-ws trace propagation support.

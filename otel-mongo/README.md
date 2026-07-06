@@ -4,14 +4,14 @@
 
 ---
 
-OpenTelemetry wrapper around the [MongoDB Go Driver](https://www.mongodb.com/docs/drivers/go/current/). Injects **W3C Trace Context** into documents on write (`_oteltrace` field) and restores it on read so the same trace can be followed across services. Per [OTel Go Contrib](https://github.com/open-telemetry/opentelemetry-go-contrib/tree/main/instrumentation): the package accepts **TracerProvider** and **Propagators** via options; it does **not** provide InitTracer. Set the global provider and propagator at process startup (see **example/**).
+OpenTelemetry wrapper around the [MongoDB Go Driver](https://www.mongodb.com/docs/drivers/go/current/). Injects **W3C Trace Context** into documents on write (`_oteltrace` field) and restores it on read so the same trace can be followed across services. Per [OTel Go Contrib](https://github.com/open-telemetry/opentelemetry-go-contrib/tree/main/instrumentation): the package accepts **TracerProvider** and **Propagators** via options; it does **not** provide InitTracer. Set the global provider and propagator at process startup (see **examples/**).
 
 Two driver versions are supported (Go convention: v2 lives under `/v2` for a clear import path):
 
 | Import path | Driver | Use when |
 |------------|--------|----------|
-| `github.com/Marz32onE/instrumentation-go/otel-mongo/v2` | MongoDB Go Driver **v2** | New projects or v2 driver (recommended) |
-| `github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo` | MongoDB Go Driver **v1** | Existing code using v1 driver |
+| `github.com/akira-core/instrumentation-go/otel-mongo/v2` | MongoDB Go Driver **v2** | New projects or v2 driver (recommended) |
+| `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | MongoDB Go Driver **v1** | Existing code using v1 driver |
 
 Both packages expose the same API surface (Client, Collection, Cursor, ContextFromDocument, etc.) and the same `_oteltrace` document-level propagation.
 
@@ -23,19 +23,22 @@ Both packages expose the same API surface (Client, Collection, Cursor, ContextFr
 otel-mongo/
 ├── otelmongo/           # MongoDB driver v1 wrapper (root module)
 │   ├── version.go, client.go, database.go, collection.go, cursor.go
-│   ├── tracing.go, semconv.go, bulkwrite.go, results.go, filter_exporter.go
-│   └── ...
+│   ├── tracing.go, results.go, env_flags.go
+│   └── internal/
+│       ├── shared/     # semconv.go, bulkwrite.go, tracing.go, impls.go — used by both direct and traced
+│       ├── direct/     # passthrough impls (no otel/sdk imports) — used when tracing is disabled
+│       └── traced/     # fully instrumented impls
 ├── v2/                  # MongoDB driver v2 wrapper (separate module, import .../v2)
 │   ├── go.mod           # module .../otel-mongo/v2, requires go.mongodb.org/mongo-driver/v2
 │   ├── version.go, client.go, database.go, collection.go, cursor.go
-│   ├── tracing.go, semconv.go, bulkwrite.go, results.go, filter_exporter.go
-│   └── *_test.go
-├── example/             # TracerProvider + global + otelmongo (uses v2)
+│   ├── tracing.go, results.go, env_flags.go
+│   └── internal/        # shared/, direct/, traced/ — mirrors otelmongo/internal/ above
+├── examples/             # TracerProvider + global + otelmongo (uses v2)
 └── README.md
 ```
 
 - **Trace storage:** Written/updated documents get a reserved **`_oteltrace`** field (W3C `traceparent` and optional `tracestate`). Use **ContextFromDocument(ctx, raw)** for raw BSON (e.g. change streams).
-- **Two layers:** (1) **Driver:** Client uses contrib `otelmongo.NewMonitor` for connection/command spans. (2) **Document:** Collection CRUD injects `_oteltrace` on write and supports span links / propagation on read.
+- **Two layers:** (1) **Client spans:** each Collection method (insert/find/update/delete/aggregate/distinct/bulkWrite/etc.) creates its own span directly in `internal/traced/collection.go` — no separate driver-level command monitor. (2) **Document:** Collection CRUD injects `_oteltrace` on write and supports span links / propagation on read.
 
 ---
 
@@ -52,15 +55,17 @@ otel-mongo/
 Defaults: all disabled when unset. Values `false/0/no/off` disable.
 
 Priority:
-1. If global is disabled, mongo module flags and **`WithTracePropagationEnabled(true)`** do not enable document propagation (global cannot be overridden by that option).
-2. If global is enabled, `OTEL_MONGO_TRACING_ENABLED` controls whether this package records wrapper CLIENT spans (when off, a noop tracer is used for those spans).
-3. If global is enabled, `OTEL_MONGO_PROPAGATION_ENABLED` is the default for `_oteltrace`; **`WithTracePropagationEnabled`** in `ConnectWithOptions` overrides that default only while global stays on.
+1. If **global** is disabled, every module flag and **`WithTracePropagationEnabled(true)`** is force-disabled — no wrapper spans, no `_oteltrace` inject/extract.
+2. If global is enabled but **`OTEL_MONGO_TRACING_ENABLED`** is disabled, this package treats Mongo tracing as off: a noop tracer is used for wrapper CLIENT spans **and** `_oteltrace` inject/extract is disabled. `WithTracePropagationEnabled(true)` cannot bypass this — propagation is gated by the same tracing switch.
+3. Only when both global and `OTEL_MONGO_TRACING_ENABLED` are on does `OTEL_MONGO_PROPAGATION_ENABLED` become the default for `_oteltrace`. **`WithTracePropagationEnabled`** in `ConnectWithOptions` overrides that default while both tracing gates stay on.
 
-When tracing flags are unset/disabled, this package’s wrapper does not emit Mongo CLIENT spans to your configured TracerProvider (noop). Deliver spans still require tracing flags plus `OTEL_EXPORTER_OTLP_ENDPOINT` as documented below.
+Rationale: turning off Mongo tracing also turns off Mongo trace propagation so callers get a single, predictable kill switch — there is no scenario where wrapper spans are noop while documents still carry `_oteltrace`.
+
+When tracing flags are unset/disabled, this package’s wrapper does not emit Mongo CLIENT spans to your configured TracerProvider (noop) **and** documents are written without `_oteltrace`. Deliver spans still require tracing flags plus `OTEL_EXPORTER_OTLP_ENDPOINT` as documented below.
 
 ### 1. Initialize provider and propagator (application responsibility)
 
-See **example/main.go**. In short: create TracerProvider (e.g. OTLP), set `otel.SetTracerProvider(tp)` and `otel.SetTextMapPropagator(prop)`, defer shutdown.
+See **examples/main.go**. In short: create TracerProvider (e.g. OTLP), set `otel.SetTracerProvider(tp)` and `otel.SetTextMapPropagator(prop)`, defer shutdown.
 
 ### 2. Connect and use
 
@@ -68,7 +73,7 @@ See **example/main.go**. In short: create TracerProvider (e.g. OTLP), set `otel.
 
 ```go
 import (
-    "github.com/Marz32onE/instrumentation-go/otel-mongo/v2"
+    "github.com/akira-core/instrumentation-go/otel-mongo/v2"
     "go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
@@ -86,7 +91,7 @@ coll := db.Collection("mycoll")
 ```go
 import (
     "context"
-    "github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo"
+    "github.com/akira-core/instrumentation-go/otel-mongo/otelmongo"
     "go.mongodb.org/mongo-driver/mongo/options"
 )
 
@@ -103,7 +108,7 @@ Optional: **ConnectWithOptions(ctx, traceOpts, mongoOpts)** (v1) or **ConnectWit
 
 ### 3. Restore trace from document (e.g. change streams)
 
-Requires the same propagation env gates as writes (`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` and `OTEL_MONGO_PROPAGATION_ENABLED`, or global on plus `WithTracePropagationEnabled(true)` via `ConnectWithOptions`). When the gates are off, `ContextFromDocument`/`ContextFromRawDocument` return zero/unchanged — existing callers that ignored the `ok` return value will silently no-op.
+Requires the same propagation env gates as writes: **all three of** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`, `OTEL_MONGO_TRACING_ENABLED`, and `OTEL_MONGO_PROPAGATION_ENABLED` must be on — or both tracing gates on plus `WithTracePropagationEnabled(true)` via `ConnectWithOptions`. When any of those gates is off, `ContextFromDocument`/`ContextFromRawDocument` return zero/unchanged — existing callers that ignored the `ok` return value will silently no-op.
 
 ```go
 fullDoc := changeStreamEvent.FullDocument
@@ -120,28 +125,6 @@ otel.SetTracerProvider(trace.NewTracerProvider())
 client, err := otelmongo.Connect(opts)
 ```
 
-### 5. Reduce noisy driver spans (e.g. `getMore`)
-
-The MongoDB driver monitor (`contrib otelmongo.NewMonitor`) emits command spans for all operations, including frequent cursor operations like `getMore`.
-
-Use `SkipDBOperationsExporter` to drop selected DB operation spans before export:
-
-```go
-exp, err := otlptracegrpc.New(ctx, otlptracegrpc.WithEndpoint(endpoint))
-if err != nil { log.Fatal(err) }
-
-// Drop db.operation.name in skip list (case-insensitive).
-exp = otelmongo.SkipDBOperationsExporter(exp, []string{"getMore"})
-
-tp := sdktrace.NewTracerProvider(
-    sdktrace.WithBatcher(exp),
-    sdktrace.WithResource(res),
-)
-otel.SetTracerProvider(tp)
-```
-
-This only filters exported spans; client CRUD behavior and `_oteltrace` propagation are unchanged.
-
 ---
 
 ## API summary
@@ -152,7 +135,6 @@ This only filters exported spans; client CRUD behavior and `_oteltrace` propagat
 | **NewClient** | Same; accepts optional **WithTracerProvider**, **WithPropagators**. |
 | **ContextFromDocument** | Restores trace context from document’s `_oteltrace` (e.g. for change streams). |
 | **ScopeName / Version()** | Used when creating Tracer (OTel contrib guideline). |
-| **SkipDBOperationsExporter** | Wraps a `SpanExporter`; drops spans whose `db.operation.name` is in the skip list (export-only). |
 
 ---
 
@@ -201,8 +183,7 @@ api ──► mongodb ──► dbwatcher
 | `NewClient` signature | `NewClient(ctx, uri, traceOpts...)` | `NewClient(uri, traceOpts...)` |
 | `Distinct` return | `([]interface{}, error)` | `*mongo.DistinctResult` |
 | `StartSession` return | `mongo.Session, error` | `*mongo.Session, error` |
-| `Cursor.DecodeWithContext` | Creates INTERNAL span + new TraceID | Pure context enrichment (no extra span) |
-| `Connect` server address | Not parsed (no `server.address` attribute) | Auto-parses URI |
+| `Cursor.DecodeWithContext` | Identical behavior in both: always emits a `mongo.cursor.decode` INTERNAL span on a new (detached) trace, with a link to the origin span when the document's `_oteltrace` metadata is present and propagation is enabled. | (same) |
 
 ---
 
@@ -226,7 +207,7 @@ Every `InsertOne`, `InsertMany`, `ReplaceOne`, and `UpdateOne`/`UpdateMany`/`Upd
 
 ### `NewCollection` vs `Connect`
 
-`NewCollection` sets **document** `_oteltrace` behaviour from the same env gates as `Connect` (global + `OTEL_MONGO_PROPAGATION_ENABLED`). There is no per-collection functional option for propagation; use **`ConnectWithOptions`** with **`WithTracePropagationEnabled`** when you need to override the env default for a client.
+`NewCollection` sets **document** `_oteltrace` behaviour from the same env gates as `Connect` (global + `OTEL_MONGO_TRACING_ENABLED` + `OTEL_MONGO_PROPAGATION_ENABLED`). When either tracing gate is off, the collection is constructed with propagation disabled. There is no per-collection functional option for propagation; use **`ConnectWithOptions`** with **`WithTracePropagationEnabled`** when you need to override the env default for a client (note: it still cannot bypass a disabled tracing gate).
 
 ### DecodeWithContext vs Decode on Cursor
 
@@ -261,6 +242,6 @@ Log entries use the `otelmongo:` prefix with `error`, `reason`, `service`, and `
 
 ## Dependencies
 
-- **v2** (`.../otel-mongo/v2`): `go.mongodb.org/mongo-driver/v2`, `go.opentelemetry.io/contrib/instrumentation/.../v2/mongo/otelmongo`, `go.opentelemetry.io/otel` and SDK. See `v2/go.mod`.
-- **otelmongo** (v1, root): `go.mongodb.org/mongo-driver` v1, `go.opentelemetry.io/contrib/instrumentation/.../mongo/otelmongo`, `go.opentelemetry.io/otel` and SDK. See root `go.mod`.
+- **v2** (`.../otel-mongo/v2`): `go.mongodb.org/mongo-driver/v2`, `go.opentelemetry.io/otel` and SDK. See `v2/go.mod`.
+- **otelmongo** (v1, root): `go.mongodb.org/mongo-driver` v1, `go.opentelemetry.io/otel` and SDK. See root `go.mod`.
 - Go 1.24+

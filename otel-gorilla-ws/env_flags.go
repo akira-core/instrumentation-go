@@ -1,8 +1,7 @@
 package otelgorillaws
 
 import (
-	"os"
-	"strings"
+	"github.com/akira-core/instrumentation-go/otel-gorilla-ws/internal/flags"
 )
 
 const (
@@ -10,22 +9,14 @@ const (
 	envWSTracingEnabled     = "OTEL_GORILLA_WS_TRACING_ENABLED"
 )
 
-func wsTracingEnabled() bool {
-	if !envEnabledByDefault(envGlobalTracingEnabled) {
-		return false
-	}
-	return envEnabledByDefault(envWSTracingEnabled)
-}
+// wsGate caches the composed two-tier tracing gate
+// (OTEL_INSTRUMENTATION_GO_TRACING_ENABLED AND OTEL_GORILLA_WS_TRACING_ENABLED)
+// for the lifetime of the process. The actual per-Conn tracing decision is
+// AND-ed with runtime Sec-WebSocket-Protocol negotiation at Dial / Upgrade time.
+var wsGate = flags.NewGate(func() bool {
+	return flags.EnvEnabled(envGlobalTracingEnabled) && flags.EnvEnabled(envWSTracingEnabled)
+})
 
-func envEnabledByDefault(key string) bool {
-	v, ok := os.LookupEnv(key)
-	if !ok {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "0", "false", "no", "off":
-		return false
-	default:
-		return true
-	}
+func wsTracingEnabled() bool {
+	return wsGate.Enabled()
 }

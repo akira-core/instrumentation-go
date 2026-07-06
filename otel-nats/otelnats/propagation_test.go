@@ -5,7 +5,7 @@ import (
 
 	nats "github.com/nats-io/nats.go"
 
-	otelnats "github.com/Marz32onE/instrumentation-go/otel-nats/otelnats"
+	otelnats "github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 )
 
 func TestHeaderCarrier_NilHeader(t *testing.T) {

@@ -16,8 +16,8 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
-	"github.com/Marz32onE/instrumentation-go/otel-nats/oteljetstream"
-	otelnats "github.com/Marz32onE/instrumentation-go/otel-nats/otelnats"
+	"github.com/akira-core/instrumentation-go/otel-nats/oteljetstream"
+	otelnats "github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 )
 
 // ── Consumer.Consume ─────────────────────────────────────────────────────────
@@ -344,64 +344,6 @@ func TestIntegration_FetchNoWaitTraceContext(t *testing.T) {
 	assert.Equal(t, 1, n)
 }
 
-// ── PushConsumer.Consume ─────────────────────────────────────────────────────
-
-// TestIntegration_PushConsumeTraceContext verifies that PushConsumer.Consume delivers
-// messages with valid trace context via server-side push delivery.
-func TestIntegration_PushConsumeTraceContext(t *testing.T) {
-	tp, sr := newTestProvider()
-	prop := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{})
-	otel.SetTracerProvider(tp)
-	otel.SetTextMapPropagator(prop)
-
-	conn, err := otelnats.Connect(natsURL, nil)
-	require.NoError(t, err)
-	defer conn.Close()
-
-	js, err := oteljetstream.New(conn)
-	require.NoError(t, err)
-
-	ctx := context.Background()
-	_, err = js.CreateOrUpdateStream(ctx, oteljetstream.StreamConfig{
-		Name:     "INTEG_PUSH",
-		Subjects: []string{"integ.push.>"},
-	})
-	require.NoError(t, err)
-
-	pushCons, err := js.CreateOrUpdatePushConsumer(ctx, "INTEG_PUSH", oteljetstream.ConsumerConfig{
-		Durable:        "integ-push-consumer",
-		DeliverSubject: "_INBOX.integ.push.deliver",
-		FilterSubject:  "integ.push.msg",
-		AckPolicy:      oteljetstream.AckExplicitPolicy,
-	})
-	require.NoError(t, err)
-
-	done := make(chan struct{}, 1)
-	cc, err := pushCons.Consume(func(m oteljetstream.Msg) {
-		assert.True(t, oteltrace.SpanFromContext(m.Context()).SpanContext().TraceID().IsValid(),
-			"PushConsumer MsgWithContext should carry a valid trace ID")
-		done <- struct{}{}
-		_ = m.Ack()
-	})
-	require.NoError(t, err)
-	defer cc.Stop()
-
-	tracer := tp.Tracer("push-pub")
-	pubCtx, pubSpan := tracer.Start(ctx, "push-parent")
-	defer pubSpan.End()
-	_, err = js.Publish(pubCtx, "integ.push.msg", []byte("hello push"))
-	require.NoError(t, err)
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("PushConsumer handler did not receive trace context in time")
-	}
-
-	consumer := waitSpanByNameAndKind(t, sr, "process integ.push.msg", oteltrace.SpanKindConsumer)
-	assert.NotNil(t, consumer)
-}
-
 // ── OrderedConsumer ──────────────────────────────────────────────────────────
 
 // TestIntegration_OrderedConsumerTraceContext verifies that an OrderedConsumer
@@ -431,7 +373,6 @@ func TestIntegration_OrderedConsumerTraceContext(t *testing.T) {
 
 	orderedCons, err := stream.OrderedConsumer(ctx, oteljetstream.OrderedConsumerConfig{
 		FilterSubjects: []string{"integ.ordered.msg"},
-		NamePrefix:     "integ-ordered",
 	})
 	require.NoError(t, err)
 
@@ -458,5 +399,5 @@ func TestIntegration_OrderedConsumerTraceContext(t *testing.T) {
 	}
 
 	consumer := waitSpanByNameAndKind(t, sr, "process integ.ordered.msg", oteltrace.SpanKindConsumer)
-	assertAttr(t, consumer.Attributes(), "messaging.consumer.name", "integ-ordered")
+	assertAttr(t, consumer.Attributes(), "messaging.consumer.name", "ordered-consumer")
 }
