@@ -8,8 +8,8 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/sdk/trace"
 
-	"github.com/Marz32onE/instrumentation-go/otel-nats/oteljetstream"
-	otelnats "github.com/Marz32onE/instrumentation-go/otel-nats/otelnats"
+	"github.com/akira-core/instrumentation-go/otel-nats/oteljetstream"
+	otelnats "github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 )
 
 func TestStreamInfo(t *testing.T) {

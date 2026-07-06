@@ -15,7 +15,7 @@ import (
 	"os"
 	"time"
 
-	otelmongo "github.com/Marz32onE/instrumentation-go/otel-mongo/v2"
+	otelmongo "github.com/akira-core/instrumentation-go/otel-mongo/v2"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"

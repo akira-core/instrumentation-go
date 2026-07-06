@@ -9,7 +9,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 
-	otelgorillaws "github.com/Marz32onE/instrumentation-go/otel-gorilla-ws"
+	otelgorillaws "github.com/akira-core/instrumentation-go/otel-gorilla-ws"
 )
 
 func TestIsCloseError(t *testing.T) {

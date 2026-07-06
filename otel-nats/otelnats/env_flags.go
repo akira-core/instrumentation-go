@@ -1,7 +1,7 @@
 package otelnats
 
 import (
-	"github.com/Marz32onE/instrumentation-go/otel-nats/otelnats/internal/flags"
+	"github.com/akira-core/instrumentation-go/otel-nats/otelnats/internal/flags"
 )
 
 const (

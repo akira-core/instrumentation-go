@@ -20,7 +20,7 @@ Incoming messages support two formats:
 ## Installation
 
 ```bash
-go get github.com/Marz32onE/instrumentation-go/otel-gorilla-ws
+go get github.com/akira-core/instrumentation-go/otel-gorilla-ws
 ```
 
 ## Usage

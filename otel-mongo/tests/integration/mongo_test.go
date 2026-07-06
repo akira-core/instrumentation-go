@@ -18,7 +18,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
-	otelmongo "github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo"
+	otelmongo "github.com/akira-core/instrumentation-go/otel-mongo/otelmongo"
 )
 
 // mongoURI is the connection string for the shared MongoDB container, set once in TestMain.

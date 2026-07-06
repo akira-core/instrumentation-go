@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	otelgorillaws "github.com/Marz32onE/instrumentation-go/otel-gorilla-ws"
+	otelgorillaws "github.com/akira-core/instrumentation-go/otel-gorilla-ws"
 )
 
 func TestIntegration_Fallback_NonEnvelopeAndClose(t *testing.T) {

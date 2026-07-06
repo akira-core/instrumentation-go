@@ -15,8 +15,8 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/direct"
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/traced"
+	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/direct"
+	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/traced"
 )
 
 // stdProp is the standard W3C propagator used across cursor tests.

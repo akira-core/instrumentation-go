@@ -44,7 +44,7 @@ cd otel-mongo/tests/integration && go test -v -race ./...
 
 Config is in `.golangci.yml` (v2 syntax). Common failure modes:
 
-- **`goimports`**: stdlib imports must be in their own group, separated from third-party by a blank line. Local prefix is `github.com/Marz32onE/instrumentation-go`.
+- **`goimports`**: stdlib imports must be in their own group, separated from third-party by a blank line. Local prefix is `github.com/akira-core/instrumentation-go`.
 - **`errcheck`**: every returned error must be handled (disabled in `_test.go`).
 - **`govet`**: includes shadow, printf format checks.
 - **`staticcheck`**: full suite enabled.

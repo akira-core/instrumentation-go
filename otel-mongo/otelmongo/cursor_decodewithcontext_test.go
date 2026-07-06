@@ -15,8 +15,8 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/direct"
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/traced"
+	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/direct"
+	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/traced"
 )
 
 func TestCursorDecodeWithContext_NewTraceIDAndLinksOriginTrace(t *testing.T) {

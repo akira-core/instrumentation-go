@@ -11,7 +11,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/shared"
+	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/shared"
 )
 
 // TraceMetadataKey is the BSON field name used to store trace metadata in documents.

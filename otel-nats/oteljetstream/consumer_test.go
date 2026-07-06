@@ -16,8 +16,8 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
-	"github.com/Marz32onE/instrumentation-go/otel-nats/oteljetstream"
-	otelnats "github.com/Marz32onE/instrumentation-go/otel-nats/otelnats"
+	"github.com/akira-core/instrumentation-go/otel-nats/oteljetstream"
+	otelnats "github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 )
 
 func startJetStreamServer(t *testing.T) string {

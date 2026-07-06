@@ -8,9 +8,9 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/direct"
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/shared"
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/traced"
+	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/direct"
+	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/shared"
+	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/traced"
 )
 
 // Collection wraps *mongo.Collection. Public methods delegate to a polymorphic

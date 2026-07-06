@@ -1,11 +1,11 @@
-module github.com/Marz32onE/instrumentation-go/otel-nats/examples
+module github.com/akira-core/instrumentation-go/otel-nats/examples
 
 go 1.24.0
 
-replace github.com/Marz32onE/instrumentation-go/otel-nats => ../
+replace github.com/akira-core/instrumentation-go/otel-nats => ../
 
 require (
-	github.com/Marz32onE/instrumentation-go/otel-nats v0.0.0
+	github.com/akira-core/instrumentation-go/otel-nats v0.0.0
 	github.com/nats-io/nats.go v1.49.0
 	go.opentelemetry.io/otel v1.41.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.41.0

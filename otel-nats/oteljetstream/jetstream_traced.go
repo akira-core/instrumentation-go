@@ -8,7 +8,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/Marz32onE/instrumentation-go/otel-nats/otelnats"
+	"github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 )
 
 // tracedJSImpl is the fully-instrumented JetStream impl: Publish/PublishMsg

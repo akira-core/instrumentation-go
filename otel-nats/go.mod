@@ -1,4 +1,4 @@
-module github.com/Marz32onE/instrumentation-go/otel-nats
+module github.com/akira-core/instrumentation-go/otel-nats
 
 go 1.24.0
 

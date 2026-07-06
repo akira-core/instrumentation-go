@@ -6,9 +6,9 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/direct"
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/shared"
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/traced"
+	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/direct"
+	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/shared"
+	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/traced"
 )
 
 // InsertOneResult wraps *mongo.InsertOneResult.

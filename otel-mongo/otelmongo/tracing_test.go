@@ -13,7 +13,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/traced"
+	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/traced"
 )
 
 func init() {

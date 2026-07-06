@@ -1,4 +1,4 @@
-module github.com/Marz32onE/instrumentation-go/otel-mongo/v2
+module github.com/akira-core/instrumentation-go/otel-mongo/v2
 
 go 1.24.0
 

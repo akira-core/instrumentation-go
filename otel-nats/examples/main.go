@@ -23,8 +23,8 @@ import (
 
 	"github.com/nats-io/nats.go/jetstream"
 
-	"github.com/Marz32onE/instrumentation-go/otel-nats/oteljetstream"
-	"github.com/Marz32onE/instrumentation-go/otel-nats/otelnats"
+	"github.com/akira-core/instrumentation-go/otel-nats/oteljetstream"
+	"github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"

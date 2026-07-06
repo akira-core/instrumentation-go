@@ -1,7 +1,7 @@
 package otelmongo
 
 import (
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/flags"
+	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/flags"
 )
 
 const (

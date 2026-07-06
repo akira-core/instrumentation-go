@@ -7,7 +7,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/traced"
+	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/traced"
 )
 
 func TestMongoDeliverSpanDisabledWithoutEndpointV2(t *testing.T) {

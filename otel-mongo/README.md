@@ -10,8 +10,8 @@ Two driver versions are supported (Go convention: v2 lives under `/v2` for a cle
 
 | Import path | Driver | Use when |
 |------------|--------|----------|
-| `github.com/Marz32onE/instrumentation-go/otel-mongo/v2` | MongoDB Go Driver **v2** | New projects or v2 driver (recommended) |
-| `github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo` | MongoDB Go Driver **v1** | Existing code using v1 driver |
+| `github.com/akira-core/instrumentation-go/otel-mongo/v2` | MongoDB Go Driver **v2** | New projects or v2 driver (recommended) |
+| `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | MongoDB Go Driver **v1** | Existing code using v1 driver |
 
 Both packages expose the same API surface (Client, Collection, Cursor, ContextFromDocument, etc.) and the same `_oteltrace` document-level propagation.
 
@@ -73,7 +73,7 @@ See **examples/main.go**. In short: create TracerProvider (e.g. OTLP), set `otel
 
 ```go
 import (
-    "github.com/Marz32onE/instrumentation-go/otel-mongo/v2"
+    "github.com/akira-core/instrumentation-go/otel-mongo/v2"
     "go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
@@ -91,7 +91,7 @@ coll := db.Collection("mycoll")
 ```go
 import (
     "context"
-    "github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo"
+    "github.com/akira-core/instrumentation-go/otel-mongo/otelmongo"
     "go.mongodb.org/mongo-driver/mongo/options"
 )
 

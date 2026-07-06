@@ -1,8 +1,8 @@
-module github.com/Marz32onE/instrumentation-go/otel-gorilla-ws/examples
+module github.com/akira-core/instrumentation-go/otel-gorilla-ws/examples
 
 go 1.24.0
 
-replace github.com/Marz32onE/instrumentation-go/otel-gorilla-ws => ../
+replace github.com/akira-core/instrumentation-go/otel-gorilla-ws => ../
 
 require (
 	go.opentelemetry.io/otel v1.41.0

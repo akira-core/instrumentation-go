@@ -12,23 +12,23 @@ Instrumentation packages **do not** create a global `TracerProvider`. They use `
 
 | Package | Import path | Version (source) | Description |
 |---------|-------------|------------------|-------------|
-| **otel-mongo** (v1) | `github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo` | 0.4.1 | MongoDB driver v1 wrapper; `_oteltrace` on writes; `ContextFromDocument` / decode helpers; optional deliver spans. |
-| **otel-mongo/v2** | `github.com/Marz32onE/instrumentation-go/otel-mongo/v2` | 0.4.1 | MongoDB driver v2 wrapper; parity with v1. |
-| **otel-nats** | `github.com/Marz32onE/instrumentation-go/otel-nats/otelnats` | 0.4.1 | Core NATS; W3C context in message headers; deliver spans. |
-| **otel-nats** | `github.com/Marz32onE/instrumentation-go/otel-nats/oteljetstream` | 0.4.1 | JetStream publish/consume/fetch; deliver spans. |
-| **otel-gorilla-ws** | `github.com/Marz32onE/instrumentation-go/otel-gorilla-ws` | 0.4.1 | Trace context in JSON message body (envelope); `NewConn` / `Dial`. |
+| **otel-mongo** (v1) | `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | 0.5.0 | MongoDB driver v1 wrapper; `_oteltrace` on writes; `ContextFromDocument` / decode helpers; optional deliver spans. |
+| **otel-mongo/v2** | `github.com/akira-core/instrumentation-go/otel-mongo/v2` | 0.5.0 | MongoDB driver v2 wrapper; parity with v1. |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.5.0 | Core NATS; W3C context in message headers; deliver spans. |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.5.0 | JetStream publish/consume/fetch; deliver spans. |
+| **otel-gorilla-ws** | `github.com/akira-core/instrumentation-go/otel-gorilla-ws` | 0.5.0 | Trace context in JSON message body (envelope); `NewConn` / `Dial`. |
 
 Per-module docs: [otel-mongo/README.md](otel-mongo/README.md), [otel-nats/README.md](otel-nats/README.md), [otel-gorilla-ws/README.md](otel-gorilla-ws/README.md) (each also ships a [README.zh-TW.md](otel-mongo/README.zh-TW.md): [otel-nats](otel-nats/README.zh-TW.md), [otel-gorilla-ws](otel-gorilla-ws/README.zh-TW.md)).
 
 ## Install
 
-Use the module path and a **git tag** that matches the release you want (tag prefix matches the module, e.g. `otel-mongo/v0.4.1`):
+Use the module path and a **git tag** that matches the release you want (tag prefix matches the module, e.g. `otel-mongo/v0.5.0`):
 
 ```bash
-go get github.com/Marz32onE/instrumentation-go/otel-mongo@otel-mongo/v0.4.1
-go get github.com/Marz32onE/instrumentation-go/otel-mongo/v2@otel-mongo/v2/v0.4.1
-go get github.com/Marz32onE/instrumentation-go/otel-nats@otel-nats/v0.4.1
-go get github.com/Marz32onE/instrumentation-go/otel-gorilla-ws@otel-gorilla-ws/v0.4.1
+go get github.com/akira-core/instrumentation-go/otel-mongo@otel-mongo/v0.5.0
+go get github.com/akira-core/instrumentation-go/otel-mongo/v2@otel-mongo/v2/v0.5.0
+go get github.com/akira-core/instrumentation-go/otel-nats@otel-nats/v0.5.0
+go get github.com/akira-core/instrumentation-go/otel-gorilla-ws@otel-gorilla-ws/v0.5.0
 ```
 
 Then import subpackages as needed (`.../otelmongo`, `.../otelnats`, `.../oteljetstream`, root `otel-gorilla-ws`).

@@ -7,8 +7,8 @@
 以 [MongoDB Go Driver](https://www.mongodb.com/docs/drivers/go/current/) 為基礎的 OpenTelemetry 包裝。寫入時將 **W3C Trace Context** 注入文件的 **`_oteltrace`** 欄位，讀取時還原，使同一條 trace 可跨服務延續。依 [OTel Go Contrib](https://github.com/open-telemetry/opentelemetry-go-contrib/tree/main/instrumentation) 規範：套件僅透過 option 接受 **TracerProvider** 與 **Propagators**，不提供 InitTracer；由應用程式在啟動時設定 global provider 與 propagator（見 **examples/**）。
 
 支援兩種 driver 版本（Go 慣例：v2 使用 import path `.../v2`）：
-- **v2**：`import "github.com/Marz32onE/instrumentation-go/otel-mongo/v2"`（MongoDB driver v2，建議）
-- **v1**：`import "github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo"`（MongoDB driver v1）
+- **v2**：`import "github.com/akira-core/instrumentation-go/otel-mongo/v2"`（MongoDB driver v2，建議）
+- **v1**：`import "github.com/akira-core/instrumentation-go/otel-mongo/otelmongo"`（MongoDB driver v1）
 
 兩個套件提供相同的 API 介面（Client、Collection、Cursor、ContextFromDocument 等）與相同的 `_oteltrace` 文件層級傳播機制。
 
@@ -70,7 +70,7 @@ otel-mongo/
 
 ```go
 import (
-    "github.com/Marz32onE/instrumentation-go/otel-mongo/v2"
+    "github.com/akira-core/instrumentation-go/otel-mongo/v2"
     "go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
@@ -88,7 +88,7 @@ coll := db.Collection("mycoll")
 ```go
 import (
     "context"
-    "github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo"
+    "github.com/akira-core/instrumentation-go/otel-mongo/otelmongo"
     "go.mongodb.org/mongo-driver/mongo/options"
 )
 

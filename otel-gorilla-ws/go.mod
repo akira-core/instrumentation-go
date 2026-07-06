@@ -1,4 +1,4 @@
-module github.com/Marz32onE/instrumentation-go/otel-gorilla-ws
+module github.com/akira-core/instrumentation-go/otel-gorilla-ws
 
 go 1.24.0
 

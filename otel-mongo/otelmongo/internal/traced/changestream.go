@@ -9,7 +9,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/shared"
+	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/shared"
 )
 
 // ChangeStream is the enabled-path impl of the otelmongo.ChangeStream

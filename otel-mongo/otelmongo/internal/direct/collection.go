@@ -6,7 +6,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/shared"
+	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/shared"
 )
 
 // Collection is the passthrough collectionImpl used when the tracing gate is

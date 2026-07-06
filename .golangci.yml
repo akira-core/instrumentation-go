@@ -55,4 +55,4 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/Marz32onE/instrumentation-go
+        - github.com/akira-core/instrumentation-go

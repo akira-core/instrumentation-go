@@ -15,7 +15,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
-	otelgorillaws "github.com/Marz32onE/instrumentation-go/otel-gorilla-ws"
+	otelgorillaws "github.com/akira-core/instrumentation-go/otel-gorilla-ws"
 )
 
 func newIntegrationTP(t *testing.T) *tracetest.SpanRecorder {

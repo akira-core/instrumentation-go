@@ -17,8 +17,8 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/direct"
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/traced"
+	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/direct"
+	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/traced"
 )
 
 // testMongoURI is populated by TestMain from the container. Zero value = Docker unavailable.

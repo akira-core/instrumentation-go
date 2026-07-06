@@ -1,9 +1,9 @@
-module github.com/Marz32onE/instrumentation-go/otel-gorilla-ws/tests/integration
+module github.com/akira-core/instrumentation-go/otel-gorilla-ws/tests/integration
 
 go 1.24.0
 
 require (
-	github.com/Marz32onE/instrumentation-go/otel-gorilla-ws v0.0.0
+	github.com/akira-core/instrumentation-go/otel-gorilla-ws v0.0.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/stretchr/testify v1.11.1
 	go.opentelemetry.io/otel v1.41.0
@@ -24,4 +24,4 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/Marz32onE/instrumentation-go/otel-gorilla-ws => ../..
+replace github.com/akira-core/instrumentation-go/otel-gorilla-ws => ../..

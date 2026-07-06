@@ -5,9 +5,9 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/direct"
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/shared"
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/traced"
+	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/direct"
+	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/shared"
+	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/traced"
 )
 
 // InsertOneResult wraps *mongo.InsertOneResult.

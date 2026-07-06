@@ -87,7 +87,7 @@ otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 
 ```go
 import (
-    "github.com/Marz32onE/instrumentation-go/otel-nats/otelnats"
+    "github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 )
 
 conn, err := otelnats.Connect(natsURL, nil)
@@ -120,8 +120,8 @@ if err != nil { log.Fatal(err) }
 
 ```go
 import (
-    "github.com/Marz32onE/instrumentation-go/otel-nats/oteljetstream"
-    "github.com/Marz32onE/instrumentation-go/otel-nats/otelnats"
+    "github.com/akira-core/instrumentation-go/otel-nats/oteljetstream"
+    "github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 )
 
 conn, _ := otelnats.Connect(natsURL, nil)

@@ -13,7 +13,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
-	otelgorillaws "github.com/Marz32onE/instrumentation-go/otel-gorilla-ws"
+	otelgorillaws "github.com/akira-core/instrumentation-go/otel-gorilla-ws"
 )
 
 func TestIntegration_RoundTrip_TraceContextPropagation(t *testing.T) {

@@ -10,7 +10,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo/internal/shared"
+	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/shared"
 )
 
 // Collection is the fully-instrumented collectionImpl: wraps every CRUD method

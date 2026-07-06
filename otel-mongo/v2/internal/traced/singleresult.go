@@ -10,7 +10,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/Marz32onE/instrumentation-go/otel-mongo/v2/internal/shared"
+	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/shared"
 )
 
 // SingleResult is the enabled-path impl of the otelmongo.SingleResult strategy.

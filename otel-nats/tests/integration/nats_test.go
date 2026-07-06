@@ -20,7 +20,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
-	otelnats "github.com/Marz32onE/instrumentation-go/otel-nats/otelnats"
+	otelnats "github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 )
 
 // natsURL is the connection string for the shared NATS container, set once in TestMain.

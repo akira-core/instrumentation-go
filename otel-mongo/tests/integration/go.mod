@@ -1,9 +1,9 @@
-module github.com/Marz32onE/instrumentation-go/otel-mongo/tests/integration
+module github.com/akira-core/instrumentation-go/otel-mongo/tests/integration
 
 go 1.24.0
 
 require (
-	github.com/Marz32onE/instrumentation-go/otel-mongo v0.0.0
+	github.com/akira-core/instrumentation-go/otel-mongo v0.0.0
 	github.com/stretchr/testify v1.11.1
 	github.com/testcontainers/testcontainers-go/modules/mongodb v0.40.0
 	go.mongodb.org/mongo-driver v1.17.9
@@ -83,4 +83,4 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/Marz32onE/instrumentation-go/otel-mongo => ../..
+replace github.com/akira-core/instrumentation-go/otel-mongo => ../..
