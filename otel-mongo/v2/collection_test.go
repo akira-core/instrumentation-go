@@ -182,7 +182,6 @@ func TestConnectGlobalOff_ZeroWrapperSpans(t *testing.T) {
 }
 
 // TestCollectionInsertOneAndFind verifies InsertOne injects _oteltrace into the document.
-// otelmongo wrapper does not create its own span for insert; contrib otelmongo provides the command span.
 func TestCollectionInsertOneAndFind(t *testing.T) {
 	uri := requireMongoDB(t)
 	tp, _ := integrationTP(t)

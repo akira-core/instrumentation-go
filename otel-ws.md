@@ -14,7 +14,7 @@ OTEL-WS Client 會在使用者指定的協議**最前面注入隱藏協議 `otel
 | 情境 | 客戶端類型     | 客戶端發送的 Subprotocol | 伺服器類型                 | 伺服器回傳的 Subprotocol | Trace Propagation | 結果               | 說明                                                                                  |
 | ---- | -------------- | ------------------------ | -------------------------- | ------------------------ | ----------------- | ------------------ | ------------------------------------------------------------------------------------- |
 | C    | otel-ws client | "otel-ws,json"           | ws server (support json)   | "json"                   | **Disabled**      | 連線成功，但無追蹤 | OTEL-WS Client 偵測到回傳的不是 `otel-ws+...` 前綴 → 停用追蹤，純透傳 payload。       |
-| D    | otel-ws client | "otel-ws,json"           | ws server (support binary) | false                    | -                 | **關閉連線**       | 伺服器不支援任何提出的協議 → OTEL-WS Client 偵測 empty → 主動關閉，強制要求相容協議。 |
+| D    | otel-ws client | "otel-ws,json"           | ws server (support binary) | false                    | **Disabled**      | 連線成功，但無追蹤 | 伺服器不支援任何提出的協議 → OTEL-WS Client 偵測到 empty → 連線保持存活，降級為 passthrough（不強制關閉連線）。 |
 | E    | otel-ws client | ""（無協議）             | ws server (support json)   | false                    | **Disabled**      | 連線成功，但無追蹤 | 不注入 `otel-ws`；握手維持空協議，OTEL-WS Client 只做轉傳。                            |
 
 ### 3. OTEL-WS Server 行為
@@ -24,7 +24,7 @@ OTEL-WS Server 會檢查收到的協議是否帶有 `otel-ws` 前綴，決定是
 | 情境 | 客戶端類型        | 客戶端發送的 Subprotocol | 伺服器類型     | 伺服器回傳的 Subprotocol | Trace Propagation | 結果                | 說明                                                                              |
 | ---- | ----------------- | ------------------------ | -------------- | ------------------------ | ----------------- | ------------------- | --------------------------------------------------------------------------------- |
 | F    | ws client（普通） | ""（無協議）             | otel-ws server | false                    | **Disabled**      | 連線成功，但無追蹤  | 不拒絕連線；OTEL-WS Server 只做轉傳。                                               |
-| G    | otel-ws client    | "otel-ws,json"           | otel-ws server | "json"                   | **Enabled**       | 連線成功 + 啟用追蹤 | 伺服器偵測到 `otel-ws` 前綴 → 啟用 trace propagation，並回傳實際使用的協議。      |
+| G    | otel-ws client    | "otel-ws,json"           | otel-ws server | "otel-ws+json"           | **Enabled**       | 連線成功 + 啟用追蹤 | 伺服器偵測到 `otel-ws` 前綴 → 啟用 trace propagation，並在線上回傳 `otel-ws+json`（`Conn.Subprotocol()` 會去除 `otel-ws+` 前綴，於應用層回傳 `json`）。 |
 | H    | ws client（普通） | "json"                   | otel-ws server | "json"                   | **Disabled**      | 連線成功，但無追蹤  | 伺服器檢查輸入協議不含 OTEL 前綴 → 停用追蹤，正常透傳所有 payload（保持相容性）。 |
 
 ### 4. OTEL-WS 核心設計原則與邊緣情境總結
@@ -40,7 +40,7 @@ OTEL-WS Server 會檢查收到的協議是否帶有 `otel-ws` 前綴，決定是
 
 **邊緣情境與注意事項**：
 
-- **如果伺服器只支援 binary**：OTEL-WS Client 注入 `otel-ws,json` 後通常會收到 empty → 關閉連線（強制協議相容）。
+- **如果伺服器只支援 binary**：OTEL-WS Client 注入 `otel-ws,json` 後通常會收到 empty → 連線保持存活，降級為 passthrough（不強制關閉連線）。
 - **追蹤開銷**：僅在成功協商 `otel-ws` 前綴時啟用，避免不必要的 header 或 context 注入。
 - **相容性優先**：OTEL-WS 設計目標是「不破壞原有非 OTEL WebSocket 連線」，降級時完全不影響功能。
 - **安全性**：強制 sub-protocol 可減少攻擊面（例如防止未經驗證的連線）。

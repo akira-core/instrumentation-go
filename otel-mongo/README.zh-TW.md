@@ -10,20 +10,32 @@
 - **v2**：`import "github.com/Marz32onE/instrumentation-go/otel-mongo/v2"`（MongoDB driver v2，建議）
 - **v1**：`import "github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo"`（MongoDB driver v1）
 
+兩個套件提供相同的 API 介面（Client、Collection、Cursor、ContextFromDocument 等）與相同的 `_oteltrace` 文件層級傳播機制。
+
 ---
 
 ## 目錄結構
 
 ```
 otel-mongo/
-├── otelmongo/     # MongoDB driver v1 包裝（root module）
-├── v2/             # MongoDB driver v2 包裝（import .../v2）
-├── examples/        # 使用 v2 的範例
+├── otelmongo/           # MongoDB driver v1 包裝（root module）
+│   ├── version.go, client.go, database.go, collection.go, cursor.go
+│   ├── tracing.go, results.go, env_flags.go
+│   └── internal/
+│       ├── shared/     # semconv.go, bulkwrite.go, tracing.go, impls.go — direct 與 traced 共用
+│       ├── direct/     # passthrough 實作（不 import otel/sdk）— tracing 停用時使用
+│       └── traced/     # 完整 instrumented 實作
+├── v2/                  # MongoDB driver v2 包裝（獨立 module，import .../v2）
+│   ├── go.mod           # module .../otel-mongo/v2，需要 go.mongodb.org/mongo-driver/v2
+│   ├── version.go, client.go, database.go, collection.go, cursor.go
+│   ├── tracing.go, results.go, env_flags.go
+│   └── internal/        # shared/, direct/, traced/ — 與上方 otelmongo/internal/ 對應
+├── examples/             # 使用 v2 的範例
 └── README.md
 ```
 
-- **Trace 儲存：** 寫入/更新的文件會有保留欄位 **`_oteltrace`**。對 raw BSON（例如 change stream）可使用 **ContextFromDocument(ctx, raw)** 還原 context。
-- **兩層：** (1) **Driver** 使用 contrib otelmongo Monitor 產生連線/指令 span。(2) **Document** 層在 CRUD 寫入時注入 `_oteltrace`，讀取時支援 span link 與傳播。
+- **Trace 儲存：** 寫入/更新的文件會有保留欄位 **`_oteltrace`**（W3C `traceparent` 及選填 `tracestate`）。對 raw BSON（例如 change stream）可使用 **ContextFromDocument(ctx, raw)** 還原 context。
+- **兩層：** (1) **Client span：** 每個 Collection 方法（insert/find/update/delete/aggregate/distinct/bulkWrite 等）都在 `internal/traced/collection.go` 直接產生自己的 span，並無獨立的 driver 層 command monitor。(2) **Document** 層在 CRUD 寫入時注入 `_oteltrace`，讀取時支援 span link 與傳播。
 
 ---
 
@@ -54,13 +66,16 @@ otel-mongo/
 
 ### 2. Connect 與 CRUD
 
-**v2**：`import ".../v2"`，`otelmongo.Connect(options.Client().ApplyURI(uri))`（無 ctx）。
-
-**v1**：`import ".../otelmongo"`，`otelmongo.Connect(ctx, options.Client().ApplyURI(uri))`。
+**MongoDB driver v2**（建議；import path 符合 Go 慣例）：
 
 ```go
-// v2 範例
+import (
+    "github.com/Marz32onE/instrumentation-go/otel-mongo/v2"
+    "go.mongodb.org/mongo-driver/v2/mongo/options"
+)
+
 client, err := otelmongo.Connect(options.Client().ApplyURI(uri))
+if err != nil { log.Fatal(err) }
 defer client.Disconnect(ctx)
 
 db := client.Database("mydb")
@@ -68,13 +83,32 @@ coll := db.Collection("mycoll")
 // InsertOne、Find、UpdateOne 等會自動處理 _oteltrace
 ```
 
-可選：**ConnectWithOptions(traceOpts, mongoOpts)** 傳入 **WithTracerProvider(tp)** 或 **WithPropagators(p)**。
+**MongoDB driver v1**（相同 API，不同 import 與 Connect 簽名）：
+
+```go
+import (
+    "context"
+    "github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo"
+    "go.mongodb.org/mongo-driver/mongo/options"
+)
+
+client, err := otelmongo.Connect(ctx, options.Client().ApplyURI(uri))
+if err != nil { log.Fatal(err) }
+defer client.Disconnect(ctx)
+
+db := client.Database("mydb")
+coll := db.Collection("mycoll")
+// CRUD 與 _oteltrace 行為與 v2 包裝相同
+```
+
+可選：**ConnectWithOptions(ctx, traceOpts, mongoOpts)**（v1）或 **ConnectWithOptions(traceOpts, mongoOpts)**（v2），搭配 **WithTracerProvider(tp)** 或 **WithPropagators(p)**。
 
 ### 3. 從文件還原 trace（例如 change stream）
 
 需與寫入相同的 propagation 環境變數：**`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`、`OTEL_MONGO_TRACING_ENABLED`、`OTEL_MONGO_PROPAGATION_ENABLED` 三者都要啟用**，或兩個 tracing gate 啟用搭配 `ConnectWithOptions` 的 `WithTracePropagationEnabled(true)`。當任一 gate 關閉時，`ContextFromDocument` / `ContextFromRawDocument` 會回傳零值或不變的 ctx — 忽略 `ok` 回傳值的舊呼叫端會靜默變成 no-op。
 
 ```go
+fullDoc := changeStreamEvent.FullDocument
 if sc, ok := otelmongo.ContextFromDocument(ctx, fullDoc); ok {
 	next := trace.ContextWithRemoteSpanContext(ctx, sc)
 	_ = next // 用於後續 span 或轉發（例如 NATS）
@@ -88,28 +122,6 @@ otel.SetTracerProvider(trace.NewTracerProvider())
 client, err := otelmongo.Connect(opts)
 ```
 
-### 5. 降低高頻 driver spans（例如 `getMore`）
-
-MongoDB driver monitor（`contrib otelmongo.NewMonitor`）會替所有 command 建立 span，包含游標常見的 `getMore`。
-
-可使用 `SkipDBOperationsExporter` 在 export 前過濾指定 DB 操作：
-
-```go
-exp, err := otlptracegrpc.New(ctx, otlptracegrpc.WithEndpoint(endpoint))
-if err != nil { log.Fatal(err) }
-
-// 過濾 db.operation.name（大小寫不敏感）
-exp = otelmongo.SkipDBOperationsExporter(exp, []string{"getMore"})
-
-tp := sdktrace.NewTracerProvider(
-    sdktrace.WithBatcher(exp),
-    sdktrace.WithResource(res),
-)
-otel.SetTracerProvider(tp)
-```
-
-此過濾只影響匯出的 spans，不改變 CRUD 行為與 `_oteltrace` 傳播機制。
-
 ---
 
 ## API 摘要
@@ -120,4 +132,113 @@ otel.SetTracerProvider(tp)
 | **NewClient** | 可選 **WithTracerProvider**、**WithPropagators**。 |
 | **ContextFromDocument** | 從文件的 `_oteltrace` 還原 trace context。 |
 | **ScopeName / Version()** | 建立 Tracer 時使用（OTel contrib 規範）。 |
-| **SkipDBOperationsExporter** | 包裝 `SpanExporter`，依 `db.operation.name` 略過匯出（僅影響匯出）。 |
+
+---
+
+## Deliver Spans（服務關係圖）
+
+當 `OTEL_EXPORTER_OTLP_ENDPOINT` 已設定時，otelmongo 會建立合成的「deliver」span，將 MongoDB 表示為 Grafana service graph 中的 broker 節點。`Connect` 與 `NewClient` 皆支援此功能 — server address 會從 `options.Client().ApplyURI(uri)` 提供的 URI 解析。
+
+Endpoint 對 HTTP 必須是**完整 URL**（例如 `http://otel-collector:4318`），對 gRPC 則是 **host:port**（例如 `otel-collector:4317`）。不支援沒有 scheme 或 port 的裸主機名稱。
+
+所有 CRUD 操作（insert、find、update、delete、replace、aggregate、bulk write、distinct、count 等）以及 cursor decode 與 change stream 路徑都會產生 deliver span。
+
+### Write path
+
+```
+InsertOne (CLIENT, api)
+  └── db.coll deliver (CONSUMER, mongodb)  ← 注入至 _oteltrace
+```
+
+### Read / delete path
+
+```
+FindOne / DeleteOne / ... (CLIENT, api)
+  └── db.coll deliver (CONSUMER, mongodb)
+```
+
+### Change stream path
+
+```
+db.coll deliver (PRODUCER, mongodb)  ← 連結至 producer deliver
+  └── watch coll (CONSUMER, dbwatcher) ← deliver 的子 span
+```
+
+### 產生的服務關係圖
+
+```
+api ──► mongodb ──► dbwatcher
+```
+
+---
+
+## v1 vs v2 API 差異
+
+| 差異 | v1（`otelmongo`） | v2（`.../v2`） |
+|------|------------------|---------------|
+| `Connect` 簽名 | `Connect(ctx, opts...)` | `Connect(opts...)` |
+| `NewClient` 簽名 | `NewClient(ctx, uri, traceOpts...)` | `NewClient(uri, traceOpts...)` |
+| `Distinct` 回傳值 | `([]interface{}, error)` | `*mongo.DistinctResult` |
+| `StartSession` 回傳值 | `mongo.Session, error` | `*mongo.Session, error` |
+| `Cursor.DecodeWithContext` | 兩者行為一致：一律在新（detached）trace 上發出 `mongo.cursor.decode` INTERNAL span，若文件的 `_oteltrace` metadata 存在且 propagation 已啟用，則附上指向來源 span 的 link。 | （同左） |
+
+---
+
+## 重要注意事項
+
+### 文件中的 `_oteltrace` 欄位
+
+每次 `InsertOne`、`InsertMany`、`ReplaceOne`、`UpdateOne`/`UpdateMany`/`UpdateByID` 呼叫時，只要 context 中有 active OTel span，就會在文件中（或 operator update 的 `$set` 中）注入保留欄位 **`_oteltrace`**。此欄位是一個子文件：
+
+```bson
+{ "traceparent": "00-<traceId>-<spanId>-01", "tracestate": "" }
+```
+
+**對 schema 的影響：** 使用嚴格 schema 驗證或指定欄位 projection 的應用程式/查詢會看到這個額外欄位。如有需要，請將 `_oteltrace` 加入允許清單或 projection。
+
+**對文件大小的影響：** 每份文件約增加 100–120 bytes。當沒有 active span 時（例如測試中未設定 TracerProvider），不會注入 `_oteltrace` 欄位。
+
+### Global OTel 狀態
+
+傳入 `ConnectWithOptions` 的 `WithTracerProvider` 與 `WithPropagators` 只會儲存在 `Client` 上，**不會**呼叫 `otel.SetTracerProvider` / `otel.SetTextMapPropagator`。若省略這些選項，client 會在連線時使用 `otel.GetTracerProvider()` 與 `otel.GetTextMapPropagator()`。多數應用程式應在啟動時設定一次 global，之後呼叫 `Connect` / `NewClient` 時不帶 trace option。
+
+### `NewCollection` 與 `Connect`
+
+`NewCollection` 會依照與 `Connect` 相同的環境變數 gate（全域 + `OTEL_MONGO_TRACING_ENABLED` + `OTEL_MONGO_PROPAGATION_ENABLED`）設定**文件層級**的 `_oteltrace` 行為。當任一 tracing gate 關閉時，該 collection 會以停用 propagation 的狀態建立。並沒有針對單一 collection 的 propagation functional option；若需覆寫某個 client 的環境預設值，請使用 **`ConnectWithOptions`** 搭配 **`WithTracePropagationEnabled`**（注意：仍無法跨越已停用的 tracing gate）。
+
+### Cursor 上的 DecodeWithContext 與 Decode
+
+`Cursor.DecodeWithContext` 會從 `_oteltrace` 擷取來源的 trace context 並回傳強化過的 context — 當你需要將後續工作連結回文件的來源 trace 時使用。單純的 `Cursor.Decode` 行為與底層 driver 的 `Decode` 完全相同，會忽略 `_oteltrace`。
+
+### FindOne 上的 span link
+
+`SingleResult.Decode` 會對已取得文件中儲存的 `_oteltrace` 加上一個 **span link**（而非 parent-child 關係）。FindOne 的 span 會在第一次呼叫 `Decode`、`Raw` 或 `TraceContext` 時結束。每個 `SingleResult` 只能呼叫其中一種方法一次。
+
+---
+
+## 診斷紀錄
+
+使用 [`log/slog`](https://pkg.go.dev/log/slog) — 預設無輸出。
+
+| 等級 | 事件 |
+|-------|------|
+| `DEBUG` | Deliver tracer 初始化成功（記錄 `service` 與 `endpoint`） |
+| `WARN` | OTLP exporter 建立失敗；resource 建立失敗 |
+
+啟動時啟用 debug 等級的 slog handler：
+
+```go
+slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+    Level: slog.LevelDebug,
+})))
+```
+
+Log 項目使用 `otelmongo:` 前綴，並附帶 `error`、`reason`、`service`、`endpoint` 等 key-value 欄位。
+
+---
+
+## Dependencies
+
+- **v2**（`.../otel-mongo/v2`）：`go.mongodb.org/mongo-driver/v2`、`go.opentelemetry.io/otel` 及其 SDK。詳見 `v2/go.mod`。
+- **otelmongo**（v1，root）：`go.mongodb.org/mongo-driver` v1、`go.opentelemetry.io/otel` 及其 SDK。詳見 root `go.mod`。
+- Go 1.24+

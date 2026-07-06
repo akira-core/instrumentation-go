@@ -93,7 +93,7 @@ func newClientConfig(opts []ClientOption) *clientConfig {
 
 // Connect creates a new Client with the given configuration options, with OpenTelemetry instrumentation.
 // Signature aligns with mongo.Connect(opts ...*options.ClientOptions). TracerProvider and Propagators default to global.
-// Set them at process startup (see example/) or pass WithTracerProvider/WithPropagators via ConnectWithOptions.
+// Set them at process startup (see ../examples/, which demos this v2 package) or pass WithTracerProvider/WithPropagators via ConnectWithOptions.
 func Connect(opts ...*options.ClientOptions) (*Client, error) {
 	return ConnectWithOptions(nil, opts...)
 }

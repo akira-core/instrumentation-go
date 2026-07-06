@@ -49,12 +49,11 @@ jobs:
         # Enforces the otel-mongo disabled-mode invariant: internal/direct/
         # packages must never import go.opentelemetry.io/otel/* so the
         # compiler can prove no SDK code path is reachable when tracing is off.
-        # See otel-mongo/STRATEGY_REFACTOR_PLAN.html §8.
         if: matrix.module == 'otel-mongo' || matrix.module == 'otel-mongo/v2'
         run: |
           if [ -d "internal/direct" ]; then
             if grep -rE '"go\.opentelemetry\.io/otel' internal/direct; then
-              echo "::error::internal/direct/ must not import go.opentelemetry.io/otel/* — see STRATEGY_REFACTOR_PLAN §8"
+              echo "::error::internal/direct/ must not import go.opentelemetry.io/otel/*"
               exit 1
             fi
             echo "OK: internal/direct/ has zero OTel SDK imports"

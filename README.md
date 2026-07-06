@@ -4,7 +4,7 @@ OpenTelemetry instrumentation for **NATS** (core + JetStream), **MongoDB** (driv
 
 This repository contains **four independent Go modules** (`go.mod` per module), each **versioned and tagged separately**. Modules target **Go 1.24**. CI runs `go build`, `go test -race`, and **golangci-lint** per module, then **integration** jobs (testcontainers; Docker required) — see [.github/workflows/ci.yml](.github/workflows/ci.yml).
 
-Instrumentation packages **do not** create a global `TracerProvider`. They use `otel.GetTracerProvider()` / `otel.GetTextMapPropagator()` unless you pass `WithTracerProvider` / `WithPropagators`. **Applications** must install a provider and W3C propagator at startup (see each module’s **example/**).
+Instrumentation packages **do not** create a global `TracerProvider`. They use `otel.GetTracerProvider()` / `otel.GetTextMapPropagator()` unless you pass `WithTracerProvider` / `WithPropagators`. **Applications** must install a provider and W3C propagator at startup (see each module’s **examples/**).
 
 **Languages:** [繁體中文說明（README.zh-TW.md）](README.zh-TW.md)
 
@@ -12,23 +12,23 @@ Instrumentation packages **do not** create a global `TracerProvider`. They use `
 
 | Package | Import path | Version (source) | Description |
 |---------|-------------|------------------|-------------|
-| **otel-mongo** (v1) | `github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo` | 0.2.11 | MongoDB driver v1 wrapper; `_oteltrace` on writes; `ContextFromDocument` / decode helpers; optional deliver spans. |
-| **otel-mongo/v2** | `github.com/Marz32onE/instrumentation-go/otel-mongo/v2` | 0.2.11 | MongoDB driver v2 wrapper; parity with v1. |
-| **otel-nats** | `github.com/Marz32onE/instrumentation-go/otel-nats/otelnats` | 0.2.11 | Core NATS; W3C context in message headers; deliver spans. |
-| **otel-nats** | `github.com/Marz32onE/instrumentation-go/otel-nats/oteljetstream` | 0.2.11 | JetStream publish/consume/fetch; deliver spans. |
-| **otel-gorilla-ws** | `github.com/Marz32onE/instrumentation-go/otel-gorilla-ws` | 0.2.11 | Trace context in JSON message body (envelope); `NewConn` / `Conn.Dial`. |
+| **otel-mongo** (v1) | `github.com/Marz32onE/instrumentation-go/otel-mongo/otelmongo` | 0.4.1 | MongoDB driver v1 wrapper; `_oteltrace` on writes; `ContextFromDocument` / decode helpers; optional deliver spans. |
+| **otel-mongo/v2** | `github.com/Marz32onE/instrumentation-go/otel-mongo/v2` | 0.4.1 | MongoDB driver v2 wrapper; parity with v1. |
+| **otel-nats** | `github.com/Marz32onE/instrumentation-go/otel-nats/otelnats` | 0.4.1 | Core NATS; W3C context in message headers; deliver spans. |
+| **otel-nats** | `github.com/Marz32onE/instrumentation-go/otel-nats/oteljetstream` | 0.4.1 | JetStream publish/consume/fetch; deliver spans. |
+| **otel-gorilla-ws** | `github.com/Marz32onE/instrumentation-go/otel-gorilla-ws` | 0.4.1 | Trace context in JSON message body (envelope); `NewConn` / `Dial`. |
 
-Per-module docs: [otel-mongo/README.md](otel-mongo/README.md), [otel-nats/README.md](otel-nats/README.md), [otel-gorilla-ws/README.md](otel-gorilla-ws/README.md) (Mongo and NATS also ship [README.zh-TW.md](otel-mongo/README.zh-TW.md) / [README.zh-TW.md](otel-nats/README.zh-TW.md)).
+Per-module docs: [otel-mongo/README.md](otel-mongo/README.md), [otel-nats/README.md](otel-nats/README.md), [otel-gorilla-ws/README.md](otel-gorilla-ws/README.md) (each also ships a [README.zh-TW.md](otel-mongo/README.zh-TW.md): [otel-nats](otel-nats/README.zh-TW.md), [otel-gorilla-ws](otel-gorilla-ws/README.zh-TW.md)).
 
 ## Install
 
-Use the module path and a **git tag** that matches the release you want (tag prefix matches the module, e.g. `otel-mongo/v0.2.11`):
+Use the module path and a **git tag** that matches the release you want (tag prefix matches the module, e.g. `otel-mongo/v0.4.1`):
 
 ```bash
-go get github.com/Marz32onE/instrumentation-go/otel-mongo@otel-mongo/v0.2.11
-go get github.com/Marz32onE/instrumentation-go/otel-mongo/v2@otel-mongo/v2/v0.2.11
-go get github.com/Marz32onE/instrumentation-go/otel-nats@otel-nats/v0.2.11
-go get github.com/Marz32onE/instrumentation-go/otel-gorilla-ws@otel-gorilla-ws/v0.2.11
+go get github.com/Marz32onE/instrumentation-go/otel-mongo@otel-mongo/v0.4.1
+go get github.com/Marz32onE/instrumentation-go/otel-mongo/v2@otel-mongo/v2/v0.4.1
+go get github.com/Marz32onE/instrumentation-go/otel-nats@otel-nats/v0.4.1
+go get github.com/Marz32onE/instrumentation-go/otel-gorilla-ws@otel-gorilla-ws/v0.4.1
 ```
 
 Then import subpackages as needed (`.../otelmongo`, `.../otelnats`, `.../oteljetstream`, root `otel-gorilla-ws`).
@@ -53,19 +53,20 @@ If the **global** switch is off, module flags are ignored. Mongo `WithTracePropa
 instrumentation-go/
 ├── otel-mongo/
 │   ├── otelmongo/           # v1 wrapper (module root)
-│   ├── v2/                  # v2 wrapper (separate go.mod)
-│   ├── example/
-│   ├── tests/integration/   # Docker: testcontainers
+│   ├── v2/                  # v2 wrapper (separate go.mod, own tests/integration/)
+│   │   └── tests/integration/
+│   ├── examples/
+│   ├── tests/integration/   # Docker: testcontainers (v1)
 │   └── README.md
 ├── otel-nats/
 │   ├── otelnats/
 │   ├── oteljetstream/
-│   ├── example/
+│   ├── examples/
 │   ├── tests/integration/
 │   ├── go.mod
 │   └── README.md
 ├── otel-gorilla-ws/
-│   ├── example/
+│   ├── examples/
 │   ├── tests/integration/
 │   ├── go.mod
 │   └── README.md
@@ -79,7 +80,7 @@ instrumentation-go/
 1. **Application** builds a `TracerProvider` (e.g. OTLP), calls `otel.SetTracerProvider(tp)` and `otel.SetTextMapPropagator(propagation.TraceContext{})` (or your stack’s setup), and shuts down on exit.
 2. **Application** wraps clients: `otelnats.Connect(url, nil)`, `otelmongo.Connect(ctx, opts...)`, `otelgorillaws.NewConn(raw, opts...)`, etc.
 
-Runnable examples: **otel-nats/example**, **otel-mongo/example**, **otel-gorilla-ws/example**.
+Runnable examples: **otel-nats/examples**, **otel-mongo/examples**, **otel-gorilla-ws/examples**.
 
 ## Diagnostic logging
 

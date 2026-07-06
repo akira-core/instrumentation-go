@@ -13,7 +13,7 @@
 // that manage the WebSocket handshake themselves (backwards compatibility).
 //
 // Tracer initialization: Set the global TracerProvider and TextMapPropagator at
-// process startup (see example/) or pass WithTracerProvider/WithPropagators when
+// process startup (see examples/) or pass WithTracerProvider/WithPropagators when
 // creating a Conn. If options are omitted, each Conn falls back to
 // otel.GetTracerProvider() and otel.GetTextMapPropagator().
 package otelgorillaws

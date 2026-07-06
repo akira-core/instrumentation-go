@@ -14,8 +14,12 @@
 //   - Consumer management methods (e.g. UpdateConsumer, OrderedConsumer, ListConsumers) are exposed and forwarded.
 //     Trace-bearing behavior remains in message publish/consume paths.
 //
-// Push-consumer wrappers, PauseConsumer/ResumeConsumer, UnpinConsumer and
-// async publish APIs (PublishAsync, PublishMsgAsync) are not provided — the
-// underlying nats.go v1.38.0 dependency does not expose these in a form this
-// wrapper can mirror.
+// Push-consumer wrappers, PauseConsumer/ResumeConsumer, and UnpinConsumer are
+// not provided — the underlying nats.go v1.38.0 dependency does not expose
+// these APIs at all.
+//
+// Async publish (PublishAsync, PublishMsgAsync) is also not wrapped: these
+// APIs exist in nats.go v1.38.0, but take no context.Context and return a
+// non-blocking PubAckFuture instead of a synchronous ack, which doesn't fit
+// this wrapper's context-propagation model.
 package oteljetstream

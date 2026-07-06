@@ -13,7 +13,7 @@ Four independent Go modules providing OpenTelemetry instrumentation for MongoDB,
 | `otel-nats/` | `.../otel-nats/otelnats` + `oteljetstream` | NATS core + JetStream |
 | `otel-gorilla-ws/` | `.../otel-gorilla-ws` | gorilla/websocket |
 
-Each module also has `example/` and `tests/integration/` sub-modules with their own `go.mod`. Integration tests use **testcontainers-go** (require Docker/Podman running).
+Each module also has `examples/` and `tests/integration/` sub-modules with their own `go.mod`. Integration tests use **testcontainers-go** (require Docker/Podman running). (`otel-mongo/v2` has no separate `examples/` of its own — the single `otel-mongo/examples/` module imports and demos the v2 package.)
 
 ## Common Commands
 
@@ -79,7 +79,7 @@ Applications call `otelsetup.Init()` at startup to configure the global provider
 |---|---|---|
 | MongoDB | Document field `_oteltrace` | `{ traceparent, tracestate }` injected on every write; stripped on read |
 | NATS/JetStream | Message headers | `traceparent`, `tracestate` headers via `HeaderCarrier` |
-| WebSocket | JSON message body | Top-level `traceparent`/`tracestate` fields + `payload` (base64); non-JSON passthrough |
+| WebSocket | JSON message body | `{"header":{"traceparent":...,"tracestate":...},"data":<payload>}` envelope on write; non-JSON payloads are JSON-string-encoded (not base64) into `data`; legacy flat top-level `traceparent`/`tracestate` fields still accepted as a read-only fallback |
 
 ### Feature Flags (otel-mongo)
 
@@ -91,15 +91,22 @@ Three env vars plus optional `ConnectWithOptions` override (all default **disabl
 | `OTEL_MONGO_TRACING_ENABLED` | gates **both** wrapper **CLIENT** spans (noop vs real tracer, deliver-span wiring) **and** `_oteltrace` document propagation for this package |
 | `OTEL_MONGO_PROPAGATION_ENABLED` | only consulted when both global and `OTEL_MONGO_TRACING_ENABLED` are on; final say on `_oteltrace` inject/extract on Collection/Cursor/ChangeStream and **ContextFromDocument** / **ContextFromRawDocument** |
 
-`envEnabledByDefault()` returns `false` when a var is absent. When `OTEL_MONGO_TRACING_ENABLED` is unset/disabled, this package uses a noop tracer for its wrapper spans **and** force-disables `_oteltrace` propagation — Mongo tracing and Mongo trace propagation share a single kill switch. `WithTracePropagationEnabled` only overrides the propagation default while both tracing gates are on; it **cannot** enable propagation when global or module tracing is off.
+`flags.EnvEnabled()` (from the shared `internal/flags` package — see below) returns `false` when a var is absent. When `OTEL_MONGO_TRACING_ENABLED` is unset/disabled, this package uses a noop tracer for its wrapper spans **and** force-disables `_oteltrace` propagation — Mongo tracing and Mongo trace propagation share a single kill switch. `WithTracePropagationEnabled` only overrides the propagation default while both tracing gates are on; it **cannot** enable propagation when global or module tracing is off.
+
+### Shared `internal/flags` package
+
+All four modules vendor their own copy of `internal/flags` (`flags.go` + `flags_test.go`); its doc comment requires the file contents (excluding the `package` line) to stay byte-identical across every copy. It exports two primitives used by both the strategy-split and cached-gate enforcement patterns below:
+
+- `EnvEnabled(name string) bool` — default-off env var read; unset or falsy (`0`/`false`/`no`/`off`, case-insensitive) → `false`.
+- `Gate` — caches a resolver function's result once via `sync.Once`/`atomic.Bool`. `NewGate(fn)` constructs one, `Enabled()` returns the cached value, and `ResetForTest()` (not parallel-safe) exists only for tests that toggle env vars with `t.Setenv`.
 
 ### Deliver Spans
 
-All three transports implement an optional "deliver span" pattern: a synthetic span is created with a service name equal to the system identifier (`nats://host:port`, `mongodb://host:port`). This creates a visible broker node in the service graph. For otel-mongo, deliver spans require **both** `mongoTracingEnabled()` to return true AND `OTEL_EXPORTER_OTLP_ENDPOINT` to be set — the function checks `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` AND `OTEL_MONGO_TRACING_ENABLED`.
+otel-mongo and otel-nats each implement an optional "deliver span" pattern: a synthetic span is created with a service name equal to the system identifier (`nats://host:port`, `mongodb://host:port`). This creates a visible broker node in the service graph. otel-gorilla-ws does **not** implement this pattern — it only sets `trace.WithSpanKind(trace.SpanKindConsumer)` on the read span itself; no separate broker-service TracerProvider is created. For otel-mongo, deliver spans require **both** `mongoTracingEnabled()` to return true AND `OTEL_EXPORTER_OTLP_ENDPOINT` to be set — the function checks `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` AND `OTEL_MONGO_TRACING_ENABLED`.
 
 ### Consumer Context
 
-Subscribers always receive a `MsgWithContext` (NATS/JetStream) or a new `context.Context` return value (WebSocket `ReadMessage`) carrying the extracted remote trace. This context must be threaded into downstream calls to continue the trace chain.
+Subscribers always receive a `Msg` (NATS/JetStream; call `.Context()` for the extracted trace) or a new `context.Context` return value (WebSocket `ReadMessage`) carrying the extracted remote trace. This context must be threaded into downstream calls to continue the trace chain.
 
 ### Span Links vs. Parent-Child
 
@@ -111,7 +118,7 @@ When any feature flag returns false, **no OTel SDK code path may run**: no `trac
 
 **1. Strategy split (preferred — otel-mongo Collection / Cursor / SingleResult / ChangeStream).** The facade type holds an `impl` interface satisfied by either `internal/direct.X` (passthrough) or `internal/traced.X` (instrumented). Construction picks the impl once; per-method runtime gates disappear. `internal/direct/*.go` imports no `go.opentelemetry.io/otel/sdk/*` and no `otel/exporters/*` — the disabled path is **compiler-enforced** by package boundary.
 
-**2. Cached gate (otel-nats, otel-gorilla-ws, and otel-mongo Client/Database).** Connect/constructor reads env once → caches `tracingEnabled bool` on the wrapper struct. Every public method starts with `if !c.tracingEnabled { /* delegate to native */ }`. Reviewer-enforced. Planned migration to strategy split tracked in `DIRECTORY_LAYOUT_PLAN.html` at module root.
+**2. Cached gate (otel-nats, otel-gorilla-ws, and otel-mongo Client/Database).** Connect/constructor reads env once → caches `tracingEnabled bool` on the wrapper struct. Every public method starts with `if !c.tracingEnabled { /* delegate to native */ }`. Reviewer-enforced. Migration of these wrappers to the strategy-split pattern is planned but not yet tracked in a written design doc.
 
 Independent of pattern:
 - For otel-mongo, `Connect` substitutes `noop.NewTracerProvider()` when disabled so any stray `tracer.Start` is inert.
@@ -147,7 +154,7 @@ Key rules:
 - `internal/shared/impls.go` declares the polymorphic interfaces (`CursorImpl`, `SingleResultImpl`, `ChangeStreamImpl`) satisfied by both `internal/direct.X` and `internal/traced.X`. Facade `Cursor` / `SingleResult` / `ChangeStream` hold an `impl shared.XImpl` field.
 - Facade `collectionImpl` interface returns raw driver types (`*mongo.Cursor`, `*mongo.SingleResult`, `*mongo.ChangeStream`) + `shared.XImpl` — the impl packages never need to import the facade, preventing any facade ↔ internal cycle. Facade methods wrap raw types into facade wrappers (`&Cursor{Cursor: raw, impl: cImpl}`).
 - `internal/traced.Collection` has **exported fields** (`Coll`, `Tracer`, `Propagator`, `PropagationEnabled`, `DeliverTracer`, `ServerAddr`, `ServerPort`) and exported `StartDeliverSpan` so facade-package tests can build literals and call them directly.
-- v1/v2 parity extends to `internal/{direct,traced,shared}/`. The helpers in `internal/shared/{bulkwrite.go,semconv.go,tracing.go,impls.go}` are intentionally duplicated across modules (separate `internal/` trees cannot share). Drift-check CI step planned (`DIRECTORY_LAYOUT_PLAN.html` §6).
+- v1/v2 parity extends to `internal/{direct,traced,shared}/`. The helpers in `internal/shared/{bulkwrite.go,semconv.go,tracing.go,impls.go}` are intentionally duplicated across modules (separate `internal/` trees cannot share). A drift-check CI step to catch divergence between the two copies is planned but not yet implemented.
 
 ### Propagation flag caching (otel-mongo)
 
@@ -172,7 +179,7 @@ Bump on any code change to a module before pushing release tag. Module pre-1.0 (
 
 ### otel-mongo
 
-- `_oteltrace` field adds ~100–120 bytes per document. Schema-aware callers can use `SkipDBOperationsExporter` to suppress noisy spans (e.g., `getMore`).
+- `_oteltrace` field adds ~100–120 bytes per document.
 - Use `Cursor.DecodeWithContext(ctx, v)` (not `Decode`) when reading in a change-stream context — it extracts the trace from the document and links spans correctly.
 - `ContextFromDocument(ctx, doc)` extracts trace from an already-decoded document map; it respects the same propagation env gates as the Collection wrapper (not a bypass).
 - **Strategy-split layout:** Collection / Cursor / SingleResult / ChangeStream all live in `internal/{direct,traced}/` (see *Strategy-split layout (otel-mongo)* above). Client and Database still use the cached-gate pattern.
@@ -181,15 +188,19 @@ Bump on any code change to a module before pushing release tag. Module pre-1.0 (
 ### otel-nats
 
 - `otelnats` wraps core NATS; `oteljetstream` wraps JetStream. Both live in the same `go.mod` (`otel-nats/`).
-- `Conn.Subscribe` handler signature is `func(MsgWithContext)` — not the native `func(*nats.Msg)`.
+- `Conn.Subscribe` handler signature is `MsgHandler` (`func(Msg)`) — not the native `func(*nats.Msg)`.
 - JetStream `Consumer.Messages()` returns an iterator; call `.Context()` on each item for the trace context.
 - `WithTraceDestination(subject)` enables NATS 2.11+ infrastructure trace events.
 
 ### otel-gorilla-ws
 
-- `NewConn` wraps an already-dialed `*websocket.Conn`; `Conn.Dial` dials and wraps in one step.
+- `NewConn` wraps an already-dialed `*websocket.Conn`; the package-level `Dial` function dials and wraps in one step.
 - The JSON envelope is an internal wire format — applications see the original payload from `ReadMessage`.
+- Subprotocol negotiation scenarios (client/server × otel-ws-aware/unaware, including the empty-subprotocol edge case) are documented in `otel-ws.md` at the repo root — consult it when touching `Dial`'s or `Upgrader.Upgrade`'s negotiation logic.
 
 ## CI
 
-`.github/workflows/ci.yml` runs a matrix job for all four modules on every push/PR to `main`, `master`, or `feat/*`. Each job: `go build`, `go test -race`, `golangci-lint`. Go 1.24, Ubuntu.
+`.github/workflows/ci.yml` runs on every push/PR to `main`, `master`, or `feat/*`, Go 1.24 on Ubuntu, with two jobs:
+
+- `test-and-lint` — matrix over all four modules: `go build`, `go test -race`, `golangci-lint`. For `otel-mongo` and `otel-mongo/v2` only, an additional "Verify direct/ has no OTel SDK imports" step greps `internal/direct/` for `go.opentelemetry.io/otel` imports and fails the build if any are found — this is the CI-enforced half of the disabled-mode invariant described above (the strategy-split package boundary is the compiler-enforced half).
+- `integration-test` — gated on `needs: test-and-lint`; matrix over `otel-nats/tests/integration`, `otel-mongo/tests/integration`, `otel-mongo/v2/tests/integration`, and `otel-gorilla-ws/tests/integration`, running `go test -v -race -timeout 120s ./...` (testcontainers-based, requires Docker).
