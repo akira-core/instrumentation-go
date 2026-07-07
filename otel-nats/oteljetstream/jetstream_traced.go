@@ -112,37 +112,22 @@ func (j *tracedJSImpl) DeleteConsumer(ctx context.Context, stream string, consum
 
 func (j *tracedJSImpl) PushConsumer(ctx context.Context, stream string, consumer string) (PushConsumer, error) {
 	cons, err := j.js.PushConsumer(ctx, stream, consumer)
-	if err != nil {
-		return nil, err
-	}
-	return &tracedPushConsumer{conn: j.conn, streamName: stream, consumerName: consumer, c: cons}, nil
+	return newTracedPushConsumer(j.conn, consumer, cons, err)
 }
 
 func (j *tracedJSImpl) CreatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error) {
 	cons, err := j.js.CreatePushConsumer(ctx, stream, cfg)
-	if err != nil {
-		return nil, err
-	}
-	name := consumerNameFromConfig(cfg)
-	return &tracedPushConsumer{conn: j.conn, streamName: stream, consumerName: name, c: cons}, nil
+	return newTracedPushConsumer(j.conn, consumerNameFromConfig(cfg), cons, err)
 }
 
 func (j *tracedJSImpl) CreateOrUpdatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error) {
 	cons, err := j.js.CreateOrUpdatePushConsumer(ctx, stream, cfg)
-	if err != nil {
-		return nil, err
-	}
-	name := consumerNameFromConfig(cfg)
-	return &tracedPushConsumer{conn: j.conn, streamName: stream, consumerName: name, c: cons}, nil
+	return newTracedPushConsumer(j.conn, consumerNameFromConfig(cfg), cons, err)
 }
 
 func (j *tracedJSImpl) UpdatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error) {
 	cons, err := j.js.UpdatePushConsumer(ctx, stream, cfg)
-	if err != nil {
-		return nil, err
-	}
-	name := consumerNameFromConfig(cfg)
-	return &tracedPushConsumer{conn: j.conn, streamName: stream, consumerName: name, c: cons}, nil
+	return newTracedPushConsumer(j.conn, consumerNameFromConfig(cfg), cons, err)
 }
 
 func (j *tracedJSImpl) Unwrap() jetstream.JetStream { return j.js }

@@ -149,7 +149,7 @@ for {
 }
 ```
 
-> **不支援：** push consumer、`PauseConsumer`/`ResumeConsumer`、`UnpinConsumer` 並未被包裝 — 底層的 `nats.go` v1.38.0 依賴根本沒有暴露這些 API。非同步 publish（`PublishAsync`/`PublishMsgAsync`）同樣未被包裝：這兩個 API 在 `nats.go` v1.38.0 確實存在，但不接受 `context.Context`，且回傳非阻塞的 `PubAckFuture` 而非同步 ack，與本包裝器的 context 傳播模型不相容（見 `oteljetstream/doc.go`）。
+> **Push consumer** 已被包裝（`JetStream` 與 `Stream` 上的 `PushConsumer`/`CreatePushConsumer`/`CreateOrUpdatePushConsumer`/`UpdatePushConsumer`）；回傳的 `PushConsumer.Consume` 會攜帶 trace context。純管理型 API（`PauseConsumer`/`ResumeConsumer`/`UnpinConsumer`）未再包裝 — 透過 `JetStream`/`Stream` 上的 `Unwrap()` 取用。非同步 publish（`PublishAsync`/`PublishMsgAsync`）未被包裝：這兩個 API 不接受 `context.Context`，且回傳非阻塞的 `PubAckFuture` 而非同步 ack，與本包裝器的 context 傳播模型不相容（見 `oteljetstream/doc.go`）。
 
 ### 5. 測試
 
@@ -173,7 +173,7 @@ conn, err := otelnats.Connect(url, nil)
 | **ConnectWithCredentials** | `ConnectWithCredentials(url, credFile string, natsOpts ...nats.Option)`。以 JWT/NKey 憑證建立連線。 |
 | **ScopeName / Version()** | 建立 Tracer 時使用（OTel contrib 規範）。 |
 | **Request / RequestWithContext / RequestMsg / RequestMsgWithContext** | 對齊 `nats.Conn` 的 RPC helper；為請求開啟 CLIENT span，並為回覆開啟一個連結的 CONSUMER span。 |
-| **JetStream consumer manager** | `JetStream` 完整包裝 `StreamConsumerManager`；`Stream` 完整包裝 `ConsumerManager`。所有回傳 `Consumer` 的方法仍會回傳具 trace 包裝的型別。不支援 push consumer（見 JetStream 章節）。 |
+| **JetStream consumer manager** | `JetStream` 完整包裝 `StreamConsumerManager`；`Stream` 完整包裝 `ConsumerManager`。所有回傳 `Consumer` 或 `PushConsumer` 的方法仍會回傳具 trace 包裝的型別（見 JetStream 章節）。 |
 | **WithTraceDestination / SubscribeTraceEvents** | 將 NATS 2.11+ 的基礎設施追蹤事件轉換為 OTel span（見 **NATS 2.11+ 追蹤事件**）。 |
 | **測試** | 在 Connect 前呼叫 `otel.SetTracerProvider(tp)`（必要時 `otel.SetTextMapPropagator(prop)`）。 |
 

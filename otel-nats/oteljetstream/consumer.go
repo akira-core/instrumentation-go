@@ -20,6 +20,10 @@ type MsgHandler func(m Msg)
 // ConsumeContext is returned by Consume. Same as jetstream.ConsumeContext; call Stop() when done.
 type ConsumeContext interface {
 	Stop()
+
+	// Unwrap returns the underlying jetstream.ConsumeContext, the escape hatch
+	// for upstream APIs the wrapper does not re-expose (e.g. Closed(), Drain()).
+	Unwrap() jetstream.ConsumeContext
 }
 
 // MessagesContext is the iterator from Messages(). Same as jetstream.MessagesContext but
@@ -199,3 +203,5 @@ func (c *consumeContextImpl) Stop() {
 		c.cc.Stop()
 	}
 }
+
+func (c *consumeContextImpl) Unwrap() jetstream.ConsumeContext { return c.cc }

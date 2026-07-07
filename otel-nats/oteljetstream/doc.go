@@ -13,13 +13,12 @@
 //   - Fetch/FetchBytes/FetchNoWait: return MessageBatch; iterate Messages() for Msg (Msg + Context()) with trace per message.
 //   - Consumer management methods (e.g. UpdateConsumer, OrderedConsumer, ListConsumers) are exposed and forwarded.
 //     Trace-bearing behavior remains in message publish/consume paths.
+//   - Push-consumer wrappers (PushConsumer/CreatePushConsumer/CreateOrUpdatePushConsumer/UpdatePushConsumer)
+//     are provided on both JetStream and Stream; the returned PushConsumer.Consume carries trace context.
+//   - Unwrap() on JetStream/Stream/ConsumeContext returns the raw jetstream handle for
+//     upstream APIs this wrapper does not re-expose (e.g. PauseConsumer/ResumeConsumer/UnpinConsumer).
 //
-// Push-consumer wrappers, PauseConsumer/ResumeConsumer, and UnpinConsumer are
-// not provided — the underlying nats.go v1.38.0 dependency does not expose
-// these APIs at all.
-//
-// Async publish (PublishAsync, PublishMsgAsync) is also not wrapped: these
-// APIs exist in nats.go v1.38.0, but take no context.Context and return a
-// non-blocking PubAckFuture instead of a synchronous ack, which doesn't fit
-// this wrapper's context-propagation model.
+// Async publish (PublishAsync, PublishMsgAsync) is not wrapped: these APIs take
+// no context.Context and return a non-blocking PubAckFuture instead of a
+// synchronous ack, which doesn't fit this wrapper's context-propagation model.
 package oteljetstream

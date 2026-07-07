@@ -149,7 +149,7 @@ for {
 }
 ```
 
-> **Not supported:** push consumers, `PauseConsumer`/`ResumeConsumer`, and `UnpinConsumer` are not wrapped — the underlying `nats.go` v1.38.0 dependency does not expose these APIs at all. Async publish (`PublishAsync`/`PublishMsgAsync`) is also not wrapped: these exist in `nats.go` v1.38.0, but take no `context.Context` and return a non-blocking `PubAckFuture` instead of a synchronous ack, which doesn't fit this wrapper's context-propagation model (see `oteljetstream/doc.go`).
+> **Push consumers** are wrapped (`PushConsumer`/`CreatePushConsumer`/`CreateOrUpdatePushConsumer`/`UpdatePushConsumer` on both `JetStream` and `Stream`); the returned `PushConsumer.Consume` carries trace context. Management-only APIs (`PauseConsumer`/`ResumeConsumer`/`UnpinConsumer`) are not re-wrapped — reach them via `Unwrap()` on `JetStream`/`Stream`. Async publish (`PublishAsync`/`PublishMsgAsync`) is not wrapped: these take no `context.Context` and return a non-blocking `PubAckFuture` instead of a synchronous ack, which doesn't fit this wrapper's context-propagation model (see `oteljetstream/doc.go`).
 
 ### 5. Tests
 
@@ -173,7 +173,7 @@ conn, err := otelnats.Connect(url, nil)
 | **ConnectWithCredentials** | `ConnectWithCredentials(url, credFile string, natsOpts ...nats.Option)`. Connects with JWT/NKey credentials. |
 | **ScopeName / Version()** | Used when creating Tracer (OTel contrib guideline). |
 | **Request / RequestWithContext / RequestMsg / RequestMsgWithContext** | RPC helpers mirroring `nats.Conn`; open a CLIENT span for the request and a linked CONSUMER span for the reply. |
-| **JetStream consumer managers** | `JetStream` fully wraps `StreamConsumerManager`; `Stream` fully wraps `ConsumerManager`. Methods returning `Consumer` remain trace-enabled wrappers. Push consumers are not supported (see JetStream section). |
+| **JetStream consumer managers** | `JetStream` fully wraps `StreamConsumerManager`; `Stream` fully wraps `ConsumerManager`. Methods returning `Consumer` or `PushConsumer` remain trace-enabled wrappers (see JetStream section). |
 | **WithTraceDestination / SubscribeTraceEvents** | Convert NATS 2.11+ infrastructure trace events into OTel spans (see **NATS 2.11+ Trace Events**). |
 | **Tests** | Use `otel.SetTracerProvider(tp)` (and `otel.SetTextMapPropagator(prop)` if needed) before Connect. |
 

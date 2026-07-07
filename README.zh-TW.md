@@ -12,23 +12,23 @@
 
 | 套件 | Import 路徑 | 原始碼版本 | 說明 |
 |------|-------------|------------|------|
-| **otel-mongo** (v1) | `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | 0.5.0 | MongoDB driver v1 封裝；寫入時注入 `_oteltrace`；`ContextFromDocument` 與解碼輔助；可選 deliver span。 |
-| **otel-mongo/v2** | `github.com/akira-core/instrumentation-go/otel-mongo/v2` | 0.5.0 | MongoDB driver v2 封裝；與 v1 行為對齊。 |
-| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.5.0 | 核心 NATS；W3C 脈絡在訊息標頭；deliver span。 |
-| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.5.0 | JetStream 發布／消費／fetch；deliver span。 |
-| **otel-gorilla-ws** | `github.com/akira-core/instrumentation-go/otel-gorilla-ws` | 0.5.0 | 在 JSON 訊息本文內傳遞 trace context（信封格式）；`NewConn` / `Dial`。 |
+| **otel-mongo** (v1) | `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | 0.6.0 | MongoDB driver v1 封裝；寫入時注入 `_oteltrace`；`ContextFromDocument` 與解碼輔助；可選 deliver span。 |
+| **otel-mongo/v2** | `github.com/akira-core/instrumentation-go/otel-mongo/v2` | 0.6.0 | MongoDB driver v2 封裝；與 v1 行為對齊。 |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.6.0 | 核心 NATS；W3C 脈絡在訊息標頭；deliver span。 |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.6.0 | JetStream 發布／消費／fetch；deliver span。 |
+| **otel-gorilla-ws** | `github.com/akira-core/instrumentation-go/otel-gorilla-ws` | 0.6.0 | 在 JSON 訊息本文內傳遞 trace context（信封格式）；`NewConn` / `Dial`。 |
 
 各模組詳細文件：[otel-mongo/README.md](otel-mongo/README.md)、[otel-nats/README.md](otel-nats/README.md)、[otel-gorilla-ws/README.md](otel-gorilla-ws/README.md)；三個模組皆另有繁中版：[otel-mongo/README.zh-TW.md](otel-mongo/README.zh-TW.md)、[otel-nats/README.zh-TW.md](otel-nats/README.zh-TW.md)、[otel-gorilla-ws/README.zh-TW.md](otel-gorilla-ws/README.zh-TW.md)。
 
 ## 安裝
 
-依模組路徑搭配對應 **Git tag**（前綴與模組一致，例如 `otel-mongo/v0.5.0`）：
+依模組路徑搭配對應 **Git tag**（前綴與模組一致，例如 `otel-mongo/v0.6.0`）：
 
 ```bash
-go get github.com/akira-core/instrumentation-go/otel-mongo@otel-mongo/v0.5.0
-go get github.com/akira-core/instrumentation-go/otel-mongo/v2@otel-mongo/v2/v0.5.0
-go get github.com/akira-core/instrumentation-go/otel-nats@otel-nats/v0.5.0
-go get github.com/akira-core/instrumentation-go/otel-gorilla-ws@otel-gorilla-ws/v0.5.0
+go get github.com/akira-core/instrumentation-go/otel-mongo@otel-mongo/v0.6.0
+go get github.com/akira-core/instrumentation-go/otel-mongo/v2@otel-mongo/v2/v0.6.0
+go get github.com/akira-core/instrumentation-go/otel-nats@otel-nats/v0.6.0
+go get github.com/akira-core/instrumentation-go/otel-gorilla-ws@otel-gorilla-ws/v0.6.0
 ```
 
 程式中再 import 子套件（`.../otelmongo`、`.../otelnats`、`.../oteljetstream`；WebSocket 為根套件）。

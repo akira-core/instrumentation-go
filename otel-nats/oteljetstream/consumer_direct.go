@@ -7,6 +7,19 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
+// directHandler adapts a user MsgHandler to the raw jetstream handler with an
+// empty context (tracing off). Returns nil for a nil handler so the underlying
+// Consume surfaces jetstream's ErrHandlerRequired instead of panicking in the
+// delivery goroutine.
+func directHandler(handler MsgHandler) func(jetstream.Msg) {
+	if handler == nil {
+		return nil
+	}
+	return func(msg jetstream.Msg) {
+		handler(Msg{Msg: msg, Ctx: context.Background()})
+	}
+}
+
 // directConsumer is the passthrough Consumer impl used when tracing is off.
 // No spans, no carriers, no attributes.
 type directConsumer struct {
@@ -14,10 +27,7 @@ type directConsumer struct {
 }
 
 func (c *directConsumer) Consume(handler MsgHandler, opts ...jetstream.PullConsumeOpt) (ConsumeContext, error) {
-	wrapped := func(msg jetstream.Msg) {
-		handler(Msg{Msg: msg, Ctx: context.Background()})
-	}
-	cc, err := c.c.Consume(wrapped, opts...)
+	cc, err := c.c.Consume(directHandler(handler), opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -103,16 +113,16 @@ func (m *directMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context
 	return context.Background(), msg, nil
 }
 
+func (m *directMessagesContext) Stop()  { m.iter.Stop() }
+func (m *directMessagesContext) Drain() { m.iter.Drain() }
+
 // directPushConsumer is the passthrough PushConsumer impl used when tracing is off.
 type directPushConsumer struct {
 	c jetstream.PushConsumer
 }
 
 func (c *directPushConsumer) Consume(handler MsgHandler, opts ...jetstream.PushConsumeOpt) (ConsumeContext, error) {
-	wrapped := func(msg jetstream.Msg) {
-		handler(Msg{Msg: msg, Ctx: context.Background()})
-	}
-	cc, err := c.c.Consume(wrapped, opts...)
+	cc, err := c.c.Consume(directHandler(handler), opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -127,5 +137,11 @@ func (c *directPushConsumer) CachedInfo() *ConsumerInfo {
 	return c.c.CachedInfo()
 }
 
-func (m *directMessagesContext) Stop()  { m.iter.Stop() }
-func (m *directMessagesContext) Drain() { m.iter.Drain() }
+// wrapDirectPushConsumer wraps a raw jetstream.PushConsumer (and its
+// constructor error) as the passthrough PushConsumer impl.
+func wrapDirectPushConsumer(cons jetstream.PushConsumer, err error) (PushConsumer, error) {
+	if err != nil {
+		return nil, err
+	}
+	return &directPushConsumer{c: cons}, nil
+}

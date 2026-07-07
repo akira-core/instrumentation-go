@@ -2,6 +2,7 @@ package oteljetstream
 
 import (
 	"context"
+	"sync"
 
 	nats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -101,9 +102,17 @@ func (c *tracedConsumer) CachedInfo() *ConsumerInfo {
 // user handler with the same extract-and-span closure as the pull variant.
 type tracedPushConsumer struct {
 	conn         *otelnats.Conn
-	streamName   string
 	consumerName string
 	c            jetstream.PushConsumer
+}
+
+// newTracedPushConsumer wraps a raw jetstream.PushConsumer (and its constructor
+// error) as the instrumented PushConsumer impl.
+func newTracedPushConsumer(conn *otelnats.Conn, name string, cons jetstream.PushConsumer, err error) (PushConsumer, error) {
+	if err != nil {
+		return nil, err
+	}
+	return &tracedPushConsumer{conn: conn, consumerName: name, c: cons}, nil
 }
 
 func (c *tracedPushConsumer) Consume(handler MsgHandler, opts ...jetstream.PushConsumeOpt) (ConsumeContext, error) {
@@ -125,7 +134,12 @@ func (c *tracedPushConsumer) CachedInfo() *ConsumerInfo {
 
 // tracedConsumeHandler returns the instrumented closure that extracts the message's
 // trace context and starts a consumer span before invoking the user handler.
+// Returns nil for a nil handler so the underlying Consume call surfaces
+// jetstream's ErrHandlerRequired instead of panicking in the delivery goroutine.
 func tracedConsumeHandler(conn *otelnats.Conn, consumerName string, handler MsgHandler) func(jetstream.Msg) {
+	if handler == nil {
+		return nil
+	}
 	tracer, prop := conn.TraceContext()
 	return func(msg jetstream.Msg) {
 		h := msg.Headers()
@@ -151,18 +165,33 @@ func tracedConsumeHandler(conn *otelnats.Conn, consumerName string, handler MsgH
 }
 
 // tracedMessagesContext is the instrumented MessagesContext iterator.
+//
+// lastSpan is guarded by mu: jetstream.MessagesContext explicitly supports
+// calling Stop/Drain from another goroutine to unblock a pending Next, so
+// Next's span bookkeeping races Stop/Drain without synchronization. The mutex
+// is never held across the blocking m.iter.Next call, so Stop can still
+// interrupt a waiting Next.
 type tracedMessagesContext struct {
 	conn         *otelnats.Conn
 	consumerName string
 	iter         jetstream.MessagesContext
+	mu           sync.Mutex
 	lastSpan     trace.Span
 }
 
-func (m *tracedMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context, jetstream.Msg, error) {
+// endLastSpan ends and clears any in-flight span. trace.Span.End is idempotent,
+// so a rare double call on the Stop/Next boundary is harmless.
+func (m *tracedMessagesContext) endLastSpan() {
+	m.mu.Lock()
 	if m.lastSpan != nil {
 		m.lastSpan.End()
 		m.lastSpan = nil
 	}
+	m.mu.Unlock()
+}
+
+func (m *tracedMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context, jetstream.Msg, error) {
+	m.endLastSpan()
 	msg, err := m.iter.Next(opts...)
 	if err != nil {
 		return nil, nil, err
@@ -185,22 +214,18 @@ func (m *tracedMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context
 		startOpts = append(startOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
 	}
 	ctx, span := tracer.Start(consumerParentCtx, spanName, startOpts...)
+	m.mu.Lock()
 	m.lastSpan = span
+	m.mu.Unlock()
 	return ctx, msg, nil
 }
 
 func (m *tracedMessagesContext) Stop() {
-	if m.lastSpan != nil {
-		m.lastSpan.End()
-		m.lastSpan = nil
-	}
+	m.endLastSpan()
 	m.iter.Stop()
 }
 
 func (m *tracedMessagesContext) Drain() {
-	if m.lastSpan != nil {
-		m.lastSpan.End()
-		m.lastSpan = nil
-	}
+	m.endLastSpan()
 	m.iter.Drain()
 }

@@ -26,6 +26,12 @@ func setupTracedJS(t *testing.T) (oteljetstream.JetStream, *tracetest.SpanRecord
 	sr := tracetest.NewSpanRecorder()
 	tp := trace.NewTracerProvider(trace.WithSpanProcessor(sr))
 	prop := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{})
+	prevTP := otel.GetTracerProvider()
+	prevProp := otel.GetTextMapPropagator()
+	t.Cleanup(func() {
+		otel.SetTracerProvider(prevTP)
+		otel.SetTextMapPropagator(prevProp)
+	})
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(prop)
 
@@ -84,9 +90,9 @@ func TestPushConsumerConsumeTraceContext(t *testing.T) {
 	consumerSpan := waitSpanByNameAndKind(t, sr, "process push.test", oteltrace.SpanKindConsumer)
 	assertAttr(t, consumerSpan.Attributes(), "messaging.consumer.name", consumerName)
 	producerSpan := findSpanByKind(sr.Ended(), oteltrace.SpanKindProducer)
-	if producerSpan != nil && len(consumerSpan.Links()) == 1 {
-		assert.Equal(t, producerSpan.SpanContext().TraceID(), consumerSpan.Links()[0].SpanContext.TraceID())
-	}
+	require.NotNil(t, producerSpan, "no producer span")
+	require.Len(t, consumerSpan.Links(), 1, "consumer span should link the producer")
+	assert.Equal(t, producerSpan.SpanContext().TraceID(), consumerSpan.Links()[0].SpanContext.TraceID())
 }
 
 // NOTE: the direct (tracing-off) push-consumer path has no runtime test here —
@@ -161,6 +167,43 @@ func TestUnwrapEscapeHatch(t *testing.T) {
 	rawStream := s.Unwrap()
 	require.NotNil(t, rawStream)
 	assert.Equal(t, "UNWRAP", rawStream.CachedInfo().Config.Name)
+
+	// ConsumeContext.Unwrap returns the raw jetstream.ConsumeContext.
+	cons, err := js.CreateOrUpdateConsumer(ctx, "UNWRAP", oteljetstream.ConsumerConfig{
+		Durable:       "unwrap-consumer",
+		FilterSubject: "unwrap.test",
+		AckPolicy:     oteljetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+	cc, err := cons.Consume(func(m oteljetstream.Msg) { _ = m.Ack() })
+	require.NoError(t, err)
+	defer cc.Stop()
+	require.NotNil(t, cc.Unwrap(), "ConsumeContext.Unwrap must return the raw handle")
+}
+
+// TestConsumeNilHandlerRejected verifies the wrappers pass a nil handler through
+// to jetstream (rather than a non-nil closure), so upstream returns its
+// ErrHandlerRequired instead of panicking later in the delivery goroutine.
+func TestConsumeNilHandlerRejected(t *testing.T) {
+	js, _, _ := setupTracedJS(t)
+	ctx := context.Background()
+
+	_, err := js.CreateOrUpdateStream(ctx, oteljetstream.StreamConfig{
+		Name:     "NILHANDLER",
+		Subjects: []string{"nilhandler.>"},
+	})
+	require.NoError(t, err)
+
+	cons, err := js.CreateOrUpdateConsumer(ctx, "NILHANDLER", oteljetstream.ConsumerConfig{
+		Durable:       "nil-consumer",
+		FilterSubject: "nilhandler.test",
+		AckPolicy:     oteljetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	cc, err := cons.Consume(nil)
+	require.Error(t, err, "Consume(nil) must surface upstream ErrHandlerRequired, not panic")
+	assert.Nil(t, cc)
 }
 
 func TestOrderedConsumerNamePrefixAttr(t *testing.T) {

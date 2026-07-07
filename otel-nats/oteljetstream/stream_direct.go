@@ -71,35 +71,19 @@ func (s *directStream) ConsumerNames(ctx context.Context) ConsumerNameLister {
 }
 
 func (s *directStream) PushConsumer(ctx context.Context, consumer string) (PushConsumer, error) {
-	cons, err := s.s.PushConsumer(ctx, consumer)
-	if err != nil {
-		return nil, err
-	}
-	return &directPushConsumer{c: cons}, nil
+	return wrapDirectPushConsumer(s.s.PushConsumer(ctx, consumer))
 }
 
 func (s *directStream) CreatePushConsumer(ctx context.Context, cfg ConsumerConfig) (PushConsumer, error) {
-	cons, err := s.s.CreatePushConsumer(ctx, cfg)
-	if err != nil {
-		return nil, err
-	}
-	return &directPushConsumer{c: cons}, nil
+	return wrapDirectPushConsumer(s.s.CreatePushConsumer(ctx, cfg))
 }
 
 func (s *directStream) CreateOrUpdatePushConsumer(ctx context.Context, cfg ConsumerConfig) (PushConsumer, error) {
-	cons, err := s.s.CreateOrUpdatePushConsumer(ctx, cfg)
-	if err != nil {
-		return nil, err
-	}
-	return &directPushConsumer{c: cons}, nil
+	return wrapDirectPushConsumer(s.s.CreateOrUpdatePushConsumer(ctx, cfg))
 }
 
 func (s *directStream) UpdatePushConsumer(ctx context.Context, cfg ConsumerConfig) (PushConsumer, error) {
-	cons, err := s.s.UpdatePushConsumer(ctx, cfg)
-	if err != nil {
-		return nil, err
-	}
-	return &directPushConsumer{c: cons}, nil
+	return wrapDirectPushConsumer(s.s.UpdatePushConsumer(ctx, cfg))
 }
 
 func (s *directStream) Unwrap() jetstream.Stream { return s.s }

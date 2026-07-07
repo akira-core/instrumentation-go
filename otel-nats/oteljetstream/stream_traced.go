@@ -66,37 +66,22 @@ func (s *tracedStream) OrderedConsumer(ctx context.Context, cfg OrderedConsumerC
 
 func (s *tracedStream) PushConsumer(ctx context.Context, consumer string) (PushConsumer, error) {
 	cons, err := s.s.PushConsumer(ctx, consumer)
-	if err != nil {
-		return nil, err
-	}
-	return &tracedPushConsumer{conn: s.conn, streamName: s.streamName, consumerName: consumer, c: cons}, nil
+	return newTracedPushConsumer(s.conn, consumer, cons, err)
 }
 
 func (s *tracedStream) CreatePushConsumer(ctx context.Context, cfg ConsumerConfig) (PushConsumer, error) {
 	cons, err := s.s.CreatePushConsumer(ctx, cfg)
-	if err != nil {
-		return nil, err
-	}
-	name := consumerNameFromConfig(cfg)
-	return &tracedPushConsumer{conn: s.conn, streamName: s.streamName, consumerName: name, c: cons}, nil
+	return newTracedPushConsumer(s.conn, consumerNameFromConfig(cfg), cons, err)
 }
 
 func (s *tracedStream) CreateOrUpdatePushConsumer(ctx context.Context, cfg ConsumerConfig) (PushConsumer, error) {
 	cons, err := s.s.CreateOrUpdatePushConsumer(ctx, cfg)
-	if err != nil {
-		return nil, err
-	}
-	name := consumerNameFromConfig(cfg)
-	return &tracedPushConsumer{conn: s.conn, streamName: s.streamName, consumerName: name, c: cons}, nil
+	return newTracedPushConsumer(s.conn, consumerNameFromConfig(cfg), cons, err)
 }
 
 func (s *tracedStream) UpdatePushConsumer(ctx context.Context, cfg ConsumerConfig) (PushConsumer, error) {
 	cons, err := s.s.UpdatePushConsumer(ctx, cfg)
-	if err != nil {
-		return nil, err
-	}
-	name := consumerNameFromConfig(cfg)
-	return &tracedPushConsumer{conn: s.conn, streamName: s.streamName, consumerName: name, c: cons}, nil
+	return newTracedPushConsumer(s.conn, consumerNameFromConfig(cfg), cons, err)
 }
 
 func (s *tracedStream) Unwrap() jetstream.Stream { return s.s }
