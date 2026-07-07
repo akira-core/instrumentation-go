@@ -164,11 +164,10 @@ func TestUnwrapEscapeHatch(t *testing.T) {
 
 	s, err := js.Stream(ctx, "UNWRAP")
 	require.NoError(t, err)
-	rawStream := s.Unwrap()
-	require.NotNil(t, rawStream)
-	assert.Equal(t, "UNWRAP", rawStream.CachedInfo().Config.Name)
+	// Stream fully mirrors jetstream.Stream — reach info directly, no Unwrap needed.
+	assert.Equal(t, "UNWRAP", s.CachedInfo().Config.Name)
 
-	// ConsumeContext.Unwrap returns the raw jetstream.ConsumeContext.
+	// ConsumeContext fully mirrors jetstream.ConsumeContext — no Unwrap needed.
 	cons, err := js.CreateOrUpdateConsumer(ctx, "UNWRAP", oteljetstream.ConsumerConfig{
 		Durable:       "unwrap-consumer",
 		FilterSubject: "unwrap.test",
@@ -177,8 +176,14 @@ func TestUnwrapEscapeHatch(t *testing.T) {
 	require.NoError(t, err)
 	cc, err := cons.Consume(func(m oteljetstream.Msg) { _ = m.Ack() })
 	require.NoError(t, err)
-	defer cc.Stop()
-	require.NotNil(t, cc.Unwrap(), "ConsumeContext.Unwrap must return the raw handle")
+	require.NotNil(t, cc.Closed(), "ConsumeContext.Closed must return the completion channel")
+	// Drain triggers a graceful shutdown; Closed fires once it completes.
+	cc.Drain()
+	select {
+	case <-cc.Closed():
+	case <-time.After(5 * time.Second):
+		t.Fatal("ConsumeContext.Closed did not fire after Drain")
+	}
 }
 
 // TestConsumeNilHandlerRejected verifies the wrappers pass a nil handler through

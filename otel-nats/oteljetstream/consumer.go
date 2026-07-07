@@ -17,13 +17,17 @@ import (
 // Type name matches nats.MsgHandler and otelnats.MsgHandler for unified naming.
 type MsgHandler func(m Msg)
 
-// ConsumeContext is returned by Consume. Same as jetstream.ConsumeContext; call Stop() when done.
+// ConsumeContext is returned by Consume. It mirrors jetstream.ConsumeContext in
+// full — every upstream method is re-exposed, so no escape hatch is needed.
 type ConsumeContext interface {
+	// Stop unsubscribes and cancels the subscription; buffered messages are discarded.
 	Stop()
-
-	// Unwrap returns the underlying jetstream.ConsumeContext, the escape hatch
-	// for upstream APIs the wrapper does not re-expose (e.g. Closed(), Drain()).
-	Unwrap() jetstream.ConsumeContext
+	// Drain unsubscribes and cancels the subscription; buffered messages are still
+	// processed by the handler before shutdown completes.
+	Drain()
+	// Closed returns a channel closed once consuming is fully stopped/drained and
+	// no more messages will be delivered.
+	Closed() <-chan struct{}
 }
 
 // MessagesContext is the iterator from Messages(). Same as jetstream.MessagesContext but
@@ -204,4 +208,15 @@ func (c *consumeContextImpl) Stop() {
 	}
 }
 
-func (c *consumeContextImpl) Unwrap() jetstream.ConsumeContext { return c.cc }
+func (c *consumeContextImpl) Drain() {
+	if c.cc != nil {
+		c.cc.Drain()
+	}
+}
+
+func (c *consumeContextImpl) Closed() <-chan struct{} {
+	if c.cc != nil {
+		return c.cc.Closed()
+	}
+	return nil
+}

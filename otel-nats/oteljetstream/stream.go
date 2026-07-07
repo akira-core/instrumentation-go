@@ -2,13 +2,14 @@ package oteljetstream
 
 import (
 	"context"
-
-	"github.com/nats-io/nats.go/jetstream"
+	"time"
 )
 
-// Stream mirrors jetstream.Stream for managing consumers with tracing. Two
-// impls exist: tracedStream wraps every consumer-returning method; directStream
-// constructs passthrough variants.
+// Stream mirrors jetstream.Stream in full for managing consumers and messages
+// with tracing. Two impls exist: tracedStream wraps every consumer-returning
+// method; directStream constructs passthrough variants. Message-management and
+// consumer-admin methods (GetMsg, Purge, PauseConsumer, ...) are pure
+// passthroughs — no trace propagation applies to these control-plane calls.
 type Stream interface {
 	Info(ctx context.Context, opts ...StreamInfoOpt) (*StreamInfo, error)
 	CachedInfo() *StreamInfo
@@ -20,13 +21,18 @@ type Stream interface {
 	ListConsumers(ctx context.Context) ConsumerInfoLister
 	DeleteConsumer(ctx context.Context, name string) error
 	ConsumerNames(ctx context.Context) ConsumerNameLister
+	PauseConsumer(ctx context.Context, consumer string, pauseUntil time.Time) (*ConsumerPauseResponse, error)
+	ResumeConsumer(ctx context.Context, consumer string) (*ConsumerPauseResponse, error)
+	UnpinConsumer(ctx context.Context, consumer string, group string) error
+	ResetConsumer(ctx context.Context, consumer string) (*ConsumerResetResponse, error)
+	ResetConsumerToSequence(ctx context.Context, consumer string, seq uint64) (*ConsumerResetResponse, error)
 	PushConsumer(ctx context.Context, consumer string) (PushConsumer, error)
 	CreatePushConsumer(ctx context.Context, cfg ConsumerConfig) (PushConsumer, error)
 	CreateOrUpdatePushConsumer(ctx context.Context, cfg ConsumerConfig) (PushConsumer, error)
 	UpdatePushConsumer(ctx context.Context, cfg ConsumerConfig) (PushConsumer, error)
-
-	// Unwrap returns the underlying jetstream.Stream, the escape hatch for
-	// upstream APIs the wrapper does not re-expose (consumer pause/resume/
-	// unpin/reset, ...). Calls made through it bypass tracing.
-	Unwrap() jetstream.Stream
+	GetMsg(ctx context.Context, seq uint64, opts ...GetMsgOpt) (*RawStreamMsg, error)
+	GetLastMsgForSubject(ctx context.Context, subject string) (*RawStreamMsg, error)
+	DeleteMsg(ctx context.Context, seq uint64) error
+	SecureDeleteMsg(ctx context.Context, seq uint64) error
+	Purge(ctx context.Context, opts ...StreamPurgeOpt) error
 }

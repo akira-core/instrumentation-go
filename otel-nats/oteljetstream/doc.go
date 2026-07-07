@@ -15,8 +15,10 @@
 //     Trace-bearing behavior remains in message publish/consume paths.
 //   - Push-consumer wrappers (PushConsumer/CreatePushConsumer/CreateOrUpdatePushConsumer/UpdatePushConsumer)
 //     are provided on both JetStream and Stream; the returned PushConsumer.Consume carries trace context.
-//   - Unwrap() on JetStream/Stream/ConsumeContext returns the raw jetstream handle for
-//     upstream APIs this wrapper does not re-expose (e.g. PauseConsumer/ResumeConsumer/UnpinConsumer).
+//   - ConsumeContext and Stream fully mirror their jetstream counterparts — no Unwrap needed.
+//     Stream's control-plane methods (GetMsg/Purge/PauseConsumer/ResetConsumer/...) are passthroughs.
+//   - Unwrap() on JetStream returns the raw jetstream.JetStream for the KeyValue and
+//     ObjectStore APIs (plus AccountInfo/Conn/Options) this messaging wrapper does not re-expose.
 //
 // Async publish (PublishAsync, PublishMsgAsync) is not wrapped: these APIs take
 // no context.Context and return a non-blocking PubAckFuture instead of a

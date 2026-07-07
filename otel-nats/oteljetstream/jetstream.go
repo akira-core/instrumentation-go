@@ -51,6 +51,21 @@ type ConsumerInfoLister = jetstream.ConsumerInfoLister
 // OrderedConsumerConfig mirrors jetstream.OrderedConsumerConfig.
 type OrderedConsumerConfig = jetstream.OrderedConsumerConfig
 
+// RawStreamMsg mirrors jetstream.RawStreamMsg (message returned by Stream.GetMsg/GetLastMsgForSubject).
+type RawStreamMsg = jetstream.RawStreamMsg
+
+// GetMsgOpt is option for Stream.GetMsg (e.g. jetstream.WithGetMsgSubject).
+type GetMsgOpt = jetstream.GetMsgOpt
+
+// StreamPurgeOpt is option for Stream.Purge (e.g. jetstream.WithPurgeSubject).
+type StreamPurgeOpt = jetstream.StreamPurgeOpt
+
+// ConsumerPauseResponse mirrors jetstream.ConsumerPauseResponse (Stream.PauseConsumer/ResumeConsumer result).
+type ConsumerPauseResponse = jetstream.ConsumerPauseResponse
+
+// ConsumerResetResponse mirrors jetstream.ConsumerResetResponse (Stream.ResetConsumer result).
+type ConsumerResetResponse = jetstream.ConsumerResetResponse
+
 // AckPolicy and ack policies mirror jetstream (so callers need not import jetstream).
 type AckPolicy = jetstream.AckPolicy
 
