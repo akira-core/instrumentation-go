@@ -95,12 +95,36 @@ type directMessagesContext struct {
 	iter jetstream.MessagesContext
 }
 
-func (m *directMessagesContext) Next() (context.Context, jetstream.Msg, error) {
-	msg, err := m.iter.Next()
+func (m *directMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context, jetstream.Msg, error) {
+	msg, err := m.iter.Next(opts...)
 	if err != nil {
 		return nil, nil, err
 	}
 	return context.Background(), msg, nil
+}
+
+// directPushConsumer is the passthrough PushConsumer impl used when tracing is off.
+type directPushConsumer struct {
+	c jetstream.PushConsumer
+}
+
+func (c *directPushConsumer) Consume(handler MsgHandler, opts ...jetstream.PushConsumeOpt) (ConsumeContext, error) {
+	wrapped := func(msg jetstream.Msg) {
+		handler(Msg{Msg: msg, Ctx: context.Background()})
+	}
+	cc, err := c.c.Consume(wrapped, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &consumeContextImpl{cc: cc}, nil
+}
+
+func (c *directPushConsumer) Info(ctx context.Context) (*ConsumerInfo, error) {
+	return c.c.Info(ctx)
+}
+
+func (c *directPushConsumer) CachedInfo() *ConsumerInfo {
+	return c.c.CachedInfo()
 }
 
 func (m *directMessagesContext) Stop()  { m.iter.Stop() }

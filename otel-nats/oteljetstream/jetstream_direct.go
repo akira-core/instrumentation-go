@@ -75,6 +75,40 @@ func (j *directJSImpl) DeleteConsumer(ctx context.Context, stream string, consum
 	return j.js.DeleteConsumer(ctx, stream, consumer)
 }
 
+func (j *directJSImpl) PushConsumer(ctx context.Context, stream string, consumer string) (PushConsumer, error) {
+	cons, err := j.js.PushConsumer(ctx, stream, consumer)
+	if err != nil {
+		return nil, err
+	}
+	return &directPushConsumer{c: cons}, nil
+}
+
+func (j *directJSImpl) CreatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error) {
+	cons, err := j.js.CreatePushConsumer(ctx, stream, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &directPushConsumer{c: cons}, nil
+}
+
+func (j *directJSImpl) CreateOrUpdatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error) {
+	cons, err := j.js.CreateOrUpdatePushConsumer(ctx, stream, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &directPushConsumer{c: cons}, nil
+}
+
+func (j *directJSImpl) UpdatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error) {
+	cons, err := j.js.UpdatePushConsumer(ctx, stream, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &directPushConsumer{c: cons}, nil
+}
+
+func (j *directJSImpl) Unwrap() jetstream.JetStream { return j.js }
+
 func (j *directJSImpl) CreateOrUpdateStream(ctx context.Context, cfg StreamConfig) (Stream, error) {
 	s, err := j.js.CreateOrUpdateStream(ctx, cfg)
 	if err != nil {

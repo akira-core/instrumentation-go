@@ -103,12 +103,49 @@ func (j *tracedJSImpl) OrderedConsumer(ctx context.Context, stream string, cfg O
 	if err != nil {
 		return nil, err
 	}
-	return &tracedConsumer{conn: j.conn, streamName: stream, consumerName: orderedConsumerName, c: cons}, nil
+	return &tracedConsumer{conn: j.conn, streamName: stream, consumerName: orderedConsumerNameFromConfig(cfg), c: cons}, nil
 }
 
 func (j *tracedJSImpl) DeleteConsumer(ctx context.Context, stream string, consumer string) error {
 	return j.js.DeleteConsumer(ctx, stream, consumer)
 }
+
+func (j *tracedJSImpl) PushConsumer(ctx context.Context, stream string, consumer string) (PushConsumer, error) {
+	cons, err := j.js.PushConsumer(ctx, stream, consumer)
+	if err != nil {
+		return nil, err
+	}
+	return &tracedPushConsumer{conn: j.conn, streamName: stream, consumerName: consumer, c: cons}, nil
+}
+
+func (j *tracedJSImpl) CreatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error) {
+	cons, err := j.js.CreatePushConsumer(ctx, stream, cfg)
+	if err != nil {
+		return nil, err
+	}
+	name := consumerNameFromConfig(cfg)
+	return &tracedPushConsumer{conn: j.conn, streamName: stream, consumerName: name, c: cons}, nil
+}
+
+func (j *tracedJSImpl) CreateOrUpdatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error) {
+	cons, err := j.js.CreateOrUpdatePushConsumer(ctx, stream, cfg)
+	if err != nil {
+		return nil, err
+	}
+	name := consumerNameFromConfig(cfg)
+	return &tracedPushConsumer{conn: j.conn, streamName: stream, consumerName: name, c: cons}, nil
+}
+
+func (j *tracedJSImpl) UpdatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error) {
+	cons, err := j.js.UpdatePushConsumer(ctx, stream, cfg)
+	if err != nil {
+		return nil, err
+	}
+	name := consumerNameFromConfig(cfg)
+	return &tracedPushConsumer{conn: j.conn, streamName: stream, consumerName: name, c: cons}, nil
+}
+
+func (j *tracedJSImpl) Unwrap() jetstream.JetStream { return j.js }
 
 func (j *tracedJSImpl) CreateOrUpdateStream(ctx context.Context, cfg StreamConfig) (Stream, error) {
 	s, err := j.js.CreateOrUpdateStream(ctx, cfg)

@@ -56,9 +56,10 @@ type AckPolicy = jetstream.AckPolicy
 
 // JetStream ack policies for consumer options.
 const (
-	AckExplicitPolicy = jetstream.AckExplicitPolicy
-	AckNonePolicy     = jetstream.AckNonePolicy
-	AckAllPolicy      = jetstream.AckAllPolicy
+	AckExplicitPolicy    = jetstream.AckExplicitPolicy
+	AckNonePolicy        = jetstream.AckNonePolicy
+	AckAllPolicy         = jetstream.AckAllPolicy
+	AckFlowControlPolicy = jetstream.AckFlowControlPolicy
 )
 
 // JetStream is the main interface for JetStream with tracing. Two impls exist:
@@ -72,9 +73,18 @@ type JetStream interface {
 	UpdateConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (Consumer, error)
 	OrderedConsumer(ctx context.Context, stream string, cfg OrderedConsumerConfig) (Consumer, error)
 	DeleteConsumer(ctx context.Context, stream string, consumer string) error
+	PushConsumer(ctx context.Context, stream string, consumer string) (PushConsumer, error)
+	CreatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error)
+	CreateOrUpdatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error)
+	UpdatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error)
 	Stream(ctx context.Context, name string) (Stream, error)
 	CreateOrUpdateStream(ctx context.Context, cfg StreamConfig) (Stream, error)
 	DeleteStream(ctx context.Context, name string) error
+
+	// Unwrap returns the underlying jetstream.JetStream, the escape hatch for
+	// upstream APIs the wrapper does not re-expose (consumer pause/resume/reset,
+	// Conn, Options, ...). Calls made through it bypass tracing.
+	Unwrap() jetstream.JetStream
 }
 
 // New returns a JetStream interface that propagates trace context across publishes
@@ -93,10 +103,17 @@ func New(conn *otelnats.Conn) (JetStream, error) {
 	return &directJSImpl{js: js}, nil
 }
 
-// orderedConsumerName is the fixed consumer-name attribute applied to ordered
-// consumer spans. OrderedConsumerConfig in nats.go v1.38.0 has no NamePrefix
-// field, so the wrapper cannot vary this per-call.
+// orderedConsumerName is the fallback consumer-name attribute applied to
+// ordered consumer spans when OrderedConsumerConfig.NamePrefix (added in
+// nats.go v1.52.0's range) is unset.
 const orderedConsumerName = "ordered-consumer"
+
+func orderedConsumerNameFromConfig(cfg OrderedConsumerConfig) string {
+	if cfg.NamePrefix != "" {
+		return cfg.NamePrefix
+	}
+	return orderedConsumerName
+}
 
 func consumerNameFromConfig(cfg ConsumerConfig) string {
 	name := cfg.Durable

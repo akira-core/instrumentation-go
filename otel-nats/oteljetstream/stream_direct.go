@@ -69,3 +69,37 @@ func (s *directStream) DeleteConsumer(ctx context.Context, name string) error {
 func (s *directStream) ConsumerNames(ctx context.Context) ConsumerNameLister {
 	return s.s.ConsumerNames(ctx)
 }
+
+func (s *directStream) PushConsumer(ctx context.Context, consumer string) (PushConsumer, error) {
+	cons, err := s.s.PushConsumer(ctx, consumer)
+	if err != nil {
+		return nil, err
+	}
+	return &directPushConsumer{c: cons}, nil
+}
+
+func (s *directStream) CreatePushConsumer(ctx context.Context, cfg ConsumerConfig) (PushConsumer, error) {
+	cons, err := s.s.CreatePushConsumer(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &directPushConsumer{c: cons}, nil
+}
+
+func (s *directStream) CreateOrUpdatePushConsumer(ctx context.Context, cfg ConsumerConfig) (PushConsumer, error) {
+	cons, err := s.s.CreateOrUpdatePushConsumer(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &directPushConsumer{c: cons}, nil
+}
+
+func (s *directStream) UpdatePushConsumer(ctx context.Context, cfg ConsumerConfig) (PushConsumer, error) {
+	cons, err := s.s.UpdatePushConsumer(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &directPushConsumer{c: cons}, nil
+}
+
+func (s *directStream) Unwrap() jetstream.Stream { return s.s }

@@ -23,9 +23,10 @@ type ConsumeContext interface {
 }
 
 // MessagesContext is the iterator from Messages(). Same as jetstream.MessagesContext but
-// Next() returns (ctx, msg, error) with ctx carrying extracted trace.
+// Next() returns (ctx, msg, error) with ctx carrying extracted trace. NextOpt options
+// (jetstream.NextContext, jetstream.NextMaxWait) are passed through to the underlying iterator.
 type MessagesContext interface {
-	Next() (context.Context, jetstream.Msg, error)
+	Next(opts ...jetstream.NextOpt) (context.Context, jetstream.Msg, error)
 	Stop()
 	Drain()
 }
@@ -51,6 +52,17 @@ type MessageBatch interface {
 
 // ConsumerInfo mirrors jetstream.ConsumerInfo.
 type ConsumerInfo = jetstream.ConsumerInfo
+
+// PushConsumer mirrors jetstream.PushConsumer (added upstream in the nats.go
+// v1.38.0→v1.52.0 range): a push-based consumer that delivers messages via
+// Consume only — no Fetch/Messages/Next pull paths. Two impls exist:
+// tracedPushConsumer applies the full instrumentation; directPushConsumer is a
+// passthrough. Requires ConsumerConfig.DeliverSubject to be set.
+type PushConsumer interface {
+	Consume(handler MsgHandler, opts ...jetstream.PushConsumeOpt) (ConsumeContext, error)
+	Info(ctx context.Context) (*ConsumerInfo, error)
+	CachedInfo() *ConsumerInfo
+}
 
 // Consumer mirrors jetstream.Consumer. Two impls exist: tracedConsumer applies
 // the full instrumentation; directConsumer is a passthrough.

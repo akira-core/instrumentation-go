@@ -97,6 +97,32 @@ func (c *tracedConsumer) CachedInfo() *ConsumerInfo {
 	return c.c.CachedInfo()
 }
 
+// tracedPushConsumer instruments the push-based consumer: Consume wraps the
+// user handler with the same extract-and-span closure as the pull variant.
+type tracedPushConsumer struct {
+	conn         *otelnats.Conn
+	streamName   string
+	consumerName string
+	c            jetstream.PushConsumer
+}
+
+func (c *tracedPushConsumer) Consume(handler MsgHandler, opts ...jetstream.PushConsumeOpt) (ConsumeContext, error) {
+	wrapped := tracedConsumeHandler(c.conn, c.consumerName, handler)
+	cc, err := c.c.Consume(wrapped, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &consumeContextImpl{cc: cc}, nil
+}
+
+func (c *tracedPushConsumer) Info(ctx context.Context) (*ConsumerInfo, error) {
+	return c.c.Info(ctx)
+}
+
+func (c *tracedPushConsumer) CachedInfo() *ConsumerInfo {
+	return c.c.CachedInfo()
+}
+
 // tracedConsumeHandler returns the instrumented closure that extracts the message's
 // trace context and starts a consumer span before invoking the user handler.
 func tracedConsumeHandler(conn *otelnats.Conn, consumerName string, handler MsgHandler) func(jetstream.Msg) {
@@ -132,12 +158,12 @@ type tracedMessagesContext struct {
 	lastSpan     trace.Span
 }
 
-func (m *tracedMessagesContext) Next() (context.Context, jetstream.Msg, error) {
+func (m *tracedMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context, jetstream.Msg, error) {
 	if m.lastSpan != nil {
 		m.lastSpan.End()
 		m.lastSpan = nil
 	}
-	msg, err := m.iter.Next()
+	msg, err := m.iter.Next(opts...)
 	if err != nil {
 		return nil, nil, err
 	}
