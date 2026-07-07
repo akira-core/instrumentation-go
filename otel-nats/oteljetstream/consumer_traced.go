@@ -61,9 +61,15 @@ func (c *tracedConsumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (
 	if originSpanCtx.IsValid() {
 		startOpts = append(startOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
 	}
-	_, span := tracer.Start(consumerParentCtx, spanName, startOpts...)
+	// Return the ctx bearing the local receive span (linked to the producer),
+	// not the raw extracted producer ctx, so downstream spans nest under this
+	// consumer's receive span — matching Messages().Next and the Consume handler.
+	// The span is ended immediately: a single-shot fetch has no processing-scope
+	// boundary to close it later. Child spans still parent correctly to an ended
+	// span via its still-valid SpanContext.
+	ctx, span := tracer.Start(consumerParentCtx, spanName, startOpts...)
 	span.End()
-	return msgCtx, msg, nil
+	return ctx, msg, nil
 }
 
 func (c *tracedConsumer) Fetch(batch int, opts ...jetstream.FetchOpt) (MessageBatch, error) {
