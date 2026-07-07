@@ -9,7 +9,11 @@ Each wrapper package SHALL keep the public API of the library it wraps reachable
 
 #### Scenario: Upstream adds a method to a curated wrapper
 - **WHEN** the wrapped library adds an exported method to a type the wrapper re-exposes as a curated subset (`otelnats.Conn`) or a curated interface (`oteljetstream.JetStream`, `Consumer`, `Stream`, `ConsumeContext`, `MessagesContext`, `MessageBatch`)
-- **THEN** a trace-relevant addition gets a new instrumented wrapper method whose first statement is the package's cached-gate delegation (`if !c.tracingEnabled { return c.nc.X(...) }`), and any non-trace addition stays reachable through the escape-hatch accessor — the caller is never left unable to reach the new upstream API, and the decision (wrap vs delegate) is recorded in the change
+- **THEN** a trace-relevant addition gets a new instrumented wrapper method whose first statement is the package's cached-gate delegation (`if !c.tracingEnabled { return c.nc.X(...) }`), and any non-trace addition either receives a pure passthrough method (when the interface is a full mirror) or stays reachable through the escape-hatch accessor — the caller is never left unable to reach the new upstream API, and the decision (wrap vs passthrough vs delegate) is recorded in the change
+
+#### Scenario: A fully mirrored interface drops its escape hatch
+- **WHEN** a curated interface re-exposes every method of its upstream counterpart (`oteljetstream.Consumer`, `Stream`, `ConsumeContext`, `MessagesContext`, `MessageBatch`), with non-trace additions handled as pure passthroughs
+- **THEN** no `Unwrap()` escape hatch is required on that interface, and removing a previously-present one is permitted (a breaking change covered by the pre-1.0 `0.6.0` minor bump); the escape hatch is retained only where the wrapper deliberately re-exposes a subset — `otelnats.Conn.NatsConn()`, and `oteljetstream.JetStream.Unwrap()` for the `KeyValueManager`/`ObjectStoreManager` feature families it does not wrap
 
 #### Scenario: Upstream removes or renames a wrapped method
 - **WHEN** the wrapped library removes or renames an exported method that the wrapper embeds-and-references, aliases, or hand-declares

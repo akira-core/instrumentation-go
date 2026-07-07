@@ -5,6 +5,7 @@ Four independent Go modules (`otel-mongo/`, `otel-mongo/v2/`, `otel-nats/`, `ote
 | Module | Dependency | Current | Latest (Go proxy) |
 |---|---|---|---|
 | all 4 | `go.opentelemetry.io/otel`, `.../sdk`, `.../trace`, `.../metric`, `.../exporters/otlp/otlptrace/otlptracegrpc`, `.../otlptracehttp` | v1.39.0 | v1.44.0 |
+| all 4 (import path) | `go.opentelemetry.io/otel/semconv/v1.37.0` → `.../semconv/v1.41.0` | v1.37.0 | v1.41.0 (latest bundled in otel v1.44.0) |
 | otel-mongo | `go.mongodb.org/mongo-driver` | v1.17.2 | v1.17.9 |
 | otel-mongo/v2 | `go.mongodb.org/mongo-driver/v2` | v2.6.0 | v2.7.0 |
 | otel-nats | `github.com/nats-io/nats.go` | v1.38.0 | v1.52.0 |
@@ -22,9 +23,11 @@ Four independent Go modules (`otel-mongo/`, `otel-mongo/v2/`, `otel-nats/`, `ote
 - Bump `instrumentationVersion` from `0.5.0` → `0.6.0` in all four top-level modules.
 - Keep `go build`, `go test -race`, and `golangci-lint run` green (0 issues) in every module after the bump, per this repo's mandatory-verification rule in `CLAUDE.md`.
 - Preserve the existing public API surface of all four wrapper packages — this is a dependency-currency change, not a feature or breaking-API change to callers.
+- Align generated semconv imports and `trace.WithSchemaURL` schema URLs with the pinned OTel SDK release.
 
 **Non-Goals:**
 - No new OTel instrumentation features, spans, or attributes.
+- No migration of `otel-mongo` `internal/shared/semconv.go` hand-written stable keys to the generated `semconv` package — that file already tracks the stable semconv spec independently of the import-path version bump.
 - No changes to the strategy-split / cached-gate disabled-mode-invariant architecture.
 - No `nats-server` upgrade beyond what's needed to move off the `-preview` build (it is test-only; its API is not part of the shipped wrapper).
 
@@ -61,6 +64,11 @@ Four independent Go modules (`otel-mongo/`, `otel-mongo/v2/`, `otel-nats/`, `ote
 
    - *Alternative considered:* convert `otelnats.Conn` to **embed** `*nats.Conn` so every future addition is auto-promoted. Rejected in this change — embedding would auto-expose the *raw, untraced* `Publish`/`Subscribe` alongside our traced overrides, letting callers bypass instrumentation by accident, and reworking the wrapper's embedding model is a design change out of scope for a dependency-currency bump. Tracked as a possible follow-up, not done here.
 
+8. **Bump `go.opentelemetry.io/otel/semconv` import paths from `v1.37.0` to `v1.41.0`**, the highest semconv release directory shipped inside `go.opentelemetry.io/otel` v1.44.0 (confirmed by listing `semconv/` under the v1.44.0 module: v1.37.0–v1.41.0 are present; v1.42.0+ are not bundled yet). This is a mechanical find-and-replace on import paths in the seven files that import generated semconv; `semconv.SchemaURL` then becomes `https://opentelemetry.io/schemas/1.41.0` automatically. No separate `go.mod` require is added — semconv subpackages version with the otel module.
+   - *Files*: `otel-mongo/otelmongo/client.go`, `otel-mongo/v2/client.go`, `otel-nats/otelnats/conn.go`, `otel-nats/otelnats/conn_traced.go`, `otel-nats/oteljetstream/jetstream.go`, `otel-nats/oteljetstream/consumer.go`, `otel-gorilla-ws/options.go`.
+   - *Out of scope*: `otel-mongo` `internal/shared/semconv.go` uses hand-written stable attribute keys (`db.system.name`, etc.) and does not import the generated package; no change unless a key rename is discovered during compile/test.
+   - *Alternative considered*: jump to a semconv version newer than what otel v1.44.0 bundles (e.g. v1.44.0 if it existed as a separate import). Rejected — semconv import paths must match a directory that exists in the pinned otel module or `go build` fails; v1.41.0 is the practical ceiling for this OTel SDK pin.
+
 ## Risks / Trade-offs
 
 - **[Risk]** Bumping `go.opentelemetry.io/otel` past v1.41.0 without first raising the `go` directive fails `go mod tidy`/`go build` with a Go-version-requirement error, in all 11 modules simultaneously → **Mitigation**: Decision 0 sequences the Go-toolchain bump (all `go.mod` files + both CI `go-version` pins) as the very first task, verified independently (`go version` ≥ 1.25 report, `go build ./...` still green with old deps) before any otel `go get` runs.
@@ -68,6 +76,7 @@ Four independent Go modules (`otel-mongo/`, `otel-mongo/v2/`, `otel-nats/`, `ote
 - **[Risk]** `mongo-driver`/`mongo-driver/v2` patch/minor bumps deprecate or change a BSON/cursor/options API used by `internal/direct` or `internal/traced` impls → **Mitigation**: confirmed via upstream release notes that v1.17.2→v1.17.9 and v2.6.0→v2.7.0 contain only bugfixes and non-breaking behavior refinements (e.g. v2's `Collection.Clone` now correctly propagates `BSONOptions` — verify no test asserted the old non-propagating behavior; causally-consistent sessions now send `afterClusterTime` on writes). Run both v1 and v2 build+test+lint per CLAUDE.md's "v1 and v2 parity rule"; the strategy-split compile-time assertions (`var _ shared.CursorImpl = (*traced.Cursor)(nil)`, etc.) will fail loudly if an impl's method set no longer satisfies the shared interfaces.
 - **[Risk]** CI's "no OTel SDK imports in `internal/direct/`" grep check breaks if a bumped indirect otel package gets pulled into `internal/direct/` transitively → **Mitigation**: this is a source-level import grep, not a `go.sum` check, so it's unaffected by version bumps as long as no new `import` statement is added to `internal/direct/*.go`; verify by re-running the grep locally before considering the module done.
 - **[Risk]** A wrapped library's minor/patch bump adds a user-facing method that our **curated** wrappers (`otelnats.Conn`, `oteljetstream` interfaces) don't surface, so callers can't reach the new upstream functionality through our package (most likely from the `nats.go` v1.38→v1.52 14-minor jump) → **Mitigation**: Decision 7's parity audit diffs each wrapped type's exported method set old-vs-new (`go doc <wrapped-type>` in scratch checkouts of each version, or `golang.org/x/exp/cmd/apidiff`) and adds an instrumented wrapper for any trace-relevant addition; non-trace additions stay reachable via the documented escape hatch (`Conn.NatsConn()`). Removals surface as `go build` errors for every mechanism except bare embedding, which the audit's grep-for-direct-calls step covers.
+- **[Risk]** Generated semconv attribute renames between v1.37.0 and v1.41.0 break `otelnats`/`oteljetstream` compile → **Mitigation**: the messaging attribute keys we use (`MessagingSystemKey`, `MessagingDestinationNameKey`, `MessagingOperationNameKey`, `MessagingMessageBodySize`, `MessagingMessageConversationID`, `MessagingConsumerGroupName`) are present with identical key strings in both versions; `go build` is the gate. Re-run span-attribute tests in `otel-nats/` after the import bump.
 - **[Trade-off]** Bumping `testcontainers-go` (v0.34.0 → v0.43.0) touches only test-only dependencies (`tests/integration/` sub-modules, plus the oddly-direct requires in `otel-mongo/go.mod` and `otel-mongo/v2/go.mod`, where `testcontainers-go` itself is `// indirect` but `.../modules/mongodb` is not) — accepted as in-scope since CLAUDE.md instructs running integration tests as part of verification, and stale testcontainers versions can fail against newer Docker/Podman daemons. Run `go mod tidy` and confirm the direct/indirect markers stay consistent.
 
 ## Migration Plan
@@ -76,8 +85,9 @@ Four independent Go modules (`otel-mongo/`, `otel-mongo/v2/`, `otel-nats/`, `ote
 2. Repeat step 1 for each module's `examples/` and `tests/integration/` sub-modules (`go build`/`go test` only for `examples/`; full integration suite for `tests/integration/`, which requires Docker/Podman running).
 3. Run the public API-surface parity audit (Decision 7) for each wrapped library whose version changed — diff the exported method set of every wrapped type old-vs-new, and add an instrumented wrapper method for any trace-relevant addition on the curated `otelnats.Conn` / `oteljetstream` surfaces; re-verify the affected module afterward.
 4. Bump the four `instrumentationVersion` constants to `0.6.0` after all dependency bumps and the parity audit are green.
-5. Re-run the full CI matrix locally where feasible (`test-and-lint` across all 4 modules, plus the `internal/direct/` grep check) before pushing.
-6. **Rollback**: each module's dependency bump is an independent `go.mod`/`go.sum` change — if one module's upgrade surfaces an unresolvable break (e.g. a genuine nats.go v1.52.0 incompatibility), that module's `go.mod`/`go.sum` can be reverted independently without affecting the other three modules' already-verified bumps, since they share no `go.mod`.
+5. Bump semconv import paths from `v1.37.0` to `v1.41.0` (Decision 8) and re-run build+test+lint in all four modules.
+6. Re-run the full CI matrix locally where feasible (`test-and-lint` across all 4 modules, plus the `internal/direct/` grep check) before pushing.
+7. **Rollback**: each module's dependency bump is an independent `go.mod`/`go.sum` change — if one module's upgrade surfaces an unresolvable break (e.g. a genuine nats.go v1.52.0 incompatibility), that module's `go.mod`/`go.sum` can be reverted independently without affecting the other three modules' already-verified bumps, since they share no `go.mod`.
 
 ## Parity Audit Record (executed)
 
@@ -88,15 +98,18 @@ Delta capture method: per-version scratch modules + `go doc` surface dumps, diff
 - **jetstream v1.38.0→v1.52.0** — wrapper changes made:
   - `MessagesContext.Next` mirrored upstream's new variadic: now `Next(opts ...jetstream.NextOpt)` (source-compatible for callers; breaking for external implementers of our interface — permitted pre-1.0).
   - **Push consumers wrapped as trace-relevant** (consume path): new `PushConsumer` wrapper interface + `tracedPushConsumer`/`directPushConsumer` impls (traced Consume reuses `tracedConsumeHandler`); `PushConsumer`/`CreatePushConsumer`/`CreateOrUpdatePushConsumer`/`UpdatePushConsumer` added to both `JetStream` and `Stream` interfaces and all four impls.
-  - **Escape hatches added** to bring the curated jetstream surfaces into spec mechanism (c): `JetStream.Unwrap() jetstream.JetStream` and `Stream.Unwrap() jetstream.Stream`.
+  - **`JetStream.Unwrap() jetstream.JetStream` escape hatch** brings the one still-curated surface into spec mechanism (c): `JetStream` deliberately does not re-expose the `KeyValueManager`/`ObjectStoreManager` feature families (nor `Conn()`/`Options()`/`AccountInfo()`), so `Unwrap()` keeps them reachable.
+  - **`Stream` and `ConsumeContext` fully mirrored — their `Unwrap()` escape hatches removed** (breaking, permitted pre-1.0). Every `jetstream.Stream` and `jetstream.ConsumeContext` method is now re-exposed, so no escape hatch is needed. `ConsumeContext` gains `Drain()` and `Closed() <-chan struct{}` alongside the existing `Stop()`.
   - `AckFlowControlPolicy` re-exported alongside the existing three ack-policy consts.
   - `OrderedConsumerConfig.NamePrefix` (new upstream field, auto-available via alias) now feeds the `messaging.consumer.name` span attribute via `orderedConsumerNameFromConfig`; fixed `"ordered-consumer"` remains the fallback.
-  - **Deliberately omitted** (management/introspection, not trace-relevant — reachable via `Unwrap()`): `JetStream.Conn()`, `JetStream.Options()`, Pause/Resume/Reset/ResetToSequence consumer (JetStream- and Stream-level), `Stream.UnpinConsumer`.
-  - Interface additions above are breaking for external implementers of `JetStream`/`Stream`/`MessagesContext` — covered by the 0.6.0 pre-1.0 minor bump.
-  - Direct-path (tracing-off) push impls have no runtime test: the otelnats gate is process-cached with a package-private reset, so jetstream external tests cannot flip it; parity is compile-enforced at `New()`'s return sites (consistent with the package's existing direct-path test coverage).
+  - **`Stream` consumer-admin + message ops now re-exposed as pure passthroughs** (control-plane, no trace context): `Stream.PauseConsumer`/`ResumeConsumer`/`UnpinConsumer`/`ResetConsumer`/`ResetConsumerToSequence` and `Stream.GetMsg`/`GetLastMsgForSubject`/`DeleteMsg`/`SecureDeleteMsg`/`Purge`. New `type X = jetstream.X` aliases added for their argument/return types (`RawStreamMsg`, `GetMsgOpt`, `StreamPurgeOpt`, `ConsumerPauseResponse`, `ConsumerResetResponse`).
+  - **`Consumer.Next` returned-context aligned with `Messages().Next`**: it now returns the context bearing the wrapper's local consumer receive span (linked to the producer), not the raw extracted producer context — so downstream spans nest under the consumer receive span, matching the `Consume` handler and iterator paths. The single-fetch span is ended immediately (no processing-scope boundary) but its still-valid `SpanContext` keeps child spans correctly parented.
+  - **Still deliberately omitted at the JetStream level** (management/introspection, reachable via `JetStream.Unwrap()`): `JetStream.Conn()`, `JetStream.Options()`, `JetStream.AccountInfo()`, JetStream-level Pause/Resume/Reset/ResetToSequence consumer, and the `KeyValueManager`/`ObjectStoreManager` surfaces.
+  - Interface additions and the `Stream`/`ConsumeContext` `Unwrap()` removals above are breaking for external implementers of `JetStream`/`Stream`/`ConsumeContext`/`MessagesContext` — covered by the 0.6.0 pre-1.0 minor bump.
+  - Direct-path (tracing-off) push impls have no runtime test: the otelnats gate is process-cached with a package-private reset, so jetstream external tests cannot flip it; parity is compile-enforced at `New()`'s return sites (consistent with the package's existing direct-path test coverage). The added `Stream` passthroughs are likewise compile-enforced against both `directStream` and `tracedStream`.
 - **gorilla/websocket**: unchanged upstream — no audit needed.
 
-Verification after additions: `go build` + `go test -race` (58 tests, includes 4 new parity tests in `pushconsumer_test.go`) + `golangci-lint` all green in `otel-nats/`.
+Verification after additions: `go build` + `go test -race` (60 tests; `pushconsumer_test.go`'s `TestUnwrapEscapeHatch` now exercises `ConsumeContext.Drain()`/`Closed()` and `Stream.CachedInfo()` directly in place of the removed `Unwrap()` calls) + `golangci-lint` all green in `otel-nats/`.
 
 ## Open Questions
 
