@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -41,12 +42,31 @@ func TestMain(m *testing.M) {
 		if err != nil {
 			log.Printf("WARNING: could not get mongodb connection string: %v", err)
 		}
+		testMongoURI = forceDirectConnection(testMongoURI)
 	}
 	code := m.Run()
 	if container != nil {
 		_ = container.Terminate(ctx)
 	}
 	os.Exit(code)
+}
+
+// forceDirectConnection rewrites the testcontainers single-node replica-set URI
+// to connect directly to the mapped port instead of doing replica-set topology
+// discovery. The module initiates the RS with the container's internal Docker IP
+// as the member host (mongodb.go: rs.initiate members[0].host = <containerIP>:27017),
+// which is unreachable from the host on macOS Docker Desktop — the driver then
+// reports ReplicaSetNoPrimary. directConnection=true skips discovery; the node is
+// still a real RS member so transactions/change streams keep working.
+func forceDirectConnection(uri string) string {
+	if uri == "" {
+		return uri
+	}
+	if i := strings.IndexByte(uri, '?'); i >= 0 {
+		uri = uri[:i]
+	}
+	uri = strings.TrimSuffix(uri, "/")
+	return uri + "/?directConnection=true"
 }
 
 // requireMongoDB returns the MongoDB URI for integration tests, preferring the
