@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -42,6 +43,7 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		log.Fatalf("get mongodb connection string: %v", err)
 	}
+	mongoURI = forceDirectConnection(mongoURI)
 
 	code := m.Run()
 	_ = container.Terminate(ctx)
@@ -49,6 +51,24 @@ func TestMain(m *testing.M) {
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+// forceDirectConnection rewrites the testcontainers single-node replica-set URI
+// to connect directly to the mapped port instead of doing replica-set topology
+// discovery. The module initiates the RS with the container's internal Docker IP
+// as the member host (mongodb.go: rs.initiate members[0].host = <containerIP>:27017),
+// which is unreachable from the host on macOS Docker Desktop — the driver then
+// reports ReplicaSetNoPrimary. directConnection=true skips discovery; the node is
+// still a real RS member so change streams keep working.
+func forceDirectConnection(uri string) string {
+	if uri == "" {
+		return uri
+	}
+	if i := strings.IndexByte(uri, '?'); i >= 0 {
+		uri = uri[:i]
+	}
+	uri = strings.TrimSuffix(uri, "/")
+	return uri + "/?directConnection=true"
+}
 
 func newTestProvider() (*sdktrace.TracerProvider, *tracetest.SpanRecorder) {
 	sr := tracetest.NewSpanRecorder()

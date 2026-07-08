@@ -1,0 +1,93 @@
+## 1. Go toolchain floor (blocking prerequisite)
+
+- [x] 1.1 Bump the `go` directive from `1.24.0` to `1.25.0` in all 11 `go.mod` files: `otel-mongo/go.mod`, `otel-mongo/examples/go.mod`, `otel-mongo/tests/integration/go.mod`, `otel-mongo/v2/go.mod`, `otel-mongo/v2/tests/integration/go.mod`, `otel-nats/go.mod`, `otel-nats/examples/go.mod`, `otel-nats/tests/integration/go.mod`, `otel-gorilla-ws/go.mod`, `otel-gorilla-ws/examples/go.mod`, `otel-gorilla-ws/tests/integration/go.mod`.
+- [x] 1.2 Bump `go-version: "1.24"` to `go-version: "1.25"` in both jobs (`test-and-lint`, `integration-test`) in `.github/workflows/ci.yml`.
+- [x] 1.3 Sanity check: run `go build ./...` in each of the 4 top-level modules (still on old dependency versions) to confirm the Go 1.25 toolchain bump alone doesn't break anything before touching dependency versions.
+
+## 2. otel-mongo (v1) dependency bump
+
+- [x] 2.1 In `otel-mongo/`: `go get go.opentelemetry.io/otel@v1.44.0 go.opentelemetry.io/otel/sdk@v1.44.0 go.opentelemetry.io/otel/trace@v1.44.0 go.opentelemetry.io/otel/metric@v1.44.0 go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc@v1.44.0 go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp@v1.44.0 go.mongodb.org/mongo-driver@v1.17.9 github.com/testcontainers/testcontainers-go/modules/mongodb@latest`, then `go mod tidy`.
+- [x] 2.2 Verify `testcontainers-go`'s direct/indirect marker in `go.mod` is still consistent after tidy (design.md notes it's oddly listed as a direct require in this module already).
+- [x] 2.3 Run `go build ./... && go test -v -race ./... && golangci-lint run ./...` in `otel-mongo/` — all three must pass with 0 issues.
+- [x] 2.4 Re-run `grep -rE '"go\.opentelemetry\.io/otel' internal/direct` in `otel-mongo/` and confirm zero matches (disabled-mode invariant, mirrors the CI check).
+- [x] 2.5 Bump the same otel-family + testcontainers deps in `otel-mongo/examples/go.mod` (`go get` + `go mod tidy`), then `go build ./...` (examples module isn't in the CI lint/test matrix, but must still compile).
+- [x] 2.6 Bump the same otel-family + testcontainers deps in `otel-mongo/tests/integration/go.mod` (`go get` + `go mod tidy`), then `go test -v -race -timeout 120s ./...` (requires Docker/Podman running).
+
+## 3. otel-mongo/v2 dependency bump
+
+- [x] 3.1 In `otel-mongo/v2/`: `go get go.opentelemetry.io/otel@v1.44.0 go.opentelemetry.io/otel/sdk@v1.44.0 go.opentelemetry.io/otel/trace@v1.44.0 go.opentelemetry.io/otel/metric@v1.44.0 go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc@v1.44.0 go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp@v1.44.0 go.mongodb.org/mongo-driver/v2@v2.7.0 github.com/testcontainers/testcontainers-go/modules/mongodb@latest`, then `go mod tidy`.
+- [x] 3.2 Run `go build ./... && go test -v -race ./... && golangci-lint run ./...` in `otel-mongo/v2/` — all three must pass with 0 issues.
+- [x] 3.3 Re-run the `internal/direct/` no-OTel-SDK-imports grep in `otel-mongo/v2/` and confirm zero matches.
+- [x] 3.4 Check `Collection.Clone`'s `BSONOptions` propagation fix (GODRIVER-3862, landed between v2.6.0 and v2.7.0) doesn't break any existing test that asserted the old non-propagating behavior.
+- [x] 3.5 Bump the same otel-family + testcontainers deps in `otel-mongo/v2/tests/integration/go.mod` (`go get` + `go mod tidy`), then `go test -v -race -timeout 120s ./...` (requires Docker/Podman running; note `otel-mongo/v2` has no separate `examples/` submodule — `otel-mongo/examples/` already covers v2 usage).
+
+## 4. otel-nats dependency bump
+
+- [x] 4.1 In `otel-nats/`: `go get go.opentelemetry.io/otel@v1.44.0 go.opentelemetry.io/otel/sdk@v1.44.0 go.opentelemetry.io/otel/trace@v1.44.0 go.opentelemetry.io/otel/metric@v1.44.0 go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc@v1.44.0 go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp@v1.44.0 github.com/nats-io/nats.go@v1.50.0 github.com/nats-io/nats-server/v2@v2.12.6`, then `go mod tidy`. (NATS deps pinned to the downstream-policy versions, not latest — see §11 and design.md Context.)
+- [x] 4.2 Run `go build ./... && go test -v -race ./...` in `otel-nats/` immediately; inspect any failure in publish-path tests for the new v1.48.0 publish-subject validation (rejects protocol-breaking characters) as the likely cause.
+- [x] 4.3 Run `golangci-lint run ./...` in `otel-nats/` — 0 issues.
+- [x] 4.4 Bump the same deps in `otel-nats/examples/go.mod` (`go get` + `go mod tidy`), then `go build ./...`.
+- [x] 4.5 Bump the same deps in `otel-nats/tests/integration/go.mod` (`go get` + `go mod tidy`), then `go test -v -race -timeout 120s ./...` (requires Docker/Podman running; exercises the embedded `nats-server/v2` v2.12.6 stable build).
+
+## 5. otel-gorilla-ws dependency bump
+
+- [x] 5.1 In `otel-gorilla-ws/`: `go get go.opentelemetry.io/otel@v1.44.0 go.opentelemetry.io/otel/sdk@v1.44.0 go.opentelemetry.io/otel/trace@v1.44.0`, then `go mod tidy` (this module has no `otel/metric` or OTLP exporter direct requires — confirm `go mod tidy` doesn't add them as unwanted new direct deps).
+- [x] 5.2 Run `go build ./... && go test -v -race ./... && golangci-lint run ./...` in `otel-gorilla-ws/` — all three must pass with 0 issues.
+- [x] 5.3 Bump the same deps in `otel-gorilla-ws/examples/go.mod` (`go get` + `go mod tidy`), then `go build ./...`.
+- [x] 5.4 Bump the same deps in `otel-gorilla-ws/tests/integration/go.mod` (`go get` + `go mod tidy`), then `go test -v -race -timeout 120s ./...` (requires Docker/Podman running).
+
+## 6. Public API surface parity audit (wrapped client libraries)
+
+Rule: a caller must be able to reach each wrapped library's public API *through* our package. Run after the dependency bumps (sections 2–5, so both old and new versions resolve) and before the version bump. See design.md Decision 7 for the per-mechanism policy.
+
+- [x] 6.1 For each wrapped library that changed version, capture the exported API delta of the wrapped type(s), old→new, in a scratch dir (`go doc <module>@<old> <Type>` vs `go doc <module>@<new> <Type>`, or `golang.org/x/exp/cmd/apidiff`): `go.mongodb.org/mongo-driver/mongo` v1.17.2→v1.17.9 (`Client`, `Database`, `Collection`, `Cursor`, `SingleResult`, `ChangeStream`); `go.mongodb.org/mongo-driver/v2/mongo` v2.6.0→v2.7.0 (same types); `github.com/nats-io/nats.go` v1.38.0→v1.50.0 (`Conn`, `Msg`, `Subscription`, package-level funcs); `github.com/nats-io/nats.go/jetstream` (same jump: `JetStream`, `Consumer`, `Stream`, `Msg`, `PubAck`, `StreamConfig`, `ConsumerConfig`, `StreamInfo`, `OrderedConsumerConfig`, `AckPolicy`). `gorilla/websocket` is unchanged — skip.
+- [x] 6.2 Embedded / aliased wrappers (auto-parity — **verify only**): confirm `otel-mongo` & `otel-mongo/v2` facades (`*mongo.*` embeds), `otel-gorilla-ws.Conn` (`*websocket.Conn` embed), `oteljetstream.Msg` (`jetstream.Msg` embed), and the `oteljetstream` `type X = jetstream.X` aliases still compile after the bump (a renamed/removed upstream symbol breaks the embed line / alias line). For the embedded mongo types specifically, grep our source + `_test.go` for any direct call to an upstream method that the 6.1 delta shows was removed (embedding drops removed methods silently — no compile error unless referenced).
+- [x] 6.3 Curated `otelnats.Conn` (hand-declared subset + `NatsConn()` escape hatch): for every ADDED exported `nats.Conn` method in the 6.1 delta, classify trace-relevant (a publish / subscribe / request / flush-with-context variant that must inject or extract trace context) vs not. Add an instrumented wrapper method for each trace-relevant addition — mirror the shape of `Conn.Publish` / `Conn.Subscribe`, cached-gate first statement `if !c.tracingEnabled { return c.nc.X(...) }` (see CLAUDE.md "Adding a new public method to a cached-gate wrapper"). Record non-trace additions as deliberately delegated to `NatsConn()`. Confirm no method the wrapper already declares was REMOVED upstream (would surface as a build error in section 4).
+- [x] 6.4 Curated `oteljetstream` behavior interfaces (`JetStream`, `Consumer`, `Stream`, `ConsumeContext`, `MessagesContext`, `MessageBatch`): for every method ADDED to the corresponding upstream `jetstream` interface in the 6.1 delta, decide extend-our-interface (trace-relevant) vs omit-and-document. Note: extending one of these interfaces is a **breaking** change for any external implementer — record it in the change (the pre-1.0 `0.6.0` minor bump already permits breaking changes per CLAUDE.md versioning).
+- [x] 6.5 If 6.3 / 6.4 added or changed any wrapper method: re-run `go build ./... && go test -v -race ./... && golangci-lint run ./...` in the affected module(s), and add/extend a test exercising each newly-surfaced wrapper method. If nothing was added (pure passthrough parity held via embed/alias/escape-hatch), state that explicitly in the change notes — the audit's conclusion must be recorded either way, no silent "assumed fine".
+
+## 7. Version bump to 0.6.0
+
+- [x] 7.1 Bump `instrumentationVersion` from `"0.5.0"` to `"0.6.0"` in `otel-mongo/otelmongo/version.go`.
+- [x] 7.2 Bump `instrumentationVersion` from `"0.5.0"` to `"0.6.0"` in `otel-mongo/v2/version.go`.
+- [x] 7.3 Bump `instrumentationVersion` from `"0.5.0"` to `"0.6.0"` in `otel-nats/otelnats/conn.go`.
+- [x] 7.4 Bump the literal returned by `Version()` from `"0.5.0"` to `"0.6.0"` in `otel-gorilla-ws/version.go`.
+- [x] 7.5 Re-run `go test -v -race ./...` in all four top-level modules to confirm any test asserting the literal version string (e.g. `Version()` unit tests) is updated to expect `0.6.0`, not just left passing by accident.
+
+## 8. Final verification
+
+- [x] 8.1 Run `go build ./... && go test -v -race ./... && golangci-lint run ./...` one more time in all four top-level modules (`otel-mongo`, `otel-mongo/v2`, `otel-nats`, `otel-gorilla-ws`) as a final green pass after the version bump.
+- [x] 8.2 Run the `internal/direct/` no-OTel-SDK-imports grep one final time in `otel-mongo/` and `otel-mongo/v2/`.
+- [x] 8.3 Confirm `git diff` touches exactly the 11 `go.mod`/`go.sum` pairs, `.github/workflows/ci.yml`, the 4 version-constant files, plus any wrapper methods added by the section 6 parity audit and any nats.go v1.50.0 adaptation (if the v1.48.0 subject-validation check in 4.2 surfaced one) — no unrelated files changed.
+
+## 9. Semconv import alignment (v1.37.0 → v1.39.0)
+
+Bump generated semconv import paths to the downstream-policy pin (v1.39.0, `flywindy/o11y` ADR 0006), a version bundled in `go.opentelemetry.io/otel` v1.44.0. See design.md Decision 8. (This section originally targeted v1.41.0; §11 re-pinned it to v1.39.0 for downstream-policy alignment.)
+
+- [x] 9.1 Replace `go.opentelemetry.io/otel/semconv/v1.37.0` with `go.opentelemetry.io/otel/semconv/v1.39.0` in all seven import sites: `otel-mongo/otelmongo/client.go`, `otel-mongo/v2/client.go`, `otel-nats/otelnats/conn.go`, `otel-nats/otelnats/conn_traced.go`, `otel-nats/oteljetstream/jetstream.go`, `otel-nats/oteljetstream/consumer.go`, `otel-gorilla-ws/options.go`.
+- [x] 9.2 Grep the repo for stale `semconv/v1.37.0`, hardcoded `schemas/1.37.0`, or other semconv version strings in source, tests, and docs; update any hits. Zero hits repo-wide.
+- [x] 9.3 Confirm `otel-mongo` `internal/shared/semconv.go` (hand-written stable keys) needs no change; only the `semconv.ServiceName` call sites in `client.go` move with the import path. Confirmed: zero `go.opentelemetry.io/otel/semconv` imports in either module's `internal/shared/semconv.go`.
+- [x] 9.4 Run `go build ./... && go test -v -race ./... && golangci-lint run ./...` in all four top-level modules — all green. Root-caused and fixed the earlier `ReplicaSetNoPrimary` failure on macOS Docker Desktop: `testcontainers-go/modules/mongodb@v0.43.0` initiates the single-node replica set with the container's **internal Docker IP** as the member host (`mongodb.go:214-223`: `rs.initiate members[0].host = <containerIP>:27017`) and returns a `?replicaSet=rs0` URI with no `directConnection`. The driver then does topology discovery, learns the primary is at `172.17.0.x:27017`, and can't route to that Docker-internal address from the macOS host → `ReplicaSetNoPrimary`. (CI passes because Linux hosts *can* route the container bridge IP.) Fix: a `forceDirectConnection` helper in each `TestMain` rewrites the URI to `?directConnection=true`, skipping discovery and connecting straight to the mapped port; the node is still a real RS member so change streams keep working. Applied to all 4 testcontainers sites (`otel-mongo/otelmongo/collection_test.go`, `otel-mongo/v2/collection_test.go`, `otel-mongo/tests/integration/mongo_test.go`, `otel-mongo/v2/tests/integration/mongo_test.go`). Verified locally: otelmongo 34 tests, otel-mongo/v2 suite, and both integration suites (incl. `TestIntegration_ContextFromDocumentChangeStream`) all pass in ~4s each; lint 0 issues.
+- [x] 9.5 Re-run the `internal/direct/` no-OTel-SDK-imports grep in `otel-mongo/` and `otel-mongo/v2/` — zero matches in both (this check doesn't require Docker).
+
+## 10. Jetstream wrapper full-parity follow-up (revises §6.4 decision)
+
+Extends the §6 parity audit: rather than keep `Stream`/`ConsumeContext` as curated subsets behind `Unwrap()`, bring them to full upstream parity and drop those escape hatches. `JetStream.Unwrap()` stays (KeyValueManager/ObjectStoreManager out of scope). See design.md Parity Audit Record and the `nats-jetstream-tracing` spec delta.
+
+- [x] 10.1 `ConsumeContext`: add `Drain()` and `Closed() <-chan struct{}` passthroughs; remove `Unwrap()`. Full `jetstream.ConsumeContext` mirror.
+- [x] 10.2 `Stream`: add message-management passthroughs (`GetMsg`/`GetLastMsgForSubject`/`DeleteMsg`/`SecureDeleteMsg`/`Purge`) and consumer-admin passthroughs (`PauseConsumer`/`ResumeConsumer`/`UnpinConsumer`) on both `directStream` and `tracedStream`; remove `Unwrap()`. Add `type X = jetstream.X` aliases (`RawStreamMsg`/`GetMsgOpt`/`StreamPurgeOpt`/`ConsumerPauseResponse`). (`ResetConsumer`/`ResetConsumerToSequence` + the `ConsumerResetResponse` alias were briefly added while targeting nats.go v1.52.0, then removed in §11 when the pin moved to v1.50.0, which does not expose them.)
+- [x] 10.3 Fix `Consumer.Next` to return the local receive-span context (matching `Messages().Next`/`Consume`) instead of the raw extracted producer context.
+- [x] 10.4 Update `TestUnwrapEscapeHatch` — exercise `ConsumeContext.Drain()`/`Closed()` and `Stream.CachedInfo()` directly in place of the removed `Unwrap()` calls; `js.Unwrap()` assertion retained.
+- [x] 10.5 Run `go build ./... && go test -race ./... && golangci-lint run ./...` in `otel-nats/` — all green (60 tests, 0 lint issues).
+- [x] 10.6 Update spec artifacts: `nats-jetstream-tracing` delta (MODIFIED unsupported-surface + ADDED ConsumeContext/Stream/Next requirements), `wrapper-api-parity` delta scenarios, design.md Parity Audit Record, proposal.md.
+
+## 11. Downstream-policy version alignment (re-pin NATS + semconv below latest)
+
+Post-hoc realignment after auditing the downstream consumer `flywindy/o11y`: its ADRs pin `otel-nats` to semconv v1.39.0 (ADR 0006) and `nats.go` v1.50.0 + `nats-server` v2.12.6 (ADR 0004 / 0022). Sections 4 and 9 originally took the newest available (nats.go v1.52.0, nats-server v2.14.3, semconv v1.41.0); this section re-pins the NATS + semconv deps to the policy versions so our shipped `otel-nats` stays drop-in-compatible with that consumer. OTel SDK core (v1.44.0) and the mongo-driver/testcontainers bumps are unaffected (already at the policy pin / not consumed by `flywindy/o11y`).
+
+- [x] 11.1 Re-pin NATS deps in `otel-nats/` (`go get github.com/nats-io/nats.go@v1.50.0 github.com/nats-io/nats-server/v2@v2.12.6 && go mod tidy`) and re-pin `nats.go@v1.50.0` in `otel-nats/examples/` and `otel-nats/tests/integration/`. nats-server must move to v2.12.6 too: v2.14.3's own `go.mod` requires nats.go v1.51.0 and would otherwise drag the client back up under MVS. Confirmed `go mod tidy` holds nats.go at v1.50.0 in all three.
+- [x] 11.2 Re-pin semconv from `v1.41.0` to `v1.39.0` in all seven import sites (same list as 9.1). No `go.mod` change (semconv ships inside otel v1.44.0). Confirmed all 10 used symbols (`Messaging*`, `SchemaURL`, `ServiceName`) exist in v1.39.0.
+- [x] 11.3 Remove the v1.52.0-only `jetstream.Stream` mirror symbols that no longer resolve at v1.50.0: `Stream.ResetConsumer`/`ResetConsumerToSequence` (interface in `oteljetstream/stream.go`; impls are embed-satisfied, so no impl-file change), the `ConsumerResetResponse` type alias and `AckFlowControlPolicy` const (`oteljetstream/jetstream.go`), and the `ResetConsumer` mention in `oteljetstream/doc.go`. `directStream`/`tracedStream` satisfy the trimmed interface via their embedded `jetstream.Stream`.
+- [x] 11.4 Verify: `go build` + `go test -race` + `golangci-lint run` green in all four top-level modules (otel-nats oteljetstream/otelnats/flags pass; mongo v1/v2 and gorilla-ws unit suites pass; lint 0 issues in all four) and `go build` green in `otel-nats/examples` + `otel-nats/tests/integration`.
+- [x] 11.5 Confirm the semconv re-pin does not change emitted NATS attribute names: the messaging attribute-key strings (`messaging.system` / `.destination.name` / `.operation.name` / `.operation.type` / `.consumer.group.name` / `.message.conversation_id` / `.message.body.size`) are byte-identical between semconv v1.39.0 and v1.41.0 (verified against the `attribute.Key(...)` literals on disk). Only `semconv.SchemaURL` changes (`schemas/1.41.0` → `schemas/1.39.0`).
+- [x] 11.6 Update spec/design/proposal artifacts to the policy-aligned versions: `semantic-convention-schema` (v1.39.0 + schema URL), `nats-jetstream-tracing` (ResetConsumer* moved back to unsupported), design.md (dep table, Decisions 3/4/8, risks, parity record, open question), proposal.md, and this tasks.md.

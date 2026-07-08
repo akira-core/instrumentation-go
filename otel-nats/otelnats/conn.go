@@ -17,14 +17,14 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 )
 
 const (
 	// ScopeName is the instrumentation scope name for Tracer creation (OTel contrib guideline).
 	ScopeName              = "instrumentation-go/otel-nats/otelnats"
-	instrumentationVersion = "0.5.0"
+	instrumentationVersion = "0.6.0"
 	messagingSystem        = "nats"
 )
 
@@ -369,7 +369,7 @@ func requestAttrs(msg *nats.Msg, serverAttrs []attribute.KeyValue) []attribute.K
 }
 
 // receiveAttrs builds consumer span attributes. opType is "process" (push) or "receive" (pull).
-// Note: oteljetstream/consumer.go has a parallel receiveAttrs for jetstream.Msg — keep both in sync.
+// Note: oteljetstream/consumer.go has parallel receiveBaseAttrs/receiveMsgAttrs for jetstream.Msg — keep the attribute sets in sync.
 func receiveAttrs(msg *nats.Msg, queue string, opType string, serverAttrs []attribute.KeyValue) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{
 		semconv.MessagingSystemKey.String(messagingSystem),

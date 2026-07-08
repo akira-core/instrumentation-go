@@ -6,7 +6,7 @@ import (
 	nats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.opentelemetry.io/otel/attribute"
-	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 
 	"github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 )
@@ -51,6 +51,18 @@ type ConsumerInfoLister = jetstream.ConsumerInfoLister
 // OrderedConsumerConfig mirrors jetstream.OrderedConsumerConfig.
 type OrderedConsumerConfig = jetstream.OrderedConsumerConfig
 
+// RawStreamMsg mirrors jetstream.RawStreamMsg (message returned by Stream.GetMsg/GetLastMsgForSubject).
+type RawStreamMsg = jetstream.RawStreamMsg
+
+// GetMsgOpt is option for Stream.GetMsg (e.g. jetstream.WithGetMsgSubject).
+type GetMsgOpt = jetstream.GetMsgOpt
+
+// StreamPurgeOpt is option for Stream.Purge (e.g. jetstream.WithPurgeSubject).
+type StreamPurgeOpt = jetstream.StreamPurgeOpt
+
+// ConsumerPauseResponse mirrors jetstream.ConsumerPauseResponse (Stream.PauseConsumer/ResumeConsumer result).
+type ConsumerPauseResponse = jetstream.ConsumerPauseResponse
+
 // AckPolicy and ack policies mirror jetstream (so callers need not import jetstream).
 type AckPolicy = jetstream.AckPolicy
 
@@ -72,9 +84,18 @@ type JetStream interface {
 	UpdateConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (Consumer, error)
 	OrderedConsumer(ctx context.Context, stream string, cfg OrderedConsumerConfig) (Consumer, error)
 	DeleteConsumer(ctx context.Context, stream string, consumer string) error
+	PushConsumer(ctx context.Context, stream string, consumer string) (PushConsumer, error)
+	CreatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error)
+	CreateOrUpdatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error)
+	UpdatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error)
 	Stream(ctx context.Context, name string) (Stream, error)
 	CreateOrUpdateStream(ctx context.Context, cfg StreamConfig) (Stream, error)
 	DeleteStream(ctx context.Context, name string) error
+
+	// Unwrap returns the underlying jetstream.JetStream, the escape hatch for
+	// upstream APIs the wrapper does not re-expose (KeyValue, ObjectStore,
+	// AccountInfo, Conn, Options, ...). Calls made through it bypass tracing.
+	Unwrap() jetstream.JetStream
 }
 
 // New returns a JetStream interface that propagates trace context across publishes
@@ -93,10 +114,23 @@ func New(conn *otelnats.Conn) (JetStream, error) {
 	return &directJSImpl{js: js}, nil
 }
 
-// orderedConsumerName is the fixed consumer-name attribute applied to ordered
-// consumer spans. OrderedConsumerConfig in nats.go v1.38.0 has no NamePrefix
-// field, so the wrapper cannot vary this per-call.
+// orderedConsumerName is the fallback consumer-name attribute applied to
+// ordered consumer spans when OrderedConsumerConfig.NamePrefix (added in
+// the nats.go v1.38.0→v1.50.0 range) is unset.
 const orderedConsumerName = "ordered-consumer"
+
+// orderedConsumerNameFromConfig returns the messaging.consumer.name attribute
+// value for ordered consumers: the configured NamePrefix (or a fixed fallback).
+// The server names ordered consumers "{NamePrefix}_{serial}", with the serial
+// rotating on every internal reset, so the attribute deliberately carries the
+// stable prefix rather than the transient server-side name — a stable value
+// aggregates better and no snapshot of the real name could stay accurate.
+func orderedConsumerNameFromConfig(cfg OrderedConsumerConfig) string {
+	if cfg.NamePrefix != "" {
+		return cfg.NamePrefix
+	}
+	return orderedConsumerName
+}
 
 func consumerNameFromConfig(cfg ConsumerConfig) string {
 	name := cfg.Durable

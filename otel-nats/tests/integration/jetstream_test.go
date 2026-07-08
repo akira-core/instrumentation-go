@@ -1,6 +1,8 @@
 package integration_test
 
-// This file covers all JetStream consumer types exposed by oteljetstream.
+// This file covers the pull-based JetStream consumer and publish paths exposed
+// by oteljetstream. Push consumers and the Unwrap escape hatches are covered by
+// in-package unit tests in oteljetstream/pushconsumer_test.go.
 // All tests share the NATS container started in TestMain (nats_test.go).
 // Each test creates a uniquely named stream to avoid cross-test conflicts.
 

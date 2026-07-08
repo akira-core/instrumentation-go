@@ -7,7 +7,7 @@ import (
 	nats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.opentelemetry.io/otel/attribute"
-	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/akira-core/instrumentation-go/otel-nats/otelnats"
@@ -17,15 +17,24 @@ import (
 // Type name matches nats.MsgHandler and otelnats.MsgHandler for unified naming.
 type MsgHandler func(m Msg)
 
-// ConsumeContext is returned by Consume. Same as jetstream.ConsumeContext; call Stop() when done.
+// ConsumeContext is returned by Consume. It mirrors jetstream.ConsumeContext in
+// full — every upstream method is re-exposed, so no escape hatch is needed.
 type ConsumeContext interface {
+	// Stop unsubscribes and cancels the subscription; buffered messages are discarded.
 	Stop()
+	// Drain unsubscribes and cancels the subscription; buffered messages are still
+	// processed by the handler before shutdown completes.
+	Drain()
+	// Closed returns a channel closed once consuming is fully stopped/drained and
+	// no more messages will be delivered.
+	Closed() <-chan struct{}
 }
 
 // MessagesContext is the iterator from Messages(). Same as jetstream.MessagesContext but
-// Next() returns (ctx, msg, error) with ctx carrying extracted trace.
+// Next() returns (ctx, msg, error) with ctx carrying extracted trace. NextOpt options
+// (jetstream.NextContext, jetstream.NextMaxWait) are passed through to the underlying iterator.
 type MessagesContext interface {
-	Next() (context.Context, jetstream.Msg, error)
+	Next(opts ...jetstream.NextOpt) (context.Context, jetstream.Msg, error)
 	Stop()
 	Drain()
 }
@@ -52,6 +61,17 @@ type MessageBatch interface {
 // ConsumerInfo mirrors jetstream.ConsumerInfo.
 type ConsumerInfo = jetstream.ConsumerInfo
 
+// PushConsumer mirrors jetstream.PushConsumer (added upstream in the nats.go
+// v1.38.0→v1.50.0 range): a push-based consumer that delivers messages via
+// Consume only — no Fetch/Messages/Next pull paths. Two impls exist:
+// tracedPushConsumer applies the full instrumentation; directPushConsumer is a
+// passthrough. Requires ConsumerConfig.DeliverSubject to be set.
+type PushConsumer interface {
+	Consume(handler MsgHandler, opts ...jetstream.PushConsumeOpt) (ConsumeContext, error)
+	Info(ctx context.Context) (*ConsumerInfo, error)
+	CachedInfo() *ConsumerInfo
+}
+
 // Consumer mirrors jetstream.Consumer. Two impls exist: tracedConsumer applies
 // the full instrumentation; directConsumer is a passthrough.
 type Consumer interface {
@@ -68,19 +88,30 @@ type Consumer interface {
 // Attribute for distinguishing which consumer handled the message (durable/consumer name).
 const attrConsumerName = "messaging.consumer.name"
 
-// receiveAttrs builds consumer span attributes. opType is "process" (push) or "receive" (pull).
+// receiveBaseAttrs builds the consumer-constant span attributes — everything
+// except the per-message subject and body size — so hot loops can compute them
+// once. opType is "process" (push) or "receive" (pull). The returned slice has
+// its capacity clamped so per-message appends never alias the shared base.
 // Note: otelnats/conn.go has a parallel receiveAttrs for *nats.Msg — keep both in sync.
-func receiveAttrs(msg jetstream.Msg, opType string, serverAttrs []attribute.KeyValue) []attribute.KeyValue {
-	attrs := []attribute.KeyValue{
+func receiveBaseAttrs(opType string, serverAttrs []attribute.KeyValue, consumerName string) []attribute.KeyValue {
+	attrs := make([]attribute.KeyValue, 0, 4+len(serverAttrs))
+	attrs = append(attrs,
 		semconv.MessagingSystemKey.String(messagingSystem),
-		semconv.MessagingDestinationNameKey.String(msg.Subject()),
 		attribute.String(string(semconv.MessagingOperationTypeKey), opType),
 		semconv.MessagingOperationNameKey.String(opType),
-	}
+		attribute.String(attrConsumerName, consumerName),
+	)
+	attrs = append(attrs, serverAttrs...)
+	return attrs[:len(attrs):len(attrs)]
+}
+
+// receiveMsgAttrs appends the per-message attributes (subject, body size) to a
+// base built by receiveBaseAttrs.
+func receiveMsgAttrs(base []attribute.KeyValue, msg jetstream.Msg) []attribute.KeyValue {
+	attrs := append(base, semconv.MessagingDestinationNameKey.String(msg.Subject()))
 	if d := msg.Data(); len(d) > 0 {
 		attrs = append(attrs, semconv.MessagingMessageBodySize(len(d)))
 	}
-	attrs = append(attrs, serverAttrs...)
 	return attrs
 }
 
@@ -145,6 +176,7 @@ func newTracedMessageBatch(conn *otelnats.Conn, consumerName string, raw jetstre
 			}
 		}()
 		tracer, prop := conn.TraceContext()
+		baseAttrs := receiveBaseAttrs("receive", conn.ServerAttrs(), consumerName)
 		for msg := range raw.Messages() {
 			if lastSpan != nil {
 				lastSpan.End()
@@ -157,7 +189,7 @@ func newTracedMessageBatch(conn *otelnats.Conn, consumerName string, raw jetstre
 			msgCtx := prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: h})
 			originSpanCtx := trace.SpanContextFromContext(msgCtx)
 			consumerParentCtx := conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
-			attrs := append(receiveAttrs(msg, "receive", conn.ServerAttrs()), attribute.String(attrConsumerName, consumerName))
+			attrs := receiveMsgAttrs(baseAttrs, msg)
 			opts := []trace.SpanStartOption{
 				trace.WithSpanKind(trace.SpanKindConsumer),
 				trace.WithAttributes(attrs...),
@@ -178,12 +210,12 @@ func newTracedMessageBatch(conn *otelnats.Conn, consumerName string, raw jetstre
 	return &messageBatchTrace{ch: ch, raw: raw, done: done}
 }
 
-type consumeContextImpl struct {
-	cc jetstream.ConsumeContext
-}
-
-func (c *consumeContextImpl) Stop() {
-	if c.cc != nil {
-		c.cc.Stop()
+// wrapConsumeContext adapts the (jetstream.ConsumeContext, error) pair from an
+// underlying Consume call to the local interface. The local ConsumeContext
+// mirrors jetstream.ConsumeContext exactly, so the raw value is returned as-is.
+func wrapConsumeContext(cc jetstream.ConsumeContext, err error) (ConsumeContext, error) {
+	if err != nil {
+		return nil, err
 	}
+	return cc, nil
 }
