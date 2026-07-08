@@ -6,7 +6,7 @@ replace github.com/akira-core/instrumentation-go/otel-nats => ../
 
 require (
 	github.com/akira-core/instrumentation-go/otel-nats v0.0.0
-	github.com/nats-io/nats.go v1.52.0
+	github.com/nats-io/nats.go v1.50.0
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.44.0
 	go.opentelemetry.io/otel/sdk v1.44.0

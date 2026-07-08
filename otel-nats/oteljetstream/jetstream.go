@@ -6,7 +6,7 @@ import (
 	nats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.opentelemetry.io/otel/attribute"
-	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 
 	"github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 )
@@ -63,18 +63,14 @@ type StreamPurgeOpt = jetstream.StreamPurgeOpt
 // ConsumerPauseResponse mirrors jetstream.ConsumerPauseResponse (Stream.PauseConsumer/ResumeConsumer result).
 type ConsumerPauseResponse = jetstream.ConsumerPauseResponse
 
-// ConsumerResetResponse mirrors jetstream.ConsumerResetResponse (Stream.ResetConsumer result).
-type ConsumerResetResponse = jetstream.ConsumerResetResponse
-
 // AckPolicy and ack policies mirror jetstream (so callers need not import jetstream).
 type AckPolicy = jetstream.AckPolicy
 
 // JetStream ack policies for consumer options.
 const (
-	AckExplicitPolicy    = jetstream.AckExplicitPolicy
-	AckNonePolicy        = jetstream.AckNonePolicy
-	AckAllPolicy         = jetstream.AckAllPolicy
-	AckFlowControlPolicy = jetstream.AckFlowControlPolicy
+	AckExplicitPolicy = jetstream.AckExplicitPolicy
+	AckNonePolicy     = jetstream.AckNonePolicy
+	AckAllPolicy      = jetstream.AckAllPolicy
 )
 
 // JetStream is the main interface for JetStream with tracing. Two impls exist:
@@ -120,7 +116,7 @@ func New(conn *otelnats.Conn) (JetStream, error) {
 
 // orderedConsumerName is the fallback consumer-name attribute applied to
 // ordered consumer spans when OrderedConsumerConfig.NamePrefix (added in
-// nats.go v1.52.0's range) is unset.
+// the nats.go v1.38.0→v1.50.0 range) is unset.
 const orderedConsumerName = "ordered-consumer"
 
 // orderedConsumerNameFromConfig returns the messaging.consumer.name attribute

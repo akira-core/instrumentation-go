@@ -149,7 +149,7 @@ for {
 }
 ```
 
-> **Push consumer** 已被包裝（`JetStream` 與 `Stream` 上的 `PushConsumer`/`CreatePushConsumer`/`CreateOrUpdatePushConsumer`/`UpdatePushConsumer`）；回傳的 `PushConsumer.Consume` 會攜帶 trace context。純管理型 API（`PauseConsumer`/`ResumeConsumer`/`UnpinConsumer`/`ResetConsumer`/`ResetConsumerToSequence`）直接在 `Stream` 上以未追蹤的 passthrough 形式提供；`Unwrap()` 僅存在於 `JetStream`，用於取用包裝器未再提供的 API（`KeyValue`/`ObjectStore`/`AccountInfo`/`Conn`/`Options`）。非同步 publish（`PublishAsync`/`PublishMsgAsync`）未被包裝：這兩個 API 不接受 `context.Context`，且回傳非阻塞的 `PubAckFuture` 而非同步 ack，與本包裝器的 context 傳播模型不相容（見 `oteljetstream/doc.go`）。
+> **Push consumer** 已被包裝（`JetStream` 與 `Stream` 上的 `PushConsumer`/`CreatePushConsumer`/`CreateOrUpdatePushConsumer`/`UpdatePushConsumer`）；回傳的 `PushConsumer.Consume` 會攜帶 trace context。純管理型 API（`PauseConsumer`/`ResumeConsumer`/`UnpinConsumer`）直接在 `Stream` 上以未追蹤的 passthrough 形式提供（`ResetConsumer`/`ResetConsumerToSequence` 未提供 — 需 nats.go v1.52.0，高於本模組釘選的 v1.50.0）；`Unwrap()` 僅存在於 `JetStream`，用於取用包裝器未再提供的 API（`KeyValue`/`ObjectStore`/`AccountInfo`/`Conn`/`Options`）。非同步 publish（`PublishAsync`/`PublishMsgAsync`）未被包裝：這兩個 API 不接受 `context.Context`，且回傳非阻塞的 `PubAckFuture` 而非同步 ack，與本包裝器的 context 傳播模型不相容（見 `oteljetstream/doc.go`）。
 
 ### 5. 測試
 

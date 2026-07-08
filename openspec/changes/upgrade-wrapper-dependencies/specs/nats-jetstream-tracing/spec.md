@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Unsupported JetStream API surface
-`oteljetstream` SHALL NOT wrap `PublishAsync`/`PublishMsgAsync` (these take no `context.Context` and return a non-blocking `PubAckFuture`, incompatible with this wrapper's context-propagation model). At the JetStream level, `oteljetstream.JetStream` SHALL NOT re-expose the `KeyValueManager` and `ObjectStoreManager` surfaces (whole key-value / object-store feature families outside a messaging-trace wrapper's scope) nor `Conn()`/`Options()`/`AccountInfo()`; these remain reachable via `JetStream.Unwrap()`. Push consumers and the consumer-admin operations `PauseConsumer`/`ResumeConsumer`/`UnpinConsumer`/`ResetConsumer`/`ResetConsumerToSequence` ARE wrapped — `nats.go` v1.52.0 exposes them (v1.38.0 did not), so they are re-exposed on the appropriate wrapper interfaces rather than left unsupported.
+`oteljetstream` SHALL NOT wrap `PublishAsync`/`PublishMsgAsync` (these take no `context.Context` and return a non-blocking `PubAckFuture`, incompatible with this wrapper's context-propagation model). At the JetStream level, `oteljetstream.JetStream` SHALL NOT re-expose the `KeyValueManager` and `ObjectStoreManager` surfaces (whole key-value / object-store feature families outside a messaging-trace wrapper's scope) nor `Conn()`/`Options()`/`AccountInfo()`; these remain reachable via `JetStream.Unwrap()`. Push consumers and the consumer-admin operations `PauseConsumer`/`ResumeConsumer`/`UnpinConsumer` ARE wrapped — `nats.go` v1.50.0 exposes them (v1.38.0 did not), so they are re-exposed on the appropriate wrapper interfaces rather than left unsupported. `Stream.ResetConsumer`/`ResetConsumerToSequence` are NOT wrapped: they first appear in `nats.go` v1.52.0, beyond the v1.50.0 pin held to stay aligned with the downstream consumer policy (`flywindy/o11y`), so they are unsupported until a future policy-aligned nats.go bump re-introduces them.
 
 #### Scenario: Async publish is not exposed
 - **WHEN** a caller inspects the `oteljetstream` public API for an async-publish equivalent of `nats.go`'s `PublishAsync`
@@ -12,8 +12,12 @@
 - **THEN** `JetStream.Unwrap()` returns the raw `jetstream.JetStream` for those calls, which are outside this messaging-trace wrapper's scope
 
 #### Scenario: Consumer-admin operations are supported
-- **WHEN** a caller pauses, resumes, unpins, or resets a consumer through `oteljetstream.Stream`
-- **THEN** `PauseConsumer`/`ResumeConsumer`/`UnpinConsumer`/`ResetConsumer`/`ResetConsumerToSequence` are available as direct passthrough methods (no `Unwrap()` required), since `nats.go` v1.52.0 exposes them
+- **WHEN** a caller pauses, resumes, or unpins a consumer through `oteljetstream.Stream`
+- **THEN** `PauseConsumer`/`ResumeConsumer`/`UnpinConsumer` are available as direct passthrough methods (no `Unwrap()` required), since `nats.go` v1.50.0 exposes them
+
+#### Scenario: Consumer reset is not exposed at the v1.50.0 pin
+- **WHEN** a caller looks for `ResetConsumer`/`ResetConsumerToSequence` on `oteljetstream.Stream`
+- **THEN** no such wrapped method exists — those `jetstream.Stream` methods first ship in `nats.go` v1.52.0, above the v1.50.0 pin held for downstream-policy alignment, and are re-exposed only when a future policy-aligned nats.go bump makes them available
 
 ## ADDED Requirements
 
@@ -25,7 +29,7 @@
 - **THEN** buffered messages are processed by the handler and the `Closed()` channel closes once consuming has fully stopped, with no `Unwrap()` call required
 
 ### Requirement: Stream mirrors the full jetstream.Stream surface
-`oteljetstream.Stream` SHALL re-expose every `jetstream.Stream` method. Consumer-returning methods remain trace-enabled wrappers; the message-management operations (`GetMsg`, `GetLastMsgForSubject`, `DeleteMsg`, `SecureDeleteMsg`, `Purge`) and the consumer-admin operations (`PauseConsumer`, `ResumeConsumer`, `UnpinConsumer`, `ResetConsumer`, `ResetConsumerToSequence`) SHALL be pure passthroughs — control-plane calls that carry no message payload, so no trace context applies. Because the surface is complete, no `Unwrap()` escape hatch is provided (removing the escape hatch previously present is a breaking change, permitted under the pre-1.0 `0.6.0` minor bump).
+`oteljetstream.Stream` SHALL re-expose every `jetstream.Stream` method available at the pinned `nats.go` v1.50.0. Consumer-returning methods remain trace-enabled wrappers; the message-management operations (`GetMsg`, `GetLastMsgForSubject`, `DeleteMsg`, `SecureDeleteMsg`, `Purge`) and the consumer-admin operations (`PauseConsumer`, `ResumeConsumer`, `UnpinConsumer`) SHALL be pure passthroughs — control-plane calls that carry no message payload, so no trace context applies. (`ResetConsumer`/`ResetConsumerToSequence` are excluded: they are not part of the `jetstream.Stream` surface until nats.go v1.52.0, above the policy-aligned pin.) Because the surface is complete for this pin, no `Unwrap()` escape hatch is provided (removing the escape hatch previously present is a breaking change, permitted under the pre-1.0 `0.6.0` minor bump).
 
 #### Scenario: Fetching a stored message through the wrapper
 - **WHEN** a caller invokes `stream.GetMsg(ctx, seq)` on an `oteljetstream.Stream`

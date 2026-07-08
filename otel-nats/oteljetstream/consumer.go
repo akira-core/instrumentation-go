@@ -7,7 +7,7 @@ import (
 	nats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.opentelemetry.io/otel/attribute"
-	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/akira-core/instrumentation-go/otel-nats/otelnats"
@@ -62,7 +62,7 @@ type MessageBatch interface {
 type ConsumerInfo = jetstream.ConsumerInfo
 
 // PushConsumer mirrors jetstream.PushConsumer (added upstream in the nats.go
-// v1.38.0→v1.52.0 range): a push-based consumer that delivers messages via
+// v1.38.0→v1.50.0 range): a push-based consumer that delivers messages via
 // Consume only — no Fetch/Messages/Next pull paths. Two impls exist:
 // tracedPushConsumer applies the full instrumentation; directPushConsumer is a
 // passthrough. Requires ConsumerConfig.DeliverSubject to be set.

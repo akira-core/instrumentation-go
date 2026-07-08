@@ -24,8 +24,6 @@ type Stream interface {
 	PauseConsumer(ctx context.Context, consumer string, pauseUntil time.Time) (*ConsumerPauseResponse, error)
 	ResumeConsumer(ctx context.Context, consumer string) (*ConsumerPauseResponse, error)
 	UnpinConsumer(ctx context.Context, consumer string, group string) error
-	ResetConsumer(ctx context.Context, consumer string) (*ConsumerResetResponse, error)
-	ResetConsumerToSequence(ctx context.Context, consumer string, seq uint64) (*ConsumerResetResponse, error)
 	PushConsumer(ctx context.Context, consumer string) (PushConsumer, error)
 	CreatePushConsumer(ctx context.Context, cfg ConsumerConfig) (PushConsumer, error)
 	CreateOrUpdatePushConsumer(ctx context.Context, cfg ConsumerConfig) (PushConsumer, error)

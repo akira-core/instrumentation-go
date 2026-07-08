@@ -16,7 +16,7 @@
 //   - Push-consumer wrappers (PushConsumer/CreatePushConsumer/CreateOrUpdatePushConsumer/UpdatePushConsumer)
 //     are provided on both JetStream and Stream; the returned PushConsumer.Consume carries trace context.
 //   - ConsumeContext and Stream fully mirror their jetstream counterparts — no Unwrap needed.
-//     Stream's control-plane methods (GetMsg/Purge/PauseConsumer/ResetConsumer/...) are passthroughs.
+//     Stream's control-plane methods (GetMsg/Purge/PauseConsumer/UnpinConsumer/...) are passthroughs.
 //   - Unwrap() on JetStream returns the raw jetstream.JetStream for the KeyValue and
 //     ObjectStore APIs (plus AccountInfo/Conn/Options) this messaging wrapper does not re-expose.
 //
