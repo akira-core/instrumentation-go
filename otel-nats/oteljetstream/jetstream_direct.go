@@ -28,7 +28,7 @@ func (j *directJSImpl) Stream(ctx context.Context, name string) (Stream, error) 
 	if err != nil {
 		return nil, err
 	}
-	return &directStream{s: s}, nil
+	return &directStream{Stream: s}, nil
 }
 
 func (j *directJSImpl) Consumer(ctx context.Context, stream string, consumer string) (Consumer, error) {
@@ -98,7 +98,7 @@ func (j *directJSImpl) CreateOrUpdateStream(ctx context.Context, cfg StreamConfi
 	if err != nil {
 		return nil, err
 	}
-	return &directStream{s: s}, nil
+	return &directStream{Stream: s}, nil
 }
 
 func (j *directJSImpl) DeleteStream(ctx context.Context, name string) error {

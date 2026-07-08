@@ -240,3 +240,38 @@ func TestOrderedConsumerNamePrefixAttr(t *testing.T) {
 	consumerSpan := waitSpanByNameAndKind(t, sr, "receive orderedprefix.test", oteltrace.SpanKindConsumer)
 	assertAttr(t, consumerSpan.Attributes(), "messaging.consumer.name", "my-ordered")
 }
+
+// TestNextFailsFastOnDoneContext verifies Consumer.Next honors an
+// already-canceled or already-expired context instead of blocking for
+// jetstream's default max wait (~30s).
+func TestNextFailsFastOnDoneContext(t *testing.T) {
+	js, _, _ := setupTracedJS(t)
+	ctx := context.Background()
+
+	_, err := js.CreateOrUpdateStream(ctx, oteljetstream.StreamConfig{
+		Name:     "FAILFAST",
+		Subjects: []string{"failfast.>"},
+	})
+	require.NoError(t, err)
+
+	cons, err := js.CreateOrUpdateConsumer(ctx, "FAILFAST", oteljetstream.ConsumerConfig{
+		Durable:       "failfast-consumer",
+		FilterSubject: "failfast.test",
+		AckPolicy:     oteljetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	start := time.Now()
+	_, _, err = cons.Next(canceledCtx)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Less(t, time.Since(start), 2*time.Second, "Next must fail fast on canceled ctx")
+
+	expiredCtx, cancel2 := context.WithDeadline(ctx, time.Now().Add(-time.Second))
+	defer cancel2()
+	start = time.Now()
+	_, _, err = cons.Next(expiredCtx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), 2*time.Second, "Next must fail fast on expired ctx")
+}

@@ -149,7 +149,7 @@ for {
 }
 ```
 
-> **Push consumers** are wrapped (`PushConsumer`/`CreatePushConsumer`/`CreateOrUpdatePushConsumer`/`UpdatePushConsumer` on both `JetStream` and `Stream`); the returned `PushConsumer.Consume` carries trace context. Management-only APIs (`PauseConsumer`/`ResumeConsumer`/`UnpinConsumer`) are not re-wrapped — reach them via `Unwrap()` on `JetStream`/`Stream`. Async publish (`PublishAsync`/`PublishMsgAsync`) is not wrapped: these take no `context.Context` and return a non-blocking `PubAckFuture` instead of a synchronous ack, which doesn't fit this wrapper's context-propagation model (see `oteljetstream/doc.go`).
+> **Push consumers** are wrapped (`PushConsumer`/`CreatePushConsumer`/`CreateOrUpdatePushConsumer`/`UpdatePushConsumer` on both `JetStream` and `Stream`); the returned `PushConsumer.Consume` carries trace context. Management-only APIs (`PauseConsumer`/`ResumeConsumer`/`UnpinConsumer`/`ResetConsumer`/`ResetConsumerToSequence`) are exposed directly on `Stream` as untraced passthroughs; `Unwrap()` exists only on `JetStream`, for APIs the wrapper does not re-expose (`KeyValue`/`ObjectStore`/`AccountInfo`/`Conn`/`Options`). Async publish (`PublishAsync`/`PublishMsgAsync`) is not wrapped: these take no `context.Context` and return a non-blocking `PubAckFuture` instead of a synchronous ack, which doesn't fit this wrapper's context-propagation model (see `oteljetstream/doc.go`).
 
 ### 5. Tests
 

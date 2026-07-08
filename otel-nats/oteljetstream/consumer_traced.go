@@ -7,6 +7,7 @@ import (
 	nats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/akira-core/instrumentation-go/otel-nats/otelnats"
@@ -23,11 +24,7 @@ type tracedConsumer struct {
 
 func (c *tracedConsumer) Consume(handler MsgHandler, opts ...jetstream.PullConsumeOpt) (ConsumeContext, error) {
 	wrapped := tracedConsumeHandler(c.conn, c.consumerName, handler)
-	cc, err := c.c.Consume(wrapped, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return &consumeContextImpl{cc: cc}, nil
+	return wrapConsumeContext(c.c.Consume(wrapped, opts...))
 }
 
 func (c *tracedConsumer) Messages(opts ...jetstream.PullMessagesOpt) (MessagesContext, error) {
@@ -35,11 +32,21 @@ func (c *tracedConsumer) Messages(opts ...jetstream.PullMessagesOpt) (MessagesCo
 	if err != nil {
 		return nil, err
 	}
-	return &tracedMessagesContext{conn: c.conn, consumerName: c.consumerName, iter: iter}, nil
+	tracer, prop := c.conn.TraceContext()
+	return &tracedMessagesContext{
+		conn:      c.conn,
+		iter:      iter,
+		tracer:    tracer,
+		prop:      prop,
+		baseAttrs: receiveBaseAttrs("receive", c.conn.ServerAttrs(), c.consumerName),
+	}, nil
 }
 
 func (c *tracedConsumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (context.Context, jetstream.Msg, error) {
-	opts = applyCtxDeadlineToFetchOpts(ctx, opts)
+	opts, err := applyCtxDeadlineToFetchOpts(ctx, opts)
+	if err != nil {
+		return nil, nil, err
+	}
 	msg, err := c.c.Next(opts...)
 	if err != nil {
 		return nil, nil, err
@@ -53,7 +60,7 @@ func (c *tracedConsumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (
 	originSpanCtx := trace.SpanContextFromContext(msgCtx)
 	consumerParentCtx := c.conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
 	spanName := "receive " + msg.Subject()
-	attrs := append(receiveAttrs(msg, "receive", c.conn.ServerAttrs()), attribute.String(attrConsumerName, c.consumerName))
+	attrs := receiveMsgAttrs(receiveBaseAttrs("receive", c.conn.ServerAttrs(), c.consumerName), msg)
 	startOpts := []trace.SpanStartOption{
 		trace.WithSpanKind(trace.SpanKindConsumer),
 		trace.WithAttributes(attrs...),
@@ -123,11 +130,7 @@ func newTracedPushConsumer(conn *otelnats.Conn, name string, cons jetstream.Push
 
 func (c *tracedPushConsumer) Consume(handler MsgHandler, opts ...jetstream.PushConsumeOpt) (ConsumeContext, error) {
 	wrapped := tracedConsumeHandler(c.conn, c.consumerName, handler)
-	cc, err := c.c.Consume(wrapped, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return &consumeContextImpl{cc: cc}, nil
+	return wrapConsumeContext(c.c.Consume(wrapped, opts...))
 }
 
 func (c *tracedPushConsumer) Info(ctx context.Context) (*ConsumerInfo, error) {
@@ -147,6 +150,7 @@ func tracedConsumeHandler(conn *otelnats.Conn, consumerName string, handler MsgH
 		return nil
 	}
 	tracer, prop := conn.TraceContext()
+	baseAttrs := receiveBaseAttrs("process", conn.ServerAttrs(), consumerName)
 	return func(msg jetstream.Msg) {
 		h := msg.Headers()
 		if h == nil {
@@ -156,7 +160,7 @@ func tracedConsumeHandler(conn *otelnats.Conn, consumerName string, handler MsgH
 		originSpanCtx := trace.SpanContextFromContext(msgCtx)
 		consumerParentCtx := conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
 		spanName := "process " + msg.Subject()
-		attrs := append(receiveAttrs(msg, "process", conn.ServerAttrs()), attribute.String(attrConsumerName, consumerName))
+		attrs := receiveMsgAttrs(baseAttrs, msg)
 		startOpts := []trace.SpanStartOption{
 			trace.WithSpanKind(trace.SpanKindConsumer),
 			trace.WithAttributes(attrs...),
@@ -178,17 +182,26 @@ func tracedConsumeHandler(conn *otelnats.Conn, consumerName string, handler MsgH
 // is never held across the blocking m.iter.Next call, so Stop can still
 // interrupt a waiting Next.
 type tracedMessagesContext struct {
-	conn         *otelnats.Conn
-	consumerName string
-	iter         jetstream.MessagesContext
-	mu           sync.Mutex
-	lastSpan     trace.Span
+	conn      *otelnats.Conn
+	iter      jetstream.MessagesContext
+	tracer    trace.Tracer
+	prop      propagation.TextMapPropagator
+	baseAttrs []attribute.KeyValue
+	mu        sync.Mutex
+	lastSpan  trace.Span
+	stopped   bool
 }
 
 // endLastSpan ends and clears any in-flight span. trace.Span.End is idempotent,
-// so a rare double call on the Stop/Next boundary is harmless.
-func (m *tracedMessagesContext) endLastSpan() {
+// so a rare double call on the Stop/Next boundary is harmless. stopping marks
+// the iterator as stopped so a span started concurrently with Stop/Drain (in
+// the window between iter.Next returning and the lastSpan store) is ended
+// immediately instead of leaking.
+func (m *tracedMessagesContext) endLastSpan(stopping bool) {
 	m.mu.Lock()
+	if stopping {
+		m.stopped = true
+	}
 	if m.lastSpan != nil {
 		m.lastSpan.End()
 		m.lastSpan = nil
@@ -197,7 +210,7 @@ func (m *tracedMessagesContext) endLastSpan() {
 }
 
 func (m *tracedMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context, jetstream.Msg, error) {
-	m.endLastSpan()
+	m.endLastSpan(false)
 	msg, err := m.iter.Next(opts...)
 	if err != nil {
 		return nil, nil, err
@@ -206,12 +219,11 @@ func (m *tracedMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context
 	if h == nil {
 		h = make(nats.Header)
 	}
-	tracer, prop := m.conn.TraceContext()
-	msgCtx := prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: h})
+	msgCtx := m.prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: h})
 	originSpanCtx := trace.SpanContextFromContext(msgCtx)
 	consumerParentCtx := m.conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
 	spanName := "receive " + msg.Subject()
-	attrs := append(receiveAttrs(msg, "receive", m.conn.ServerAttrs()), attribute.String(attrConsumerName, m.consumerName))
+	attrs := receiveMsgAttrs(m.baseAttrs, msg)
 	startOpts := []trace.SpanStartOption{
 		trace.WithSpanKind(trace.SpanKindConsumer),
 		trace.WithAttributes(attrs...),
@@ -219,19 +231,24 @@ func (m *tracedMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context
 	if originSpanCtx.IsValid() {
 		startOpts = append(startOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
 	}
-	ctx, span := tracer.Start(consumerParentCtx, spanName, startOpts...)
+	ctx, span := m.tracer.Start(consumerParentCtx, spanName, startOpts...)
 	m.mu.Lock()
-	m.lastSpan = span
+	if m.stopped {
+		// Stop/Drain already ran endLastSpan; nobody will end this span later.
+		span.End()
+	} else {
+		m.lastSpan = span
+	}
 	m.mu.Unlock()
 	return ctx, msg, nil
 }
 
 func (m *tracedMessagesContext) Stop() {
-	m.endLastSpan()
+	m.endLastSpan(true)
 	m.iter.Stop()
 }
 
 func (m *tracedMessagesContext) Drain() {
-	m.endLastSpan()
+	m.endLastSpan(true)
 	m.iter.Drain()
 }

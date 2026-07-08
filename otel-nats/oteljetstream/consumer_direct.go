@@ -27,11 +27,7 @@ type directConsumer struct {
 }
 
 func (c *directConsumer) Consume(handler MsgHandler, opts ...jetstream.PullConsumeOpt) (ConsumeContext, error) {
-	cc, err := c.c.Consume(directHandler(handler), opts...)
-	if err != nil {
-		return nil, err
-	}
-	return &consumeContextImpl{cc: cc}, nil
+	return wrapConsumeContext(c.c.Consume(directHandler(handler), opts...))
 }
 
 func (c *directConsumer) Messages(opts ...jetstream.PullMessagesOpt) (MessagesContext, error) {
@@ -43,7 +39,10 @@ func (c *directConsumer) Messages(opts ...jetstream.PullMessagesOpt) (MessagesCo
 }
 
 func (c *directConsumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (context.Context, jetstream.Msg, error) {
-	opts = applyCtxDeadlineToFetchOpts(ctx, opts)
+	opts, err := applyCtxDeadlineToFetchOpts(ctx, opts)
+	if err != nil {
+		return nil, nil, err
+	}
 	msg, err := c.c.Next(opts...)
 	if err != nil {
 		return nil, nil, err
@@ -51,21 +50,27 @@ func (c *directConsumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (
 	return context.Background(), msg, nil
 }
 
-// applyCtxDeadlineToFetchOpts converts a ctx deadline to a FetchMaxWait so callers
-// retain timeout behavior even though nats.go v1.38.0 lacks jetstream.FetchContext.
-func applyCtxDeadlineToFetchOpts(ctx context.Context, opts []jetstream.FetchOpt) []jetstream.FetchOpt {
+// applyCtxDeadlineToFetchOpts converts a ctx deadline to a FetchMaxWait so
+// callers retain timeout behavior (the underlying pull Next takes no ctx; we
+// avoid jetstream.FetchContext because it errors when combined with a
+// caller-passed FetchMaxWait). An already-canceled or expired ctx returns its
+// error so Next fails fast instead of blocking for jetstream's default max wait.
+func applyCtxDeadlineToFetchOpts(ctx context.Context, opts []jetstream.FetchOpt) ([]jetstream.FetchOpt, error) {
 	if ctx == nil {
-		return opts
+		return opts, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	dl, ok := ctx.Deadline()
 	if !ok {
-		return opts
+		return opts, nil
 	}
 	d := time.Until(dl)
 	if d <= 0 {
-		return opts
+		return nil, context.DeadlineExceeded
 	}
-	return append([]jetstream.FetchOpt{jetstream.FetchMaxWait(d)}, opts...)
+	return append([]jetstream.FetchOpt{jetstream.FetchMaxWait(d)}, opts...), nil
 }
 
 func (c *directConsumer) Fetch(batch int, opts ...jetstream.FetchOpt) (MessageBatch, error) {
@@ -122,11 +127,7 @@ type directPushConsumer struct {
 }
 
 func (c *directPushConsumer) Consume(handler MsgHandler, opts ...jetstream.PushConsumeOpt) (ConsumeContext, error) {
-	cc, err := c.c.Consume(directHandler(handler), opts...)
-	if err != nil {
-		return nil, err
-	}
-	return &consumeContextImpl{cc: cc}, nil
+	return wrapConsumeContext(c.c.Consume(directHandler(handler), opts...))
 }
 
 func (c *directPushConsumer) Info(ctx context.Context) (*ConsumerInfo, error) {

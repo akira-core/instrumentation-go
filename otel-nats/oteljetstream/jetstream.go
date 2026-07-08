@@ -97,8 +97,8 @@ type JetStream interface {
 	DeleteStream(ctx context.Context, name string) error
 
 	// Unwrap returns the underlying jetstream.JetStream, the escape hatch for
-	// upstream APIs the wrapper does not re-expose (consumer pause/resume/reset,
-	// Conn, Options, ...). Calls made through it bypass tracing.
+	// upstream APIs the wrapper does not re-expose (KeyValue, ObjectStore,
+	// AccountInfo, Conn, Options, ...). Calls made through it bypass tracing.
 	Unwrap() jetstream.JetStream
 }
 
@@ -123,6 +123,12 @@ func New(conn *otelnats.Conn) (JetStream, error) {
 // nats.go v1.52.0's range) is unset.
 const orderedConsumerName = "ordered-consumer"
 
+// orderedConsumerNameFromConfig returns the messaging.consumer.name attribute
+// value for ordered consumers: the configured NamePrefix (or a fixed fallback).
+// The server names ordered consumers "{NamePrefix}_{serial}", with the serial
+// rotating on every internal reset, so the attribute deliberately carries the
+// stable prefix rather than the transient server-side name — a stable value
+// aggregates better and no snapshot of the real name could stay accurate.
 func orderedConsumerNameFromConfig(cfg OrderedConsumerConfig) string {
 	if cfg.NamePrefix != "" {
 		return cfg.NamePrefix

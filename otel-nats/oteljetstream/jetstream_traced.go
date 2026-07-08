@@ -60,7 +60,7 @@ func (j *tracedJSImpl) Stream(ctx context.Context, name string) (Stream, error) 
 	if err != nil {
 		return nil, err
 	}
-	return &tracedStream{conn: j.conn, streamName: name, s: s}, nil
+	return &tracedStream{conn: j.conn, streamName: name, Stream: s}, nil
 }
 
 func (j *tracedJSImpl) Consumer(ctx context.Context, stream string, consumer string) (Consumer, error) {
@@ -137,7 +137,7 @@ func (j *tracedJSImpl) CreateOrUpdateStream(ctx context.Context, cfg StreamConfi
 	if err != nil {
 		return nil, err
 	}
-	return &tracedStream{conn: j.conn, streamName: cfg.Name, s: s}, nil
+	return &tracedStream{conn: j.conn, streamName: cfg.Name, Stream: s}, nil
 }
 
 func (j *tracedJSImpl) DeleteStream(ctx context.Context, name string) error {

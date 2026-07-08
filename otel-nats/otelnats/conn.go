@@ -369,7 +369,7 @@ func requestAttrs(msg *nats.Msg, serverAttrs []attribute.KeyValue) []attribute.K
 }
 
 // receiveAttrs builds consumer span attributes. opType is "process" (push) or "receive" (pull).
-// Note: oteljetstream/consumer.go has a parallel receiveAttrs for jetstream.Msg — keep both in sync.
+// Note: oteljetstream/consumer.go has parallel receiveBaseAttrs/receiveMsgAttrs for jetstream.Msg — keep the attribute sets in sync.
 func receiveAttrs(msg *nats.Msg, queue string, opType string, serverAttrs []attribute.KeyValue) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{
 		semconv.MessagingSystemKey.String(messagingSystem),
