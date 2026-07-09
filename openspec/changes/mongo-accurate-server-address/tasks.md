@@ -42,5 +42,5 @@
 ## 7. Final verification
 
 - [x] 7.1 Full sweep: `go build`, `go test -race`, `golangci-lint run` green in both `otel-mongo/otelmongo` and `otel-mongo/v2`.
-- [ ] 7.2 Run `otel-mongo/tests/integration` and `otel-mongo/v2/tests/integration` (Docker/testcontainers) — confirm `server.address` on emitted spans matches the actual container-mapped host:port used by the test's `mongo.Client`.
-- [ ] 7.3 Manual spot-check: connect against a real (or testcontainers-based) MongoDB replica set with a multi-host connection string where the first host is not the primary; confirm span `server.address` matches the primary, not the first-listed host.
+- [x] 7.2 Run `otel-mongo/tests/integration` and `otel-mongo/v2/tests/integration` (Docker/testcontainers) — confirm `server.address` on emitted spans matches the actual container-mapped host:port used by the test's `mongo.Client`.
+- [x] 7.3 Manual spot-check: connect against a real (or testcontainers-based) MongoDB replica set with a multi-host connection string where the first host is not the primary; confirm span `server.address` matches the primary, not the first-listed host.
