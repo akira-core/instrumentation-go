@@ -64,9 +64,9 @@ otel-gorilla-ws/v0.6.0
 ## Upgrade
 
 ```bash
-go get github.com/akira-core/instrumentation-go/otel-mongo@otel-mongo/v0.6.0
-go get github.com/akira-core/instrumentation-go/otel-mongo/v2@otel-mongo/v2/v0.6.0
-go get github.com/akira-core/instrumentation-go/otel-nats@otel-nats/v0.6.0
-go get github.com/akira-core/instrumentation-go/otel-gorilla-ws@otel-gorilla-ws/v0.6.0
+go get github.com/akira-core/instrumentation-go/otel-mongo@v0.6.0
+go get github.com/akira-core/instrumentation-go/otel-mongo/v2@v0.6.0
+go get github.com/akira-core/instrumentation-go/otel-nats@v0.6.0
+go get github.com/akira-core/instrumentation-go/otel-gorilla-ws@v0.6.0
 ```
 Then ensure your build uses Go ≥ 1.25.
