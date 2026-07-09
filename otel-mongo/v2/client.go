@@ -4,9 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -182,36 +180,51 @@ func (c *Client) StartSession(opts ...options.Lister[options.SessionOptions]) (*
 	return c.Client.StartSession(opts...)
 }
 
+// stripURIWhitespace removes raw ASCII whitespace (space, tab, CR, LF) from a
+// URI. MongoDB URIs never legitimately contain raw whitespace — hosts are
+// comma-separated with none between them, and any whitespace elsewhere must be
+// percent-encoded — but a URI assembled across config-file lines can pick up
+// stray spaces or newlines around the multi-host list. url.Parse would reject
+// such a string wholesale ("invalid control character" / "invalid character in
+// host name"), collapsing server.* to ("", 0); stripping first lets the first
+// host still be recovered. Safe here because parseServerFromURI consumes only
+// the host/port, never userinfo, path, or query.
+func stripURIWhitespace(uri string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\n', '\r':
+			return -1
+		}
+		return r
+	}, uri)
+}
+
 // parseServerFromURI extracts server address and port from a MongoDB URI for semconv server.* attributes.
 // Uses the first host when the URI has multiple hosts (e.g. replica set). Handles IPv6 (e.g. [::1]).
-// Returns ("", 0) on parse failure or when the URI has no host (e.g. some SRV forms).
+// Stray whitespace around the multi-host list is tolerated (see stripURIWhitespace).
+// Returns ("", 0) when the URI has no host (e.g. some SRV forms or a scheme-only URI).
+//
+// The authority is sliced out by hand rather than via url.Parse: url.Parse
+// validates the whole string as one host:port, so it rejects any legitimate
+// multi-host replica-set URI whose last host omits a port (mongodb://a:27017,b)
+// or that lists three or more hosts, and it cannot parse a comma-joined IPv6
+// host list. Peeling scheme → path/query → userinfo → first host keeps only the
+// part we need and sidesteps all of that.
 func parseServerFromURI(uri string) (addr string, port int) {
-	u, err := url.Parse(uri)
-	if err != nil || u.Host == "" {
-		return "", 0
+	uri = stripURIWhitespace(uri)
+	if i := strings.Index(uri, "://"); i >= 0 {
+		uri = uri[i+3:]
 	}
-	firstHost := u.Host
-	if i := strings.Index(u.Host, ","); i >= 0 {
-		firstHost = strings.TrimSpace(u.Host[:i])
+	if i := strings.IndexAny(uri, "/?#"); i >= 0 { // drop /path, ?query, #fragment
+		uri = uri[:i]
 	}
-	u2, err := url.Parse("//" + firstHost)
-	if err != nil {
-		return "", 0
+	if i := strings.LastIndexByte(uri, '@'); i >= 0 { // drop user:pass@ userinfo
+		uri = uri[i+1:]
 	}
-	addr = u2.Hostname()
-	if addr == "" {
-		return "", 0
+	if i := strings.IndexByte(uri, ','); i >= 0 { // first host of a replica-set list
+		uri = uri[:i]
 	}
-	portStr := u2.Port()
-	if portStr == "" {
-		port = 27017
-		return addr, port
-	}
-	p, _ := strconv.Atoi(portStr)
-	if p <= 0 {
-		p = 27017
-	}
-	return addr, p
+	return shared.SplitHostPort(uri)
 }
 
 // initMongoProvider creates an independent TracerProvider with service.name = "mongodb://{addr}"

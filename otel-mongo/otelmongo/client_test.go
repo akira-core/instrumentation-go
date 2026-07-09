@@ -65,13 +65,15 @@ func TestParseServerFromClientOptions(t *testing.T) {
 	})
 }
 
-// TestParseServerFromURI exercises the URI-derived static fallback directly,
-// covering the multi-host replica-set and mongodb+srv:// forms that motivated
+// TestParseServerFromURI exercises the URI-derived static fallback directly.
+// It covers the multi-host replica-set and mongodb+srv:// forms that motivated
 // per-command capture (only the first host is used; the SRV name is not
-// resolved) plus the IPv6 and malformed edge cases. url.Parse validates the
-// whole string first, so a multi-host IPv6 URI (invalid IP-literal) and any URI
-// containing a newline control character both fail safe to ("", 0) before the
-// first-host split is ever reached.
+// resolved), the userinfo/path/query trimming, IPv6 (single and multi-host),
+// and — per the caller's requirement — the stray-space and stray-newline forms
+// a URI can pick up when assembled across config-file lines. Cases that url.Parse
+// would reject wholesale (last host without a port, three or more hosts, IPv6
+// host lists, embedded whitespace) resolve to the first host here because the
+// authority is sliced out by hand.
 func TestParseServerFromURI(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -81,12 +83,20 @@ func TestParseServerFromURI(t *testing.T) {
 	}{
 		{"single host with port", "mongodb://mongo:27018", "mongo", 27018},
 		{"single host default port", "mongodb://mongo", "mongo", 27017},
+		{"single host with path and query", "mongodb://mongo:27018/admin?w=majority", "mongo", 27018},
 		{"multi-host replica set uses first", "mongodb://host1:27017,host2:27018", "host1", 27017},
 		{"multi-host first host non-default port", "mongodb://host1:27019,host2:27020", "host1", 27019},
+		{"multi-host last host omits port", "mongodb://host1:27017,host2", "host1", 27017},
+		{"three hosts last omits port", "mongodb://host1:27019,host2:27018,host3", "host1", 27019},
+		{"multi-host with path and query", "mongodb://host1:27017,host2:27018/admin?replicaSet=rs0", "host1", 27017},
+		{"userinfo stripped", "mongodb://user:pass@host1:27018,host2:27019", "host1", 27018},
 		{"mongodb+srv name not resolved", "mongodb+srv://cluster.example.mongodb.net", "cluster.example.mongodb.net", 27017},
 		{"single ipv6 host", "mongodb://[::1]:27017", "::1", 27017},
-		{"multi-host ipv6 unparseable", "mongodb://[::1]:27017,[::2]:27018", "", 0},
-		{"multi-host with newline char", "mongodb://host1:27017,\nhost2:27018", "", 0},
+		{"multi-host ipv6 uses first", "mongodb://[::1]:27017,[::2]:27018", "::1", 27017},
+		{"multi-host newline before second host", "mongodb://host1:27017,\nhost2:27018", "host1", 27017},
+		{"space after comma", "mongodb://host1:27018, host2:27019", "host1", 27018},
+		{"space before comma", "mongodb://host1:27020 ,host2:27021", "host1", 27020},
+		{"tab and crlf around hosts, last omits port", "mongodb://host1:27018 ,\r\n\thost2", "host1", 27018},
 		{"empty uri", "", "", 0},
 		{"scheme only no host", "mongodb://", "", 0},
 	}
