@@ -214,6 +214,16 @@ api ──► mongodb ──► dbwatcher
 
 `SingleResult.Decode` 會對已取得文件中儲存的 `_oteltrace` 加上一個 **span link**（而非 parent-child 關係）。FindOne 的 span 會在第一次呼叫 `Decode`、`Raw` 或 `TraceContext` 時結束。每個 `SingleResult` 只能呼叫其中一種方法一次。
 
+### `server.address` / `server.port` 的來源
+
+啟用 tracing 時，Collection 的 CRUD CLIENT span（`InsertOne`、`Find`、`UpdateOne`、`Aggregate`、`Watch` 等）上的 `server.address`/`server.port`，來自實際處理該次指令的 MongoDB 連線 —— 透過在底層 driver client 上註冊 `event.CommandMonitor`擷取，而非僅在 `Connect` 時對連線字串做一次性解析。這讓多主機的 replica-set URI、`mongodb+srv://` 連線字串，以及 primary failover 後的情境，都能得到正確的 attribute（URI 中列出的第一台主機不一定是實際處理該次指令的主機）。
+
+若某次呼叫沒有觀察到任何 command 事件（例如防禦性/邊界情況的程式路徑），span 會回退使用連線字串靜態解析出的位址 —— 與 0.6.1 之前的行為一致。
+
+**呼叫端自行提供的 `SetMonitor` 會被串接，而非取代。** 若你在傳入 `Connect`/`ConnectWithOptions` 的 `*options.ClientOptions` 上呼叫了自己的 `SetMonitor(...)`，otelmongo 的位址擷取回呼會先執行，接著原封不動地呼叫你的 `Started`/`Succeeded`/`Failed` 回呼 —— 不會被靜默忽略。
+
+此擷取機制僅在啟用 tracing 的路徑上執行；停用 tracing 時不會註冊任何 `CommandMonitor`，你所提供的 monitor 會完全原樣通過。
+
 ---
 
 ## 診斷紀錄

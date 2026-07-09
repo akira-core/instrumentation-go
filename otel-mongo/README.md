@@ -217,6 +217,16 @@ Every `InsertOne`, `InsertMany`, `ReplaceOne`, and `UpdateOne`/`UpdateMany`/`Upd
 
 `SingleResult.Decode` adds a **span link** (not a parent-child relationship) to the `_oteltrace` stored in the fetched document. The FindOne span ends when `Decode`, `Raw`, or `TraceContext` is first called. Call exactly one of these per `SingleResult`.
 
+### `server.address` / `server.port` attribution
+
+When tracing is enabled, Collection CRUD CLIENT spans (`InsertOne`, `Find`, `UpdateOne`, `Aggregate`, `Watch`, etc.) carry the `server.address`/`server.port` of the MongoDB connection that **actually served that specific command** — captured via an `event.CommandMonitor` registered on the underlying driver client, not just parsed once from the connection URI at `Connect` time. This makes the attribute accurate for multi-host replica-set URIs, `mongodb+srv://` connection strings, and after a primary failover, where the first host in the URI may not be the host that served a given command.
+
+If no command event was observed for a call (e.g. a defensive/edge-case code path), the span falls back to the statically-parsed address from the connection URI — identical to pre-0.6.1 behavior.
+
+**Caller-supplied `SetMonitor` is chained, not replaced.** If you pass your own `*options.ClientOptions` with `SetMonitor(...)` to `Connect`/`ConnectWithOptions`, otelmongo's address-capture callback runs first and then delegates to your `Started`/`Succeeded`/`Failed` callbacks unmodified — nothing is silently dropped.
+
+This capture only runs on the tracing-enabled path; when tracing is disabled, no `CommandMonitor` is registered and any monitor you supply passes through completely untouched.
+
 ---
 
 ## Diagnostic logging

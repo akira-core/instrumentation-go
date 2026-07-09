@@ -22,6 +22,8 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
+
+	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/shared"
 )
 
 // Client wraps *mongo.Client with OpenTelemetry instrumentation.
@@ -132,6 +134,7 @@ func ConnectWithOptions(traceOpts []ClientOption, opts ...*options.ClientOptions
 	propEnabled := resolveDocumentPropagation(cfg.PropagationEnabled)
 	tracer := tp.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
 	merged := options.MergeClientOptions(opts...)
+	merged.SetMonitor(shared.NewCommandMonitor(merged.Monitor))
 	mc, err := mongo.Connect(merged)
 	if err != nil {
 		return nil, err

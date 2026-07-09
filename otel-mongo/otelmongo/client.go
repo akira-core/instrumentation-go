@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +21,8 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
+
+	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/shared"
 )
 
 // Client wraps *mongo.Client with OpenTelemetry instrumentation.
@@ -102,11 +103,12 @@ func Connect(ctx context.Context, opts ...*options.ClientOptions) (*Client, erro
 // Without options, falls back to otel.GetTracerProvider()/otel.GetTextMapPropagator() at connect time.
 func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*options.ClientOptions) (*Client, error) {
 	if !mongoTracingEnabled() {
-		mc, err := mongo.Connect(ctx, opts...)
+		merged := options.MergeClientOptions(opts...) //nolint:staticcheck // SA1019: v1 driver deprecates struct-merging ahead of v2; still needed here to read the effective merged Monitor/URI.
+		mc, err := mongo.Connect(ctx, merged)
 		if err != nil {
 			return nil, err
 		}
-		addr, port := parseServerFromURI(lastNonEmptyURI(opts))
+		addr, port := parseServerFromURI(merged.GetURI())
 		tracer := noop.NewTracerProvider().Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
 		return &Client{
 			Client:             mc,
@@ -129,11 +131,13 @@ func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*
 	}
 	propEnabled := resolveDocumentPropagation(cfg.PropagationEnabled)
 	tracer := tp.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
-	mc, err := mongo.Connect(ctx, opts...)
+	merged := options.MergeClientOptions(opts...) //nolint:staticcheck // SA1019: see rationale above; also needed to chain a caller-supplied SetMonitor with shared.NewCommandMonitor.
+	merged.SetMonitor(shared.NewCommandMonitor(merged.Monitor))
+	mc, err := mongo.Connect(ctx, merged)
 	if err != nil {
 		return nil, err
 	}
-	addr, port := parseServerFromURI(lastNonEmptyURI(opts))
+	addr, port := parseServerFromURI(merged.GetURI())
 	mongoTP, deliverTracer := initMongoProvider(addr, port)
 	return &Client{
 		Client:             mc,
@@ -148,24 +152,7 @@ func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*
 	}, nil
 }
 
-// lastNonEmptyURI walks the ClientOptions slice in reverse and returns the URI
-// from the most recently-applied options struct. mongo.Connect already merges
-// the slice internally, so the wrapper only needs the effective URI to derive
-// semconv server.* attributes.
-func lastNonEmptyURI(opts []*options.ClientOptions) string {
-	for i := len(opts) - 1; i >= 0; i-- {
-		if opts[i] == nil {
-			continue
-		}
-		if uri := opts[i].GetURI(); uri != "" {
-			return uri
-		}
-	}
-	return ""
-}
-
 // parseServerFromClientOptions is retained for tests that exercise URI parsing.
-// It mirrors lastNonEmptyURI for the single-options case.
 func parseServerFromClientOptions(opts *options.ClientOptions) (addr string, port int) {
 	if opts == nil {
 		return "", 0
@@ -213,24 +200,7 @@ func parseServerFromURI(uri string) (addr string, port int) {
 	if i := strings.Index(u.Host, ","); i >= 0 {
 		firstHost = strings.TrimSpace(u.Host[:i])
 	}
-	u2, err := url.Parse("//" + firstHost)
-	if err != nil {
-		return "", 0
-	}
-	addr = u2.Hostname()
-	if addr == "" {
-		return "", 0
-	}
-	portStr := u2.Port()
-	if portStr == "" {
-		port = 27017
-		return addr, port
-	}
-	p, _ := strconv.Atoi(portStr)
-	if p <= 0 {
-		p = 27017
-	}
-	return addr, p
+	return shared.SplitHostPort(firstHost)
 }
 
 // initMongoProvider creates an independent TracerProvider with service.name = "mongodb://{addr}"

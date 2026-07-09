@@ -72,11 +72,22 @@ func DBAttributes(dbName, collName, operation string, batchSize int, serverAddr 
 	if batchSize >= 2 {
 		attrs = append(attrs, attribute.Int(keyDBOpBatchSize, batchSize))
 	}
-	if serverAddr != "" {
-		attrs = append(attrs, attribute.String(keyServerAddress, serverAddr))
-		if serverPort > 0 && serverPort != 27017 {
-			attrs = append(attrs, attribute.Int(keyServerPort, serverPort))
-		}
+	return append(attrs, ServerAttributes(serverAddr, serverPort)...)
+}
+
+// ServerAttributes returns the server.address/server.port attribute pair for
+// serverAddr/serverPort, following semconv defaulting rules: nil when
+// serverAddr is empty, server.port omitted when serverPort is the MongoDB
+// default (27017). Used both for the start-time db.* attribute set
+// (DBAttributes) and to overwrite server.* post-call with the per-command
+// captured address (see monitor.go).
+func ServerAttributes(serverAddr string, serverPort int) []attribute.KeyValue {
+	if serverAddr == "" {
+		return nil
+	}
+	attrs := []attribute.KeyValue{attribute.String(keyServerAddress, serverAddr)}
+	if serverPort > 0 && serverPort != 27017 {
+		attrs = append(attrs, attribute.Int(keyServerPort, serverPort))
 	}
 	return attrs
 }

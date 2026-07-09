@@ -54,6 +54,15 @@ func (t *Collection) StartDeliverSpan(ctx context.Context, dbName, collName stri
 	return deliverCtx, span
 }
 
+// setCapturedServerAttrs overwrites the span's server.address/server.port with the
+// per-command captured value, falling back to the static t.ServerAddr/ServerPort
+// when nothing was captured for this call. See internal/shared/monitor.go.
+func (t *Collection) setCapturedServerAttrs(span trace.Span, capture *shared.AddrCapture) {
+	if addr, port := capture.Resolve(t.ServerAddr, t.ServerPort); addr != "" {
+		span.SetAttributes(shared.ServerAttributes(addr, port)...)
+	}
+}
+
 // InsertOne inserts a single document; wraps *mongo.Collection with a CLIENT span (and propagation when enabled).
 func (t *Collection) InsertOne(ctx context.Context, document any, opts ...*options.InsertOneOptions) (*mongo.InsertOneResult, error) {
 	dbName, collName := t.dbAndColl()
@@ -62,6 +71,7 @@ func (t *Collection) InsertOne(ctx context.Context, document any, opts ...*optio
 		trace.WithAttributes(shared.DBAttributes(dbName, collName, "insert", 0, t.ServerAddr, t.ServerPort)...),
 	)
 	defer span.End()
+	ctx, capture := shared.WithAddrCapture(ctx)
 
 	injectCtx, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
 	defer deliverSpan.End()
@@ -74,6 +84,7 @@ func (t *Collection) InsertOne(ctx context.Context, document any, opts ...*optio
 		docToInsert = docWithTrace
 	}
 	res, err := t.Coll.InsertOne(injectCtx, docToInsert, opts...)
+	t.setCapturedServerAttrs(span, capture)
 	shared.RecordSpanError(span, err)
 	if err != nil {
 		return nil, err
@@ -89,6 +100,7 @@ func (t *Collection) InsertMany(ctx context.Context, documents []any, opts ...*o
 		trace.WithAttributes(shared.DBAttributes(dbName, collName, "insert", len(documents), t.ServerAddr, t.ServerPort)...),
 	)
 	defer span.End()
+	ctx, capture := shared.WithAddrCapture(ctx)
 
 	injectCtx, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
 	defer deliverSpan.End()
@@ -105,6 +117,7 @@ func (t *Collection) InsertMany(ctx context.Context, documents []any, opts ...*o
 		docsToInsert = docsWithTrace
 	}
 	res, err := t.Coll.InsertMany(injectCtx, docsToInsert, opts...)
+	t.setCapturedServerAttrs(span, capture)
 	shared.RecordSpanError(span, err)
 	if err != nil {
 		return nil, err
@@ -120,11 +133,13 @@ func (t *Collection) Find(ctx context.Context, filter any, opts ...*options.Find
 		trace.WithAttributes(shared.DBAttributes(dbName, collName, "find", 0, t.ServerAddr, t.ServerPort)...),
 	)
 	defer span.End()
+	ctx, capture := shared.WithAddrCapture(ctx)
 
 	_, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
 	defer deliverSpan.End()
 
 	cursor, err := t.Coll.Find(ctx, filter, opts...)
+	t.setCapturedServerAttrs(span, capture)
 	shared.RecordSpanError(span, err)
 	if err != nil {
 		return nil, nil, err
@@ -139,8 +154,10 @@ func (t *Collection) FindOne(ctx context.Context, filter any, opts ...*options.F
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(shared.DBAttributes(dbName, collName, "find", 0, t.ServerAddr, t.ServerPort)...),
 	)
+	ctx, capture := shared.WithAddrCapture(ctx)
 	_, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
 	sr := t.Coll.FindOne(ctx, filter, opts...)
+	t.setCapturedServerAttrs(span, capture)
 	deliverSpan.End()
 	return sr, NewSingleResult(sr, span, ctx, t.Propagator, t.PropagationEnabled)
 }
@@ -162,6 +179,7 @@ func (t *Collection) runUpdate(ctx context.Context, op string, filter, update an
 		trace.WithAttributes(shared.DBAttributes(dbName, collName, "update", 0, t.ServerAddr, t.ServerPort)...),
 	)
 	defer span.End()
+	ctx, capture := shared.WithAddrCapture(ctx)
 
 	injectCtx, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
 	defer deliverSpan.End()
@@ -185,6 +203,7 @@ func (t *Collection) runUpdate(ctx context.Context, op string, filter, update an
 	case "UpdateMany":
 		res, err = t.Coll.UpdateMany(injectCtx, filter, updateWithTrace, opts...)
 	}
+	t.setCapturedServerAttrs(span, capture)
 	shared.RecordSpanError(span, err)
 	if err != nil {
 		return nil, err
@@ -200,6 +219,7 @@ func (t *Collection) ReplaceOne(ctx context.Context, filter any, replacement any
 		trace.WithAttributes(shared.DBAttributes(dbName, collName, "update", 0, t.ServerAddr, t.ServerPort)...),
 	)
 	defer span.End()
+	ctx, capture := shared.WithAddrCapture(ctx)
 
 	injectCtx, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
 	defer deliverSpan.End()
@@ -212,6 +232,7 @@ func (t *Collection) ReplaceOne(ctx context.Context, filter any, replacement any
 		replacementToUse = replacementWithTrace
 	}
 	res, err := t.Coll.ReplaceOne(injectCtx, filter, replacementToUse, opts...)
+	t.setCapturedServerAttrs(span, capture)
 	shared.RecordSpanError(span, err)
 	if err != nil {
 		return nil, err
@@ -236,6 +257,7 @@ func (t *Collection) runDelete(ctx context.Context, op string, filter any, opts 
 		trace.WithAttributes(shared.DBAttributes(dbName, collName, "delete", 0, t.ServerAddr, t.ServerPort)...),
 	)
 	defer span.End()
+	ctx, capture := shared.WithAddrCapture(ctx)
 
 	_, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
 	defer deliverSpan.End()
@@ -250,6 +272,7 @@ func (t *Collection) runDelete(ctx context.Context, op string, filter any, opts 
 	case "DeleteMany":
 		res, err = t.Coll.DeleteMany(ctx, filter, opts...)
 	}
+	t.setCapturedServerAttrs(span, capture)
 	shared.RecordSpanError(span, err)
 	if err != nil {
 		return nil, err
@@ -265,11 +288,13 @@ func (t *Collection) CountDocuments(ctx context.Context, filter any, opts ...*op
 		trace.WithAttributes(shared.DBAttributes(dbName, collName, "aggregate", 0, t.ServerAddr, t.ServerPort)...),
 	)
 	defer span.End()
+	ctx, capture := shared.WithAddrCapture(ctx)
 
 	_, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
 	defer deliverSpan.End()
 
 	n, err := t.Coll.CountDocuments(ctx, filter, opts...)
+	t.setCapturedServerAttrs(span, capture)
 	shared.RecordSpanError(span, err)
 	return n, err
 }
@@ -282,11 +307,13 @@ func (t *Collection) Distinct(ctx context.Context, fieldName string, filter any,
 		trace.WithAttributes(shared.DBAttributes(dbName, collName, "distinct", 0, t.ServerAddr, t.ServerPort)...),
 	)
 	defer span.End()
+	ctx, capture := shared.WithAddrCapture(ctx)
 
 	_, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
 	defer deliverSpan.End()
 
 	vals, err := t.Coll.Distinct(ctx, fieldName, filter, opts...)
+	t.setCapturedServerAttrs(span, capture)
 	shared.RecordSpanError(span, err)
 	return vals, err
 }
@@ -299,11 +326,13 @@ func (t *Collection) Aggregate(ctx context.Context, pipeline any, opts ...*optio
 		trace.WithAttributes(shared.DBAttributes(dbName, collName, "aggregate", 0, t.ServerAddr, t.ServerPort)...),
 	)
 	defer span.End()
+	ctx, capture := shared.WithAddrCapture(ctx)
 
 	_, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
 	defer deliverSpan.End()
 
 	cursor, err := t.Coll.Aggregate(ctx, pipeline, opts...)
+	t.setCapturedServerAttrs(span, capture)
 	shared.RecordSpanError(span, err)
 	if err != nil {
 		return nil, nil, err
@@ -319,6 +348,7 @@ func (t *Collection) UpdateByID(ctx context.Context, id any, update any, opts ..
 		trace.WithAttributes(shared.DBAttributes(dbName, collName, "update", 0, t.ServerAddr, t.ServerPort)...),
 	)
 	defer span.End()
+	ctx, capture := shared.WithAddrCapture(ctx)
 
 	injectCtx, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
 	defer deliverSpan.End()
@@ -333,6 +363,7 @@ func (t *Collection) UpdateByID(ctx context.Context, id any, update any, opts ..
 		}
 	}
 	res, err := t.Coll.UpdateByID(injectCtx, id, updateWithTrace, opts...)
+	t.setCapturedServerAttrs(span, capture)
 	shared.RecordSpanError(span, err)
 	if err != nil {
 		return nil, err
@@ -348,6 +379,7 @@ func (t *Collection) BulkWrite(ctx context.Context, models []mongo.WriteModel, o
 		trace.WithAttributes(shared.DBAttributes(dbName, collName, "bulkWrite", len(models), t.ServerAddr, t.ServerPort)...),
 	)
 	defer span.End()
+	ctx, capture := shared.WithAddrCapture(ctx)
 
 	injectCtx, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
 	defer deliverSpan.End()
@@ -361,6 +393,7 @@ func (t *Collection) BulkWrite(ctx context.Context, models []mongo.WriteModel, o
 		modelsToWrite = injected
 	}
 	res, err := t.Coll.BulkWrite(injectCtx, modelsToWrite, opts...)
+	t.setCapturedServerAttrs(span, capture)
 	shared.RecordSpanError(span, err)
 	if err != nil {
 		return nil, err
@@ -377,12 +410,17 @@ func (t *Collection) Watch(ctx context.Context, pipeline interface{}, opts ...*o
 		trace.WithAttributes(shared.DBAttributes(dbName, collName, "aggregate", 0, t.ServerAddr, t.ServerPort)...),
 	)
 	defer span.End()
+	ctx, capture := shared.WithAddrCapture(ctx)
 
 	cs, err := t.Coll.Watch(ctx, pipeline, opts...)
+	t.setCapturedServerAttrs(span, capture)
 	shared.RecordSpanError(span, err)
 	if err != nil {
 		return nil, nil, err
 	}
+	// baseSpanOpts seeds the ChangeStream reader's later getMore spans, which are
+	// out of scope for per-command address capture (design non-goal) — they keep
+	// the static t.ServerAddr/ServerPort snapshot, not this Watch call's captured value.
 	baseSpanOpts := []trace.SpanStartOption{
 		trace.WithSpanKind(trace.SpanKindConsumer),
 		trace.WithAttributes(shared.DBAttributes(dbName, collName, "aggregate", 0, t.ServerAddr, t.ServerPort)...),
