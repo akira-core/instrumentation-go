@@ -68,7 +68,7 @@ func (t *Collection) InsertOne(ctx context.Context, document any, opts ...*optio
 	dbName, collName := t.dbAndColl()
 	ctx, span := t.Tracer.Start(ctx, shared.DBSpanName("insert", collName),
 		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(shared.DBAttributes(dbName, collName, "insert", 0, t.ServerAddr, t.ServerPort)...),
+		trace.WithAttributes(shared.DBAttributes(dbName, collName, "insert", 0)...),
 	)
 	defer span.End()
 	ctx, capture := shared.WithAddrCapture(ctx)
@@ -97,7 +97,7 @@ func (t *Collection) InsertMany(ctx context.Context, documents []any, opts ...*o
 	dbName, collName := t.dbAndColl()
 	ctx, span := t.Tracer.Start(ctx, shared.DBSpanName("insert", collName),
 		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(shared.DBAttributes(dbName, collName, "insert", len(documents), t.ServerAddr, t.ServerPort)...),
+		trace.WithAttributes(shared.DBAttributes(dbName, collName, "insert", len(documents))...),
 	)
 	defer span.End()
 	ctx, capture := shared.WithAddrCapture(ctx)
@@ -130,7 +130,7 @@ func (t *Collection) Find(ctx context.Context, filter any, opts ...*options.Find
 	dbName, collName := t.dbAndColl()
 	ctx, span := t.Tracer.Start(ctx, shared.DBSpanName("find", collName),
 		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(shared.DBAttributes(dbName, collName, "find", 0, t.ServerAddr, t.ServerPort)...),
+		trace.WithAttributes(shared.DBAttributes(dbName, collName, "find", 0)...),
 	)
 	defer span.End()
 	ctx, capture := shared.WithAddrCapture(ctx)
@@ -152,7 +152,7 @@ func (t *Collection) FindOne(ctx context.Context, filter any, opts ...*options.F
 	dbName, collName := t.dbAndColl()
 	ctx, span := t.Tracer.Start(ctx, shared.DBSpanName("find", collName),
 		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(shared.DBAttributes(dbName, collName, "find", 0, t.ServerAddr, t.ServerPort)...),
+		trace.WithAttributes(shared.DBAttributes(dbName, collName, "find", 0)...),
 	)
 	ctx, capture := shared.WithAddrCapture(ctx)
 	_, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
@@ -176,7 +176,7 @@ func (t *Collection) runUpdate(ctx context.Context, op string, filter, update an
 	dbName, collName := t.dbAndColl()
 	ctx, span := t.Tracer.Start(ctx, shared.DBSpanName("update", collName),
 		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(shared.DBAttributes(dbName, collName, "update", 0, t.ServerAddr, t.ServerPort)...),
+		trace.WithAttributes(shared.DBAttributes(dbName, collName, "update", 0)...),
 	)
 	defer span.End()
 	ctx, capture := shared.WithAddrCapture(ctx)
@@ -216,7 +216,7 @@ func (t *Collection) ReplaceOne(ctx context.Context, filter any, replacement any
 	dbName, collName := t.dbAndColl()
 	ctx, span := t.Tracer.Start(ctx, shared.DBSpanName("update", collName),
 		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(shared.DBAttributes(dbName, collName, "update", 0, t.ServerAddr, t.ServerPort)...),
+		trace.WithAttributes(shared.DBAttributes(dbName, collName, "update", 0)...),
 	)
 	defer span.End()
 	ctx, capture := shared.WithAddrCapture(ctx)
@@ -254,7 +254,7 @@ func (t *Collection) runDelete(ctx context.Context, op string, filter any, opts 
 	dbName, collName := t.dbAndColl()
 	ctx, span := t.Tracer.Start(ctx, shared.DBSpanName("delete", collName),
 		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(shared.DBAttributes(dbName, collName, "delete", 0, t.ServerAddr, t.ServerPort)...),
+		trace.WithAttributes(shared.DBAttributes(dbName, collName, "delete", 0)...),
 	)
 	defer span.End()
 	ctx, capture := shared.WithAddrCapture(ctx)
@@ -285,7 +285,7 @@ func (t *Collection) CountDocuments(ctx context.Context, filter any, opts ...*op
 	dbName, collName := t.dbAndColl()
 	ctx, span := t.Tracer.Start(ctx, shared.DBSpanName("aggregate", collName),
 		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(shared.DBAttributes(dbName, collName, "aggregate", 0, t.ServerAddr, t.ServerPort)...),
+		trace.WithAttributes(shared.DBAttributes(dbName, collName, "aggregate", 0)...),
 	)
 	defer span.End()
 	ctx, capture := shared.WithAddrCapture(ctx)
@@ -304,7 +304,7 @@ func (t *Collection) Distinct(ctx context.Context, fieldName string, filter any,
 	dbName, collName := t.dbAndColl()
 	ctx, span := t.Tracer.Start(ctx, shared.DBSpanName("distinct", collName),
 		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(shared.DBAttributes(dbName, collName, "distinct", 0, t.ServerAddr, t.ServerPort)...),
+		trace.WithAttributes(shared.DBAttributes(dbName, collName, "distinct", 0)...),
 	)
 	defer span.End()
 	ctx, capture := shared.WithAddrCapture(ctx)
@@ -323,7 +323,7 @@ func (t *Collection) Aggregate(ctx context.Context, pipeline any, opts ...*optio
 	dbName, collName := t.dbAndColl()
 	ctx, span := t.Tracer.Start(ctx, shared.DBSpanName("aggregate", collName),
 		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(shared.DBAttributes(dbName, collName, "aggregate", 0, t.ServerAddr, t.ServerPort)...),
+		trace.WithAttributes(shared.DBAttributes(dbName, collName, "aggregate", 0)...),
 	)
 	defer span.End()
 	ctx, capture := shared.WithAddrCapture(ctx)
@@ -345,7 +345,7 @@ func (t *Collection) UpdateByID(ctx context.Context, id any, update any, opts ..
 	dbName, collName := t.dbAndColl()
 	ctx, span := t.Tracer.Start(ctx, shared.DBSpanName("update", collName),
 		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(shared.DBAttributes(dbName, collName, "update", 0, t.ServerAddr, t.ServerPort)...),
+		trace.WithAttributes(shared.DBAttributes(dbName, collName, "update", 0)...),
 	)
 	defer span.End()
 	ctx, capture := shared.WithAddrCapture(ctx)
@@ -376,7 +376,7 @@ func (t *Collection) BulkWrite(ctx context.Context, models []mongo.WriteModel, o
 	dbName, collName := t.dbAndColl()
 	ctx, span := t.Tracer.Start(ctx, shared.DBSpanName("bulkWrite", collName),
 		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(shared.DBAttributes(dbName, collName, "bulkWrite", len(models), t.ServerAddr, t.ServerPort)...),
+		trace.WithAttributes(shared.DBAttributes(dbName, collName, "bulkWrite", len(models))...),
 	)
 	defer span.End()
 	ctx, capture := shared.WithAddrCapture(ctx)
@@ -407,7 +407,7 @@ func (t *Collection) Watch(ctx context.Context, pipeline interface{}, opts ...*o
 	spanName := shared.DBSpanName("aggregate", collName)
 	ctx, span := t.Tracer.Start(ctx, spanName,
 		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(shared.DBAttributes(dbName, collName, "aggregate", 0, t.ServerAddr, t.ServerPort)...),
+		trace.WithAttributes(shared.DBAttributes(dbName, collName, "aggregate", 0)...),
 	)
 	defer span.End()
 	ctx, capture := shared.WithAddrCapture(ctx)
@@ -423,7 +423,7 @@ func (t *Collection) Watch(ctx context.Context, pipeline interface{}, opts ...*o
 	// the static t.ServerAddr/ServerPort snapshot, not this Watch call's captured value.
 	baseSpanOpts := []trace.SpanStartOption{
 		trace.WithSpanKind(trace.SpanKindConsumer),
-		trace.WithAttributes(shared.DBAttributes(dbName, collName, "aggregate", 0, t.ServerAddr, t.ServerPort)...),
+		trace.WithAttributes(shared.DBAttributes(dbName, collName, "aggregate", 0)...),
 	}
 	deliverAttrs := shared.DeliverAttributes(dbName, collName, t.ServerAddr, t.ServerPort)
 	return cs, NewChangeStream(cs, ChangeStreamConfig{
