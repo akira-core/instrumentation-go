@@ -24,6 +24,7 @@
 - [x] 4.2 Add a test asserting the caller-supplied `SetMonitor` chaining requirement from the spec (`Requirement: Caller-supplied CommandMonitor is chained, not replaced`) — both callbacks fire, nil-subset caller monitor doesn't panic.
 - [x] 4.3 Add a test asserting the fallback requirement (`Requirement: Fallback to static URI-derived address`) — when the capture holder never gets written, `t.ServerAddr`/`t.ServerPort` are used, matching pre-change behavior exactly.
 - [x] 4.4 Add a test for the default-port omission under capture: a captured `ConnectionID` of `host:27017[-1]` emits `server.address` only (no `server.port`), while `host:27018[-1]` emits both — matching `ServerAttributes`' 27017 rule.
+- [x] 4.5 Harden the post-call `setCapturedServerAttrs` against inject-failure early returns (review follow-up): change the call sites from an explicit post-driver-call statement to `defer t.setCapturedServerAttrs(span, capture)` registered immediately after `WithAddrCapture` (so LIFO runs it before the `defer span.End()` above). Without this, `InsertOne`/`InsertMany`/`ReplaceOne`/`BulkWrite` returning early on `_oteltrace` inject / BSON-encode failure skip the static fallback entirely, emitting a span with no `server.*` — violating the `Fallback to static URI-derived address` requirement. `FindOne` keeps its explicit call (it hands the still-open span to its `SingleResult`). Add v1 tests asserting `InsertOne` and `BulkWrite` inject-failure spans still carry the static `server.address`/`server.port`.
 
 ## 5. otel-mongo v2 — mirror v1 (parity)
 
@@ -31,6 +32,7 @@
 - [x] 5.2 Apply tasks 2.1–2.3 identically to `v2/client.go` — v2's `ConnectWithOptions` **already** does `merged := options.MergeClientOptions(opts...)` before `mongo.Connect(merged)`, so 2.1 reduces to inserting `merged.SetMonitor(shared.NewCommandMonitor(merged.Monitor))` after that merge (no signature/flow change; v2 `mongo.Connect` takes no `ctx`).
 - [x] 5.3 Apply tasks 3.1–3.3 identically to `v2/internal/traced/collection.go` (16 call sites).
 - [x] 5.4 Apply tasks 4.1–4.4 identically to `v2/`.
+- [x] 5.6 Apply task 4.5 identically to `v2/internal/traced/collection.go` (14 CRUD sites → `defer`, `FindOne` explicit; note v2 `Distinct` returns `*mongo.DistinctResult` and its explicit call site is followed by `deliverSpan.End()`, not `RecordSpanError`) + v2 inject-failure tests.
 - [x] 5.5 `go build ./... && go test -v -race ./... && golangci-lint run ./...` in `otel-mongo/v2/` — all pass; direct/ grep clean.
 
 ## 6. Docs + version bump
