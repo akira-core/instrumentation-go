@@ -56,8 +56,11 @@ func DBSpanName(operation, collectionName string) string {
 	return operation + " " + collectionName
 }
 
-// DBAttributes returns attributes for a MongoDB client span.
-func DBAttributes(dbName, collName, operation string, batchSize int, serverAddr string, serverPort int) []attribute.KeyValue {
+// DBAttributes returns attributes for a MongoDB client span. It emits db.* only;
+// server.address/server.port are emitted once, post-call, via ServerAttributes
+// (see monitor.go) from the per-command captured address, so the exported
+// server.* is always a same-source pair with no stale-port hazard.
+func DBAttributes(dbName, collName, operation string, batchSize int) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{
 		attribute.String(keyDBSystemName, dbSystemMongoDB),
 		attribute.String(keyDBCollection, collName),
@@ -69,15 +72,15 @@ func DBAttributes(dbName, collName, operation string, batchSize int, serverAddr 
 	if batchSize >= 2 {
 		attrs = append(attrs, attribute.Int(keyDBOpBatchSize, batchSize))
 	}
-	return append(attrs, ServerAttributes(serverAddr, serverPort)...)
+	return attrs
 }
 
 // ServerAttributes returns the server.address/server.port attribute pair for
 // serverAddr/serverPort, following semconv defaulting rules: nil when
 // serverAddr is empty, server.port omitted when serverPort is the MongoDB
-// default (27017). Used both for the start-time db.* attribute set
-// (DBAttributes) and to overwrite server.* post-call with the per-command
-// captured address (see monitor.go).
+// default (27017). It is the sole emitter of server.*, called once post-call
+// with the per-command captured address (see monitor.go); DBAttributes no
+// longer emits server.* at span start.
 func ServerAttributes(serverAddr string, serverPort int) []attribute.KeyValue {
 	if serverAddr == "" {
 		return nil

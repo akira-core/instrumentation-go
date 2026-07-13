@@ -34,12 +34,14 @@ func TestServerAttributes(t *testing.T) {
 	})
 }
 
-func TestDBAttributes_UsesServerAttributesInternally(t *testing.T) {
-	// DBAttributes and ServerAttributes must not drift: DBAttributes' server.*
-	// tail is produced by calling ServerAttributes internally (see design.md
-	// Decision 2, "Helper split").
-	dbAttrs := DBAttributes("db", "coll", "find", 0, "host", 27018)
-	serverAttrs := ServerAttributes("host", 27018)
-	require.GreaterOrEqual(t, len(dbAttrs), len(serverAttrs))
-	assert.Equal(t, serverAttrs, dbAttrs[len(dbAttrs)-len(serverAttrs):])
+func TestDBAttributes_EmitsNoServerAttrs(t *testing.T) {
+	// Post Decision 2: DBAttributes emits db.* only. server.* is emitted once,
+	// post-call, via ServerAttributes (see design.md Decision 2) — so DBAttributes
+	// must carry no server.address/server.port key at span start.
+	attrs := DBAttributes("db", "coll", "find", 0)
+	for _, kv := range attrs {
+		k := string(kv.Key)
+		assert.NotEqual(t, "server.address", k)
+		assert.NotEqual(t, "server.port", k)
+	}
 }
