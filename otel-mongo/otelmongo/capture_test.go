@@ -2,6 +2,7 @@ package otelmongo
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -27,7 +28,21 @@ func TestCollectionCapturesPerCommandServerAddress(t *testing.T) {
 	uri := requireMongoDB(t)
 	ctx := context.Background()
 
-	clientOpts := options.Client().ApplyURI(uri).SetMonitor(shared.NewCommandMonitor(nil))
+	// An independent chained monitor records the insert command's real
+	// ConnectionID straight from the driver. It is the oracle for the assertion
+	// below: rather than compare against the URI (which for a replica-set
+	// container legitimately differs from the advertised connection host — the
+	// very reason per-command capture exists), we compare the span attribute
+	// against the address the driver itself reported for this exact command.
+	var insertConnID string
+	oracle := &event.CommandMonitor{
+		Started: func(_ context.Context, ev *event.CommandStartedEvent) {
+			if ev.CommandName == "insert" {
+				insertConnID = ev.ConnectionID
+			}
+		},
+	}
+	clientOpts := options.Client().ApplyURI(uri).SetMonitor(shared.NewCommandMonitor(oracle))
 	mc, err := mongo.Connect(ctx, clientOpts)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = mc.Disconnect(context.Background()) })
@@ -54,14 +69,37 @@ func TestCollectionCapturesPerCommandServerAddress(t *testing.T) {
 	span := spans[len(spans)-1]
 
 	var gotAddr string
+	var gotPort int64
+	var sawPort bool
 	for _, kv := range span.Attributes() {
-		if string(kv.Key) == "server.address" {
+		switch string(kv.Key) {
+		case "server.address":
 			gotAddr = kv.Value.AsString()
+		case "server.port":
+			gotPort = kv.Value.AsInt64()
+			sawPort = true
 		}
 	}
-	assert.NotEmpty(t, gotAddr)
 	assert.NotEqual(t, "bogus-fallback-host", gotAddr,
 		"expected the per-command captured address to override the deliberately wrong static fallback")
+
+	// Strengthened beyond "not the bogus fallback": the span must carry the exact
+	// host:port the driver reported for this insert command, parsed from the
+	// oracle monitor's independently-observed ConnectionID (format "<addr>[-<n>]").
+	require.NotEmpty(t, insertConnID, "oracle monitor should have observed the insert command's ConnectionID")
+	connAddr := insertConnID
+	if i := strings.LastIndexByte(connAddr, '['); i >= 0 {
+		connAddr = connAddr[:i]
+	}
+	wantAddr, wantPort := shared.SplitHostPort(connAddr)
+	require.NotEmpty(t, wantAddr, "test setup: could not parse host from ConnectionID %q", insertConnID)
+	assert.Equal(t, wantAddr, gotAddr, "captured server.address should match the driver's ConnectionID")
+	if wantPort != 27017 {
+		require.True(t, sawPort, "expected server.port for the non-default connection port")
+		assert.Equal(t, int64(wantPort), gotPort, "captured server.port should match the driver's ConnectionID")
+	} else {
+		assert.False(t, sawPort, "server.port omitted for the default 27017 per semconv")
+	}
 }
 
 // TestCollectionCapturesPerCommandServerAddress_ChainsCallerMonitor mirrors the
