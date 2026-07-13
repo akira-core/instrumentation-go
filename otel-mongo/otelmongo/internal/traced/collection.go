@@ -63,6 +63,18 @@ func (t *Collection) setCapturedServerAttrs(span trace.Span, capture *shared.Add
 	}
 }
 
+// changeStreamReaderAttrs builds the attribute set for the ChangeStream reader's
+// getMore consumer spans: db.* plus the static server.* snapshot. Those spans are
+// out of scope for per-command capture (design non-goal), so — unlike CRUD sites,
+// which emit server.* once post-call from the captured value — they keep the
+// Connect-time static t.ServerAddr/ServerPort. Since DBAttributes no longer emits
+// server.*, ServerAttributes must be appended here or the reader spans would carry
+// no server.address at all.
+func (t *Collection) changeStreamReaderAttrs(dbName, collName string) []attribute.KeyValue {
+	attrs := shared.DBAttributes(dbName, collName, "aggregate", 0)
+	return append(attrs, shared.ServerAttributes(t.ServerAddr, t.ServerPort)...)
+}
+
 // InsertOne inserts a single document; wraps *mongo.Collection with a CLIENT span (and propagation when enabled).
 func (t *Collection) InsertOne(ctx context.Context, document any, opts ...*options.InsertOneOptions) (*mongo.InsertOneResult, error) {
 	dbName, collName := t.dbAndColl()
@@ -423,7 +435,7 @@ func (t *Collection) Watch(ctx context.Context, pipeline interface{}, opts ...*o
 	// the static t.ServerAddr/ServerPort snapshot, not this Watch call's captured value.
 	baseSpanOpts := []trace.SpanStartOption{
 		trace.WithSpanKind(trace.SpanKindConsumer),
-		trace.WithAttributes(shared.DBAttributes(dbName, collName, "aggregate", 0)...),
+		trace.WithAttributes(t.changeStreamReaderAttrs(dbName, collName)...),
 	}
 	deliverAttrs := shared.DeliverAttributes(dbName, collName, t.ServerAddr, t.ServerPort)
 	return cs, NewChangeStream(cs, ChangeStreamConfig{
