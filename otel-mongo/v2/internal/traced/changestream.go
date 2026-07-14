@@ -4,7 +4,6 @@ import (
 	"context"
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
@@ -20,9 +19,6 @@ type ChangeStream struct {
 	propagationEnabled bool
 	spanName           string
 	baseSpanOpts       []trace.SpanStartOption
-	deliverTracer      trace.Tracer
-	deliverSpanName    string
-	deliverAttrs       []attribute.KeyValue
 }
 
 // ChangeStreamConfig groups construction parameters for NewChangeStream.
@@ -32,9 +28,6 @@ type ChangeStreamConfig struct {
 	PropagationEnabled bool
 	SpanName           string
 	BaseSpanOpts       []trace.SpanStartOption
-	DeliverTracer      trace.Tracer
-	DeliverSpanName    string
-	DeliverAttrs       []attribute.KeyValue
 }
 
 // NewChangeStream wraps cs with the enabled-path ChangeStream impl.
@@ -46,9 +39,6 @@ func NewChangeStream(cs *mongo.ChangeStream, cfg ChangeStreamConfig) *ChangeStre
 		propagationEnabled: cfg.PropagationEnabled,
 		spanName:           cfg.SpanName,
 		baseSpanOpts:       cfg.BaseSpanOpts,
-		deliverTracer:      cfg.DeliverTracer,
-		deliverSpanName:    cfg.DeliverSpanName,
-		deliverAttrs:       cfg.DeliverAttrs,
 	}
 }
 
@@ -67,7 +57,7 @@ func (c *ChangeStream) DecodeWithContext(ctx context.Context, val any) (context.
 		}
 	}
 
-	newCtx, span := buildConsumerCtx(ctx, c.tracer, c.deliverTracer, c.deliverSpanName, c.deliverAttrs, c.spanName, c.baseSpanOpts, originSpanCtx)
+	newCtx, span := buildLinkedSpanCtx(ctx, c.tracer, c.spanName, c.baseSpanOpts, originSpanCtx)
 
 	if err := c.cs.Decode(val); err != nil {
 		span.RecordError(err)
@@ -83,26 +73,15 @@ func (c *ChangeStream) DecodeWithContext(ctx context.Context, val any) (context.
 // Decode delegates to *mongo.ChangeStream.Decode.
 func (c *ChangeStream) Decode(val any) error { return c.cs.Decode(val) }
 
-// buildConsumerCtx creates a detached context with a consumer span linked to originSpanCtx.
-func buildConsumerCtx(ctx context.Context, tracer trace.Tracer, deliverTracer trace.Tracer, deliverSpanName string, deliverAttrs []attribute.KeyValue, spanName string, baseSpanOpts []trace.SpanStartOption, originSpanCtx trace.SpanContext) (context.Context, trace.Span) {
+// buildLinkedSpanCtx creates a detached context with a span linked to
+// originSpanCtx (when valid).
+func buildLinkedSpanCtx(ctx context.Context, tracer trace.Tracer, spanName string, baseSpanOpts []trace.SpanStartOption, originSpanCtx trace.SpanContext) (context.Context, trace.Span) {
 	detachedCtx := trace.ContextWithSpanContext(ctx, trace.SpanContext{})
-	consumerCtx := detachedCtx
-
-	if deliverTracer != nil && originSpanCtx.IsValid() {
-		_, deliverSpan := deliverTracer.Start(detachedCtx,
-			deliverSpanName,
-			trace.WithSpanKind(trace.SpanKindProducer),
-			trace.WithAttributes(deliverAttrs...),
-			trace.WithLinks(trace.Link{SpanContext: originSpanCtx}),
-		)
-		deliverSpan.End()
-		consumerCtx = trace.ContextWithRemoteSpanContext(detachedCtx, deliverSpan.SpanContext())
-	}
 
 	spanOpts := append([]trace.SpanStartOption{}, baseSpanOpts...)
 	if originSpanCtx.IsValid() {
 		spanOpts = append(spanOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
 	}
 
-	return tracer.Start(consumerCtx, spanName, spanOpts...)
+	return tracer.Start(detachedCtx, spanName, spanOpts...)
 }

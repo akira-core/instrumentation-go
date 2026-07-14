@@ -12,10 +12,10 @@ Instrumentation packages **do not** create a global `TracerProvider`. They use `
 
 | Package | Import path | Version (source) | Description |
 |---------|-------------|------------------|-------------|
-| **otel-mongo** (v1) | `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | 0.6.0 | MongoDB driver v1 wrapper; `_oteltrace` on writes; `ContextFromDocument` / decode helpers; optional deliver spans. |
-| **otel-mongo/v2** | `github.com/akira-core/instrumentation-go/otel-mongo/v2` | 0.6.0 | MongoDB driver v2 wrapper; parity with v1. |
-| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.6.0 | Core NATS; W3C context in message headers; deliver spans. |
-| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.6.0 | JetStream publish/consume/fetch; deliver spans. |
+| **otel-mongo** (v1) | `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | 0.6.2 | MongoDB driver v1 wrapper; `_oteltrace` on writes; `ContextFromDocument` / decode helpers. |
+| **otel-mongo/v2** | `github.com/akira-core/instrumentation-go/otel-mongo/v2` | 0.6.2 | MongoDB driver v2 wrapper; parity with v1. |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.6.2 | Core NATS; W3C context in message headers. |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.6.2 | JetStream publish/consume/fetch. |
 | **otel-gorilla-ws** | `github.com/akira-core/instrumentation-go/otel-gorilla-ws` | 0.6.0 | Trace context in JSON message body (envelope); `NewConn` / `Dial`. |
 
 Per-module docs: [otel-mongo/README.md](otel-mongo/README.md), [otel-nats/README.md](otel-nats/README.md), [otel-gorilla-ws/README.md](otel-gorilla-ws/README.md) (each also ships a [README.zh-TW.md](otel-mongo/README.zh-TW.md): [otel-nats](otel-nats/README.zh-TW.md), [otel-gorilla-ws](otel-gorilla-ws/README.zh-TW.md)).
@@ -40,7 +40,7 @@ Switches are **opt-in via environment variables**: if a variable is **unset**, i
 | Env var | Scope | When unset | Effect |
 |---------|-------|------------|--------|
 | `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | All modules | off | Global gate. Must be on for module-level tracing flags and (for Mongo) document propagation to apply. |
-| `OTEL_MONGO_TRACING_ENABLED` | `otel-mongo` + `otel-mongo/v2` | off | CLIENT spans, deliver-span wiring, non-noop tracer for the wrapper. |
+| `OTEL_MONGO_TRACING_ENABLED` | `otel-mongo` + `otel-mongo/v2` | off | CLIENT spans, non-noop tracer for the wrapper. |
 | `OTEL_MONGO_PROPAGATION_ENABLED` | `otel-mongo` + `otel-mongo/v2` | off | Inject/extract `_oteltrace` on writes/reads; still gated by the global switch above. |
 | `OTEL_NATS_TRACING_ENABLED` | `otelnats` + `oteljetstream` | off | NATS/JetStream wrapper tracing. |
 | `OTEL_GORILLA_WS_TRACING_ENABLED` | `otel-gorilla-ws` | off | WebSocket wrapper tracing. |
@@ -88,10 +88,8 @@ Packages use [`log/slog`](https://pkg.go.dev/log/slog); with the default handler
 
 | Package | Level | Events |
 |---------|-------|--------|
-| `otel-nats` | `DEBUG` | Server address parse failure, deliver tracer init success |
-| `otel-nats` | `WARN` | Deliver tracer init failure (endpoint missing or unreachable) |
-| `otel-mongo` | `DEBUG` | Deliver tracer init success |
-| `otel-mongo` | `WARN` | OTLP exporter / resource creation failure |
+| `otel-nats` | `DEBUG` | Server address parse failure |
+| `otel-nats` | `DEBUG`/`WARN` | Trace-event unmarshal failure (when `WithTraceDestination` is used) |
 
 Example:
 
@@ -101,17 +99,4 @@ slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 })))
 ```
 
-Prefixes include `otelnats:` and `otelmongo:` with structured fields (`reason`, `error`, `service`, `endpoint`).
-
----
-
-## `OTEL_EXPORTER_OTLP_ENDPOINT` format
-
-**Deliver spans** (otel-mongo, otel-nats) use this env var to build a small separate exporter for synthetic “broker” spans. Use an explicit endpoint:
-
-| Protocol | Format | Example |
-|----------|--------|---------|
-| OTLP/HTTP | Full URL with scheme | `http://otel-collector:4318` |
-| OTLP/gRPC | `host:port` (no scheme) | `otel-collector:4317` |
-
-Bare hostnames without scheme or port (e.g. `otel-collector` alone) are **not** supported.
+Prefix: `otelnats:` with structured fields (`reason`, `error`, `addr`).

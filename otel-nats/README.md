@@ -15,7 +15,7 @@ otel-nats/
 ├── otelnats/               # Core NATS: Connect, Conn, Publish, Subscribe, Request, HeaderCarrier
 │   ├── connect.go          # Connect, ConnectWithOptions, ConnectTLS, ConnectWithCredentials
 │   ├── conn.go             # Conn, connImpl interface, Options (WithTracerProvider, WithPropagators, WithTraceDestination)
-│   ├── conn_traced.go      # tracedConn: instrumented connImpl (spans, propagation, deliver spans)
+│   ├── conn_traced.go      # tracedConn: instrumented connImpl (spans, propagation)
 │   ├── conn_direct.go      # directConn: passthrough connImpl used when tracing is disabled
 │   ├── traceevent.go       # WithTraceDestination / SubscribeTraceEvents / TraceEvent / TraceHop (NATS 2.11+ trace events)
 │   ├── propagation.go      # HeaderCarrier (nats.Header ↔ TextMapCarrier)
@@ -105,13 +105,13 @@ Optional: pass **WithTracerProvider(tp)** or **WithPropagators(p)** to **Connect
 
 ### 3. Request/Reply
 
-`Conn.Request` / `RequestWithContext` / `RequestMsg` / `RequestMsgWithContext` mirror the equivalent `nats.Conn` methods exactly, but open a CLIENT span for the RPC and a CONSUMER span for the reply:
+`Conn.Request` / `RequestWithContext` / `RequestMsg` / `RequestMsgWithContext` mirror the equivalent `nats.Conn` methods exactly, but open a CLIENT span for the RPC and a second, linked CLIENT span for the reply (`receive` — a pull per the OTel messaging span-kind mapping):
 
 ```go
 reply, err := conn.RequestWithContext(ctx, "subject", []byte("ping"))
 if err != nil { log.Fatal(err) }
 // reply.Data — trace context for the request/reply pair is recorded on the CLIENT span;
-// the reply itself is recorded as a linked CONSUMER span.
+// the reply itself is recorded as a linked CLIENT "receive" span.
 ```
 
 `Request` / `RequestMsg` have no `context.Context` parameter (mirroring `nats.Conn`), so their producer span is rooted at `context.Background()` — use `RequestWithContext` / `RequestMsgWithContext` to chain into an existing trace.
@@ -172,37 +172,29 @@ conn, err := otelnats.Connect(url, nil)
 | **ConnectTLS** | `ConnectTLS(url, certFile, keyFile, caFile string, natsOpts ...nats.Option)`. Connects with mutual TLS. |
 | **ConnectWithCredentials** | `ConnectWithCredentials(url, credFile string, natsOpts ...nats.Option)`. Connects with JWT/NKey credentials. |
 | **ScopeName / Version()** | Used when creating Tracer (OTel contrib guideline). |
-| **Request / RequestWithContext / RequestMsg / RequestMsgWithContext** | RPC helpers mirroring `nats.Conn`; open a CLIENT span for the request and a linked CONSUMER span for the reply. |
+| **Request / RequestWithContext / RequestMsg / RequestMsgWithContext** | RPC helpers mirroring `nats.Conn`; open a CLIENT span for the request and a linked CLIENT span for the reply receive. |
 | **JetStream consumer managers** | `JetStream` fully wraps `StreamConsumerManager`; `Stream` fully wraps `ConsumerManager`. Methods returning `Consumer` or `PushConsumer` remain trace-enabled wrappers (see JetStream section). |
 | **WithTraceDestination / SubscribeTraceEvents** | Convert NATS 2.11+ infrastructure trace events into OTel spans (see **NATS 2.11+ Trace Events**). |
 | **Tests** | Use `otel.SetTracerProvider(tp)` (and `otel.SetTextMapPropagator(prop)` if needed) before Connect. |
 
 ---
 
-## Deliver Spans (Service Graph)
+## Span kinds
 
-When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, otelnats/oteljetstream creates synthetic "deliver" spans so NATS appears as a broker in Grafana service graph.
-
-### Span hierarchy
+Span kind follows the OTel messaging "Span kind" mapping (`send` → `PRODUCER`, `receive` (pull) → `CLIENT`, `process` (push) → `CONSUMER`):
 
 ```
-send subject (PRODUCER, api)
-  └── subject deliver (CONSUMER, nats://addr)  ← injected into headers
+Publish / PublishMsg                     PRODUCER  (send)
+Request / RequestWithContext / ...       CLIENT    (request, awaits reply)
+  └── receive <reply-subject>            CLIENT    (linked reply receive, pull)
+Subscribe / QueueSubscribe handler       CONSUMER  (process, push-delivered)
 
-process subject (CONSUMER, worker)  ← links to deliver span
+JetStream publish                        PRODUCER  (send)
+JetStream Consume handler                CONSUMER  (process, push-delivered callback)
+JetStream Fetch / Messages / Next        CLIENT    (linked receive, pull)
 ```
 
-### Resulting service graph
-
-```
-api ──► nats ──► worker
-```
-
-Deliver spans use an independent TracerProvider with `service.name = "nats://{connected_addr}"`. This is initialised automatically during `Connect`; no extra configuration is needed beyond setting the OTLP endpoint.
-
-The endpoint must be a **full URL** for HTTP (e.g. `http://otel-collector:4318`) or **host:port** for gRPC (e.g. `otel-collector:4317`). Bare hostnames without scheme or port are not supported.
-
-Deliver spans additionally require tracing itself to be enabled: both `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` and `OTEL_NATS_TRACING_ENABLED` must be truthy (see **Tracing feature flags**). When tracing is disabled, `Connect` never initialises the deliver-span TracerProvider, regardless of `OTEL_EXPORTER_OTLP_ENDPOINT`.
+JetStream `receive`/`process` spans additionally carry `messaging.consumer.name` (the durable/consumer name); core NATS spans do not.
 
 ---
 
@@ -272,8 +264,8 @@ Uses [`log/slog`](https://pkg.go.dev/log/slog) — no output by default.
 
 | Level | Events |
 |-------|--------|
-| `DEBUG` | Server address parse failure in `serverAttrsFromConn`; deliver tracer initialised successfully; trace event received (`traceevent.go`) |
-| `WARN` | Deliver tracer init failure (exporter or resource creation error); trace event JSON unmarshal failure (`traceevent.go`) |
+| `DEBUG` | Server address parse failure in `serverAttrsFromConn`; trace event received (`traceevent.go`) |
+| `WARN` | Trace event JSON unmarshal failure (`traceevent.go`) |
 
 Enable with a debug-level slog handler at startup:
 
@@ -283,7 +275,7 @@ slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 })))
 ```
 
-Log entries use the `otelnats:` prefix. Connection/deliver-span log lines (`conn.go`) use `error`, `reason`, `service`, and `endpoint` key-value pairs; trace-event log lines (`traceevent.go`) additionally use `raw`, `server`, `hops`, `events`, and `request_headers`.
+Log entries use the `otelnats:` prefix. The connection log line (`conn.go`) uses `addr` and `error`; trace-event log lines (`traceevent.go`) use `raw`, `server`, `hops`, `events`, `error`, and `request_headers`.
 
 ---
 

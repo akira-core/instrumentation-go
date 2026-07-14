@@ -46,7 +46,7 @@ otel-mongo/
 `otel-mongo`（v1 + v2）使用一個全域開關加兩個模組開關：
 
 - `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`（全域總開關）
-- `OTEL_MONGO_TRACING_ENABLED`（控制本套件的 wrapper **CLIENT** span、deliver-span 路徑、與 noop vs 實際 tracer — driver/contrib command span 不受此影響）
+- `OTEL_MONGO_TRACING_ENABLED`（控制本套件的 wrapper **CLIENT** span、與 noop vs 實際 tracer — driver/contrib command span 不受此影響）
 - `OTEL_MONGO_PROPAGATION_ENABLED`（控制 wrapped Collection/Cursor/ChangeStream 的 `_oteltrace` 注入/還原，以及 **ContextFromDocument** / **ContextFromRawDocument**）
 
 預設值：未設定即停用。值為 `false/0/no/off` 視為停用。
@@ -58,7 +58,7 @@ otel-mongo/
 
 設計理由：關閉 Mongo tracing 時連同 Mongo trace propagation 也一併關閉，呼叫端只需一個 kill switch — 不會出現 wrapper span 為 noop 但文件仍被寫入 `_oteltrace` 的情境。
 
-當 tracing 旗標未設定或停用時，本套件的 wrapper 不會送出 Mongo CLIENT span 到你配置的 TracerProvider（noop），**且**寫入的文件不會帶有 `_oteltrace`。Deliver span 另外還需 `OTEL_EXPORTER_OTLP_ENDPOINT`，見下文。
+當 tracing 旗標未設定或停用時，本套件的 wrapper 不會送出 Mongo CLIENT span 到你配置的 TracerProvider（noop），**且**寫入的文件不會帶有 `_oteltrace`。
 
 ### 1. 初始化 Provider 與 Propagator（應用程式負責）
 
@@ -135,39 +135,14 @@ client, err := otelmongo.Connect(opts)
 
 ---
 
-## Deliver Spans（服務關係圖）
+## Span kind
 
-當 `OTEL_EXPORTER_OTLP_ENDPOINT` 已設定時，otelmongo 會建立合成的「deliver」span，將 MongoDB 表示為 Grafana service graph 中的 broker 節點。`Connect` 與 `NewClient` 皆支援此功能 — server address 會從 `options.Client().ApplyURI(uri)` 提供的 URI 解析。
-
-Endpoint 對 HTTP 必須是**完整 URL**（例如 `http://otel-collector:4318`），對 gRPC 則是 **host:port**（例如 `otel-collector:4317`）。不支援沒有 scheme 或 port 的裸主機名稱。
-
-所有 CRUD 操作（insert、find、update、delete、replace、aggregate、bulk write、distinct、count 等）以及 cursor decode 與 change stream 路徑都會產生 deliver span。
-
-### Write path
+MongoDB 是資料庫，不是訊息系統：每個操作 span 一律使用 `CLIENT`（`Watch` 的 change-stream 讀取 span 也不例外 — 它是同步的 `getMore` 呼叫，不是非同步遞送）。純本地端工作（`Cursor.DecodeWithContext` 未觸發往返時）使用 `INTERNAL`。
 
 ```
-InsertOne (CLIENT, api)
-  └── db.coll deliver (CONSUMER, mongodb)  ← 注入至 _oteltrace
-```
-
-### Read / delete path
-
-```
-FindOne / DeleteOne / ... (CLIENT, api)
-  └── db.coll deliver (CONSUMER, mongodb)
-```
-
-### Change stream path
-
-```
-db.coll deliver (PRODUCER, mongodb)  ← 連結至 producer deliver
-  └── watch coll (CONSUMER, dbwatcher) ← deliver 的子 span
-```
-
-### 產生的服務關係圖
-
-```
-api ──► mongodb ──► dbwatcher
+InsertOne / FindOne / UpdateOne / ... (CLIENT)
+Watch → change-stream 讀取 (CLIENT)
+Cursor.DecodeWithContext (INTERNAL；文件帶 `_oteltrace` 時連結回原始 span)
 ```
 
 ---
@@ -223,27 +198,6 @@ api ──► mongodb ──► dbwatcher
 **呼叫端自行提供的 `SetMonitor` 會被串接，而非取代。** 若你在傳入 `Connect`/`ConnectWithOptions` 的 `*options.ClientOptions` 上呼叫了自己的 `SetMonitor(...)`，otelmongo 的位址擷取回呼會先執行，接著原封不動地呼叫你的 `Started`/`Succeeded`/`Failed` 回呼 —— 不會被靜默忽略。
 
 此擷取機制僅在啟用 tracing 的路徑上執行；停用 tracing 時不會註冊任何 `CommandMonitor`，你所提供的 monitor 會完全原樣通過。
-
----
-
-## 診斷紀錄
-
-使用 [`log/slog`](https://pkg.go.dev/log/slog) — 預設無輸出。
-
-| 等級 | 事件 |
-|-------|------|
-| `DEBUG` | Deliver tracer 初始化成功（記錄 `service` 與 `endpoint`） |
-| `WARN` | OTLP exporter 建立失敗；resource 建立失敗 |
-
-啟動時啟用 debug 等級的 slog handler：
-
-```go
-slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-    Level: slog.LevelDebug,
-})))
-```
-
-Log 項目使用 `otelmongo:` 前綴，並附帶 `error`、`reason`、`service`、`endpoint` 等 key-value 欄位。
 
 ---
 

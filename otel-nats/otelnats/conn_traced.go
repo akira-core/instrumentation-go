@@ -14,20 +14,16 @@ import (
 
 // tracedConn is the fully-instrumented connImpl: every Publish/PublishMsg/Request
 // opens a producer span, every wrapMsgHandler closure extracts the incoming trace
-// header and opens a consumer span. deliverTracer is non-nil only when
-// OTEL_EXPORTER_OTLP_ENDPOINT is set; per the construction invariant, tracing
-// is on whenever this impl exists.
+// header and opens a consumer span.
 type tracedConn struct {
-	nc            *nats.Conn
-	tracer        trace.Tracer
-	propagator    propagation.TextMapPropagator
-	serverAttrs   []attribute.KeyValue
-	traceDest     string
-	deliverTracer trace.Tracer // may be nil when no exporter endpoint
+	nc          *nats.Conn
+	tracer      trace.Tracer
+	propagator  propagation.TextMapPropagator
+	serverAttrs []attribute.KeyValue
+	traceDest   string
 }
 
-func (t *tracedConn) TracingEnabled() bool     { return true }
-func (t *tracedConn) DeliverSpanEnabled() bool { return t.deliverTracer != nil }
+func (t *tracedConn) TracingEnabled() bool { return true }
 func (t *tracedConn) TraceContext() (trace.Tracer, propagation.TextMapPropagator) {
 	return t.tracer, t.propagator
 }
@@ -122,19 +118,14 @@ func (t *tracedConn) requestWithCtx(parent context.Context, msg *nats.Msg) (*nat
 }
 
 // startSendSpan opens the PRODUCER span used by Publish/PublishMsg, injects
-// trace context (through a deliver span when configured), and returns the
-// span-carrying context for the underlying driver call. Fire-and-forget
-// semantics: caller does not block on a peer reply.
+// trace context, and returns the span-carrying context for the underlying
+// driver call. Fire-and-forget semantics: caller does not block on a peer reply.
 func (t *tracedConn) startSendSpan(parent context.Context, msg *nats.Msg) (context.Context, trace.Span) {
 	ctx, span := t.tracer.Start(parent, "send "+msg.Subject,
 		trace.WithSpanKind(trace.SpanKindProducer),
 		trace.WithAttributes(publishAttrs(msg, t.serverAttrs)...),
 	)
-	injectCtx := ctx
-	if t.deliverTracer != nil {
-		injectCtx = t.StartDeliverSpan(ctx, msg.Subject)
-	}
-	t.propagator.Inject(injectCtx, &HeaderCarrier{H: msg.Header})
+	t.propagator.Inject(ctx, &HeaderCarrier{H: msg.Header})
 	return ctx, span
 }
 
@@ -142,26 +133,20 @@ func (t *tracedConn) startSendSpan(parent context.Context, msg *nats.Msg) (conte
 // RequestWithContext/RequestMsgWithContext. Request/reply is an RPC pattern
 // (caller blocks on a peer Respond), so PRODUCER kind would mis-classify it.
 // Span name follows OTel naming guidance for RPC client operations:
-// "{destination} request". Propagation inject + deliver-span wrapping match
-// startSendSpan so the responder side sees the same wire format.
+// "{destination} request".
 func (t *tracedConn) startRequestSpan(parent context.Context, msg *nats.Msg) (context.Context, trace.Span) {
 	ctx, span := t.tracer.Start(parent, msg.Subject+" request",
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(requestAttrs(msg, t.serverAttrs)...),
 	)
-	injectCtx := ctx
-	if t.deliverTracer != nil {
-		injectCtx = t.StartDeliverSpan(ctx, msg.Subject)
-	}
-	t.propagator.Inject(injectCtx, &HeaderCarrier{H: msg.Header})
+	t.propagator.Inject(ctx, &HeaderCarrier{H: msg.Header})
 	return ctx, span
 }
 
-// recordReply finalises the producer span with reply size and emits a CONSUMER
-// span representing reply reception — aligned with the Subscribe consumer
-// surface so every inbound message path produces a span + propagation extract.
-// Extracts W3C trace context from reply.Header so any responder-side trace is
-// linked into the receive span.
+// recordReply finalises the producer span with reply size and emits a CLIENT
+// span representing reply reception (a pull "receive" per the OTel messaging
+// span-kind mapping). Extracts W3C trace context from reply.Header so any
+// responder-side trace is linked into the receive span.
 func (t *tracedConn) recordReply(parent context.Context, sendSpan trace.Span, reply *nats.Msg) {
 	sendSpan.SetAttributes(attribute.Int(string(semconv.MessagingMessageBodySizeKey), len(reply.Data)))
 	var originSC trace.SpanContext
@@ -174,7 +159,7 @@ func (t *tracedConn) recordReply(parent context.Context, sendSpan trace.Span, re
 		}
 	}
 	opts := []trace.SpanStartOption{
-		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(receiveAttrs(reply, "", "receive", t.serverAttrs)...),
 	}
 	if originSC.IsValid() {
@@ -192,7 +177,6 @@ func (t *tracedConn) wrapMsgHandler(subject, queue string, handler MsgHandler) n
 	return func(msg *nats.Msg) {
 		msgCtx := t.propagator.Extract(context.Background(), &HeaderCarrier{H: msg.Header})
 		originSpanCtx := trace.SpanContextFromContext(msgCtx)
-		consumerParentCtx := t.ConsumerContextWithDeliver(context.Background(), subject, originSpanCtx)
 		spanName := "process " + subject
 		opts := []trace.SpanStartOption{
 			trace.WithSpanKind(trace.SpanKindConsumer),
@@ -201,50 +185,8 @@ func (t *tracedConn) wrapMsgHandler(subject, queue string, handler MsgHandler) n
 		if originSpanCtx.IsValid() {
 			opts = append(opts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
 		}
-		ctx, span := t.tracer.Start(consumerParentCtx, spanName, opts...)
+		ctx, span := t.tracer.Start(context.Background(), spanName, opts...)
 		defer span.End()
 		handler(Msg{Msg: msg, Ctx: ctx})
-	}
-}
-
-// StartDeliverSpan creates a synthetic CONSUMER span representing NATS broker delivery.
-// When deliverTracer is nil (no OTEL_EXPORTER_OTLP_ENDPOINT) returns ctx unchanged —
-// this is the only remaining runtime check; the !tracingEnabled disjunct is gone
-// because directConn provides its own passthrough implementation.
-func (t *tracedConn) StartDeliverSpan(ctx context.Context, subject string) context.Context {
-	if t.deliverTracer == nil {
-		return ctx
-	}
-	deliverCtx, span := t.deliverTracer.Start(ctx, subject+" deliver",
-		trace.WithSpanKind(trace.SpanKindConsumer),
-		trace.WithAttributes(t.deliverAttrs(subject)...),
-	)
-	span.End()
-	return deliverCtx
-}
-
-// ConsumerContextWithDeliver creates a consumer-side deliver span (SpanKindProducer)
-// linked to origin and returns a context carrying that deliver span as remote
-// parent for consumer spans. The deliverTracer-nil and origin-invalid checks
-// remain per-call concerns.
-func (t *tracedConn) ConsumerContextWithDeliver(ctx context.Context, subject string, origin trace.SpanContext) context.Context {
-	if t.deliverTracer == nil || !origin.IsValid() {
-		return ctx
-	}
-	detachedCtx := trace.ContextWithSpanContext(ctx, trace.SpanContext{})
-	_, deliverSpan := t.deliverTracer.Start(detachedCtx,
-		subject+" deliver",
-		trace.WithSpanKind(trace.SpanKindProducer),
-		trace.WithAttributes(t.deliverAttrs(subject)...),
-		trace.WithLinks(trace.Link{SpanContext: origin}),
-	)
-	deliverSpan.End()
-	return trace.ContextWithRemoteSpanContext(detachedCtx, deliverSpan.SpanContext())
-}
-
-func (t *tracedConn) deliverAttrs(subject string) []attribute.KeyValue {
-	return []attribute.KeyValue{
-		semconv.MessagingSystemKey.String(messagingSystem),
-		semconv.MessagingDestinationNameKey.String(subject),
 	}
 }

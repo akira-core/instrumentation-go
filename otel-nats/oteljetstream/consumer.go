@@ -188,16 +188,15 @@ func newTracedMessageBatch(conn *otelnats.Conn, consumerName string, raw jetstre
 			}
 			msgCtx := prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: h})
 			originSpanCtx := trace.SpanContextFromContext(msgCtx)
-			consumerParentCtx := conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
 			attrs := receiveMsgAttrs(baseAttrs, msg)
 			opts := []trace.SpanStartOption{
-				trace.WithSpanKind(trace.SpanKindConsumer),
+				trace.WithSpanKind(trace.SpanKindClient),
 				trace.WithAttributes(attrs...),
 			}
 			if originSpanCtx.IsValid() {
 				opts = append(opts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
 			}
-			ctx, span := tracer.Start(consumerParentCtx, "receive "+msg.Subject(), opts...)
+			ctx, span := tracer.Start(context.Background(), "receive "+msg.Subject(), opts...)
 			select {
 			case ch <- Msg{Msg: msg, Ctx: ctx}:
 				lastSpan = span

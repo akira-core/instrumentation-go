@@ -86,7 +86,7 @@ func (c *Conn) WriteMessage(ctx context.Context, messageType int, data []byte) e
 		trace.WithSpanKind(trace.SpanKindProducer),
 		trace.WithAttributes(
 			attribute.Int("websocket.message.type", messageType),
-			attribute.Int("messaging.message.body.size", len(data)),
+			attribute.Int("websocket.message.body.size", len(data)),
 		),
 	)
 	defer span.End()
@@ -156,7 +156,7 @@ func (c *Conn) ReadMessage(ctx context.Context) (context.Context, int, []byte, e
 		append(startOpts,
 			trace.WithAttributes(
 				attribute.Int("websocket.message.type", msgType),
-				attribute.Int("messaging.message.body.size", len(payload)),
+				attribute.Int("websocket.message.body.size", len(payload)),
 			),
 		)...,
 	)

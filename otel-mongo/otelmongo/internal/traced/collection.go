@@ -14,9 +14,9 @@ import (
 )
 
 // Collection is the fully-instrumented collectionImpl: wraps every CRUD method
-// with a CLIENT span, a deliver CONSUMER span, and (when PropagationEnabled)
-// _oteltrace document injection. Constructed by the facade NewCollection /
-// newCollectionForDatabase only when the tracing gate is on.
+// with a CLIENT span and (when PropagationEnabled) _oteltrace document
+// injection. Constructed by the facade NewCollection / newCollectionForDatabase
+// only when the tracing gate is on.
 //
 // Fields are exported so tests in the facade package (and elsewhere within
 // this module) can build Collection literals for unit testing without going
@@ -26,7 +26,6 @@ type Collection struct {
 	Tracer             trace.Tracer
 	Propagator         propagation.TextMapPropagator
 	PropagationEnabled bool
-	DeliverTracer      trace.Tracer
 	ServerAddr         string
 	ServerPort         int
 }
@@ -37,21 +36,6 @@ func (t *Collection) dbAndColl() (dbName, collName string) {
 		dbName = t.Coll.Database().Name()
 	}
 	return dbName, collName
-}
-
-// StartDeliverSpan creates a synthetic CONSUMER span representing MongoDB broker delivery.
-// The returned context carries the deliver span, suitable for injecting into documents so
-// change stream consumers link to it. When DeliverTracer is nil, returns a no-op span safe to End.
-func (t *Collection) StartDeliverSpan(ctx context.Context, dbName, collName string) (context.Context, trace.Span) {
-	if t.DeliverTracer == nil {
-		return ctx, trace.SpanFromContext(context.Background())
-	}
-	deliverCtx, span := t.DeliverTracer.Start(ctx,
-		dbName+"."+collName+" deliver",
-		trace.WithSpanKind(trace.SpanKindConsumer),
-		trace.WithAttributes(shared.DeliverAttributes(dbName, collName, t.ServerAddr, t.ServerPort)...),
-	)
-	return deliverCtx, span
 }
 
 // setCapturedServerAttrs overwrites the span's server.address/server.port with the
@@ -76,7 +60,7 @@ func (t *Collection) setCapturedServerAttrs(span trace.Span, capture *shared.Add
 }
 
 // changeStreamReaderAttrs builds the attribute set for the ChangeStream reader's
-// getMore consumer spans: db.* plus the static server.* snapshot. Those spans are
+// getMore spans: db.* plus the static server.* snapshot. Those spans are
 // out of scope for per-command capture (design non-goal), so — unlike CRUD sites,
 // which emit server.* once post-call from the captured value — they keep the
 // Connect-time static t.ServerAddr/ServerPort. Since DBAttributes no longer emits
@@ -98,17 +82,15 @@ func (t *Collection) InsertOne(ctx context.Context, document any, opts ...*optio
 	ctx, capture := shared.WithAddrCapture(ctx)
 	defer t.setCapturedServerAttrs(span, capture)
 
-	injectCtx, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
 	docToInsert := document
 	if t.PropagationEnabled {
-		docWithTrace, err := shared.InjectTraceIntoDocument(injectCtx, document, t.Propagator)
+		docWithTrace, err := shared.InjectTraceIntoDocument(ctx, document, t.Propagator)
 		if err != nil {
 			return nil, fmt.Errorf("otelmongo: inject trace: %w", err)
 		}
 		docToInsert = docWithTrace
 	}
-	res, err := t.Coll.InsertOne(injectCtx, docToInsert, opts...)
+	res, err := t.Coll.InsertOne(ctx, docToInsert, opts...)
 	shared.RecordSpanError(span, err)
 	if err != nil {
 		return nil, err
@@ -127,13 +109,11 @@ func (t *Collection) InsertMany(ctx context.Context, documents []any, opts ...*o
 	ctx, capture := shared.WithAddrCapture(ctx)
 	defer t.setCapturedServerAttrs(span, capture)
 
-	injectCtx, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
 	docsToInsert := documents
 	if t.PropagationEnabled {
 		docsWithTrace := make([]any, 0, len(documents))
 		for _, doc := range documents {
-			d, err := shared.InjectTraceIntoDocument(injectCtx, doc, t.Propagator)
+			d, err := shared.InjectTraceIntoDocument(ctx, doc, t.Propagator)
 			if err != nil {
 				return nil, fmt.Errorf("otelmongo: inject trace: %w", err)
 			}
@@ -141,7 +121,7 @@ func (t *Collection) InsertMany(ctx context.Context, documents []any, opts ...*o
 		}
 		docsToInsert = docsWithTrace
 	}
-	res, err := t.Coll.InsertMany(injectCtx, docsToInsert, opts...)
+	res, err := t.Coll.InsertMany(ctx, docsToInsert, opts...)
 	shared.RecordSpanError(span, err)
 	if err != nil {
 		return nil, err
@@ -160,9 +140,6 @@ func (t *Collection) Find(ctx context.Context, filter any, opts ...*options.Find
 	ctx, capture := shared.WithAddrCapture(ctx)
 	defer t.setCapturedServerAttrs(span, capture)
 
-	_, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
-
 	cursor, err := t.Coll.Find(ctx, filter, opts...)
 	shared.RecordSpanError(span, err)
 	if err != nil {
@@ -179,10 +156,8 @@ func (t *Collection) FindOne(ctx context.Context, filter any, opts ...*options.F
 		trace.WithAttributes(shared.DBAttributes(dbName, collName, "find", 0)...),
 	)
 	ctx, capture := shared.WithAddrCapture(ctx)
-	_, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
 	sr := t.Coll.FindOne(ctx, filter, opts...)
 	t.setCapturedServerAttrs(span, capture)
-	deliverSpan.End()
 	return sr, NewSingleResult(sr, span, ctx, t.Propagator, t.PropagationEnabled)
 }
 
@@ -206,12 +181,10 @@ func (t *Collection) runUpdate(ctx context.Context, op string, filter, update an
 	ctx, capture := shared.WithAddrCapture(ctx)
 	defer t.setCapturedServerAttrs(span, capture)
 
-	injectCtx, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
 	updateWithTrace := update
 	if t.PropagationEnabled {
 		var err error
-		updateWithTrace, err = shared.InjectTraceIntoUpdate(injectCtx, update, t.Propagator)
+		updateWithTrace, err = shared.InjectTraceIntoUpdate(ctx, update, t.Propagator)
 		if err != nil {
 			span.AddEvent("otelmongo.trace_inject_failed",
 				trace.WithAttributes(attribute.String("error.message", err.Error())))
@@ -224,9 +197,9 @@ func (t *Collection) runUpdate(ctx context.Context, op string, filter, update an
 	)
 	switch op {
 	case "UpdateOne":
-		res, err = t.Coll.UpdateOne(injectCtx, filter, updateWithTrace, opts...)
+		res, err = t.Coll.UpdateOne(ctx, filter, updateWithTrace, opts...)
 	case "UpdateMany":
-		res, err = t.Coll.UpdateMany(injectCtx, filter, updateWithTrace, opts...)
+		res, err = t.Coll.UpdateMany(ctx, filter, updateWithTrace, opts...)
 	}
 	shared.RecordSpanError(span, err)
 	if err != nil {
@@ -246,17 +219,15 @@ func (t *Collection) ReplaceOne(ctx context.Context, filter any, replacement any
 	ctx, capture := shared.WithAddrCapture(ctx)
 	defer t.setCapturedServerAttrs(span, capture)
 
-	injectCtx, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
 	replacementToUse := replacement
 	if t.PropagationEnabled {
-		replacementWithTrace, err := shared.InjectTraceIntoDocument(injectCtx, replacement, t.Propagator)
+		replacementWithTrace, err := shared.InjectTraceIntoDocument(ctx, replacement, t.Propagator)
 		if err != nil {
 			return nil, fmt.Errorf("otelmongo: inject trace: %w", err)
 		}
 		replacementToUse = replacementWithTrace
 	}
-	res, err := t.Coll.ReplaceOne(injectCtx, filter, replacementToUse, opts...)
+	res, err := t.Coll.ReplaceOne(ctx, filter, replacementToUse, opts...)
 	shared.RecordSpanError(span, err)
 	if err != nil {
 		return nil, err
@@ -283,9 +254,6 @@ func (t *Collection) runDelete(ctx context.Context, op string, filter any, opts 
 	defer span.End()
 	ctx, capture := shared.WithAddrCapture(ctx)
 	defer t.setCapturedServerAttrs(span, capture)
-
-	_, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
 
 	var (
 		res *mongo.DeleteResult
@@ -315,9 +283,6 @@ func (t *Collection) CountDocuments(ctx context.Context, filter any, opts ...*op
 	ctx, capture := shared.WithAddrCapture(ctx)
 	defer t.setCapturedServerAttrs(span, capture)
 
-	_, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
-
 	n, err := t.Coll.CountDocuments(ctx, filter, opts...)
 	shared.RecordSpanError(span, err)
 	return n, err
@@ -334,9 +299,6 @@ func (t *Collection) Distinct(ctx context.Context, fieldName string, filter any,
 	ctx, capture := shared.WithAddrCapture(ctx)
 	defer t.setCapturedServerAttrs(span, capture)
 
-	_, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
-
 	vals, err := t.Coll.Distinct(ctx, fieldName, filter, opts...)
 	shared.RecordSpanError(span, err)
 	return vals, err
@@ -352,9 +314,6 @@ func (t *Collection) Aggregate(ctx context.Context, pipeline any, opts ...*optio
 	defer span.End()
 	ctx, capture := shared.WithAddrCapture(ctx)
 	defer t.setCapturedServerAttrs(span, capture)
-
-	_, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
 
 	cursor, err := t.Coll.Aggregate(ctx, pipeline, opts...)
 	shared.RecordSpanError(span, err)
@@ -375,19 +334,17 @@ func (t *Collection) UpdateByID(ctx context.Context, id any, update any, opts ..
 	ctx, capture := shared.WithAddrCapture(ctx)
 	defer t.setCapturedServerAttrs(span, capture)
 
-	injectCtx, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
 	updateWithTrace := update
 	if t.PropagationEnabled {
 		var err error
-		updateWithTrace, err = shared.InjectTraceIntoUpdate(injectCtx, update, t.Propagator)
+		updateWithTrace, err = shared.InjectTraceIntoUpdate(ctx, update, t.Propagator)
 		if err != nil {
 			span.AddEvent("otelmongo.trace_inject_failed",
 				trace.WithAttributes(attribute.String("error.message", err.Error())))
 			updateWithTrace = update
 		}
 	}
-	res, err := t.Coll.UpdateByID(injectCtx, id, updateWithTrace, opts...)
+	res, err := t.Coll.UpdateByID(ctx, id, updateWithTrace, opts...)
 	shared.RecordSpanError(span, err)
 	if err != nil {
 		return nil, err
@@ -406,18 +363,16 @@ func (t *Collection) BulkWrite(ctx context.Context, models []mongo.WriteModel, o
 	ctx, capture := shared.WithAddrCapture(ctx)
 	defer t.setCapturedServerAttrs(span, capture)
 
-	injectCtx, deliverSpan := t.StartDeliverSpan(ctx, dbName, collName)
-	defer deliverSpan.End()
 	modelsToWrite := models
 	if t.PropagationEnabled {
-		injected, err := shared.BuildBulkWriteModelsWithTrace(injectCtx, models, t.Propagator)
+		injected, err := shared.BuildBulkWriteModelsWithTrace(ctx, models, t.Propagator)
 		if err != nil {
 			shared.RecordSpanError(span, err)
 			return nil, err
 		}
 		modelsToWrite = injected
 	}
-	res, err := t.Coll.BulkWrite(injectCtx, modelsToWrite, opts...)
+	res, err := t.Coll.BulkWrite(ctx, modelsToWrite, opts...)
 	shared.RecordSpanError(span, err)
 	if err != nil {
 		return nil, err
@@ -446,18 +401,14 @@ func (t *Collection) Watch(ctx context.Context, pipeline interface{}, opts ...*o
 	// out of scope for per-command address capture (design non-goal) — they keep
 	// the static t.ServerAddr/ServerPort snapshot, not this Watch call's captured value.
 	baseSpanOpts := []trace.SpanStartOption{
-		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(t.changeStreamReaderAttrs(dbName, collName)...),
 	}
-	deliverAttrs := shared.DeliverAttributes(dbName, collName, t.ServerAddr, t.ServerPort)
 	return cs, NewChangeStream(cs, ChangeStreamConfig{
 		Tracer:             t.Tracer,
 		Propagator:         t.Propagator,
 		PropagationEnabled: t.PropagationEnabled,
 		SpanName:           spanName,
 		BaseSpanOpts:       baseSpanOpts,
-		DeliverTracer:      t.DeliverTracer,
-		DeliverSpanName:    dbName + "." + collName + " deliver",
-		DeliverAttrs:       deliverAttrs,
 	}), nil
 }

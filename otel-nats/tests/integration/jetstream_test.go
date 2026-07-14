@@ -180,7 +180,7 @@ func TestIntegration_ConsumerNextSingleMsg(t *testing.T) {
 		"Next() should return context with valid trace ID")
 	_ = msg.Ack()
 
-	consumer := waitSpanByNameAndKind(t, sr, "receive integ.next.msg", oteltrace.SpanKindConsumer)
+	consumer := waitSpanByNameAndKind(t, sr, "receive integ.next.msg", oteltrace.SpanKindClient)
 	assert.NotNil(t, consumer)
 }
 
@@ -243,7 +243,7 @@ func TestIntegration_FetchTraceContext(t *testing.T) {
 	require.Equal(t, 1, received, "expected exactly 1 message")
 	require.NoError(t, batch.Error())
 
-	consumerSpan := findSpanByKind(sr.Ended(), oteltrace.SpanKindConsumer)
+	consumerSpan := findSpanByKind(sr.Ended(), oteltrace.SpanKindClient)
 	producerSpan := findSpanByKind(sr.Ended(), oteltrace.SpanKindProducer)
 	require.NotNil(t, consumerSpan, "consumer span must exist")
 	if producerSpan != nil && len(consumerSpan.Links()) == 1 {

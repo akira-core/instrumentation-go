@@ -51,8 +51,7 @@ func main() {
 	//
 	//    NewClient(uri, ...ClientOption) parses the server address from
 	//    the URI so that spans include server.address / server.port
-	//    semantic convention attributes, and enables synthetic "deliver"
-	//    spans for change stream consumers.
+	//    semantic convention attributes.
 	//
 	//    It falls back to otel.GetTracerProvider() and
 	//    otel.GetTextMapPropagator() set above. To override per-client,

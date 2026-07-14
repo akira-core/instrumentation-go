@@ -3,6 +3,8 @@ package otelnats
 import (
 	"os"
 	"testing"
+
+	nats "github.com/nats-io/nats.go"
 )
 
 func resetNATSGateForTest() {
@@ -54,5 +56,38 @@ func TestNATSTracingEnabled_GlobalOffOverridesModule(t *testing.T) {
 	t.Cleanup(resetNATSGateForTest)
 	if natsTracingEnabled() {
 		t.Fatal("expected global flag to disable nats tracing")
+	}
+}
+
+// TestNewConn_TracingDisabled_UsesDirectConn covers the disabled-mode
+// invariant at the Conn level: with the tracing gate off, newConn must
+// select directConn (no spans, no propagator, no deliver TracerProvider —
+// the latter no longer exists in the package at all).
+func TestNewConn_TracingDisabled_UsesDirectConn(t *testing.T) {
+	prevGlobal, globalExisted := os.LookupEnv(envGlobalTracingEnabled)
+	prevNATS, natsExisted := os.LookupEnv(envNATSTracingEnabled)
+	_ = os.Unsetenv(envGlobalTracingEnabled)
+	_ = os.Unsetenv(envNATSTracingEnabled)
+	t.Cleanup(func() {
+		if globalExisted {
+			_ = os.Setenv(envGlobalTracingEnabled, prevGlobal)
+		} else {
+			_ = os.Unsetenv(envGlobalTracingEnabled)
+		}
+		if natsExisted {
+			_ = os.Setenv(envNATSTracingEnabled, prevNATS)
+		} else {
+			_ = os.Unsetenv(envNATSTracingEnabled)
+		}
+	})
+	resetNATSGateForTest()
+	t.Cleanup(resetNATSGateForTest)
+
+	conn := newConn(&nats.Conn{})
+	if _, ok := conn.impl.(*directConn); !ok {
+		t.Fatalf("expected *directConn impl when tracing gate is off, got %T", conn.impl)
+	}
+	if conn.TracingEnabled() {
+		t.Fatal("expected TracingEnabled() false")
 	}
 }

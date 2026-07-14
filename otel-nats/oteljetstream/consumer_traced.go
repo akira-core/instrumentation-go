@@ -58,11 +58,10 @@ func (c *tracedConsumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (
 	tracer, prop := c.conn.TraceContext()
 	msgCtx := prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: h})
 	originSpanCtx := trace.SpanContextFromContext(msgCtx)
-	consumerParentCtx := c.conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
 	spanName := "receive " + msg.Subject()
 	attrs := receiveMsgAttrs(receiveBaseAttrs("receive", c.conn.ServerAttrs(), c.consumerName), msg)
 	startOpts := []trace.SpanStartOption{
-		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(attrs...),
 	}
 	if originSpanCtx.IsValid() {
@@ -74,7 +73,7 @@ func (c *tracedConsumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (
 	// The span is ended immediately: a single-shot fetch has no processing-scope
 	// boundary to close it later. Child spans still parent correctly to an ended
 	// span via its still-valid SpanContext.
-	ctx, span := tracer.Start(consumerParentCtx, spanName, startOpts...)
+	ctx, span := tracer.Start(context.Background(), spanName, startOpts...)
 	span.End()
 	return ctx, msg, nil
 }
@@ -158,7 +157,6 @@ func tracedConsumeHandler(conn *otelnats.Conn, consumerName string, handler MsgH
 		}
 		msgCtx := prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: h})
 		originSpanCtx := trace.SpanContextFromContext(msgCtx)
-		consumerParentCtx := conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
 		spanName := "process " + msg.Subject()
 		attrs := receiveMsgAttrs(baseAttrs, msg)
 		startOpts := []trace.SpanStartOption{
@@ -168,7 +166,7 @@ func tracedConsumeHandler(conn *otelnats.Conn, consumerName string, handler MsgH
 		if originSpanCtx.IsValid() {
 			startOpts = append(startOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
 		}
-		ctx, span := tracer.Start(consumerParentCtx, spanName, startOpts...)
+		ctx, span := tracer.Start(context.Background(), spanName, startOpts...)
 		defer span.End()
 		handler(Msg{Msg: msg, Ctx: ctx})
 	}
@@ -221,17 +219,16 @@ func (m *tracedMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context
 	}
 	msgCtx := m.prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: h})
 	originSpanCtx := trace.SpanContextFromContext(msgCtx)
-	consumerParentCtx := m.conn.ConsumerContextWithDeliver(context.Background(), msg.Subject(), originSpanCtx)
 	spanName := "receive " + msg.Subject()
 	attrs := receiveMsgAttrs(m.baseAttrs, msg)
 	startOpts := []trace.SpanStartOption{
-		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(attrs...),
 	}
 	if originSpanCtx.IsValid() {
 		startOpts = append(startOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
 	}
-	ctx, span := m.tracer.Start(consumerParentCtx, spanName, startOpts...)
+	ctx, span := m.tracer.Start(context.Background(), spanName, startOpts...)
 	m.mu.Lock()
 	if m.stopped {
 		// Stop/Drain already ran endLastSpan; nobody will end this span later.

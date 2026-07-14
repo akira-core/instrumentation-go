@@ -32,26 +32,6 @@ const (
 	errorTypeOther  = "_OTHER"
 )
 
-// DeliverAttributes returns the attribute set for a MongoDB deliver span
-// (the synthetic CONSUMER span that represents broker delivery). Caller passes
-// only the values it has — semconv key + conditional defaulting stays here.
-func DeliverAttributes(dbName, collName, serverAddr string, serverPort int) []attribute.KeyValue {
-	attrs := []attribute.KeyValue{
-		attribute.String(keyDBSystemName, dbSystemMongoDB),
-		attribute.String(keyDBCollection, collName),
-	}
-	if dbName != "" {
-		attrs = append(attrs, attribute.String(keyDBNamespace, dbName))
-	}
-	if serverAddr != "" {
-		attrs = append(attrs, attribute.String(keyServerAddress, serverAddr))
-		if serverPort > 0 && serverPort != 27017 {
-			attrs = append(attrs, attribute.Int(keyServerPort, serverPort))
-		}
-	}
-	return attrs
-}
-
 // DBSpanName returns the span name per OTel: "{db.operation.name} {target}".
 func DBSpanName(operation, collectionName string) string {
 	if collectionName == "" {

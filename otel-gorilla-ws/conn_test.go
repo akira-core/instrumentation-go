@@ -141,7 +141,10 @@ func TestSpanAttributes(t *testing.T) {
 	assert.Equal(t, oteltrace.SpanKindProducer, sendSpans[0].SpanKind())
 	sendAttrs := attrsToMap(sendSpans[0])
 	assert.Equal(t, int64(websocket.TextMessage), sendAttrs["websocket.message.type"])
-	assert.Equal(t, int64(len(payload)), sendAttrs["messaging.message.body.size"])
+	assert.Equal(t, int64(len(payload)), sendAttrs["websocket.message.body.size"])
+	for k := range sendAttrs {
+		assert.False(t, strings.HasPrefix(k, "messaging."), "send span must not carry messaging.* attribute %q", k)
+	}
 
 	// Server ReadMessage + client ReadMessage = 2 receive spans
 	require.NotEmpty(t, recvSpans, "expected websocket.receive spans")

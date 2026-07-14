@@ -86,7 +86,6 @@ func newCollectionForDatabase(d *Database, raw *mongo.Collection) *Collection {
 			Tracer:             d.tracer,
 			Propagator:         d.propagator,
 			PropagationEnabled: d.propagationEnabled,
-			DeliverTracer:      d.deliverTracer,
 			ServerAddr:         d.serverAddr,
 			ServerPort:         d.serverPort,
 		},
@@ -94,8 +93,8 @@ func newCollectionForDatabase(d *Database, raw *mongo.Collection) *Collection {
 }
 
 // InsertOne inserts a document. When tracing is enabled, the call is wrapped
-// in a CLIENT span and (with propagation on) the deliver span traceparent is
-// injected into the document's "_oteltrace" field.
+// in a CLIENT span and (with propagation on) the current trace's traceparent
+// is injected into the document's "_oteltrace" field.
 func (c *Collection) InsertOne(ctx context.Context, document any, opts ...*options.InsertOneOptions) (*InsertOneResult, error) {
 	res, err := c.impl.InsertOne(ctx, document, opts...)
 	if err != nil {
@@ -104,7 +103,7 @@ func (c *Collection) InsertOne(ctx context.Context, document any, opts ...*optio
 	return &InsertOneResult{res}, nil
 }
 
-// InsertMany inserts multiple documents, injecting the deliver span
+// InsertMany inserts multiple documents, injecting the current trace's
 // traceparent into each "_oteltrace" when propagation is on.
 func (c *Collection) InsertMany(ctx context.Context, documents []any, opts ...*options.InsertManyOptions) (*InsertManyResult, error) {
 	res, err := c.impl.InsertMany(ctx, documents, opts...)

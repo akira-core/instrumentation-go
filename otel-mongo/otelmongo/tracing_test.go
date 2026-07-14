@@ -12,8 +12,6 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
-
-	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/traced"
 )
 
 func init() {
@@ -126,44 +124,6 @@ func TestContextFromRawDocumentV1_PropagationDisabled(t *testing.T) {
 	out := ContextFromRawDocument(ctx, raw)
 	assert.Equal(t, ctx, out)
 	assert.False(t, trace.SpanFromContext(out).SpanContext().IsValid())
-}
-
-func TestStartDeliverSpanDisabled(t *testing.T) {
-	// StartDeliverSpan now lives on *traced.Collection (the only impl that creates
-	// deliver spans). When DeliverTracer is nil the helper must return ctx unchanged.
-	impl := &traced.Collection{DeliverTracer: nil}
-	ctx := context.Background()
-	got, span := impl.StartDeliverSpan(ctx, "testdb", "testcoll")
-	defer span.End()
-	assert.Equal(t, ctx, got, "expected unchanged ctx when DeliverTracer is nil")
-	assert.False(t, trace.SpanFromContext(got).SpanContext().IsValid(), "expected no span in ctx when DeliverTracer is nil")
-}
-
-func TestStartDeliverSpanEnabled(t *testing.T) {
-	tp := sdktrace.NewTracerProvider()
-	tracer := tp.Tracer(ScopeName)
-	impl := &traced.Collection{
-		DeliverTracer: tracer,
-		ServerAddr:    "localhost",
-		ServerPort:    27017,
-	}
-
-	// Establish a parent span so we can verify the deliver span is a child.
-	parentCtx, parentSpan := tp.Tracer(ScopeName).Start(context.Background(), "parent")
-	defer parentSpan.End()
-
-	got, deliverSpan := impl.StartDeliverSpan(parentCtx, "testdb", "testcoll")
-	defer deliverSpan.End()
-
-	deliverSC := trace.SpanFromContext(got).SpanContext()
-	require.True(t, deliverSC.IsValid(), "expected valid span context in returned ctx")
-	parentSC := parentSpan.SpanContext()
-	assert.NotEqual(t, parentSC.SpanID(), deliverSC.SpanID(), "deliver span ID should differ from parent span ID")
-	assert.Equal(t, parentSC.TraceID(), deliverSC.TraceID(), "deliver span should share trace ID with parent")
-	// span should still be recording — caller has not yet called End()
-	if ro, ok := deliverSpan.(interface{ IsRecording() bool }); ok {
-		assert.True(t, ro.IsRecording(), "deliver span should still be recording before End() is called")
-	}
 }
 
 func Test_injectTraceIntoUpdate_DotNotationPreserved(t *testing.T) {
