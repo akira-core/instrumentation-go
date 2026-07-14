@@ -70,6 +70,9 @@ func (t *Collection) setCapturedServerAttrs(span trace.Span, capture *shared.Add
 	if addr, port := capture.Resolve(t.ServerAddr, t.ServerPort); addr != "" {
 		span.SetAttributes(shared.ServerAttributes(addr, port)...)
 	}
+	if !capture.Captured() {
+		span.SetAttributes(shared.ServerAddressFallbackAttribute())
+	}
 }
 
 // changeStreamReaderAttrs builds the attribute set for the ChangeStream reader's

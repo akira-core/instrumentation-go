@@ -15,15 +15,16 @@ import (
 )
 
 const (
-	keyDBSystemName         = "db.system.name"
-	keyDBCollection         = "db.collection.name"
-	keyDBNamespace          = "db.namespace"
-	keyDBOperationName      = "db.operation.name"
-	keyDBOpBatchSize        = "db.operation.batch.size"
-	keyDBResponseStatusCode = "db.response.status_code"
-	keyErrorType            = "error.type"
-	keyServerAddress        = "server.address"
-	keyServerPort           = "server.port"
+	keyDBSystemName          = "db.system.name"
+	keyDBCollection          = "db.collection.name"
+	keyDBNamespace           = "db.namespace"
+	keyDBOperationName       = "db.operation.name"
+	keyDBOpBatchSize         = "db.operation.batch.size"
+	keyDBResponseStatusCode  = "db.response.status_code"
+	keyErrorType             = "error.type"
+	keyServerAddress         = "server.address"
+	keyServerPort            = "server.port"
+	keyServerAddressFallback = "mongodb.server_address.fallback"
 )
 
 const (
@@ -93,6 +94,14 @@ func ServerAttributes(serverAddr string, serverPort int) []attribute.KeyValue {
 		attrs = append(attrs, attribute.Int(keyServerPort, serverPort))
 	}
 	return attrs
+}
+
+// ServerAddressFallbackAttribute marks a span whose server.* came from the
+// static Connect-time URI parse rather than a per-command CommandMonitor
+// capture (see monitor.go). Temporary debug aid for telling the two sources
+// apart in production traces.
+func ServerAddressFallbackAttribute() attribute.KeyValue {
+	return attribute.Bool(keyServerAddressFallback, true)
 }
 
 // RecordSpanError sets span status to Error and records db.response.status_code and error.type.

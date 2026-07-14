@@ -70,7 +70,7 @@ func TestCollectionCapturesPerCommandServerAddress(t *testing.T) {
 
 	var gotAddr string
 	var gotPort int64
-	var sawPort bool
+	var sawPort, gotFallback bool
 	for _, kv := range span.Attributes() {
 		switch string(kv.Key) {
 		case "server.address":
@@ -78,10 +78,13 @@ func TestCollectionCapturesPerCommandServerAddress(t *testing.T) {
 		case "server.port":
 			gotPort = kv.Value.AsInt64()
 			sawPort = true
+		case "mongodb.server_address.fallback":
+			gotFallback = kv.Value.AsBool()
 		}
 	}
 	assert.NotEqual(t, "bogus-fallback-host", gotAddr,
 		"expected the per-command captured address to override the deliberately wrong static fallback")
+	assert.False(t, gotFallback, "expected no mongodb.server_address.fallback attribute when capture succeeds")
 
 	// Strengthened beyond "not the bogus fallback": the span must carry the exact
 	// host:port the driver reported for this insert command, parsed from the

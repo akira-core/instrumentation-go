@@ -30,6 +30,17 @@ func spanServerAttrs(t *testing.T, span sdktrace.ReadOnlySpan) (addr string, por
 	return addr, port, sawPort
 }
 
+// spanHasFallbackAttr reports whether a recorded span carries
+// mongodb.server_address.fallback=true (see shared.ServerAddressFallbackAttribute).
+func spanHasFallbackAttr(span sdktrace.ReadOnlySpan) bool {
+	for _, kv := range span.Attributes() {
+		if string(kv.Key) == "mongodb.server_address.fallback" {
+			return kv.Value.AsBool()
+		}
+	}
+	return false
+}
+
 // TestCollection_FallsBackToStaticAddrWhenNoCommandCaptured exercises the real
 // InsertOne code path (not a mock) against a *mongo.Client whose Connect is
 // lazy (mongo.Connect does not dial synchronously) pointed at an address nothing
@@ -64,6 +75,7 @@ func TestCollection_FallsBackToStaticAddrWhenNoCommandCaptured(t *testing.T) {
 	assert.Equal(t, "static-fallback-host", addr)
 	require.True(t, sawPort, "expected server.port for a non-default port fallback")
 	assert.Equal(t, int64(27018), port)
+	assert.True(t, spanHasFallbackAttr(spans[0]), "expected mongodb.server_address.fallback=true")
 }
 
 // newFailingPropCollection builds a propagation-enabled Collection pointed at a lazy
@@ -104,6 +116,7 @@ func TestCollection_InsertOne_InjectFailureKeepsStaticAddr(t *testing.T) {
 	assert.Equal(t, "static-fallback-host", addr)
 	require.True(t, sawPort, "inject-failure span must still carry server.port fallback")
 	assert.Equal(t, int64(27018), port)
+	assert.True(t, spanHasFallbackAttr(spans[0]), "expected mongodb.server_address.fallback=true")
 }
 
 // TestCollection_BulkWrite_InjectFailureKeepsStaticAddr is the BulkWrite counterpart:
@@ -123,4 +136,5 @@ func TestCollection_BulkWrite_InjectFailureKeepsStaticAddr(t *testing.T) {
 	assert.Equal(t, "static-fallback-host", addr)
 	require.True(t, sawPort, "inject-failure span must still carry server.port fallback")
 	assert.Equal(t, int64(27018), port)
+	assert.True(t, spanHasFallbackAttr(spans[0]), "expected mongodb.server_address.fallback=true")
 }
