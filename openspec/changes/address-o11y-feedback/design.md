@@ -136,7 +136,7 @@ Resolution happens once at construction (where the cached-gate pattern already r
 
 ### 7. D3 — release-tag guard as a standalone workflow with a version-location map
 
-New workflow `.github/workflows/release-guard.yml`, triggered on `push: tags: ['otel-*/v*']`. A single script:
+New workflow `.github/workflows/release-guard.yml`, triggered on four explicit tag globs (`otel-mongo/v[0-9]*`, `otel-mongo/v2/v[0-9]*`, `otel-nats/v[0-9]*`, `otel-gorilla-ws/v[0-9]*` — a single `otel-*/v*` would miss the nested `otel-mongo/v2/...` shape because GHA tag globs don't cross `/`; discovered during implementation). A single script:
 
 1. Parses module path and version from the tag (`otel-nats/v0.7.0` → module `otel-nats`, version `0.7.0`).
 2. Extracts the module's version constant from a hard-coded location map — `otel-nats/otelnats/conn.go` (`instrumentationVersion`), `otel-mongo/otelmongo/version.go`, `otel-mongo/v2/version.go`, `otel-gorilla-ws/version.go` (`Version()` return literal).

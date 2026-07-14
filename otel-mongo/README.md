@@ -38,7 +38,7 @@ otel-mongo/
 ```
 
 - **Trace storage:** Written/updated documents get a reserved **`_oteltrace`** field (W3C `traceparent` and optional `tracestate`). Use **ContextFromDocument(ctx, raw)** for raw BSON (e.g. change streams).
-- **Two layers:** (1) **Client spans:** each Collection method (insert/find/update/delete/aggregate/distinct/bulkWrite/etc.) creates its own span directly in `internal/traced/collection.go` — no separate driver-level command monitor. (2) **Document:** Collection CRUD injects `_oteltrace` on write and supports span links / propagation on read.
+- **Two layers:** (1) **Client spans:** each Collection method (insert/find/update/delete/aggregate/distinct/bulkWrite/etc.) creates its own span directly in `internal/traced/collection.go`; a **chained** driver `CommandMonitor` (registered only when tracing is enabled, and chained after any monitor you set yourself) captures the real per-command server address for the span's `server.*` attributes. (2) **Document:** Collection CRUD injects `_oteltrace` on write and supports span links / propagation on read.
 
 ---
 

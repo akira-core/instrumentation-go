@@ -10,7 +10,7 @@ This is a multi-module repository: `otel-mongo`, `otel-mongo/v2`, `otel-nats`, a
 
 Examples: `otel-nats/v0.7.0`, `otel-mongo/v2/v0.7.0`. The module segment matches the directory path relative to the repo root.
 
-Each tag must point at a commit where that module's version constant equals the tag's version. A CI workflow enforces this on every push of a tag matching `otel-*/v*` — see [CI enforcement](#ci-enforcement) below.
+Each tag must point at a commit where that module's version constant equals the tag's version. A CI workflow enforces this on every push of a tag matching one of the four module patterns (`otel-mongo/v[0-9]*`, `otel-mongo/v2/v[0-9]*`, `otel-nats/v[0-9]*`, `otel-gorilla-ws/v[0-9]*`) — see [CI enforcement](#ci-enforcement) below.
 
 ## Pre-1.0 (`0.x`) policy
 
@@ -43,6 +43,6 @@ This constant is what every wrapper package reports as its `TracerProvider.Trace
 
 ## CI enforcement
 
-`.github/workflows/release-guard.yml` triggers on any pushed tag matching `otel-*/v*`. It parses the module and version out of the tag name, extracts the corresponding version constant using the table above, and fails the workflow if they don't match. This exists because a hand-maintained constant with no automated check has already shipped wrong once (`otel-nats` `0.5.0` reported `0.4.1` on every span) — the guard makes that class of mistake fail loudly at tag-push time instead of shipping silently.
+`.github/workflows/release-guard.yml` triggers on any pushed tag matching one of four explicit patterns — `otel-mongo/v[0-9]*`, `otel-mongo/v2/v[0-9]*`, `otel-nats/v[0-9]*`, `otel-gorilla-ws/v[0-9]*` (a single `otel-*/v*` glob would miss the nested `otel-mongo/v2/vX.Y.Z` shape, since GitHub Actions tag globs do not cross `/`). It parses the module and version out of the tag name, extracts the corresponding version constant using the table above, and fails the workflow if they don't match. This exists because a hand-maintained constant with no automated check has already shipped wrong once (`otel-nats` `0.5.0` reported `0.4.1` on every span) — the guard makes that class of mistake fail loudly at tag-push time instead of shipping silently.
 
 The guard checks the version constant against the tag; it does not check that a `CHANGELOG.md` entry exists for the version. That remains a review-checklist item.

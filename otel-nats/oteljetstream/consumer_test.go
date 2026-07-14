@@ -150,6 +150,9 @@ func TestFetchReturnsMessagesWithTraceContext(t *testing.T) {
 	producerSpan := findSpanByKind(spans, oteltrace.SpanKindProducer)
 	require.NotNil(t, receiveSpan, "no client (pull-receive) span")
 	assertAttr(t, receiveSpan.Attributes(), "messaging.consumer.group.name", consumerName)
+	for _, kv := range receiveSpan.Attributes() {
+		assert.NotEqual(t, "messaging.consumer.name", string(kv.Key), "receive span must not carry the pre-0.7.0 literal messaging.consumer.name")
+	}
 	require.NotNil(t, producerSpan, "no producer span")
 	for _, kv := range producerSpan.Attributes() {
 		assert.NotEqual(t, "messaging.consumer.group.name", string(kv.Key), "core publish span must not carry messaging.consumer.group.name")

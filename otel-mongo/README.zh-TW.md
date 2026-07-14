@@ -35,7 +35,7 @@ otel-mongo/
 ```
 
 - **Trace 儲存：** 寫入/更新的文件會有保留欄位 **`_oteltrace`**（W3C `traceparent` 及選填 `tracestate`）。對 raw BSON（例如 change stream）可使用 **ContextFromDocument(ctx, raw)** 還原 context。
-- **兩層：** (1) **Client span：** 每個 Collection 方法（insert/find/update/delete/aggregate/distinct/bulkWrite 等）都在 `internal/traced/collection.go` 直接產生自己的 span，並無獨立的 driver 層 command monitor。(2) **Document** 層在 CRUD 寫入時注入 `_oteltrace`，讀取時支援 span link 與傳播。
+- **兩層：** (1) **Client span：** 每個 Collection 方法（insert/find/update/delete/aggregate/distinct/bulkWrite 等）都在 `internal/traced/collection.go` 直接產生自己的 span；另有一個**串接式** driver `CommandMonitor`（僅在啟用 tracing 時註冊，且串接在你自行設定的 monitor 之後）負責擷取每個指令實際命中的伺服器位址，寫入 span 的 `server.*` 屬性。(2) **Document** 層在 CRUD 寫入時注入 `_oteltrace`，讀取時支援 span link 與傳播。
 
 ---
 
