@@ -198,7 +198,9 @@ func TestUpgrader_Upgrade_WithTracingEnabled_OverridesEnvGate(t *testing.T) {
 	otel.SetTracerProvider(tp)
 
 	up := Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	serverDone := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(serverDone)
 		conn, err := up.Upgrade(w, r, nil, WithTracingEnabled(true))
 		if err != nil {
 			t.Errorf("upgrade: %v", err)
@@ -222,6 +224,13 @@ func TestUpgrader_Upgrade_WithTracingEnabled_OverridesEnvGate(t *testing.T) {
 	if _, _, err := rawConn.ReadMessage(); err != nil {
 		t.Fatalf("client read: %v", err)
 	}
+
+	// The server-side send span ends via `defer span.End()` inside WriteMessage,
+	// which runs only after the bytes are already on the wire — so the client's
+	// ReadMessage above can return before that span is recorded. Wait for the
+	// handler (hence the deferred span.End) to finish before asserting, else
+	// sr.Ended() races the server goroutine.
+	<-serverDone
 
 	if len(sr.Ended()) == 0 {
 		t.Fatal("expected recorded spans on the server side: WithTracingEnabled(true) must reach Upgrader.Upgrade")
