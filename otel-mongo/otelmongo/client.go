@@ -2,22 +2,13 @@ package otelmongo
 
 import (
 	"context"
-	"fmt"
-	"log/slog"
-	"os"
 	"strings"
-	"time"
 
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/sdk/resource"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
@@ -35,8 +26,6 @@ type Client struct {
 	propagator         propagation.TextMapPropagator // from option or otel.GetTextMapPropagator()
 	tracingEnabled     bool                          // cached mongoTracingEnabled() result; gates wrapper CLIENT spans
 	propagationEnabled bool
-	deliverTracer      trace.Tracer             // MongoDB deliver span tracer (nil when disabled)
-	mongoTP            *sdktrace.TracerProvider // independent TracerProvider for deliver spans (nil when disabled)
 }
 
 // ClientOption configures Connect/NewClient. Per OTel contrib: accept TracerProvider and Propagators.
@@ -137,7 +126,6 @@ func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*
 		return nil, err
 	}
 	addr, port := parseServerFromURI(merged.GetURI())
-	mongoTP, deliverTracer := initMongoProvider(addr, port)
 	return &Client{
 		Client:             mc,
 		serverAddr:         addr,
@@ -146,8 +134,6 @@ func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*
 		propagator:         prop,
 		tracingEnabled:     true,
 		propagationEnabled: propEnabled,
-		mongoTP:            mongoTP,
-		deliverTracer:      deliverTracer,
 	}, nil
 }
 
@@ -165,15 +151,9 @@ func NewClient(ctx context.Context, uri string, traceOpts ...ClientOption) (*Cli
 	return ConnectWithOptions(ctx, traceOpts, options.Client().ApplyURI(uri))
 }
 
-// Disconnect disconnects the MongoDB client and shuts down the deliver TracerProvider if active.
+// Disconnect disconnects the MongoDB client.
 func (c *Client) Disconnect(ctx context.Context) error {
-	err := c.Client.Disconnect(ctx)
-	if c.mongoTP != nil {
-		shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		_ = c.mongoTP.Shutdown(shutCtx) // best-effort; deliver spans may be lost on failure
-	}
-	return err
+	return c.Client.Disconnect(ctx)
 }
 
 // Ping runs a ping command against the server. Use readpref.Primary() or nil for default.
@@ -234,63 +214,6 @@ func parseServerFromURI(uri string) (addr string, port int) {
 	return shared.SplitHostPort(uri)
 }
 
-// initMongoProvider creates an independent TracerProvider with service.name = "mongodb://{addr}"
-// for synthetic deliver spans. Only enabled when OTEL_EXPORTER_OTLP_ENDPOINT is set.
-// The endpoint must be a full URL (e.g. "http://otel-collector:4318") for HTTP,
-// or a host:port (e.g. "otel-collector:4317") for gRPC.
-func initMongoProvider(addr string, port int) (*sdktrace.TracerProvider, trace.Tracer) {
-	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-	if endpoint == "" {
-		return nil, nil
-	}
-	ctx := context.Background()
-
-	var exp sdktrace.SpanExporter
-	var err error
-	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
-		exp, err = otlptracehttp.New(ctx,
-			otlptracehttp.WithEndpointURL(endpoint),
-		)
-	} else {
-		exp, err = otlptracegrpc.New(ctx,
-			otlptracegrpc.WithEndpoint(endpoint),
-		)
-	}
-	if err != nil {
-		slog.Warn("otelmongo: deliver tracer disabled", "reason", "exporter creation failed", "error", err)
-		return nil, nil
-	}
-
-	serviceName := mongoServiceName(addr, port)
-	res, err := resource.New(ctx, resource.WithAttributes(
-		semconv.ServiceName(serviceName),
-	))
-	if err != nil {
-		slog.Warn("otelmongo: deliver tracer disabled", "reason", "resource creation failed", "error", err)
-		_ = exp.Shutdown(ctx) // avoid leaking the exporter connection
-		return nil, nil
-	}
-	slog.Debug("otelmongo: deliver tracer enabled", "service", serviceName, "endpoint", endpoint) //nolint:gosec // intentional diagnostic log of internal config values
-
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exp),
-		sdktrace.WithResource(res),
-	)
-	tracer := tp.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
-	return tp, tracer
-}
-
-// mongoServiceName returns the service.name for the MongoDB deliver span TracerProvider.
-func mongoServiceName(addr string, port int) string {
-	if addr == "" {
-		return "mongodb"
-	}
-	if port > 0 && port != 27017 {
-		return fmt.Sprintf("mongodb://%s:%d", addr, port)
-	}
-	return "mongodb://" + addr
-}
-
 // Database returns a wrapped Database for document-level tracing.
 func (c *Client) Database(name string, opts ...*options.DatabaseOptions) *Database {
 	return &Database{
@@ -301,6 +224,5 @@ func (c *Client) Database(name string, opts ...*options.DatabaseOptions) *Databa
 		propagator:         c.propagator,
 		tracingEnabled:     c.tracingEnabled,
 		propagationEnabled: c.propagationEnabled,
-		deliverTracer:      c.deliverTracer,
 	}
 }

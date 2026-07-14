@@ -13,7 +13,7 @@ import (
 )
 
 // TestChangeStreamReaderAttrs_CarriesStaticServerAddr locks the invariant that the
-// ChangeStream reader's getMore consumer spans keep the static server.address/
+// ChangeStream reader's getMore spans keep the static server.address/
 // server.port snapshot. Those spans are seeded from baseSpanOpts built by Watch and
 // never get a post-call ServerAttributes overwrite, so if DBAttributes stops emitting
 // server.* (as it does since the emit-once-post-call refactor) the reader attrs must
@@ -42,7 +42,7 @@ func TestChangeStreamReaderAttrs_CarriesStaticServerAddr(t *testing.T) {
 	assert.Equal(t, int64(27019), port)
 }
 
-func TestBuildConsumerCtx_NewTraceIDAndLinksOriginTrace(t *testing.T) {
+func TestBuildLinkedSpanCtx_NewTraceIDAndLinksOriginTrace(t *testing.T) {
 	sr := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithSpanProcessor(sr),
@@ -56,7 +56,7 @@ func TestBuildConsumerCtx_NewTraceIDAndLinksOriginTrace(t *testing.T) {
 	originSpanCtx := originSpan.SpanContext()
 	originSpan.End()
 
-	newCtx, span := buildConsumerCtx(originCtx, tracer, nil, "", nil, "test-decode-span", nil, originSpanCtx)
+	newCtx, span := buildLinkedSpanCtx(originCtx, tracer, "test-decode-span", nil, originSpanCtx)
 	span.End()
 
 	recovered := trace.SpanContextFromContext(newCtx)
@@ -75,47 +75,4 @@ func TestBuildConsumerCtx_NewTraceIDAndLinksOriginTrace(t *testing.T) {
 		break
 	}
 	require.True(t, found, `expected a span named "test-decode-span"`)
-}
-
-func TestBuildConsumerCtx_WithDeliverTracer_ChildOfDeliver(t *testing.T) {
-	sr := tracetest.NewSpanRecorder()
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithSpanProcessor(sr),
-		sdktrace.WithSampler(sdktrace.AlwaysSample()),
-	)
-	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
-	otel.SetTracerProvider(tp)
-
-	deliverSR := tracetest.NewSpanRecorder()
-	deliverTP := sdktrace.NewTracerProvider(
-		sdktrace.WithSpanProcessor(deliverSR),
-		sdktrace.WithSampler(sdktrace.AlwaysSample()),
-	)
-	t.Cleanup(func() { _ = deliverTP.Shutdown(context.Background()) })
-	deliverTracer := deliverTP.Tracer("deliver-test")
-
-	tracer := tp.Tracer("test")
-	_, originSpan := tracer.Start(context.Background(), "origin")
-	originSpanCtx := originSpan.SpanContext()
-	originSpan.End()
-
-	newCtx, span := buildConsumerCtx(context.Background(), tracer, deliverTracer, "test deliver", nil, "test-consumer-span", nil, originSpanCtx)
-	span.End()
-
-	consumerSpanCtx := trace.SpanContextFromContext(newCtx)
-	require.True(t, consumerSpanCtx.IsValid())
-	assert.NotEqual(t, originSpanCtx.TraceID(), consumerSpanCtx.TraceID())
-
-	var deliverFound bool
-	for _, s := range deliverSR.Ended() {
-		if s.Name() != "test deliver" {
-			continue
-		}
-		deliverFound = true
-		require.NotEmpty(t, s.Links())
-		assert.Equal(t, originSpanCtx.TraceID(), s.Links()[0].SpanContext.TraceID())
-		assert.Equal(t, s.SpanContext().TraceID(), consumerSpanCtx.TraceID())
-		break
-	}
-	require.True(t, deliverFound, `expected a deliver span named "test deliver"`)
 }

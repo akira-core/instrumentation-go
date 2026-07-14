@@ -12,15 +12,12 @@ import (
 )
 
 // directConn is the passthrough connImpl used when tracing is off. No spans,
-// no propagator inject/extract, no deliver tracer (the invariant from
-// conn.go's old construction site is now enforced by type: this impl never
-// holds a deliverTracer). Subscribe handlers receive Msg with an empty Ctx.
+// no propagator inject/extract. Subscribe handlers receive Msg with an empty Ctx.
 type directConn struct {
 	nc *nats.Conn
 }
 
-func (d *directConn) TracingEnabled() bool     { return false }
-func (d *directConn) DeliverSpanEnabled() bool { return false }
+func (d *directConn) TracingEnabled() bool { return false }
 
 // TraceContext returns a noop tracer and the global propagator. External
 // callers that capture these (and call .Start on the tracer) see zero spans.
@@ -68,12 +65,4 @@ func (d *directConn) wrapMsgHandler(_, _ string, handler MsgHandler) nats.MsgHan
 // so callers can attach Unsubscribe lifecycle as usual.
 func (d *directConn) traceEventHandler() nats.MsgHandler {
 	return func(*nats.Msg) {}
-}
-
-func (d *directConn) StartDeliverSpan(ctx context.Context, _ string) context.Context {
-	return ctx
-}
-
-func (d *directConn) ConsumerContextWithDeliver(ctx context.Context, _ string, _ trace.SpanContext) context.Context {
-	return ctx
 }

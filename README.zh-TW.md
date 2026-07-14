@@ -12,10 +12,10 @@
 
 | 套件 | Import 路徑 | 原始碼版本 | 說明 |
 |------|-------------|------------|------|
-| **otel-mongo** (v1) | `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | 0.6.0 | MongoDB driver v1 封裝；寫入時注入 `_oteltrace`；`ContextFromDocument` 與解碼輔助；可選 deliver span。 |
-| **otel-mongo/v2** | `github.com/akira-core/instrumentation-go/otel-mongo/v2` | 0.6.0 | MongoDB driver v2 封裝；與 v1 行為對齊。 |
-| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.6.0 | 核心 NATS；W3C 脈絡在訊息標頭；deliver span。 |
-| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.6.0 | JetStream 發布／消費／fetch；deliver span。 |
+| **otel-mongo** (v1) | `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | 0.6.2 | MongoDB driver v1 封裝；寫入時注入 `_oteltrace`；`ContextFromDocument` 與解碼輔助。 |
+| **otel-mongo/v2** | `github.com/akira-core/instrumentation-go/otel-mongo/v2` | 0.6.2 | MongoDB driver v2 封裝；與 v1 行為對齊。 |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.6.2 | 核心 NATS；W3C 脈絡在訊息標頭。 |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.6.2 | JetStream 發布／消費／fetch。 |
 | **otel-gorilla-ws** | `github.com/akira-core/instrumentation-go/otel-gorilla-ws` | 0.6.0 | 在 JSON 訊息本文內傳遞 trace context（信封格式）；`NewConn` / `Dial`。 |
 
 各模組詳細文件：[otel-mongo/README.md](otel-mongo/README.md)、[otel-nats/README.md](otel-nats/README.md)、[otel-gorilla-ws/README.md](otel-gorilla-ws/README.md)；三個模組皆另有繁中版：[otel-mongo/README.zh-TW.md](otel-mongo/README.zh-TW.md)、[otel-nats/README.zh-TW.md](otel-nats/README.zh-TW.md)、[otel-gorilla-ws/README.zh-TW.md](otel-gorilla-ws/README.zh-TW.md)。
@@ -40,7 +40,7 @@ go get github.com/akira-core/instrumentation-go/otel-gorilla-ws@otel-gorilla-ws/
 | 環境變數 | 作用範圍 | 未設定時 | 說明 |
 |----------|----------|----------|------|
 | `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | 全部模組 | 關 | 總開關；須開啟後，各模組追蹤旗標與（Mongo 的）文件傳播才會生效。 |
-| `OTEL_MONGO_TRACING_ENABLED` | `otel-mongo` + `otel-mongo/v2` | 關 | CLIENT span、deliver span 相關邏輯、非 noop tracer。 |
+| `OTEL_MONGO_TRACING_ENABLED` | `otel-mongo` + `otel-mongo/v2` | 關 | CLIENT span、非 noop tracer。 |
 | `OTEL_MONGO_PROPAGATION_ENABLED` | `otel-mongo` + `otel-mongo/v2` | 關 | `_oteltrace` 寫入／讀取抽取；仍受上述總開關約束。 |
 | `OTEL_NATS_TRACING_ENABLED` | `otelnats` + `oteljetstream` | 關 | NATS／JetStream 封裝追蹤。 |
 | `OTEL_GORILLA_WS_TRACING_ENABLED` | `otel-gorilla-ws` | 關 | WebSocket 封裝追蹤。 |
@@ -88,10 +88,8 @@ instrumentation-go/
 
 | 套件 | 層級 | 內容 |
 |------|------|------|
-| `otel-nats` | `DEBUG` | 伺服器位址解析失敗、deliver tracer 初始化成功 |
-| `otel-nats` | `WARN` | Deliver tracer 初始化失敗（端點缺漏或無法連線） |
-| `otel-mongo` | `DEBUG` | Deliver tracer 初始化成功 |
-| `otel-mongo` | `WARN` | OTLP exporter／resource 建立失敗 |
+| `otel-nats` | `DEBUG` | 伺服器位址解析失敗 |
+| `otel-nats` | `DEBUG`／`WARN` | trace event 解析失敗（使用 `WithTraceDestination` 時） |
 
 範例：
 
@@ -101,17 +99,4 @@ slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 })))
 ```
 
-日誌會帶前綴（如 `otelnats:`、`otelmongo:`）與結構化欄位（`reason`、`error`、`service`、`endpoint`）。
-
----
-
-## `OTEL_EXPORTER_OTLP_ENDPOINT` 格式
-
-**Deliver span**（otel-mongo、otel-nats）會讀此變數以建立獨立 exporter，產生中介／broker 類型的合成 span。端點須寫清楚：
-
-| 協定 | 格式 | 範例 |
-|------|------|------|
-| OTLP/HTTP | 含 scheme 的完整 URL | `http://otel-collector:4318` |
-| OTLP/gRPC | `host:port`（無 scheme） | `otel-collector:4317` |
-
-僅寫主機名、無 port 或無 scheme（例如單獨 `otel-collector`）**不支援**。
+日誌帶前綴 `otelnats:` 與結構化欄位（`reason`、`error`、`addr`）。

@@ -41,11 +41,7 @@ func (j *tracedJSImpl) PublishMsg(ctx context.Context, msg *nats.Msg, opts ...je
 		trace.WithAttributes(publishAttrs(msg, j.conn.ServerAttrs())...),
 	)
 	defer span.End()
-	injectCtx := ctx
-	if j.conn.DeliverSpanEnabled() {
-		injectCtx = j.conn.StartDeliverSpan(ctx, msg.Subject)
-	}
-	prop.Inject(injectCtx, &otelnats.HeaderCarrier{H: msg.Header})
+	prop.Inject(ctx, &otelnats.HeaderCarrier{H: msg.Header})
 	ack, err := j.js.PublishMsg(ctx, msg, opts...)
 	if err != nil {
 		span.RecordError(err)

@@ -49,7 +49,7 @@ otel-mongo/
 `otel-mongo` (v1 + v2) supports one global switch and two module switches:
 
 - `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` (global master switch)
-- `OTEL_MONGO_TRACING_ENABLED` (wrapper **CLIENT** spans for this package, deliver-span path, and noop vs real tracer — driver/contrib command spans are separate)
+- `OTEL_MONGO_TRACING_ENABLED` (wrapper **CLIENT** spans for this package and noop vs real tracer — driver/contrib command spans are separate)
 - `OTEL_MONGO_PROPAGATION_ENABLED` (document `_oteltrace` injection/extraction on wrapped Collection/Cursor/ChangeStream, plus **ContextFromDocument** / **ContextFromRawDocument**)
 
 Defaults: all disabled when unset. Values `false/0/no/off` disable.
@@ -61,7 +61,7 @@ Priority:
 
 Rationale: turning off Mongo tracing also turns off Mongo trace propagation so callers get a single, predictable kill switch — there is no scenario where wrapper spans are noop while documents still carry `_oteltrace`.
 
-When tracing flags are unset/disabled, this package’s wrapper does not emit Mongo CLIENT spans to your configured TracerProvider (noop) **and** documents are written without `_oteltrace`. Deliver spans still require tracing flags plus `OTEL_EXPORTER_OTLP_ENDPOINT` as documented below.
+When tracing flags are unset/disabled, this package’s wrapper does not emit Mongo CLIENT spans to your configured TracerProvider (noop) **and** documents are written without `_oteltrace`.
 
 ### 1. Initialize provider and propagator (application responsibility)
 
@@ -138,39 +138,14 @@ client, err := otelmongo.Connect(opts)
 
 ---
 
-## Deliver Spans (Service Graph)
+## Span kinds
 
-When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, otelmongo creates synthetic "deliver" spans representing MongoDB as a broker node in Grafana service graph. Both `Connect` and `NewClient` support this — the server address is parsed from the URI provided via `options.Client().ApplyURI(uri)`.
-
-The endpoint must be a **full URL** for HTTP (e.g. `http://otel-collector:4318`) or **host:port** for gRPC (e.g. `otel-collector:4317`). Bare hostnames without scheme or port are not supported.
-
-Deliver spans are emitted for all CRUD operations (insert, find, update, delete, replace, aggregate, bulk write, distinct, count, etc.) as well as cursor decode and change stream paths.
-
-### Write path
+MongoDB is a database, not a messaging system: every operation span uses `CLIENT` (`Watch`'s change-stream read span included — it is a synchronous `getMore` call, not an async delivery). Local-only work (`Cursor.DecodeWithContext` on a document with no round trip) uses `INTERNAL`.
 
 ```
-InsertOne (CLIENT, api)
-  └── db.coll deliver (CONSUMER, mongodb)  ← injected into _oteltrace
-```
-
-### Read / delete path
-
-```
-FindOne / DeleteOne / ... (CLIENT, api)
-  └── db.coll deliver (CONSUMER, mongodb)
-```
-
-### Change stream path
-
-```
-db.coll deliver (PRODUCER, mongodb)  ← links to producer deliver
-  └── watch coll (CONSUMER, dbwatcher) ← child of deliver
-```
-
-### Resulting service graph
-
-```
-api ──► mongodb ──► dbwatcher
+InsertOne / FindOne / UpdateOne / ... (CLIENT)
+Watch → change-stream read (CLIENT)
+Cursor.DecodeWithContext (INTERNAL, linked to the origin span when `_oteltrace` is present)
 ```
 
 ---
@@ -226,27 +201,6 @@ If no command event was observed for a call (e.g. a defensive/edge-case code pat
 **Caller-supplied `SetMonitor` is chained, not replaced.** If you pass your own `*options.ClientOptions` with `SetMonitor(...)` to `Connect`/`ConnectWithOptions`, otelmongo's address-capture callback runs first and then delegates to your `Started`/`Succeeded`/`Failed` callbacks unmodified — nothing is silently dropped.
 
 This capture only runs on the tracing-enabled path; when tracing is disabled, no `CommandMonitor` is registered and any monitor you supply passes through completely untouched.
-
----
-
-## Diagnostic logging
-
-Uses [`log/slog`](https://pkg.go.dev/log/slog) — no output by default.
-
-| Level | Events |
-|-------|--------|
-| `DEBUG` | Deliver tracer initialised successfully (logs `service` and `endpoint`) |
-| `WARN` | OTLP exporter creation failure; resource creation failure |
-
-Enable with a debug-level slog handler at startup:
-
-```go
-slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-    Level: slog.LevelDebug,
-})))
-```
-
-Log entries use the `otelmongo:` prefix with `error`, `reason`, `service`, and `endpoint` key-value pairs.
 
 ---
 

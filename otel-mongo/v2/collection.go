@@ -86,7 +86,6 @@ func newCollectionForDatabase(d *Database, raw *mongo.Collection) *Collection {
 			Tracer:             d.tracer,
 			Propagator:         d.propagator,
 			PropagationEnabled: d.propagationEnabled,
-			DeliverTracer:      d.deliverTracer,
 			ServerAddr:         d.serverAddr,
 			ServerPort:         d.serverPort,
 		},

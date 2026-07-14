@@ -146,12 +146,16 @@ func TestFetchReturnsMessagesWithTraceContext(t *testing.T) {
 	}
 
 	spans := sr.Ended()
-	consumerSpan := findSpanByKind(spans, oteltrace.SpanKindConsumer)
+	receiveSpan := findSpanByKind(spans, oteltrace.SpanKindClient)
 	producerSpan := findSpanByKind(spans, oteltrace.SpanKindProducer)
-	require.NotNil(t, consumerSpan, "no consumer span")
-	assertAttr(t, consumerSpan.Attributes(), "messaging.consumer.name", consumerName)
-	if producerSpan != nil && len(consumerSpan.Links()) == 1 {
-		linkCtx := consumerSpan.Links()[0].SpanContext
+	require.NotNil(t, receiveSpan, "no client (pull-receive) span")
+	assertAttr(t, receiveSpan.Attributes(), "messaging.consumer.name", consumerName)
+	require.NotNil(t, producerSpan, "no producer span")
+	for _, kv := range producerSpan.Attributes() {
+		assert.NotEqual(t, "messaging.consumer.name", string(kv.Key), "core publish span must not carry messaging.consumer.name")
+	}
+	if len(receiveSpan.Links()) == 1 {
+		linkCtx := receiveSpan.Links()[0].SpanContext
 		assert.Equal(t, producerSpan.SpanContext().TraceID(), linkCtx.TraceID())
 		assert.Equal(t, producerSpan.SpanContext().SpanID(), linkCtx.SpanID())
 	}
@@ -416,8 +420,10 @@ func TestConsumerInfo(t *testing.T) {
 	require.Equal(t, "info-cons", info.Name)
 }
 
-func TestJetStreamDeliverSpanConsume(t *testing.T) {
-	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317")
+// TestJetStreamConsumeLinksDirectlyToProducer asserts the removal of deliver
+// spans: the Consume (push, CONSUMER-kind "process") span links directly to the
+// producer span with no intermediate deliver span.
+func TestJetStreamConsumeLinksDirectlyToProducer(t *testing.T) {
 	url := startJetStreamServer(t)
 	sr := tracetest.NewSpanRecorder()
 	tp := trace.NewTracerProvider(trace.WithSpanProcessor(sr))
@@ -477,14 +483,14 @@ func TestJetStreamDeliverSpanConsume(t *testing.T) {
 	require.NotNil(t, consumer)
 	require.Len(t, consumer.Links(), 1)
 	linkSpanID := consumer.Links()[0].SpanContext.SpanID()
-	assert.NotEqual(t, producer.SpanContext().SpanID(), linkSpanID,
-		"consumer link should point to deliver span, not producer")
-	assert.Equal(t, producer.SpanContext().TraceID(), consumer.Links()[0].SpanContext.TraceID(),
-		"deliver span should share traceID with producer")
+	assert.Equal(t, producer.SpanContext().SpanID(), linkSpanID,
+		"consumer link should point directly to the producer span (no deliver span)")
+	assert.Equal(t, producer.SpanContext().TraceID(), consumer.Links()[0].SpanContext.TraceID())
 }
 
-func TestJetStreamDeliverSpanFetch(t *testing.T) {
-	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317")
+// TestJetStreamFetchLinksDirectlyToProducer mirrors TestJetStreamConsumeLinksDirectlyToProducer
+// for the Fetch (pull, CLIENT-kind "receive") path.
+func TestJetStreamFetchLinksDirectlyToProducer(t *testing.T) {
 	url := startJetStreamServer(t)
 	sr := tracetest.NewSpanRecorder()
 	tp := trace.NewTracerProvider(trace.WithSpanProcessor(sr))
@@ -536,15 +542,14 @@ func TestJetStreamDeliverSpanFetch(t *testing.T) {
 
 	spans := sr.Ended()
 	producer := findSpanByNameAndKind(spans, "send "+"delfetch.msg", oteltrace.SpanKindProducer)
-	consumer := findSpanByNameAndKind(spans, "receive "+"delfetch.msg", oteltrace.SpanKindConsumer)
+	consumer := findSpanByNameAndKind(spans, "receive "+"delfetch.msg", oteltrace.SpanKindClient)
 	require.NotNil(t, producer)
 	require.NotNil(t, consumer)
 	require.Len(t, consumer.Links(), 1)
 	linkSpanID := consumer.Links()[0].SpanContext.SpanID()
-	assert.NotEqual(t, producer.SpanContext().SpanID(), linkSpanID,
-		"consumer link should point to deliver span, not producer")
-	assert.Equal(t, producer.SpanContext().TraceID(), consumer.Links()[0].SpanContext.TraceID(),
-		"deliver span should share traceID with producer")
+	assert.Equal(t, producer.SpanContext().SpanID(), linkSpanID,
+		"consumer link should point directly to the producer span (no deliver span)")
+	assert.Equal(t, producer.SpanContext().TraceID(), consumer.Links()[0].SpanContext.TraceID())
 }
 
 func TestConsumerCachedInfo(t *testing.T) {

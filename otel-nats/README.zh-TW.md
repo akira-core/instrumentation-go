@@ -15,7 +15,7 @@ otel-nats/
 ├── otelnats/               # Core NATS：Connect、Conn、Publish、Subscribe、Request、HeaderCarrier
 │   ├── connect.go          # Connect、ConnectWithOptions、ConnectTLS、ConnectWithCredentials
 │   ├── conn.go             # Conn、connImpl 介面、Option（WithTracerProvider、WithPropagators、WithTraceDestination）
-│   ├── conn_traced.go      # tracedConn：完整 instrumented 的 connImpl（span、propagation、deliver span）
+│   ├── conn_traced.go      # tracedConn：完整 instrumented 的 connImpl（span、propagation）
 │   ├── conn_direct.go      # directConn：tracing 停用時使用的 passthrough connImpl
 │   ├── traceevent.go       # WithTraceDestination / SubscribeTraceEvents / TraceEvent / TraceHop（NATS 2.11+ 追蹤事件）
 │   ├── propagation.go      # HeaderCarrier（nats.Header ↔ TextMapCarrier）
@@ -105,13 +105,13 @@ conn.QueueSubscribe("subject", "queue", handler)
 
 ### 3. Request/Reply
 
-`Conn.Request` / `RequestWithContext` / `RequestMsg` / `RequestMsgWithContext` 完全對齊 `nats.Conn` 的同名方法，但會為這次 RPC 開啟一個 CLIENT span，並為回覆開啟一個 CONSUMER span：
+`Conn.Request` / `RequestWithContext` / `RequestMsg` / `RequestMsgWithContext` 完全對齊 `nats.Conn` 的同名方法，但會為這次 RPC 開啟一個 CLIENT span，並為回覆開啟第二個連結的 CLIENT span（`receive` — 依 OTel messaging span-kind 對照表，pull 屬於 CLIENT）：
 
 ```go
 reply, err := conn.RequestWithContext(ctx, "subject", []byte("ping"))
 if err != nil { log.Fatal(err) }
 // reply.Data — request/reply 的 trace context 記錄在 CLIENT span 上；
-// 回覆本身則以連結（link）的 CONSUMER span 記錄。
+// 回覆本身則以連結（link）的 CLIENT「receive」span 記錄。
 ```
 
 `Request` / `RequestMsg` 沒有 `context.Context` 參數（對齊 `nats.Conn`），因此其 producer span 以 `context.Background()` 為 parent — 若需要串接既有 trace，請改用 `RequestWithContext` / `RequestMsgWithContext`。
@@ -172,37 +172,29 @@ conn, err := otelnats.Connect(url, nil)
 | **ConnectTLS** | `ConnectTLS(url, certFile, keyFile, caFile string, natsOpts ...nats.Option)`。以雙向 TLS 建立連線。 |
 | **ConnectWithCredentials** | `ConnectWithCredentials(url, credFile string, natsOpts ...nats.Option)`。以 JWT/NKey 憑證建立連線。 |
 | **ScopeName / Version()** | 建立 Tracer 時使用（OTel contrib 規範）。 |
-| **Request / RequestWithContext / RequestMsg / RequestMsgWithContext** | 對齊 `nats.Conn` 的 RPC helper；為請求開啟 CLIENT span，並為回覆開啟一個連結的 CONSUMER span。 |
+| **Request / RequestWithContext / RequestMsg / RequestMsgWithContext** | 對齊 `nats.Conn` 的 RPC helper；為請求開啟 CLIENT span，並為回覆接收開啟一個連結的 CLIENT span。 |
 | **JetStream consumer manager** | `JetStream` 完整包裝 `StreamConsumerManager`；`Stream` 完整包裝 `ConsumerManager`。所有回傳 `Consumer` 或 `PushConsumer` 的方法仍會回傳具 trace 包裝的型別（見 JetStream 章節）。 |
 | **WithTraceDestination / SubscribeTraceEvents** | 將 NATS 2.11+ 的基礎設施追蹤事件轉換為 OTel span（見 **NATS 2.11+ 追蹤事件**）。 |
 | **測試** | 在 Connect 前呼叫 `otel.SetTracerProvider(tp)`（必要時 `otel.SetTextMapPropagator(prop)`）。 |
 
 ---
 
-## Deliver Spans（服務圖）
+## Span kind
 
-當 `OTEL_EXPORTER_OTLP_ENDPOINT` 已設定時，otelnats/oteljetstream 會建立合成的「deliver」span，使 NATS 在 Grafana service graph 中顯示為 broker 節點。
-
-### Span 階層
+Span kind 依 OTel messaging「Span kind」對照表（`send` → `PRODUCER`、`receive`（pull）→ `CLIENT`、`process`（push）→ `CONSUMER`）：
 
 ```
-send subject (PRODUCER, api)
-  └── subject deliver (CONSUMER, nats://addr)  ← 注入至 header
+Publish / PublishMsg                     PRODUCER（send）
+Request / RequestWithContext / ...       CLIENT（request，等待回覆）
+  └── receive <reply-subject>            CLIENT（連結的回覆接收，pull）
+Subscribe / QueueSubscribe handler       CONSUMER（process，push 遞送）
 
-process subject (CONSUMER, worker)  ← 連結至 deliver span
+JetStream publish                        PRODUCER（send）
+JetStream Consume handler                CONSUMER（process，push 遞送 callback）
+JetStream Fetch / Messages / Next        CLIENT（連結的 receive，pull）
 ```
 
-### 產生的服務關係圖
-
-```
-api ──► nats ──► worker
-```
-
-Deliver span 使用獨立的 TracerProvider，`service.name = "nats://{connected_addr}"`。此設定會在 `Connect` 期間自動初始化；除了設定 OTLP endpoint 之外不需要額外配置。
-
-Endpoint 對 HTTP 必須是**完整 URL**（例如 `http://otel-collector:4318`），對 gRPC 則是 **host:port**（例如 `otel-collector:4317`）。不支援沒有 scheme 或 port 的裸主機名稱。
-
-Deliver span 另外還需要 tracing 本身已啟用：`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` 與 `OTEL_NATS_TRACING_ENABLED` 都必須為 truthy（見 **追蹤功能旗標**）。當 tracing 停用時，`Connect` 不會初始化 deliver-span 用的 TracerProvider，無論 `OTEL_EXPORTER_OTLP_ENDPOINT` 是否設定。
+JetStream 的 `receive`／`process` span 另外帶有 `messaging.consumer.name`（durable/consumer 名稱）；core NATS 的 span 則不帶此屬性。
 
 ---
 
@@ -272,8 +264,8 @@ for m := range batch.Messages() {
 
 | 等級 | 事件 |
 |-------|------|
-| `DEBUG` | `serverAttrsFromConn` 中的伺服器位址解析失敗；deliver tracer 初始化成功；收到追蹤事件（`traceevent.go`） |
-| `WARN` | Deliver tracer 初始化失敗（exporter 或 resource 建立錯誤）；追蹤事件 JSON 解碼失敗（`traceevent.go`） |
+| `DEBUG` | `serverAttrsFromConn` 中的伺服器位址解析失敗；收到追蹤事件（`traceevent.go`） |
+| `WARN` | 追蹤事件 JSON 解碼失敗（`traceevent.go`） |
 
 啟動時啟用 debug 等級的 slog handler：
 
@@ -283,7 +275,7 @@ slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 })))
 ```
 
-Log 項目使用 `otelnats:` 前綴。連線／deliver-span 相關的 log（`conn.go`）使用 `error`、`reason`、`service`、`endpoint` 等 key-value 欄位；追蹤事件的 log（`traceevent.go`）則另外使用 `raw`、`server`、`hops`、`events`、`request_headers`。
+Log 項目使用 `otelnats:` 前綴。連線相關的 log（`conn.go`）使用 `addr`、`error`；追蹤事件的 log（`traceevent.go`）使用 `raw`、`server`、`hops`、`events`、`error`、`request_headers`。
 
 ---
 

@@ -18,7 +18,6 @@ type Database struct {
 	propagator         propagation.TextMapPropagator
 	tracingEnabled     bool
 	propagationEnabled bool
-	deliverTracer      trace.Tracer
 }
 
 // Collection returns a Collection with document-level trace propagation.

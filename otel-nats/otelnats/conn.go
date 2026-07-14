@@ -4,19 +4,13 @@ import (
 	"context"
 	"log/slog"
 	"net"
-	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	nats "github.com/nats-io/nats.go"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/sdk/resource"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -24,7 +18,7 @@ import (
 const (
 	// ScopeName is the instrumentation scope name for Tracer creation (OTel contrib guideline).
 	ScopeName              = "instrumentation-go/otel-nats/otelnats"
-	instrumentationVersion = "0.6.0"
+	instrumentationVersion = "0.6.2"
 	messagingSystem        = "nats"
 )
 
@@ -47,9 +41,8 @@ type MsgHandler func(m Msg)
 // All instrumentation behaviour lives behind a polymorphic connImpl chosen once at
 // connection time — tracedConn when tracing is on, directConn (passthrough) when off.
 type Conn struct {
-	nc     *nats.Conn
-	natsTP *sdktrace.TracerProvider // independent TracerProvider for NATS deliver spans (nil when disabled)
-	impl   connImpl
+	nc   *nats.Conn
+	impl connImpl
 }
 
 // connImpl is the polymorphic core of Conn. Two implementations exist
@@ -64,10 +57,7 @@ type connImpl interface {
 	RequestMsgWithContext(ctx context.Context, msg *nats.Msg) (*nats.Msg, error)
 	wrapMsgHandler(subject, queue string, handler MsgHandler) nats.MsgHandler
 	traceEventHandler() nats.MsgHandler
-	StartDeliverSpan(ctx context.Context, subject string) context.Context
-	ConsumerContextWithDeliver(ctx context.Context, subject string, origin trace.SpanContext) context.Context
 	TracingEnabled() bool
-	DeliverSpanEnabled() bool
 	TraceContext() (trace.Tracer, propagation.TextMapPropagator)
 	ServerAttrs() []attribute.KeyValue
 	TraceDest() string
@@ -142,21 +132,14 @@ func newConn(nc *nats.Conn, opts ...Option) *Conn {
 	}
 	tracer := tp.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()), trace.WithSchemaURL(semconv.SchemaURL))
 	serverAttrs := serverAttrsFromConn(nc)
-	deliverServiceName := nc.ConnectedUrlRedacted()
-	if deliverServiceName == "" {
-		deliverServiceName = "nats://" + nc.ConnectedAddr()
-	}
-	natsTP, deliverTracer := initNATSProvider(deliverServiceName, serverAttrs)
 	return &Conn{
-		nc:     nc,
-		natsTP: natsTP,
+		nc: nc,
 		impl: &tracedConn{
-			nc:            nc,
-			tracer:        tracer,
-			propagator:    cfg.Propagators,
-			serverAttrs:   serverAttrs,
-			traceDest:     cfg.TraceDest,
-			deliverTracer: deliverTracer,
+			nc:          nc,
+			tracer:      tracer,
+			propagator:  cfg.Propagators,
+			serverAttrs: serverAttrs,
+			traceDest:   cfg.TraceDest,
 		},
 	}
 }
@@ -180,70 +163,6 @@ func serverAttrsFromConn(nc *nats.Conn) []attribute.KeyValue {
 	return attrs
 }
 
-// initNATSProvider creates an independent TracerProvider for synthetic deliver spans.
-// serviceName is the redacted connected URL (no password); serverAttrs come from ConnectedAddr.
-// Only enabled when OTEL_EXPORTER_OTLP_ENDPOINT is set.
-// The endpoint must be a full URL (e.g. "http://otel-collector:4318") for HTTP,
-// or a host:port (e.g. "otel-collector:4317") for gRPC.
-func initNATSProvider(serviceName string, serverAttrs []attribute.KeyValue) (*sdktrace.TracerProvider, trace.Tracer) {
-	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-	if endpoint == "" {
-		slog.Debug("otelnats: deliver tracer disabled", "reason", "OTEL_EXPORTER_OTLP_ENDPOINT not set")
-		return nil, nil
-	}
-	ctx := context.Background()
-
-	var exp sdktrace.SpanExporter
-	var err error
-	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
-		exp, err = otlptracehttp.New(ctx,
-			otlptracehttp.WithEndpointURL(endpoint),
-		)
-	} else {
-		exp, err = otlptracegrpc.New(ctx,
-			otlptracegrpc.WithEndpoint(endpoint),
-		)
-	}
-	if err != nil {
-		slog.Warn("otelnats: deliver tracer disabled", "reason", "exporter creation failed", "error", err)
-		return nil, nil
-	}
-
-	attrs := make([]attribute.KeyValue, 0, 1+len(serverAttrs))
-	attrs = append(attrs, semconv.ServiceName(serviceName))
-	attrs = append(attrs, serverAttrs...)
-	res, err := resource.New(ctx, resource.WithAttributes(attrs...))
-	if err != nil {
-		slog.Warn("otelnats: deliver tracer disabled", "reason", "resource creation failed", "error", err)
-		_ = exp.Shutdown(ctx) // avoid leaking the exporter connection
-		return nil, nil
-	}
-	slog.Debug("otelnats: deliver tracer enabled", "service", serviceName, "endpoint", endpoint) //nolint:gosec // intentional diagnostic log of internal config values
-
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exp),
-		sdktrace.WithResource(res),
-	)
-	tracer := tp.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()), trace.WithSchemaURL(semconv.SchemaURL))
-	return tp, tracer
-}
-
-// StartDeliverSpan creates a synthetic messaging span for NATS broker delivery.
-// Delegates to the impl — tracedConn creates the span when deliverTracer is set;
-// directConn returns ctx unchanged.
-func (c *Conn) StartDeliverSpan(ctx context.Context, subject string) context.Context {
-	return c.impl.StartDeliverSpan(ctx, subject)
-}
-
-// ConsumerContextWithDeliver creates a consumer-side deliver span linked to origin.
-// Delegates to the impl.
-func (c *Conn) ConsumerContextWithDeliver(ctx context.Context, subject string, origin trace.SpanContext) context.Context {
-	return c.impl.ConsumerContextWithDeliver(ctx, subject, origin)
-}
-
-// DeliverSpanEnabled reports whether the NATS deliver span feature is active.
-func (c *Conn) DeliverSpanEnabled() bool { return c.impl.DeliverSpanEnabled() }
-
 // TracingEnabled reports whether tracing and trace propagation are enabled.
 func (c *Conn) TracingEnabled() bool { return c.impl.TracingEnabled() }
 
@@ -266,22 +185,11 @@ func (c *Conn) NatsConn() *nats.Conn {
 // Close closes the connection (same as nats.Conn.Close).
 func (c *Conn) Close() {
 	c.nc.Close()
-	if c.natsTP != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		_ = c.natsTP.Shutdown(ctx) // best-effort; deliver spans may be lost on failure
-	}
 }
 
 // Drain flushes and closes (same as nats.Conn.Drain).
 func (c *Conn) Drain() error {
-	err := c.nc.Drain()
-	if c.natsTP != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		_ = c.natsTP.Shutdown(ctx) // best-effort; deliver spans may be lost on failure
-	}
-	return err
+	return c.nc.Drain()
 }
 
 // Publish publishes data to subject. Same as nats.Conn.Publish but accepts context for trace.
