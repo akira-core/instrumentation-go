@@ -65,7 +65,9 @@ type Upgrader struct {
 // WithTracingEnabled(false)), otel-ws is never confirmed even if the client
 // requested it: confirming would commit the client to the JSON envelope wire
 // format that this feature-off side neither writes nor unwraps. The upgrade
-// then proceeds with normal application-protocol selection (Scenario H).
+// then proceeds with normal application-protocol selection (Scenario H). As
+// defense in depth for that path, any otel-ws token the caller placed in
+// responseHeader is stripped before gorilla sees it — see stripOTelSubprotocol.
 func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeader http.Header, opts ...Option) (*Conn, error) {
 	clientProtos := websocket.Subprotocols(r)
 	otelRequested, appClientProtos := splitClientProtocols(clientProtos)
@@ -121,8 +123,13 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 	} else {
 		// Scenarios F and H (and otel-ws requests with the feature off): normal
 		// gorilla protocol selection from AppSubprotocols. The client's otel-ws
-		// tokens are never in appProtocols, so they cannot be selected.
+		// tokens are never in appProtocols, so they cannot be selected. When
+		// appProtocols is nil, gorilla falls back to reading
+		// Sec-Websocket-Protocol straight from responseHeader — strip any
+		// otel-ws token the caller may have put there so it can't be echoed
+		// back and smuggle a false negotiation past this feature-off path.
 		inner.Subprotocols = appProtocols
+		responseHeader = stripOTelSubprotocol(responseHeader)
 	}
 
 	raw, err := inner.Upgrade(w, r, responseHeader)
@@ -161,6 +168,55 @@ func cloneHeader(h http.Header) http.Header {
 	out := make(http.Header, len(h))
 	for k, v := range h {
 		out[k] = v
+	}
+	return out
+}
+
+// stripOTelSubprotocol returns h with any otel-ws token(s) removed from its
+// "Sec-Websocket-Protocol" value(s). It returns h unchanged (no clone) if
+// there was nothing to strip, and a shallow clone with the token(s) removed
+// otherwise. Nil-safe: a nil h returns nil.
+//
+// Defense in depth: gorilla reads Sec-Websocket-Protocol straight from a
+// caller-supplied header, bypassing this package's negotiation logic,
+// whenever Inner.Subprotocols (server) or Dialer.Subprotocols (client) is
+// empty — see the Upgrade and Dial doc comments. Without this strip, a
+// caller-supplied header carrying a stray otel-ws token could smuggle a
+// feature-off side into offering/confirming otel-ws it will not speak,
+// committing its peer to an envelope wire format this side never unwraps.
+func stripOTelSubprotocol(h http.Header) http.Header {
+	if h == nil {
+		return nil
+	}
+	const key = "Sec-Websocket-Protocol"
+	values := h.Values(key)
+	if len(values) == 0 {
+		return h
+	}
+
+	var surviving []string
+	stripped := false
+	for _, line := range values {
+		for _, tok := range strings.Split(line, ",") {
+			tok = strings.TrimSpace(tok)
+			if tok == "" {
+				continue
+			}
+			if tok == otelWSProtocol || strings.HasPrefix(tok, otelWSProtocol+"+") {
+				stripped = true
+				continue
+			}
+			surviving = append(surviving, tok)
+		}
+	}
+	if !stripped {
+		return h
+	}
+
+	out := cloneHeader(h)
+	out.Del(key)
+	if len(surviving) > 0 {
+		out.Set(key, strings.Join(surviving, ", "))
 	}
 	return out
 }

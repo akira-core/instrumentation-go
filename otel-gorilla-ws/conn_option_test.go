@@ -357,3 +357,111 @@ func TestDial_TracingDisabled_DoesNotOfferOTelWS(t *testing.T) {
 		t.Fatalf("client received %q, want clean round-tripped payload %q", got, payload)
 	}
 }
+
+// TestUpgrader_FeatureOff_StripsOTelFromCallerResponseHeader is a
+// defense-in-depth regression test: gorilla reads Sec-Websocket-Protocol
+// straight from a caller-supplied responseHeader whenever Inner.Subprotocols
+// is nil (true here since both Subprotocols and AppSubprotocols are unset),
+// bypassing this package's own negotiation logic entirely. If a caller's
+// responseHeader happens to carry an otel-ws token, a feature-off Upgrade
+// must still strip it before calling into gorilla — otherwise gorilla echoes
+// it back verbatim and the client believes otel-ws was negotiated even
+// though this server's Conn has tracing disabled.
+func TestUpgrader_FeatureOff_StripsOTelFromCallerResponseHeader(t *testing.T) {
+	clearWSTracingEnv(t)
+
+	up := Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		responseHeader := http.Header{"Sec-Websocket-Protocol": {"otel-ws+json"}}
+		conn, err := up.Upgrade(w, r, responseHeader, WithTracingEnabled(false))
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+		if conn.tracingEnabled {
+			t.Error("server must not negotiate otel-ws when its tracing is off, even via a caller-supplied responseHeader")
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	// Raw gorilla dial (not this package's Dial) to observe the true
+	// wire-level response, bypassing any client-side stripping.
+	rawConn, resp, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = rawConn.Close() })
+
+	if got := rawConn.Subprotocol(); strings.Contains(got, "otel-ws") {
+		t.Fatalf("client observed negotiated subprotocol %q, want no otel-ws token: the caller responseHeader must be stripped when the feature is off", got)
+	}
+	if got := resp.Header.Get("Sec-Websocket-Protocol"); strings.Contains(got, "otel-ws") {
+		t.Fatalf("response header Sec-Websocket-Protocol = %q, want no otel-ws token", got)
+	}
+}
+
+// TestDial_FeatureOff_StripsOTelFromCallerRequestHeader is the client-side
+// counterpart: gorilla's Dialer sends a caller-supplied requestHeader's
+// Sec-Websocket-Protocol value verbatim whenever Dialer.Subprotocols is
+// empty (true here since subprotocols is nil and otelInjected therefore
+// stays false), bypassing this package's own negotiation logic entirely. If
+// a caller's requestHeader happens to carry an otel-ws token, a
+// feature-off/no-subprotocols Dial must still strip it — otherwise an
+// otel-ws-aware server confirms and envelopes every message, which this
+// client's Conn (tracingEnabled false) never unwraps.
+func TestDial_FeatureOff_StripsOTelFromCallerRequestHeader(t *testing.T) {
+	enableWSTracingEnv(t)
+
+	payload := `{"clean":"payload"}`
+	up := Upgrader{
+		CheckOrigin:  func(r *http.Request) bool { return true },
+		Subprotocols: []string{"json"},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// env gates on: this server WOULD confirm otel-ws if it were offered.
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+		if conn.tracingEnabled {
+			t.Error("server must not see an otel-ws offer smuggled through a feature-off client's requestHeader")
+		}
+		_, mt, data, err := conn.ReadMessage(context.Background())
+		if err != nil {
+			return
+		}
+		if string(data) != payload {
+			t.Errorf("server received %q, want raw payload %q", data, payload)
+		}
+		_ = conn.WriteMessage(context.Background(), mt, data)
+	}))
+	t.Cleanup(srv.Close)
+
+	requestHeader := http.Header{"Sec-Websocket-Protocol": {"otel-ws"}}
+	client, resp, err := Dial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http"), requestHeader, nil, WithTracingEnabled(false))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	if client.tracingEnabled {
+		t.Fatal("client must not have tracing enabled: feature is off")
+	}
+	if got := resp.Header.Get("Sec-Websocket-Protocol"); strings.Contains(got, "otel-ws") {
+		t.Fatalf("response header Sec-Websocket-Protocol = %q, want no otel-ws confirmation: the caller requestHeader must be stripped before dialing", got)
+	}
+
+	if err := client.WriteMessage(context.Background(), websocket.TextMessage, []byte(payload)); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+	_, _, got, err := client.ReadMessage(context.Background())
+	if err != nil {
+		t.Fatalf("client read: %v", err)
+	}
+	if string(got) != payload {
+		t.Fatalf("client received %q, want clean round-tripped payload %q", got, payload)
+	}
+}

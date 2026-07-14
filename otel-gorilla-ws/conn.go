@@ -192,6 +192,9 @@ func (c *Conn) ReadMessage(ctx context.Context) (context.Context, int, []byte, e
 // WithTracingEnabled(false)), otel-ws is not offered at all: a feature-off
 // side never unwraps the JSON envelope, so offering the subprotocol would
 // commit an otel-ws-aware server to a wire format this client cannot read.
+// As defense in depth for that path (and whenever subprotocols is empty),
+// any otel-ws token the caller placed in requestHeader is stripped before
+// gorilla sees it — see stripOTelSubprotocol.
 func Dial(ctx context.Context, urlStr string, requestHeader http.Header, subprotocols []string, opts ...Option) (*Conn, *http.Response, error) {
 	cfg := resolveConnOptions(opts)
 	featureOn := effectiveFeatureEnabled(cfg)
@@ -203,6 +206,13 @@ func Dial(ctx context.Context, urlStr string, requestHeader http.Header, subprot
 		dialProtos = append(dialProtos, otelWSProtocol)
 		dialProtos = append(dialProtos, subprotocols...)
 		otelInjected = true
+	} else {
+		// gorilla's Dialer silently sends a caller-supplied
+		// Sec-Websocket-Protocol request header verbatim whenever
+		// Dialer.Subprotocols is empty (true whenever otelInjected is false
+		// here). Strip any otel-ws token so it can't smuggle an otel-ws offer
+		// past this feature-off/no-subprotocols path.
+		requestHeader = stripOTelSubprotocol(requestHeader)
 	}
 
 	dialer := websocket.Dialer{
