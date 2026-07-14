@@ -10,6 +10,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -90,7 +91,8 @@ func newFailingPropCollection(t *testing.T, sr *tracetest.SpanRecorder) *Collect
 }
 
 // TestCollection_InsertOne_InjectFailureKeepsStaticAddr proves InsertOne's inject-failure
-// early return still carries the static server.* fallback (regression: it used to skip it).
+// early return still carries the static server.* fallback (regression: it used to skip it),
+// and that the span is marked as errored (regression: it used to skip RecordSpanError too).
 func TestCollection_InsertOne_InjectFailureKeepsStaticAddr(t *testing.T) {
 	sr := tracetest.NewSpanRecorder()
 	impl := newFailingPropCollection(t, sr)
@@ -104,6 +106,50 @@ func TestCollection_InsertOne_InjectFailureKeepsStaticAddr(t *testing.T) {
 	assert.Equal(t, "static-fallback-host", addr)
 	require.True(t, sawPort, "inject-failure span must still carry server.port fallback")
 	assert.Equal(t, int64(27018), port)
+	assert.Equal(t, codes.Error, spans[0].Status().Code, "inject-failure span must be recorded as errored")
+	assert.NotEmpty(t, spans[0].Status().Description, "inject-failure span must carry an error description")
+}
+
+// TestCollection_InsertMany_InjectFailureKeepsStaticAddr is the InsertMany counterpart:
+// an un-encodable document in the per-document loop makes InjectTraceIntoDocument fail
+// before the driver call, and the failed span must still carry the static server.*
+// fallback and be recorded as errored.
+func TestCollection_InsertMany_InjectFailureKeepsStaticAddr(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	impl := newFailingPropCollection(t, sr)
+
+	_, err := impl.InsertMany(context.Background(), []any{bson.M{"bad": make(chan int)}})
+	require.Error(t, err)
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	addr, port, sawPort := spanServerAttrs(t, spans[0])
+	assert.Equal(t, "static-fallback-host", addr)
+	require.True(t, sawPort, "inject-failure span must still carry server.port fallback")
+	assert.Equal(t, int64(27018), port)
+	assert.Equal(t, codes.Error, spans[0].Status().Code, "inject-failure span must be recorded as errored")
+	assert.NotEmpty(t, spans[0].Status().Description, "inject-failure span must carry an error description")
+}
+
+// TestCollection_ReplaceOne_InjectFailureKeepsStaticAddr is the ReplaceOne counterpart:
+// an un-encodable replacement document makes InjectTraceIntoDocument fail before the
+// driver call, and the failed span must still carry the static server.* fallback and be
+// recorded as errored.
+func TestCollection_ReplaceOne_InjectFailureKeepsStaticAddr(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	impl := newFailingPropCollection(t, sr)
+
+	_, err := impl.ReplaceOne(context.Background(), bson.M{"_id": 1}, bson.M{"bad": make(chan int)})
+	require.Error(t, err)
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	addr, port, sawPort := spanServerAttrs(t, spans[0])
+	assert.Equal(t, "static-fallback-host", addr)
+	require.True(t, sawPort, "inject-failure span must still carry server.port fallback")
+	assert.Equal(t, int64(27018), port)
+	assert.Equal(t, codes.Error, spans[0].Status().Code, "inject-failure span must be recorded as errored")
+	assert.NotEmpty(t, spans[0].Status().Description, "inject-failure span must carry an error description")
 }
 
 // TestCollection_BulkWrite_InjectFailureKeepsStaticAddr is the BulkWrite counterpart:
