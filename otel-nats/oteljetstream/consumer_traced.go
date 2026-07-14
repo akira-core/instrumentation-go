@@ -3,7 +3,6 @@ package oteljetstream
 import (
 	"context"
 
-	nats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
@@ -50,12 +49,11 @@ func (c *tracedConsumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (
 	if err != nil {
 		return nil, nil, err
 	}
-	h := msg.Headers()
-	if h == nil {
-		h = make(nats.Header)
-	}
 	tracer, prop := c.conn.TraceContext()
-	msgCtx := prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: h})
+	msgCtx := context.Background()
+	if h := msg.Headers(); h != nil {
+		msgCtx = prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: h})
+	}
 	originSpanCtx := trace.SpanContextFromContext(msgCtx)
 	spanName := "receive " + msg.Subject()
 	attrs := receiveMsgAttrs(receiveBaseAttrs("receive", c.conn.ServerAttrs(), c.consumerName), msg)
@@ -150,11 +148,10 @@ func tracedConsumeHandler(conn *otelnats.Conn, consumerName string, handler MsgH
 	tracer, prop := conn.TraceContext()
 	baseAttrs := receiveBaseAttrs("process", conn.ServerAttrs(), consumerName)
 	return func(msg jetstream.Msg) {
-		h := msg.Headers()
-		if h == nil {
-			h = make(nats.Header)
+		msgCtx := context.Background()
+		if h := msg.Headers(); h != nil {
+			msgCtx = prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: h})
 		}
-		msgCtx := prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: h})
 		originSpanCtx := trace.SpanContextFromContext(msgCtx)
 		spanName := "process " + msg.Subject()
 		attrs := receiveMsgAttrs(baseAttrs, msg)
@@ -188,11 +185,10 @@ func (m *tracedMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context
 	if err != nil {
 		return nil, nil, err
 	}
-	h := msg.Headers()
-	if h == nil {
-		h = make(nats.Header)
+	msgCtx := context.Background()
+	if h := msg.Headers(); h != nil {
+		msgCtx = m.prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: h})
 	}
-	msgCtx := m.prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: h})
 	originSpanCtx := trace.SpanContextFromContext(msgCtx)
 	spanName := "receive " + msg.Subject()
 	attrs := receiveMsgAttrs(m.baseAttrs, msg)

@@ -4,7 +4,6 @@ import (
 	"context"
 	"sync"
 
-	nats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
@@ -212,11 +211,10 @@ func newTracedMessageBatch(conn *otelnats.Conn, consumerName string, raw jetstre
 			case <-done:
 				return
 			}
-			h := msg.Headers()
-			if h == nil {
-				h = make(nats.Header)
+			msgCtx := context.Background()
+			if h := msg.Headers(); h != nil {
+				msgCtx = prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: h})
 			}
-			msgCtx := prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: h})
 			originSpanCtx := trace.SpanContextFromContext(msgCtx)
 			attrs := receiveMsgAttrs(baseAttrs, msg)
 			opts := []trace.SpanStartOption{

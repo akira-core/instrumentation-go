@@ -113,10 +113,7 @@ func Connect(ctx context.Context, opts ...*options.ClientOptions) (*Client, erro
 // Without options, falls back to otel.GetTracerProvider()/otel.GetTextMapPropagator() at connect time.
 func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*options.ClientOptions) (*Client, error) {
 	cfg := newClientConfig(traceOpts)
-	enabled := mongoTracingEnabled()
-	if cfg.TracingEnabled != nil {
-		enabled = *cfg.TracingEnabled
-	}
+	enabled := resolveFlag(cfg.TracingEnabled, mongoTracingEnabled())
 	if !enabled {
 		merged := options.MergeClientOptions(opts...) //nolint:staticcheck // SA1019: v1 driver deprecates struct-merging ahead of v2; still needed here to read the effective merged Monitor/URI.
 		mc, err := mongo.Connect(ctx, merged)

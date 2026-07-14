@@ -32,7 +32,7 @@
 - [x] 5.1 Remove any deliver wiring from `consumer.go` / `consumer_traced.go` / `jetstream_traced.go`.
 - [x] 5.2 Change pull-consume spans (`Consume` / `Fetch` / `Messages` iterator, `receive`) from `SpanKindConsumer` to `SpanKindClient`; keep publish=Producer and push `process`=Consumer.
 - [x] 5.3 Delete deliver assertions from `oteljetstream/consumer_test.go` and `otelnats/conn_test.go`.
-- [x] 5.4 Add/keep a test asserting JetStream `receive`/`process` spans carry `messaging.consumer.name=<consumer>` and that core-NATS spans do not — covers the JetStream-consumer-name addition to the "NATS span attribute set" requirement.
+- [x] 5.4 Add/keep a test asserting JetStream `receive`/`process` spans carry `messaging.consumer.name=<consumer>` and that core-NATS spans do not — covers the JetStream-consumer-name addition to the "NATS span attribute set" requirement. *(Historical: the key was renamed to the semconv `messaging.consumer.group.name` in 0.7.0 by the address-o11y-feedback change; this change's spec delta was aligned accordingly.)*
 - [x] 5.5 `go build ./... && go test -race ./... && golangci-lint run ./...` in `otel-nats/` — all pass.
 
 ## 6. otel-gorilla-ws — attributes only

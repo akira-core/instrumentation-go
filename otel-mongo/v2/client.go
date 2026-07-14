@@ -114,10 +114,7 @@ func Connect(opts ...*options.ClientOptions) (*Client, error) {
 // Without options, falls back to otel.GetTracerProvider()/otel.GetTextMapPropagator() at connect time.
 func ConnectWithOptions(traceOpts []ClientOption, opts ...*options.ClientOptions) (*Client, error) {
 	cfg := newClientConfig(traceOpts)
-	enabled := mongoTracingEnabled()
-	if cfg.TracingEnabled != nil {
-		enabled = *cfg.TracingEnabled
-	}
+	enabled := resolveFlag(cfg.TracingEnabled, mongoTracingEnabled())
 	if !enabled {
 		merged := options.MergeClientOptions(opts...)
 		mc, err := mongo.Connect(merged)

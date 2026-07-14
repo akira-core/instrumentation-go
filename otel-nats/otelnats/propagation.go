@@ -24,26 +24,8 @@ type HeaderCarrier struct {
 // not value emptiness: a verbatim key present with an empty value wins over a
 // canonical or case-insensitive entry, matching Values.
 func (c HeaderCarrier) Get(key string) string {
-	if len(c.H) == 0 {
-		return ""
-	}
-	if vs, ok := c.H[key]; ok {
-		if len(vs) > 0 {
-			return vs[0]
-		}
-		return ""
-	}
-	if vs, ok := c.H[textproto.CanonicalMIMEHeaderKey(key)]; ok {
-		if len(vs) > 0 {
-			return vs[0]
-		}
-		return ""
-	}
-	if vs, ok := c.lookupFold(key); ok {
-		if len(vs) > 0 {
-			return vs[0]
-		}
-		return ""
+	if vs := c.Values(key); len(vs) > 0 {
+		return vs[0]
 	}
 	return ""
 }

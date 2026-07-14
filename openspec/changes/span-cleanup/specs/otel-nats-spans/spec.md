@@ -38,7 +38,7 @@ Span kind SHALL follow the OTel messaging "Span kind" mapping: `send` → `PRODU
 
 Message spans SHALL carry OTel messaging-semconv attributes: `messaging.system`, `messaging.destination.name`, `messaging.operation.type`, `messaging.operation.name`, `messaging.message.body.size` (when body non-empty), plus `server.address` / `server.port`. Conditional attributes SHALL be set when their value exists: `messaging.message.conversation_id` (reply subject), `messaging.consumer.group.name` (queue group). `messaging.operation.type` for a pull-receive span SHALL be `receive`.
 
-JetStream consumer spans (`receive` and `process`) SHALL additionally carry `messaging.consumer.name` set to the JetStream durable/consumer name. This key is set as a literal (no semconv helper exists for it in the pinned semconv version); it is the only messaging attribute unique to `oteljetstream` — core `otelnats` spans do not carry it.
+JetStream consumer spans (`receive` and `process`) SHALL additionally carry `messaging.consumer.group.name` set to the JetStream durable/consumer name (the semconv v1.39.0 key; this delta originally specified the non-semconv literal `messaging.consumer.name`, renamed by the address-o11y-feedback change — aligned here so archiving this change cannot reintroduce the old key). It is the only messaging attribute unique to `oteljetstream` — core `otelnats` spans do not carry it.
 
 #### Scenario: Publish attributes
 
@@ -54,8 +54,8 @@ JetStream consumer spans (`receive` and `process`) SHALL additionally carry `mes
 #### Scenario: JetStream span carries consumer name
 
 - **WHEN** a JetStream consumer named `orders-worker` receives or processes a message
-- **THEN** the span SHALL additionally carry `messaging.consumer.name=orders-worker`
-- **AND** an equivalent core-NATS `Publish` / subscribe span SHALL NOT carry `messaging.consumer.name`
+- **THEN** the span SHALL additionally carry `messaging.consumer.group.name=orders-worker`
+- **AND** an equivalent core-NATS `Publish` / subscribe span SHALL NOT carry `messaging.consumer.group.name`
 
 ### Requirement: Disabled tracing emits no spans or SDK objects
 

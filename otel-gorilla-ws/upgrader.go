@@ -202,7 +202,7 @@ func stripOTelSubprotocol(h http.Header) http.Header {
 			if tok == "" {
 				continue
 			}
-			if tok == otelWSProtocol || strings.HasPrefix(tok, otelWSProtocol+"+") {
+			if isOTelWireProtocol(tok) {
 				stripped = true
 				continue
 			}
