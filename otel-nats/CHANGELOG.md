@@ -29,7 +29,7 @@ All notable changes to the `otel-nats` module (`otelnats` + `oteljetstream`) are
 
 ## [0.6.0] - 2026-07-08
 
-See [`RELEASE-NOTES-0.6.0.md`](../RELEASE-NOTES-0.6.0.md) at the repo root for the full cross-module notes. Highlights for this module:
+Highlights for this module:
 
 - Dependencies refreshed: `go.opentelemetry.io/otel` v1.44.0, `nats.go` v1.50.0 (downstream-policy pin), `semconv` v1.39.0 (downstream-policy pin). Go toolchain floor raised to 1.25.
 - `oteljetstream.PushConsumer` added (push consumers now wrapped): `PushConsumer`/`CreatePushConsumer`/`CreateOrUpdatePushConsumer`/`UpdatePushConsumer` on `JetStream` and `Stream`.

@@ -12,11 +12,11 @@ Instrumentation packages **do not** create a global `TracerProvider`. They use `
 
 | Package | Import path | Version (source) | Description |
 |---------|-------------|------------------|-------------|
-| **otel-mongo** (v1) | `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | 0.6.2 | MongoDB driver v1 wrapper; `_oteltrace` on writes; `ContextFromDocument` / decode helpers. |
-| **otel-mongo/v2** | `github.com/akira-core/instrumentation-go/otel-mongo/v2` | 0.6.2 | MongoDB driver v2 wrapper; parity with v1. |
-| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.6.2 | Core NATS; W3C context in message headers. |
-| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.6.2 | JetStream publish/consume/fetch. |
-| **otel-gorilla-ws** | `github.com/akira-core/instrumentation-go/otel-gorilla-ws` | 0.6.0 | Trace context in JSON message body (envelope); `NewConn` / `Dial`. |
+| **otel-mongo** (v1) | `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | 0.7.0 | MongoDB driver v1 wrapper; `_oteltrace` on writes; `ContextFromDocument` / decode helpers. |
+| **otel-mongo/v2** | `github.com/akira-core/instrumentation-go/otel-mongo/v2` | 0.7.0 | MongoDB driver v2 wrapper; parity with v1. |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.7.0 | Core NATS; W3C context in message headers. |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.7.0 | JetStream publish/consume/fetch. |
+| **otel-gorilla-ws** | `github.com/akira-core/instrumentation-go/otel-gorilla-ws` | 0.7.0 | Trace context in JSON message body (envelope); `NewConn` / `Dial`. |
 
 Per-module docs: [otel-mongo/README.md](otel-mongo/README.md), [otel-nats/README.md](otel-nats/README.md), [otel-gorilla-ws/README.md](otel-gorilla-ws/README.md) (each also ships a [README.zh-TW.md](otel-mongo/README.zh-TW.md): [otel-nats](otel-nats/README.zh-TW.md), [otel-gorilla-ws](otel-gorilla-ws/README.zh-TW.md)).
 

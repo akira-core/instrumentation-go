@@ -67,3 +67,66 @@
 - [x] 11.4 Full gates on all four modules after the version bump: **428 unit tests** (otel-nats 80, otel-mongo 138, otel-mongo/v2 159, otel-gorilla-ws 51), all `go build`/`golangci-lint` clean. **27 integration tests** (Docker, testcontainers) run and passed across all four `tests/integration/` sub-modules — otel-nats 11, otel-mongo 6, otel-mongo/v2 6, otel-gorilla-ws 4
 - [x] 11.5 ~~Merge; tag; publish GitHub Releases~~ — **removed from this change** (2026-07-11, user decision): release execution happens **after** the change is archived (archive → merge → tag `otel-nats/v0.7.0` first so the guard self-validates, then the other three → GitHub Releases with migration notes). Not part of the change's implementation scope.
 - [x] 11.6 ~~Update `UPSTREAM-ENGAGEMENT-NOTES.md`~~ — **obsolete**: the file was removed by the user (2026-07-11); no engagement-notes update to perform. Task closed as skipped.
+
+## 12. Post-PR branch code review (2026-07-14) — 6 findings, all fixed
+
+An independent line-by-line review of `git diff main...HEAD` after this change's implementation was
+complete (PR #22) surfaced 6 findings (3 Important, 3 Moderate), tracked in a since-deleted
+`CODE_REVIEW_REPORT.md` with a Decision Log. All 6 were accepted as real; 2 of #2's sub-fixes had already
+landed pre-review (`9b0c911`). This task closes out the remainder — see individual module `CHANGELOG.md`
+entries and git history for full detail; this entry exists so the review trail survives the report file's
+removal.
+
+- [x] 12.1 **#1 Important — otel-gorilla-ws wire corruption via caller-supplied header.** `Upgrader.Upgrade`'s
+  `!negotiateOTel` path and `Dial`'s `otelInjected==false` path both left a caller-supplied
+  `responseHeader`/`requestHeader` untouched, even though gorilla reads `Sec-Websocket-Protocol` straight
+  from that header (bypassing all negotiation logic) whenever `Inner.Subprotocols`/`Dialer.Subprotocols` is
+  empty — a stray `otel-ws`/`otel-ws+*` token in a caller header could smuggle a false negotiation past a
+  feature-off side. Fixed with a new `stripOTelSubprotocol` helper (`upgrader.go`), applied in both
+  `Upgrade`'s `else` branch and `Dial`'s new `else` branch (`conn.go`). Two new regression tests:
+  `TestUpgrader_FeatureOff_StripsOTelFromCallerResponseHeader`,
+  `TestDial_FeatureOff_StripsOTelFromCallerRequestHeader` (both run ×50 under `-race` clean, plus full
+  suite).
+- [x] 12.2 **#2 residual — otel-mongo inject-failure spans missing error status.** `InsertOne`, `InsertMany`,
+  `ReplaceOne` in both v1 (`otelmongo/internal/traced/collection.go`) and v2
+  (`v2/internal/traced/collection.go`) returned early on `_oteltrace` injection failure without calling
+  `shared.RecordSpanError` — the `server.*` fallback (fixed pre-review by `9b0c911`) landed on the span, but
+  it carried no error status/exception. Fixed by wrapping the error, recording it, then returning — matching
+  `BulkWrite`'s existing pattern. `UpdateOne`/`UpdateMany`/`UpdateByID` were left untouched (they already use
+  a different, correct fallback-and-continue pattern). New tests:
+  `TestCollection_InsertMany_InjectFailureKeepsStaticAddr`,
+  `TestCollection_ReplaceOne_InjectFailureKeepsStaticAddr` (both modules); extended
+  `TestCollection_InsertOne_InjectFailureKeepsStaticAddr` with a `codes.Error` status assertion. Confirmed
+  v1/v2 diffs are byte-parity (same 3-hunk +9/-3 shape). Noted but out of scope: v1's `collection.go` already
+  had `UpdateOne`/`UpdateMany` and `DeleteOne`/`DeleteMany` deduplicated into shared `runUpdate`/`runDelete`
+  helpers pre-review; v2 does not — a pre-existing v1/v2 structural drift, unrelated to this fix, left for a
+  future change.
+- [x] 12.3 **#3 Important — `Upgrader.Upgrade` CHANGELOG mislabel.** The variadic `opts ...Option` addition
+  changes the method's Go type (breaks method-value/interface assignments pinned to the old 3-arg signature)
+  but was filed under `### Added` as "(backward-compatible...)". Moved to `### Changed — BREAKING` in
+  `otel-gorilla-ws/CHANGELOG.md` with a migration note (wrap in a 3-arg closure). No code change — labeling
+  only; `UpgradeWithOptions` split was explicitly rejected (pre-1.0 minor-bump-for-breaking policy already
+  applies, 3-arg calls stay source-compatible).
+- [x] 12.4 **#4 Moderate, low-priority — otel-nats `HeaderCarrier` arbitrary casing.** `Get`/`Values` only
+  tried verbatim and MIME-canonical (`Traceparent`) key forms; other legal casings (`TRACEPARENT`,
+  `TraceParent`) still lost trace context. Added a third `strings.EqualFold` linear-scan fallback
+  (`lookupFold`) in `otel-nats/otelnats/propagation.go`, triggered only after both exact-match tiers miss;
+  key-presence (not value-emptiness) fallback semantics preserved. 4 new tests incl.
+  `TestHeaderCarrier_VerbatimEmptyValueWinsOverCaseFold` pinning the presence-based precedence for the new
+  tier. Accepted for implementation (not skipped as YAGNI) given the fix's low cost and the header
+  case-insensitivity convention.
+- [x] 12.5 **#5 Moderate — root README version tables stale.** `README.md`/`README.zh-TW.md`'s "Version
+  (source)"/"原始碼版本" columns still showed `0.6.2`/`0.6.0` while all four `instrumentationVersion`
+  constants are `0.7.0` on this branch. Updated both tables (5 rows each). Left `go get ...@otel-*/v0.6.0`
+  install-example lines untouched — `v0.7.0` isn't tagged yet, so changing those would break real `go get`
+  commands until the actual release.
+- [x] 12.6 **#6 Moderate — dead links to a deleted release-notes file.** `RELEASE-NOTES-0.6.0.md` was deleted
+  earlier on this branch (`bd8bde6`), but `otel-gorilla-ws/otel-mongo/otel-mongo/v2/otel-nats`'s
+  `CHANGELOG.md` `## [0.6.0]` sections still linked to it. Removed the dead-link clause from all four,
+  keeping the "Highlights for this module:" intro and existing per-module bullets (already self-contained).
+  Not restoring the file — its removal was deliberate and `VERSIONING.md` already documents module
+  `CHANGELOG.md` as canonical, root release notes as optional.
+- [x] 12.7 Full build/test-race/lint gate re-run independently (not just implementer self-report) on all four
+  modules after 12.1–12.6: otel-gorilla-ws 64 tests, otel-mongo 169 tests, otel-mongo/v2 190 tests, otel-nats
+  92 tests — all green, 0 lint issues, `git diff --check` clean. `CODE_REVIEW_REPORT.md`/`.html` removed
+  after this verification passed.

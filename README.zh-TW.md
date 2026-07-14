@@ -12,11 +12,11 @@
 
 | 套件 | Import 路徑 | 原始碼版本 | 說明 |
 |------|-------------|------------|------|
-| **otel-mongo** (v1) | `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | 0.6.2 | MongoDB driver v1 封裝；寫入時注入 `_oteltrace`；`ContextFromDocument` 與解碼輔助。 |
-| **otel-mongo/v2** | `github.com/akira-core/instrumentation-go/otel-mongo/v2` | 0.6.2 | MongoDB driver v2 封裝；與 v1 行為對齊。 |
-| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.6.2 | 核心 NATS；W3C 脈絡在訊息標頭。 |
-| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.6.2 | JetStream 發布／消費／fetch。 |
-| **otel-gorilla-ws** | `github.com/akira-core/instrumentation-go/otel-gorilla-ws` | 0.6.0 | 在 JSON 訊息本文內傳遞 trace context（信封格式）；`NewConn` / `Dial`。 |
+| **otel-mongo** (v1) | `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | 0.7.0 | MongoDB driver v1 封裝；寫入時注入 `_oteltrace`；`ContextFromDocument` 與解碼輔助。 |
+| **otel-mongo/v2** | `github.com/akira-core/instrumentation-go/otel-mongo/v2` | 0.7.0 | MongoDB driver v2 封裝；與 v1 行為對齊。 |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.7.0 | 核心 NATS；W3C 脈絡在訊息標頭。 |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.7.0 | JetStream 發布／消費／fetch。 |
+| **otel-gorilla-ws** | `github.com/akira-core/instrumentation-go/otel-gorilla-ws` | 0.7.0 | 在 JSON 訊息本文內傳遞 trace context（信封格式）；`NewConn` / `Dial`。 |
 
 各模組詳細文件：[otel-mongo/README.md](otel-mongo/README.md)、[otel-nats/README.md](otel-nats/README.md)、[otel-gorilla-ws/README.md](otel-gorilla-ws/README.md)；三個模組皆另有繁中版：[otel-mongo/README.zh-TW.md](otel-mongo/README.zh-TW.md)、[otel-nats/README.zh-TW.md](otel-nats/README.zh-TW.md)、[otel-gorilla-ws/README.zh-TW.md](otel-gorilla-ws/README.zh-TW.md)。
 

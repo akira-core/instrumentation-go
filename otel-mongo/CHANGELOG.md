@@ -27,7 +27,7 @@ All notable changes to the `otel-mongo` module (v1, `go.mongodb.org/mongo-driver
 
 ## [0.6.0] - 2026-07-08
 
-See [`RELEASE-NOTES-0.6.0.md`](../RELEASE-NOTES-0.6.0.md) at the repo root for the full cross-module notes. Highlights for this module:
+Highlights for this module:
 
 - Dependencies refreshed: `go.opentelemetry.io/otel` v1.44.0, `go.mongodb.org/mongo-driver` v1.17.9, `semconv` v1.39.0. Go toolchain floor raised to 1.25.
 - Module path renamed from `Marz32onE/instrumentation-go` to `akira-core/instrumentation-go`.
