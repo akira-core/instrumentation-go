@@ -127,3 +127,57 @@ func TestHeaderCarrier_VerbatimEmptyValueWinsOverCanonical(t *testing.T) {
 		t.Errorf(`Values(traceparent): got %v, want [""] (verbatim entry, no fallback)`, vals)
 	}
 }
+
+func TestHeaderCarrier_CaseFoldFallback_Get(t *testing.T) {
+	h := nats.Header{}
+	h.Set("TRACEPARENT", "00-allcaps-1-01") // neither verbatim nor MIME-canonical
+	c := otelnats.HeaderCarrier{H: h}
+
+	if got := c.Get("traceparent"); got != "00-allcaps-1-01" {
+		t.Errorf("Get(traceparent) case-fold fallback: got %q, want all-caps value", got)
+	}
+}
+
+func TestHeaderCarrier_CaseFoldFallback_MixedCase_Get(t *testing.T) {
+	h := nats.Header{}
+	h.Set("TraceParent", "00-mixedcase-1-01") // capital P: not MIME-canonical ("Traceparent")
+	c := otelnats.HeaderCarrier{H: h}
+
+	if got := c.Get("traceparent"); got != "00-mixedcase-1-01" {
+		t.Errorf("Get(traceparent) case-fold fallback: got %q, want mixed-case value", got)
+	}
+}
+
+func TestHeaderCarrier_CaseFoldFallback_Values(t *testing.T) {
+	h := nats.Header{}
+	h.Add("BAGGAGE", "a=1")
+	h.Add("BAGGAGE", "b=2")
+	c := otelnats.HeaderCarrier{H: h}
+
+	vals := c.Values("baggage")
+	if len(vals) != 2 || vals[0] != "a=1" || vals[1] != "b=2" {
+		t.Errorf("Values(baggage) case-fold fallback: got %v, want [a=1 b=2]", vals)
+	}
+}
+
+// TestHeaderCarrier_VerbatimEmptyValueWinsOverCaseFold pins presence-based
+// fallback for the third tier, mirroring
+// TestHeaderCarrier_VerbatimEmptyValueWinsOverCanonical: a verbatim key
+// present with an empty value must win over a non-empty all-caps entry
+// elsewhere in the header (the fallback triggers on key absence, not value
+// emptiness), identically for Get and Values.
+func TestHeaderCarrier_VerbatimEmptyValueWinsOverCaseFold(t *testing.T) {
+	h := nats.Header{
+		"traceparent": {""},
+		"TRACEPARENT": {"00-allcaps-1-01"},
+	}
+	c := otelnats.HeaderCarrier{H: h}
+
+	if got := c.Get("traceparent"); got != "" {
+		t.Errorf("Get(traceparent): got %q, want empty verbatim value (no case-fold fallback)", got)
+	}
+	vals := c.Values("traceparent")
+	if len(vals) != 1 || vals[0] != "" {
+		t.Errorf(`Values(traceparent): got %v, want [""] (verbatim entry, no fallback)`, vals)
+	}
+}
