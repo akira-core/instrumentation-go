@@ -1,0 +1,14 @@
+name: NG Words
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: akira-core/action-workflow@77e48b36042800b1db6b1a8b2bde8f98b41695b4 # v1
+        with:
+          ng-words: ${{ secrets.NG_WORDS }}
