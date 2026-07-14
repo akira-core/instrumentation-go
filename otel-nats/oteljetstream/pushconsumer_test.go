@@ -237,7 +237,7 @@ func TestOrderedConsumerNamePrefixAttr(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "ordered msg", string(msg.Data()))
 
-	consumerSpan := waitSpanByNameAndKind(t, sr, "receive orderedprefix.test", oteltrace.SpanKindConsumer)
+	consumerSpan := waitSpanByNameAndKind(t, sr, "receive orderedprefix.test", oteltrace.SpanKindClient)
 	assertAttr(t, consumerSpan.Attributes(), "messaging.consumer.name", "my-ordered")
 }
 
