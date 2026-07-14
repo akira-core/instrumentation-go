@@ -50,18 +50,40 @@ otel-mongo/
 
 - `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` (global master switch)
 - `OTEL_MONGO_TRACING_ENABLED` (wrapper **CLIENT** spans for this package and noop vs real tracer — driver/contrib command spans are separate)
-- `OTEL_MONGO_PROPAGATION_ENABLED` (document `_oteltrace` injection/extraction on wrapped Collection/Cursor/ChangeStream, plus **ContextFromDocument** / **ContextFromRawDocument**)
+- `OTEL_MONGO_PROPAGATION_ENABLED` (document `_oteltrace` injection/extraction on wrapped Collection/Cursor/ChangeStream; also gates package-level **ContextFromDocument** / **ContextFromRawDocument**)
 
 Defaults: all disabled when unset. Values `false/0/no/off` disable.
 
-Priority:
-1. If **global** is disabled, every module flag and **`WithTracePropagationEnabled(true)`** is force-disabled — no wrapper spans, no `_oteltrace` inject/extract.
-2. If global is enabled but **`OTEL_MONGO_TRACING_ENABLED`** is disabled, this package treats Mongo tracing as off: a noop tracer is used for wrapper CLIENT spans **and** `_oteltrace` inject/extract is disabled. `WithTracePropagationEnabled(true)` cannot bypass this — propagation is gated by the same tracing switch.
-3. Only when both global and `OTEL_MONGO_TRACING_ENABLED` are on does `OTEL_MONGO_PROPAGATION_ENABLED` become the default for `_oteltrace`. **`WithTracePropagationEnabled`** in `ConnectWithOptions` overrides that default while both tracing gates stay on.
+#### Env × `WithTracingEnabled` (CLIENT spans / traced vs direct impl)
 
-Rationale: turning off Mongo tracing also turns off Mongo trace propagation so callers get a single, predictable kill switch — there is no scenario where wrapper spans are noop while documents still carry `_oteltrace`.
+`WithTracingEnabled(v bool)` on `ConnectWithOptions` overrides the two tracing env vars for that `Client` only (and everything built from it). When absent, env decides.
 
-When tracing flags are unset/disabled, this package’s wrapper does not emit Mongo CLIENT spans to your configured TracerProvider (noop) **and** documents are written without `_oteltrace`.
+| Env (`GLOBAL` ∧ `OTEL_MONGO_TRACING_ENABLED`) | `WithTracingEnabled` | Effective tracing |
+|-----------------------------------------------|----------------------|-------------------|
+| off (unset or falsy) | *(absent)* | **off** |
+| off (unset or falsy) | `true` | **on** |
+| off (unset or falsy) | `false` | **off** |
+| on | *(absent)* | **on** |
+| on | `false` | **off** |
+| on | `true` | **on** |
+
+#### Effective tracing × `WithTracePropagationEnabled` (`_oteltrace` on that client)
+
+Propagation requires **effective tracing on**. `WithTracePropagationEnabled` only overrides `OTEL_MONGO_PROPAGATION_ENABLED` while tracing is effectively on; it cannot enable `_oteltrace` when tracing is off.
+
+| Effective tracing | `OTEL_MONGO_PROPAGATION_ENABLED` | `WithTracePropagationEnabled` | Client `_oteltrace` |
+|-------------------|----------------------------------|-------------------------------|---------------------|
+| off | * | * | **off** |
+| on | off/unset | *(absent)* | **off** |
+| on | on | *(absent)* | **on** |
+| on | * | `true` | **on** |
+| on | * | `false` | **off** |
+
+Rationale: turning off Mongo tracing also turns off Mongo trace propagation — one kill switch; no noop spans while documents still carry `_oteltrace`.
+
+**`ContextFromDocument` / `ContextFromRawDocument`**: process-wide, **env-only** (all three env vars must be on). Per-client `WithTracingEnabled` / `WithTracePropagationEnabled` do **not** affect these helpers — a client may inject `_oteltrace` via options while `ContextFromDocument` still returns `ok == false` if the env gates are off. Prefer Collection/Cursor extract paths (or turn all three env vars on) when restoring from maps.
+
+When effective tracing is off, this package’s wrapper does not emit Mongo CLIENT spans to your configured TracerProvider (noop) **and** documents are written without `_oteltrace`.
 
 ### 1. Initialize provider and propagator (application responsibility)
 
@@ -104,11 +126,11 @@ coll := db.Collection("mycoll")
 // Same CRUD and _oteltrace behaviour as v2 wrapper
 ```
 
-Optional: **ConnectWithOptions(ctx, traceOpts, mongoOpts)** (v1) or **ConnectWithOptions(traceOpts, mongoOpts)** (v2) with **WithTracerProvider(tp)** or **WithPropagators(p)**.
+Optional: **ConnectWithOptions(ctx, traceOpts, mongoOpts)** (v1) or **ConnectWithOptions(traceOpts, mongoOpts)** (v2) with **WithTracerProvider(tp)**, **WithPropagators(p)**, or **WithTracingEnabled(v bool)**.
 
 ### 3. Restore trace from document (e.g. change streams)
 
-Requires the same propagation env gates as writes: **all three of** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`, `OTEL_MONGO_TRACING_ENABLED`, and `OTEL_MONGO_PROPAGATION_ENABLED` must be on — or both tracing gates on plus `WithTracePropagationEnabled(true)` via `ConnectWithOptions`. When any of those gates is off, `ContextFromDocument`/`ContextFromRawDocument` return zero/unchanged — existing callers that ignored the `ok` return value will silently no-op.
+Requires **all three** env vars on: `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`, `OTEL_MONGO_TRACING_ENABLED`, and `OTEL_MONGO_PROPAGATION_ENABLED` — see **[Tracing feature flags](#tracing-feature-flags)** above; per-client options don't enable them. When any env gate is off, they return zero/`ok == false` (callers that ignored `ok` silently no-op).
 
 ```go
 fullDoc := changeStreamEvent.FullDocument
@@ -132,7 +154,7 @@ client, err := otelmongo.Connect(opts)
 | Item | Description |
 |------|-------------|
 | **Connect / ConnectWithOptions** | Uses `otel.GetTracerProvider()` unless **WithTracerProvider(tp)** is passed. |
-| **NewClient** | Same; accepts optional **WithTracerProvider**, **WithPropagators**. |
+| **NewClient** | Same; accepts optional **WithTracerProvider**, **WithPropagators**, **WithTracingEnabled**. |
 | **ContextFromDocument** | Restores trace context from document’s `_oteltrace` (e.g. for change streams). |
 | **ScopeName / Version()** | Used when creating Tracer (OTel contrib guideline). |
 

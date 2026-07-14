@@ -32,17 +32,28 @@ go get github.com/akira-core/instrumentation-go/otel-gorilla-ws
 - `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` (global master switch)
 - `OTEL_GORILLA_WS_TRACING_ENABLED` (ws module switch)
 
-Defaults: disabled when unset (opt-in) — both vars must be explicitly set to a truthy value to enable tracing. Values `false/0/no/off` (case-insensitive) explicitly disable; any other set value (including empty string) is truthy.
+Defaults: disabled when unset (opt-in) — both vars must be truthy to enable via env. Values `false/0/no/off` (case-insensitive) disable; any other set value (including empty string) is truthy.
 
-Priority:
-1. Global off disables ws tracing regardless of module flag.
-2. Otherwise module flag controls ws tracing.
+When disabled, send/receive spans and envelope inject/extract are off (passthrough to `*websocket.Conn`).
 
-When disabled, both send/receive spans and trace-context propagation are turned off (the connection delegates straight to the underlying `*websocket.Conn`).
+#### Env × `WithTracingEnabled` (`featureEnabled`)
+
+`WithTracingEnabled(v bool)` on `NewConn`, `Dial`, or `Upgrader.Upgrade` overrides the two env vars for that `Conn` only (`featureEnabled` — whether any OTel SDK path runs). When absent, env decides.
+
+| Env (`GLOBAL` ∧ `OTEL_GORILLA_WS_TRACING_ENABLED`) | `WithTracingEnabled` | Effective feature |
+|----------------------------------------------------|----------------------|-------------------|
+| off (unset or falsy) | *(absent)* | **off** |
+| off (unset or falsy) | `true` | **on** |
+| off (unset or falsy) | `false` | **off** |
+| on | *(absent)* | **on** |
+| on | `false` | **off** |
+| on | `true` | **on** |
+
+For `Dial` / `Upgrader.Upgrade`, the **effective** feature is also resolved **before** the handshake: when off, the side neither offers nor confirms `otel-ws` (avoids wire corruption). `WithTracingEnabled(true)` still cannot force the envelope onto a peer that did not negotiate otel-ws — that outcome is `Conn.tracingEnabled` (negotiation), a separate boolean from `featureEnabled`.
 
 ### NewConn vs. Dial / Upgrader
 
-The feature flags above only gate whether tracing runs at all. Separately, whether the wire envelope (the `traceparent`/`tracestate` JSON wrapper) gets written/read depends on **which constructor created the `Conn`**:
+The effective feature flag above gates whether tracing runs at all. Separately, whether the wire envelope gets written/read depends on **which constructor** created the `Conn` (and, for Dial/Upgrade, whether otel-ws was negotiated):
 
 - **`NewConn(rawConn, opts...)`** wraps a `*websocket.Conn` you already dialed/upgraded yourself. It always enables envelope wrapping when the feature flags are on, regardless of subprotocol — kept for backward compatibility with callers that manage their own handshake.
 - **`Dial(ctx, urlStr, requestHeader, subprotocols, opts...)`** is the spec-compliant client entry point. It injects the `otel-ws` subprotocol into the handshake; envelope wrapping is enabled only if the server confirms support by returning an `otel-ws`/`otel-ws+<proto>` subprotocol.

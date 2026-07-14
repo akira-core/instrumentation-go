@@ -49,13 +49,24 @@ otel-nats/
 - `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`（全域總開關）
 - `OTEL_NATS_TRACING_ENABLED`（nats 模組開關）
 
-預設值：**未設定即停用** — 兩個環境變數都必須明確設為 truthy 值才能啟用 tracing。值為 `false/0/no/off`（不分大小寫）視為停用；其他任何已設定的值皆視為啟用。
+預設值：**未設定即停用** — 經 env 啟用時兩個變數都必須明確設為 truthy。值為 `false/0/no/off`（不分大小寫）視為停用；其他任何已設定的值皆視為啟用。
 
-優先順序：
-1. 全域關閉時，無論模組旗標為何，皆停用所有 nats tracing。
-2. 否則由模組旗標控制 nats tracing。
+停用時，span 建立與 W3C header 傳播皆關閉（沒有獨立的 propagation option — tracing 與 header 傳播共用同一閘門）。
 
-停用時，span 建立與 W3C header 傳播皆會關閉。
+#### Env × `WithTracingEnabled`
+
+`ConnectWithOptions`／`ConnectTLSWithOptions`／`ConnectWithCredentialsWithOptions` 的 `WithTracingEnabled(v bool)` 會針對該 `Conn` 覆寫兩個環境變數。由該 `Conn` 建立的 `oteljetstream` wrapper 繼承有效狀態。沒傳 option 時聽 env。
+
+| Env（`GLOBAL` ∧ `OTEL_NATS_TRACING_ENABLED`） | `WithTracingEnabled` | 有效 tracing |
+|----------------------------------------------|----------------------|--------------|
+| 關（未設或 falsy） | （無） | **關** |
+| 關（未設或 falsy） | `true` | **開** |
+| 關（未設或 falsy） | `false` | **關** |
+| 開 | （無） | **開** |
+| 開 | `false` | **關** |
+| 開 | `true` | **開** |
+
+適合讓 NATS tracing 跟隨應用程式自身開關，或在同一測試執行檔中同時建立已追蹤與未追蹤連線（純 env 閘門在 process 生命週期內只解析一次並快取）。
 
 ### 1. 初始化 Provider 與 Propagator（應用程式負責）
 
@@ -101,7 +112,7 @@ conn.Subscribe("subject", func(m otelnats.Msg) {
 conn.QueueSubscribe("subject", "queue", handler)
 ```
 
-可選：使用 **ConnectWithOptions** 並傳入 **WithTracerProvider(tp)** 或 **WithPropagators(p)** 覆寫 global。
+可選：使用 **ConnectWithOptions** 並傳入 **WithTracerProvider(tp)**、**WithPropagators(p)** 或 **WithTracingEnabled(v bool)** 覆寫 global。
 
 ### 3. Request/Reply
 
@@ -168,7 +179,7 @@ conn, err := otelnats.Connect(url, nil)
 | 項目 | 說明 |
 |------|------|
 | **Connect** | 使用 `otel.GetTracerProvider()` 與 `otel.GetTextMapPropagator()`；可透過 ConnectWithOptions 以 option 覆寫。 |
-| **ConnectWithOptions** | 可傳入 **WithTracerProvider(tp)**、**WithPropagators(p)**。 |
+| **ConnectWithOptions** | 可傳入 **WithTracerProvider(tp)**、**WithPropagators(p)**、**WithTracingEnabled(v bool)**。 |
 | **ConnectTLS** | `ConnectTLS(url, certFile, keyFile, caFile string, natsOpts ...nats.Option)`。以雙向 TLS 建立連線。 |
 | **ConnectWithCredentials** | `ConnectWithCredentials(url, credFile string, natsOpts ...nats.Option)`。以 JWT/NKey 憑證建立連線。 |
 | **ScopeName / Version()** | 建立 Tracer 時使用（OTel contrib 規範）。 |
@@ -194,7 +205,7 @@ JetStream Consume handler                CONSUMER（process，push 遞送 callba
 JetStream Fetch / Messages / Next        CLIENT（連結的 receive，pull）
 ```
 
-JetStream 的 `receive`／`process` span 另外帶有 `messaging.consumer.name`（durable/consumer 名稱）；core NATS 的 span 則不帶此屬性。
+JetStream 的 `receive`／`process` span 另外帶有 `messaging.consumer.group.name`（durable/consumer 名稱）；core NATS 的 span 則不帶此屬性。
 
 ---
 

@@ -149,10 +149,10 @@ func TestFetchReturnsMessagesWithTraceContext(t *testing.T) {
 	receiveSpan := findSpanByKind(spans, oteltrace.SpanKindClient)
 	producerSpan := findSpanByKind(spans, oteltrace.SpanKindProducer)
 	require.NotNil(t, receiveSpan, "no client (pull-receive) span")
-	assertAttr(t, receiveSpan.Attributes(), "messaging.consumer.name", consumerName)
+	assertAttr(t, receiveSpan.Attributes(), "messaging.consumer.group.name", consumerName)
 	require.NotNil(t, producerSpan, "no producer span")
 	for _, kv := range producerSpan.Attributes() {
-		assert.NotEqual(t, "messaging.consumer.name", string(kv.Key), "core publish span must not carry messaging.consumer.name")
+		assert.NotEqual(t, "messaging.consumer.group.name", string(kv.Key), "core publish span must not carry messaging.consumer.group.name")
 	}
 	if len(receiveSpan.Links()) == 1 {
 		linkCtx := receiveSpan.Links()[0].SpanContext
@@ -254,6 +254,40 @@ func TestMessagesNextTraceContext(t *testing.T) {
 	_ = msg.Ack()
 }
 
+// TestMessagesContextNextSpanEndsAtReturn verifies MessagesContext.Next ends
+// its receive span before returning (R5) — matching single-shot
+// Consumer.Next semantics — instead of deferring the end to the following
+// Next() call via the removed lastSpan bookkeeping.
+func TestMessagesContextNextSpanEndsAtReturn(t *testing.T) {
+	js, _, _ := setupTracedJS(t)
+	ctx := context.Background()
+	_, err := js.CreateOrUpdateStream(ctx, oteljetstream.StreamConfig{
+		Name:     "MSGENDATRETURN",
+		Subjects: []string{"msgendatreturn.>"},
+	})
+	require.NoError(t, err)
+	stream, err := js.Stream(ctx, "MSGENDATRETURN")
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(ctx, oteljetstream.ConsumerConfig{
+		Durable:       "msgendatreturn-dup",
+		FilterSubject: "msgendatreturn.one",
+		AckPolicy:     oteljetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	iter, err := cons.Messages()
+	require.NoError(t, err)
+	defer iter.Stop()
+
+	_, _ = js.Publish(ctx, "msgendatreturn.one", []byte("data"))
+	time.Sleep(300 * time.Millisecond)
+
+	msgCtx, msg, err := iter.Next()
+	require.NoError(t, err)
+	assert.False(t, oteltrace.SpanFromContext(msgCtx).IsRecording(), "receive span must already be ended when Next returns")
+	_ = msg.Ack()
+}
+
 func TestFetchNoWaitReturnsTraceContext(t *testing.T) {
 	url := startJetStreamServer(t)
 	tp := trace.NewTracerProvider(trace.WithSpanProcessor(tracetest.NewSpanRecorder()))
@@ -335,6 +369,89 @@ func TestFetchBytesTraceContext(t *testing.T) {
 	}
 }
 
+// TestTracedFetchStopWhileWaiting verifies MessageBatch.Stop() releases the
+// traced batch's forwarding goroutine promptly even while parked waiting for
+// the server (no message ever arrives), well before the FetchMaxWait
+// deadline — the receive-side half of the F4 nested-select fix.
+func TestTracedFetchStopWhileWaiting(t *testing.T) {
+	js, _, _ := setupTracedJS(t)
+	ctx := context.Background()
+	_, err := js.CreateOrUpdateStream(ctx, oteljetstream.StreamConfig{
+		Name:     "STOPWAIT",
+		Subjects: []string{"stopwait.>"},
+	})
+	require.NoError(t, err)
+	stream, err := js.Stream(ctx, "STOPWAIT")
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(ctx, oteljetstream.ConsumerConfig{
+		Durable:       "stopwait-c",
+		FilterSubject: "stopwait.x",
+		AckPolicy:     oteljetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	// No publish: the fetch has nothing to deliver and would otherwise wait
+	// out the full FetchMaxWait.
+	batch, err := cons.Fetch(1, jetstream.FetchMaxWait(10*time.Second))
+	require.NoError(t, err)
+
+	stopStart := time.Now()
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		batch.Stop()
+	}()
+
+	select {
+	case _, ok := <-batch.Messages():
+		assert.False(t, ok, "expected closed channel with no message")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Messages() channel did not close promptly after Stop()")
+	}
+	assert.Less(t, time.Since(stopStart), 2*time.Second,
+		"Stop() must release the goroutine well before the 10s FetchMaxWait")
+}
+
+// TestBatchMessageSpanEndsAtHandover verifies a batch message's receive span
+// has already ended by the time the message is delivered through
+// batch.Messages() — the span measures receive-to-handover, not the gap
+// until the next message is read (R5).
+func TestBatchMessageSpanEndsAtHandover(t *testing.T) {
+	js, _, _ := setupTracedJS(t)
+	ctx := context.Background()
+	_, err := js.CreateOrUpdateStream(ctx, oteljetstream.StreamConfig{
+		Name:     "HANDOVERBATCH",
+		Subjects: []string{"handoverbatch.>"},
+	})
+	require.NoError(t, err)
+	stream, err := js.Stream(ctx, "HANDOVERBATCH")
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(ctx, oteljetstream.ConsumerConfig{
+		Durable:       "handoverbatch-c",
+		FilterSubject: "handoverbatch.x",
+		AckPolicy:     oteljetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	_, _ = js.Publish(ctx, "handoverbatch.x", []byte("v1"))
+	_, _ = js.Publish(ctx, "handoverbatch.x", []byte("v2"))
+	time.Sleep(200 * time.Millisecond)
+
+	batch, err := cons.Fetch(2, jetstream.FetchMaxWait(3*time.Second))
+	require.NoError(t, err)
+
+	m1, ok := <-batch.Messages()
+	require.True(t, ok, "expected first message")
+	span1 := oteltrace.SpanFromContext(m1.Context())
+	assert.False(t, span1.IsRecording(), "first message's receive span must already be ended at handover, not deferred to the next message")
+	_ = m1.Ack()
+
+	m2, ok := <-batch.Messages()
+	require.True(t, ok, "expected second message")
+	span2 := oteltrace.SpanFromContext(m2.Context())
+	assert.False(t, span2.IsRecording(), "second message's receive span must already be ended at handover")
+	_ = m2.Ack()
+}
+
 func TestOrderedConsumerTraceContext(t *testing.T) {
 	url := startJetStreamServer(t)
 	sr := tracetest.NewSpanRecorder()
@@ -387,7 +504,7 @@ func TestOrderedConsumerTraceContext(t *testing.T) {
 	}
 
 	consumer := waitSpanByNameAndKind(t, sr, "process ordered.msg", oteltrace.SpanKindConsumer)
-	assertAttr(t, consumer.Attributes(), "messaging.consumer.name", "ordered-consumer")
+	assertAttr(t, consumer.Attributes(), "messaging.consumer.group.name", "ordered-consumer")
 }
 
 func TestConsumerInfo(t *testing.T) {

@@ -41,11 +41,24 @@ Switches are **opt-in via environment variables**: if a variable is **unset**, i
 |---------|-------|------------|--------|
 | `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | All modules | off | Global gate. Must be on for module-level tracing flags and (for Mongo) document propagation to apply. |
 | `OTEL_MONGO_TRACING_ENABLED` | `otel-mongo` + `otel-mongo/v2` | off | CLIENT spans, non-noop tracer for the wrapper. |
-| `OTEL_MONGO_PROPAGATION_ENABLED` | `otel-mongo` + `otel-mongo/v2` | off | Inject/extract `_oteltrace` on writes/reads; still gated by the global switch above. |
+| `OTEL_MONGO_PROPAGATION_ENABLED` | `otel-mongo` + `otel-mongo/v2` | off | Inject/extract `_oteltrace` on writes/reads; still gated by effective tracing. |
 | `OTEL_NATS_TRACING_ENABLED` | `otelnats` + `oteljetstream` | off | NATS/JetStream wrapper tracing. |
 | `OTEL_GORILLA_WS_TRACING_ENABLED` | `otel-gorilla-ws` | off | WebSocket wrapper tracing. |
 
-If the **global** switch is off, module flags are ignored. Mongo `WithTracePropagationEnabled` cannot enable propagation when the global switch is off.
+### Env × `WithTracingEnabled` decision table
+
+Every module accepts `WithTracingEnabled(v bool)` at construction (`ConnectWithOptions` / `NewConn` / `Dial` / `Upgrade`, etc.). When the option is **present**, it is **authoritative** (overrides env in either direction). When **absent**, env decides (`GLOBAL` AND module switch).
+
+| Env (`GLOBAL` ∧ module) | `WithTracingEnabled` | Effective tracing |
+|-------------------------|----------------------|-------------------|
+| off (unset or falsy) | *(absent)* | **off** |
+| off (unset or falsy) | `true` | **on** |
+| off (unset or falsy) | `false` | **off** |
+| on | *(absent)* | **on** |
+| on | `false` | **off** |
+| on | `true` | **on** |
+
+Mongo-only: `WithTracePropagationEnabled` controls `_oteltrace` on that client only while effective tracing is **on**; it cannot enable propagation when effective tracing is off. Package-level `ContextFromDocument` / `ContextFromRawDocument` stay **env-only** (all three Mongo env vars) and ignore per-client options. See [otel-mongo/README.md](otel-mongo/README.md) for the propagation sub-table.
 
 ## Layout
 

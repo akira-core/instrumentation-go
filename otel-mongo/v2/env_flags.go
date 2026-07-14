@@ -24,18 +24,28 @@ func mongoPropagationEnvOnly() bool {
 }
 
 func mongoPropagationEnabled() bool {
-	return resolveDocumentPropagation(nil)
+	return resolveDocumentPropagation(mongoTracingEnabled(), nil)
 }
 
-// resolveDocumentPropagation returns the effective _oteltrace propagation flag for a Client.
-// Both the global env (OTEL_INSTRUMENTATION_GO_TRACING_ENABLED) and the module env
-// (OTEL_MONGO_TRACING_ENABLED) must be on; otherwise propagation is force-disabled so
-// no _oteltrace inject/extract occurs while wrapper spans are off. When both are on,
-// an explicit option override (e.g. WithTracePropagationEnabled) wins, otherwise
-// OTEL_MONGO_PROPAGATION_ENABLED is the default. WithTracePropagationEnabled cannot
-// bypass a disabled tracing gate.
-func resolveDocumentPropagation(override *bool) bool {
-	if !mongoTracingEnabled() {
+// resolveDocumentPropagation returns the effective _oteltrace propagation flag
+// for a Client, given that Client's already-resolved effective tracing state
+// (tracingEnabled — the env gates, or a WithTracingEnabled override if one was
+// supplied). tracingEnabled must be false before propagation is force-disabled,
+// so no _oteltrace inject/extract occurs while wrapper spans are off. When
+// tracingEnabled is true, an explicit option override (e.g.
+// WithTracePropagationEnabled) wins, otherwise OTEL_MONGO_PROPAGATION_ENABLED
+// is the default. WithTracePropagationEnabled cannot bypass tracingEnabled
+// being false, however that false came about.
+//
+// tracingEnabled is a parameter rather than an internal mongoTracingEnabled()
+// call so a WithTracingEnabled(true) override (env gates unset) still lets
+// WithTracePropagationEnabled take effect — the package-level
+// mongoPropagationEnabled() (used only by the process-wide, env-only
+// propEnabledGate that ContextFromDocument/ContextFromRawDocument read) passes
+// the plain env-derived mongoTracingEnabled() explicitly, preserving its
+// existing env-only behavior.
+func resolveDocumentPropagation(tracingEnabled bool, override *bool) bool {
+	if !tracingEnabled {
 		return false
 	}
 	return resolveFlag(override, mongoPropagationEnvOnly())

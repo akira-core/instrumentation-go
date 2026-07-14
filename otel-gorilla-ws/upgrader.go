@@ -57,9 +57,23 @@ type Upgrader struct {
 // Inner.Subprotocols=nil and injects the otel-ws+<proto> value via responseHeader
 // for the otel-ws path; for the non-otel path it restores Inner.Subprotocols so
 // gorilla performs normal matching.
-func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeader http.Header) (*Conn, error) {
+//
+// opts (WithTracerProvider, WithPropagators, WithTracingEnabled) configure the
+// returned Conn the same way as NewConn/Dial.
+//
+// When the connection's effective tracing feature is off (env gates, or
+// WithTracingEnabled(false)), otel-ws is never confirmed even if the client
+// requested it: confirming would commit the client to the JSON envelope wire
+// format that this feature-off side neither writes nor unwraps. The upgrade
+// then proceeds with normal application-protocol selection (Scenario H).
+func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeader http.Header, opts ...Option) (*Conn, error) {
 	clientProtos := websocket.Subprotocols(r)
 	otelRequested, appClientProtos := splitClientProtocols(clientProtos)
+	cfg := resolveConnOptions(opts)
+	// Gate negotiation on the effective feature flag, resolved BEFORE the
+	// handshake — the wire format each side speaks must match what it
+	// advertises.
+	negotiateOTel := otelRequested && effectiveFeatureEnabled(cfg)
 
 	// Work on a copy of Inner so we never mutate the caller's upgrader.
 	inner := u.Inner
@@ -90,7 +104,7 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 		appProtocols = u.AppSubprotocols
 	}
 
-	if otelRequested {
+	if negotiateOTel {
 		// Match only app protocols (non otel-ws tokens).
 		negotiated := selectFirst(appClientProtos, appProtocols)
 
@@ -105,7 +119,9 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 		}
 		responseHeader.Set("Sec-Websocket-Protocol", proto)
 	} else {
-		// Scenarios F and H: normal gorilla protocol selection from AppSubprotocols.
+		// Scenarios F and H (and otel-ws requests with the feature off): normal
+		// gorilla protocol selection from AppSubprotocols. The client's otel-ws
+		// tokens are never in appProtocols, so they cannot be selected.
 		inner.Subprotocols = appProtocols
 	}
 
@@ -114,7 +130,7 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 		return nil, err
 	}
 
-	return newConn(raw, otelRequested), nil
+	return newConnFromConfig(raw, negotiateOTel, cfg), nil
 }
 
 // splitClientProtocols returns whether otel-ws propagation was requested and the

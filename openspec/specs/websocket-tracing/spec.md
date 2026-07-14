@@ -17,13 +17,25 @@ TBD - created by archiving change document-otel-instrumentation. Update Purpose 
 ### Requirement: Two-tier tracing feature-flag gating
 The package SHALL gate span creation and trace-context propagation behind `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` (global) and `OTEL_GORILLA_WS_TRACING_ENABLED` (module). Both SHALL default to disabled when unset; values `0`/`false`/`no`/`off` (case-insensitive) SHALL disable; any other set value, including an empty string, SHALL enable.
 
-#### Scenario: Global flag off
-- **WHEN** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is unset or falsy
+The env-derived result SHALL serve as the **default**: when the caller passes `WithTracingEnabled(v bool)` to `NewConn`, `Dial`, or `Upgrader.Upgrade`, that value SHALL be authoritative for the resulting `Conn` (`featureEnabled`), overriding both environment gates in either direction. Effective tracing SHALL follow the shared `WithTracingEnabled` decision table in `shared-feature-flags`. Connections constructed without the option SHALL behave exactly as before.
+
+`Dial` SHALL NOT offer, and `Upgrader.Upgrade` SHALL NOT confirm, the `otel-ws` subprotocol when the connection's effective tracing feature resolves to disabled (resolved **before** the handshake). `WithTracingEnabled(true)` cannot force the envelope onto a peer that did not negotiate otel-ws — negotiation outcome (`Conn.tracingEnabled`) still requires both sides to agree.
+
+#### Scenario: Global flag off (no option)
+- **WHEN** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is unset or falsy and no `WithTracingEnabled` option is passed
 - **THEN** the connection delegates directly to the underlying `*websocket.Conn` with no spans and no envelope handling, regardless of `OTEL_GORILLA_WS_TRACING_ENABLED`
 
-#### Scenario: Both flags enabled
-- **WHEN** both tracing env vars are set to a truthy value
+#### Scenario: Both flags enabled (no option)
+- **WHEN** both tracing env vars are set to a truthy value and no `WithTracingEnabled` option is passed
 - **THEN** `WriteMessage`/`ReadMessage` create send/receive spans
+
+#### Scenario: Option enables tracing with env off
+- **WHEN** `NewConn(raw, WithTracingEnabled(true))` is called with both tracing env vars unset or falsy
+- **THEN** the connection creates send/receive spans and handles the JSON envelope (for `NewConn`)
+
+#### Scenario: Option disables tracing despite truthy env vars
+- **WHEN** both env gates are truthy and a connection is constructed with `WithTracingEnabled(false)`
+- **THEN** that connection delegates directly to the native `*websocket.Conn` (no spans, no envelope), and `Dial`/`Upgrade` do not offer/confirm otel-ws
 
 ### Requirement: JSON envelope wire format
 When tracing is enabled and envelope wrapping applies (see `NewConn` vs. `Dial`/`Upgrade` requirement), outgoing messages SHALL be wrapped as `{"header": {"traceparent": ..., "tracestate": ...}, "data": <payload>}`, where `data` is the original payload verbatim if it is valid JSON, or a JSON-encoded string if it is not.

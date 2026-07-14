@@ -36,7 +36,7 @@ func filterNilOptions(natsOpts []nats.Option) []nats.Option {
 // certFile and keyFile are paths to PEM-encoded client certificate and private key.
 // caFile is the path to a PEM-encoded CA certificate for server verification (empty string skips CA override).
 func ConnectTLS(url, certFile, keyFile, caFile string, natsOpts ...nats.Option) (*Conn, error) {
-	return ConnectTLSWithOptions(url, certFile, keyFile, caFile, filterNilOptions(natsOpts), nil)
+	return ConnectTLSWithOptions(url, certFile, keyFile, caFile, filterNilOptions(natsOpts))
 }
 
 // ConnectTLSWithOptions is ConnectTLS with additional trace options (WithTracerProvider, WithPropagators).
@@ -58,7 +58,7 @@ func ConnectTLSWithOptions(url, certFile, keyFile, caFile string, natsOpts []nat
 // ConnectWithCredentials connects to NATS using a credentials file (JWT + NKey), with tracing.
 // credFile is the path to a NATS credentials file (.creds).
 func ConnectWithCredentials(url, credFile string, natsOpts ...nats.Option) (*Conn, error) {
-	return ConnectWithCredentialsWithOptions(url, credFile, filterNilOptions(natsOpts), nil)
+	return ConnectWithCredentialsWithOptions(url, credFile, filterNilOptions(natsOpts))
 }
 
 // ConnectWithCredentialsWithOptions is ConnectWithCredentials with additional trace options

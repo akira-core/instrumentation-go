@@ -17,17 +17,39 @@ The `otel-mongo` (v1) and `otel-mongo/v2` packages SHALL NOT construct or own a 
 ### Requirement: Three-tier tracing feature-flag gating
 The package SHALL gate all wrapper CLIENT spans and `_oteltrace` document propagation behind three environment variables: `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` (global), `OTEL_MONGO_TRACING_ENABLED` (module tracing), and `OTEL_MONGO_PROPAGATION_ENABLED` (module propagation). An unset variable SHALL be treated as disabled; values `0`/`false`/`no`/`off` (case-insensitive) SHALL be treated as disabled; any other set value SHALL be treated as enabled.
 
-#### Scenario: Global flag disabled disables everything
-- **WHEN** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is unset or falsy
+The env-derived tracing result (`GLOBAL` AND `OTEL_MONGO_TRACING_ENABLED`) SHALL serve as the **default**: when the caller passes `WithTracingEnabled(v bool)` to `ConnectWithOptions`, that value SHALL be authoritative for the resulting `Client` — and everything constructed from it (Databases, Collections including strategy-split impl selection, Cursors, ChangeStreams) — overriding both tracing env gates in either direction. Effective tracing SHALL follow the shared `WithTracingEnabled` decision table in `shared-feature-flags`.
+
+`WithTracePropagationEnabled` SHALL govern only `_oteltrace` inject/extract on that client (Collection/Cursor/ChangeStream paths). Propagation requires the client's **effective** tracing to be on: when effective tracing is off, propagation is force-disabled regardless of `WithTracePropagationEnabled` or `OTEL_MONGO_PROPAGATION_ENABLED`. When effective tracing is on, `WithTracePropagationEnabled` (if present) overrides `OTEL_MONGO_PROPAGATION_ENABLED`; if absent, the propagation env var is the default.
+
+| Effective tracing | `OTEL_MONGO_PROPAGATION_ENABLED` | `WithTracePropagationEnabled` | Client `_oteltrace` |
+|-------------------|----------------------------------|-------------------------------|---------------------|
+| off | * | * | off |
+| on | off/unset | absent | off |
+| on | on | absent | on |
+| on | * | `true` | on |
+| on | * | `false` | off |
+
+The package-level `ContextFromDocument`/`ContextFromRawDocument` gate remains **env-only** (all three env vars) and is unaffected by per-client options. This applies identically to v1 and v2.
+
+#### Scenario: Global flag disabled disables everything (no option)
+- **WHEN** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is unset or falsy and no `WithTracingEnabled` option is passed
 - **THEN** the wrapper uses a noop tracer for CLIENT spans and does not inject or extract `_oteltrace`, regardless of `OTEL_MONGO_TRACING_ENABLED`, `OTEL_MONGO_PROPAGATION_ENABLED`, or `WithTracePropagationEnabled`
 
-#### Scenario: Module tracing disabled forces propagation off
-- **WHEN** the global flag is enabled but `OTEL_MONGO_TRACING_ENABLED` is unset or falsy
+#### Scenario: Module tracing disabled forces propagation off (no option)
+- **WHEN** the global flag is enabled but `OTEL_MONGO_TRACING_ENABLED` is unset or falsy, and no `WithTracingEnabled` option is passed
 - **THEN** the wrapper uses a noop tracer for CLIENT spans and `_oteltrace` inject/extract is disabled, and `WithTracePropagationEnabled(true)` cannot override this
 
 #### Scenario: Both tracing gates on, propagation flag decides the default
-- **WHEN** the global flag and `OTEL_MONGO_TRACING_ENABLED` are both enabled
+- **WHEN** the global flag and `OTEL_MONGO_TRACING_ENABLED` are both enabled and no `WithTracingEnabled` is passed
 - **THEN** `OTEL_MONGO_PROPAGATION_ENABLED` sets the default for `_oteltrace` inject/extract, and `WithTracePropagationEnabled` passed to `ConnectWithOptions` can override that default
+
+#### Scenario: Option enables tracing with env off
+- **WHEN** `ConnectWithOptions` is called with `WithTracingEnabled(true)` while tracing env vars are unset or falsy
+- **THEN** the client creates real CLIENT spans and its Collections select the traced impl; `WithTracePropagationEnabled(true)` may enable `_oteltrace` for that client
+
+#### Scenario: Option disables tracing despite truthy env vars
+- **WHEN** all env gates are truthy and the caller passes `WithTracingEnabled(false)`
+- **THEN** that client uses the noop tracer, Collections select the direct impl, and `_oteltrace` is disabled regardless of `WithTracePropagationEnabled`
 
 ### Requirement: `_oteltrace` document propagation on write
 When document propagation is enabled and an active span is present in the context, `InsertOne`, `InsertMany`, `ReplaceOne`, `UpdateOne`, `UpdateMany`, `UpdateByID`, and `BulkWrite` (for its `InsertOneModel`, `UpdateOneModel`, and `UpdateManyModel` write models) SHALL inject a reserved `_oteltrace` subdocument (`{ traceparent, tracestate }`) into the written document, or into `$set` for operator-style updates.

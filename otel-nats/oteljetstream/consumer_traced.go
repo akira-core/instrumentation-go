@@ -2,7 +2,6 @@ package oteljetstream
 
 import (
 	"context"
-	"sync"
 
 	nats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -43,7 +42,7 @@ func (c *tracedConsumer) Messages(opts ...jetstream.PullMessagesOpt) (MessagesCo
 }
 
 func (c *tracedConsumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (context.Context, jetstream.Msg, error) {
-	opts, err := applyCtxDeadlineToFetchOpts(ctx, opts)
+	opts, err := applyCtxToFetchOpts(ctx, opts)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -172,43 +171,19 @@ func tracedConsumeHandler(conn *otelnats.Conn, consumerName string, handler MsgH
 	}
 }
 
-// tracedMessagesContext is the instrumented MessagesContext iterator.
-//
-// lastSpan is guarded by mu: jetstream.MessagesContext explicitly supports
-// calling Stop/Drain from another goroutine to unblock a pending Next, so
-// Next's span bookkeeping races Stop/Drain without synchronization. The mutex
-// is never held across the blocking m.iter.Next call, so Stop can still
-// interrupt a waiting Next.
+// tracedMessagesContext is the instrumented MessagesContext iterator. Each
+// call to Next ends its own receive span before returning (handover), so
+// there is no cross-call span state and nothing for Stop/Drain to race
+// against or clean up.
 type tracedMessagesContext struct {
 	conn      *otelnats.Conn
 	iter      jetstream.MessagesContext
 	tracer    trace.Tracer
 	prop      propagation.TextMapPropagator
 	baseAttrs []attribute.KeyValue
-	mu        sync.Mutex
-	lastSpan  trace.Span
-	stopped   bool
-}
-
-// endLastSpan ends and clears any in-flight span. trace.Span.End is idempotent,
-// so a rare double call on the Stop/Next boundary is harmless. stopping marks
-// the iterator as stopped so a span started concurrently with Stop/Drain (in
-// the window between iter.Next returning and the lastSpan store) is ended
-// immediately instead of leaking.
-func (m *tracedMessagesContext) endLastSpan(stopping bool) {
-	m.mu.Lock()
-	if stopping {
-		m.stopped = true
-	}
-	if m.lastSpan != nil {
-		m.lastSpan.End()
-		m.lastSpan = nil
-	}
-	m.mu.Unlock()
 }
 
 func (m *tracedMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context, jetstream.Msg, error) {
-	m.endLastSpan(false)
 	msg, err := m.iter.Next(opts...)
 	if err != nil {
 		return nil, nil, err
@@ -228,24 +203,19 @@ func (m *tracedMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context
 	if originSpanCtx.IsValid() {
 		startOpts = append(startOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
 	}
+	// Return the ctx bearing the local receive span (linked to the producer),
+	// ended immediately at handover — matching single-shot Consumer.Next.
+	// Child spans still parent correctly to an ended span via its still-valid
+	// SpanContext.
 	ctx, span := m.tracer.Start(context.Background(), spanName, startOpts...)
-	m.mu.Lock()
-	if m.stopped {
-		// Stop/Drain already ran endLastSpan; nobody will end this span later.
-		span.End()
-	} else {
-		m.lastSpan = span
-	}
-	m.mu.Unlock()
+	span.End()
 	return ctx, msg, nil
 }
 
 func (m *tracedMessagesContext) Stop() {
-	m.endLastSpan(true)
 	m.iter.Stop()
 }
 
 func (m *tracedMessagesContext) Drain() {
-	m.endLastSpan(true)
 	m.iter.Drain()
 }

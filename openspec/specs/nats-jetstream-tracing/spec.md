@@ -17,13 +17,23 @@ TBD - created by archiving change document-otel-instrumentation. Update Purpose 
 ### Requirement: Two-tier tracing feature-flag gating
 The packages SHALL gate span creation and W3C header propagation behind `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` (global) and `OTEL_NATS_TRACING_ENABLED` (module). Both SHALL default to disabled when unset; values `0`/`false`/`no`/`off` (case-insensitive) SHALL disable; any other set value SHALL enable.
 
-#### Scenario: Global flag off
-- **WHEN** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is unset or falsy
+The env-derived result SHALL serve as the **default**: when the caller passes `WithTracingEnabled(v bool)` to a connect variant (`ConnectWithOptions` / `ConnectTLSWithOptions` / `ConnectWithCredentialsWithOptions`), that value SHALL be authoritative for the resulting `Conn` (and everything derived from it, including `oteljetstream` wrappers), overriding both environment gates in either direction. Effective tracing SHALL follow the shared `WithTracingEnabled` decision table in `shared-feature-flags`. Connections constructed without the option SHALL behave exactly as before.
+
+#### Scenario: Global flag off (no option)
+- **WHEN** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is unset or falsy and no `WithTracingEnabled` option is passed
 - **THEN** all NATS/JetStream tracing is disabled regardless of `OTEL_NATS_TRACING_ENABLED`
 
-#### Scenario: Both flags on
-- **WHEN** both `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` and `OTEL_NATS_TRACING_ENABLED` are set to a truthy value
+#### Scenario: Both flags on (no option)
+- **WHEN** both env vars are truthy and no `WithTracingEnabled` option is passed
 - **THEN** `Conn` and JetStream operations create spans and propagate W3C trace context in message headers
+
+#### Scenario: Option enables tracing with env off
+- **WHEN** `ConnectWithOptions(url, nil, WithTracingEnabled(true))` is called with both tracing env vars unset or falsy
+- **THEN** the connection creates spans and propagates trace context
+
+#### Scenario: Option disables tracing despite truthy env vars
+- **WHEN** both env gates are truthy and the caller passes `WithTracingEnabled(false)`
+- **THEN** that connection performs no tracing (direct/native delegation), while other connections without the option still trace per the env gates
 
 ### Requirement: Header-based trace propagation
 When tracing is enabled, `Publish`/`PublishMsg` (core NATS) and JetStream publish operations SHALL inject the current span's W3C trace context into `nats.Header` via `HeaderCarrier`. `Subscribe`/`QueueSubscribe` handlers SHALL receive a `Msg` whose `.Context()` carries the trace extracted from the message headers.
