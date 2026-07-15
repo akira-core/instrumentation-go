@@ -13,6 +13,7 @@ All notable changes to the `otel-nats` module (`otelnats` + `oteljetstream`) are
 - `ConnectTLS` and `ConnectWithCredentials` no longer panic on every successful connection (a stray nil trace option reached the option applier); nil `Option` values are now skipped everywhere.
 - `MessageBatch.Stop()` now takes effect promptly even while the forwarding goroutine is parked waiting to receive from the native batch (previously only observed while blocked sending to the wrapper channel).
 - `Consume(nil)` and other nil-handler paths continue to surface upstream's `ErrHandlerRequired` rather than panicking (carried from 0.6.0).
+- Request/reply "send" (CLIENT) spans no longer have their `messaging.message.body.size` overwritten with the reply payload size after the round trip — the attribute now always reports the request payload size. The reply size is unchanged and lives on the reply "receive" span, where it already was.
 
 ### Changed — BREAKING
 

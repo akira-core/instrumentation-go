@@ -90,6 +90,17 @@ func assertAttr(t *testing.T, attrs []attribute.KeyValue, key, want string) {
 	t.Errorf("attribute %q not found", key)
 }
 
+func assertIntAttr(t *testing.T, attrs []attribute.KeyValue, key string, want int64) {
+	t.Helper()
+	for _, kv := range attrs {
+		if string(kv.Key) == key {
+			assert.Equal(t, want, kv.Value.AsInt64(), "attribute %q", key)
+			return
+		}
+	}
+	t.Errorf("attribute %q not found", key)
+}
+
 func TestW3CPropagationRoundtrip(t *testing.T) {
 	url := startServer(t)
 	tp, _ := newTestProvider()
@@ -304,6 +315,39 @@ func TestRequestCreatesClientSpanAndReturnsReply(t *testing.T) {
 	}
 	require.NotNil(t, receiveSpan, "no client span for reply receive")
 	assert.True(t, strings.HasPrefix(receiveSpan.Name(), "receive "), "reply receive span name %q", receiveSpan.Name())
+}
+
+// TestRequestSpanKeepsRequestBodySize pins that recordReply does not overwrite
+// the request span's messaging.message.body.size with the reply size: the send
+// span reports the request payload, the receive span reports the reply payload.
+func TestRequestSpanKeepsRequestBodySize(t *testing.T) {
+	url := startServer(t)
+	tp, sr := newTestProvider()
+	otel.SetTracerProvider(tp)
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	subject := "req.bodysize"
+	request := []byte("ping")
+	replyPayload := []byte("pong-pong!")
+	_, err = conn.NatsConn().Subscribe(subject, func(msg *nats.Msg) {
+		_ = msg.Respond(replyPayload)
+	})
+	require.NoError(t, err)
+
+	reply, err := conn.Request(subject, request, 2*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, replyPayload, reply.Data)
+
+	spans := sr.Ended()
+	requestSpan := findSpanByNameAndKind(spans, subject+" request", oteltrace.SpanKindClient)
+	require.NotNil(t, requestSpan, "no client span for request")
+	assertIntAttr(t, requestSpan.Attributes(), "messaging.message.body.size", int64(len(request)))
+
+	receiveSpan := findSpanByNameAndKind(spans, "receive "+reply.Subject, oteltrace.SpanKindClient)
+	require.NotNil(t, receiveSpan, "no client span for reply receive")
+	assertIntAttr(t, receiveSpan.Attributes(), "messaging.message.body.size", int64(len(replyPayload)))
 }
 
 func TestTraceContextReturnsTracerAndPropagator(t *testing.T) {

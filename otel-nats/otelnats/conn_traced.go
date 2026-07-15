@@ -8,7 +8,6 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
-	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -98,7 +97,7 @@ func (t *tracedConn) requestWithTimeout(parent context.Context, msg *nats.Msg, t
 		reqSpan.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
-	t.recordReply(reqCtx, reqSpan, reply)
+	t.recordReply(reqCtx, reply)
 	return reply, nil
 }
 
@@ -113,7 +112,7 @@ func (t *tracedConn) requestWithCtx(parent context.Context, msg *nats.Msg) (*nat
 		reqSpan.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
-	t.recordReply(reqCtx, reqSpan, reply)
+	t.recordReply(reqCtx, reply)
 	return reply, nil
 }
 
@@ -143,12 +142,12 @@ func (t *tracedConn) startRequestSpan(parent context.Context, msg *nats.Msg) (co
 	return ctx, span
 }
 
-// recordReply finalises the producer span with reply size and emits a CLIENT
-// span representing reply reception (a pull "receive" per the OTel messaging
-// span-kind mapping). Extracts W3C trace context from reply.Header so any
-// responder-side trace is linked into the receive span.
-func (t *tracedConn) recordReply(parent context.Context, sendSpan trace.Span, reply *nats.Msg) {
-	sendSpan.SetAttributes(attribute.Int(string(semconv.MessagingMessageBodySizeKey), len(reply.Data)))
+// recordReply emits a CLIENT span representing reply reception (a pull
+// "receive" per the OTel messaging span-kind mapping). Extracts W3C trace
+// context from reply.Header so any responder-side trace is linked into the
+// receive span. The request span's attributes are left untouched: reply body
+// size belongs to the receive span (via receiveAttrs), not the send span.
+func (t *tracedConn) recordReply(parent context.Context, reply *nats.Msg) {
 	var originSC trace.SpanContext
 	receiveCtx := parent
 	if reply.Header != nil {
