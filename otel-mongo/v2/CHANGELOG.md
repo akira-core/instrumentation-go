@@ -4,7 +4,11 @@ All notable changes to the `otel-mongo/v2` module (`go.mongodb.org/mongo-driver/
 
 > **Coverage note**: this file starts at `0.6.0`. Earlier history lives only in git tags (`otel-mongo/v2/vX.Y.Z`) — see the repo root `VERSIONING.md` for the root cause and the release-tag CI guard that now keeps the version constant and tag in sync going forward.
 
-## [0.7.0] - 2026-07-15
+## [2.7.0] - 2026-07-15
+
+Re-versioning of the `0.7.0` content (below) under the module's Go-resolvable `v2.x.y` tag line — the module path ends in the `/v2` major-version suffix, so Go requires version major 2 and the tag shape `otel-mongo/v2.x.y`; every old `otel-mongo/v2/v0.x.y` tag was never resolvable by `go get`. `v2.MINOR.PATCH` tracks the sibling modules' `0.MINOR.PATCH` — see `VERSIONING.md`. No code change relative to `0.7.0` other than the version constant: `otel.scope.version` on emitted spans now reports `2.7.0`.
+
+## [0.7.0] - 2026-07-15 (tag `otel-mongo/v2/v0.7.0` — not resolvable by Go tooling; use `v2.7.0`)
 
 ### Fixed
 
