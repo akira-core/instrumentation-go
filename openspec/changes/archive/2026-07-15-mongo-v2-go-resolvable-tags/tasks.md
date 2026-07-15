@@ -22,6 +22,6 @@
 
 ## 5. Release (post-merge)
 
-- [ ] 5.1 PR to `main`, merge; tag `otel-mongo/v2.7.0` on the merge commit and push; release-guard passes (live verification of the new routing).
-- [ ] 5.2 GitHub Release `otel-mongo/v2 v2.7.0`; verify `GOPROXY=direct go list -m github.com/akira-core/instrumentation-go/otel-mongo/v2@v2.7.0` resolves.
-- [ ] 5.3 Edit the existing `otel-mongo/v2 v0.7.0` GitHub Release body: banner pointing at `v2.7.0` as the Go-resolvable tag for the same content.
+- [x] 5.1 PR to `main`, merge; tag `otel-mongo/v2.7.0` on the merge commit and push; release-guard passes (live verification of the new routing).
+- [x] 5.2 GitHub Release `otel-mongo/v2 v2.7.0`; verify `GOPROXY=direct go list -m github.com/akira-core/instrumentation-go/otel-mongo/v2@v2.7.0` resolves.
+- [x] 5.3 Edit the existing `otel-mongo/v2 v0.7.0` GitHub Release body: banner pointing at `v2.7.0` as the Go-resolvable tag for the same content.
