@@ -21,13 +21,14 @@ func newRecorderTP(t *testing.T) (*sdktrace.TracerProvider, *tracetest.SpanRecor
 	return tp, recorder
 }
 
-func TestApplyOptions_GlobalFallback(t *testing.T) {
+func TestConfigureConn_GlobalFallback(t *testing.T) {
+	enableWSTracingEnv(t)
 	globalTP, globalRecorder := newRecorderTP(t)
 	otel.SetTracerProvider(globalTP)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 
-	c := &Conn{featureEnabled: true}
-	applyOptions(c, nil)
+	c := &Conn{}
+	configureConn(c, resolveConnOptions(nil))
 
 	_, span := c.tracer.Start(context.Background(), "global-fallback")
 	span.End()
@@ -37,13 +38,14 @@ func TestApplyOptions_GlobalFallback(t *testing.T) {
 	assert.Equal(t, propagation.TraceContext{}.Fields(), c.propagator.Fields())
 }
 
-func TestApplyOptions_FeatureDisabled_UsesNoopTracer(t *testing.T) {
+func TestConfigureConn_FeatureDisabled_UsesNoopTracer(t *testing.T) {
+	clearWSTracingEnv(t)
 	globalTP, globalRecorder := newRecorderTP(t)
 	otel.SetTracerProvider(globalTP)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 
-	c := &Conn{featureEnabled: false}
-	applyOptions(c, nil)
+	c := &Conn{}
+	configureConn(c, resolveConnOptions(nil))
 
 	_, span := c.tracer.Start(context.Background(), "should-not-be-recorded")
 	span.End()
@@ -52,6 +54,7 @@ func TestApplyOptions_FeatureDisabled_UsesNoopTracer(t *testing.T) {
 }
 
 func TestApplyOptions_UsesProvidedOptionsWithoutMutatingGlobals(t *testing.T) {
+	enableWSTracingEnv(t)
 	globalTP, globalRecorder := newRecorderTP(t)
 	otel.SetTracerProvider(globalTP)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
@@ -59,11 +62,11 @@ func TestApplyOptions_UsesProvidedOptionsWithoutMutatingGlobals(t *testing.T) {
 	customTP, customRecorder := newRecorderTP(t)
 	customProp := propagation.NewCompositeTextMapPropagator(propagation.Baggage{})
 
-	c := &Conn{featureEnabled: true}
-	applyOptions(c, []Option{
+	c := &Conn{}
+	configureConn(c, resolveConnOptions([]Option{
 		WithTracerProvider(customTP),
 		WithPropagators(customProp),
-	})
+	}))
 
 	_, span := c.tracer.Start(context.Background(), "custom-provider")
 	span.End()

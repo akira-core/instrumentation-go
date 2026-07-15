@@ -35,7 +35,7 @@ otel-mongo/
 ```
 
 - **Trace 儲存：** 寫入/更新的文件會有保留欄位 **`_oteltrace`**（W3C `traceparent` 及選填 `tracestate`）。對 raw BSON（例如 change stream）可使用 **ContextFromDocument(ctx, raw)** 還原 context。
-- **兩層：** (1) **Client span：** 每個 Collection 方法（insert/find/update/delete/aggregate/distinct/bulkWrite 等）都在 `internal/traced/collection.go` 直接產生自己的 span，並無獨立的 driver 層 command monitor。(2) **Document** 層在 CRUD 寫入時注入 `_oteltrace`，讀取時支援 span link 與傳播。
+- **兩層：** (1) **Client span：** 每個 Collection 方法（insert/find/update/delete/aggregate/distinct/bulkWrite 等）都在 `internal/traced/collection.go` 直接產生自己的 span；另有一個**串接式** driver `CommandMonitor`（僅在啟用 tracing 時註冊，且串接在你自行設定的 monitor 之後）負責擷取每個指令實際命中的伺服器位址，寫入 span 的 `server.*` 屬性。(2) **Document** 層在 CRUD 寫入時注入 `_oteltrace`，讀取時支援 span link 與傳播。
 
 ---
 
@@ -47,18 +47,40 @@ otel-mongo/
 
 - `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`（全域總開關）
 - `OTEL_MONGO_TRACING_ENABLED`（控制本套件的 wrapper **CLIENT** span、與 noop vs 實際 tracer — driver/contrib command span 不受此影響）
-- `OTEL_MONGO_PROPAGATION_ENABLED`（控制 wrapped Collection/Cursor/ChangeStream 的 `_oteltrace` 注入/還原，以及 **ContextFromDocument** / **ContextFromRawDocument**）
+- `OTEL_MONGO_PROPAGATION_ENABLED`（控制 wrapped Collection/Cursor/ChangeStream 的 `_oteltrace` 注入/還原；亦閘控套件層 **ContextFromDocument** / **ContextFromRawDocument**）
 
 預設值：未設定即停用。值為 `false/0/no/off` 視為停用。
 
-優先順序：
-1. 若**全域**停用，所有模組旗標與 **`WithTracePropagationEnabled(true)`** 皆強制停用 — 不會產生 wrapper span，也不會做 `_oteltrace` 注入/還原。
-2. 若全域啟用但 **`OTEL_MONGO_TRACING_ENABLED`** 停用，本套件視 Mongo tracing 為關閉：wrapper CLIENT span 改用 noop tracer，**同時** `_oteltrace` 注入/還原也一併停用。`WithTracePropagationEnabled(true)` 無法跨越此 gate — propagation 與 tracing 共用同一個開關。
-3. 只有當全域與 `OTEL_MONGO_TRACING_ENABLED` **皆啟用**時，`OTEL_MONGO_PROPAGATION_ENABLED` 才會作為 `_oteltrace` 的預設值；在兩個 tracing gate 都開啟期間，`ConnectWithOptions` 內的 **`WithTracePropagationEnabled`** 可覆寫該預設。
+#### Env × `WithTracingEnabled`（CLIENT span／traced vs direct impl）
 
-設計理由：關閉 Mongo tracing 時連同 Mongo trace propagation 也一併關閉，呼叫端只需一個 kill switch — 不會出現 wrapper span 為 noop 但文件仍被寫入 `_oteltrace` 的情境。
+`ConnectWithOptions` 的 `WithTracingEnabled(v bool)` 會針對該 `Client`（及其衍生物件）覆寫兩個 tracing 環境變數。沒傳時聽 env。
 
-當 tracing 旗標未設定或停用時，本套件的 wrapper 不會送出 Mongo CLIENT span 到你配置的 TracerProvider（noop），**且**寫入的文件不會帶有 `_oteltrace`。
+| Env（`GLOBAL` ∧ `OTEL_MONGO_TRACING_ENABLED`） | `WithTracingEnabled` | 有效 tracing |
+|-----------------------------------------------|----------------------|--------------|
+| 關（未設或 falsy） | （無） | **關** |
+| 關（未設或 falsy） | `true` | **開** |
+| 關（未設或 falsy） | `false` | **關** |
+| 開 | （無） | **開** |
+| 開 | `false` | **關** |
+| 開 | `true` | **開** |
+
+#### 有效 tracing × `WithTracePropagationEnabled`（該 client 的 `_oteltrace`）
+
+Propagation 需要**有效 tracing 為開**。`WithTracePropagationEnabled` 只在 tracing 有效開啟時覆寫 `OTEL_MONGO_PROPAGATION_ENABLED`；tracing 關時無法單獨打開 `_oteltrace`。
+
+| 有效 tracing | `OTEL_MONGO_PROPAGATION_ENABLED` | `WithTracePropagationEnabled` | Client `_oteltrace` |
+|--------------|----------------------------------|-------------------------------|---------------------|
+| 關 | * | * | **關** |
+| 開 | 關／未設 | （無） | **關** |
+| 開 | 開 | （無） | **開** |
+| 開 | * | `true` | **開** |
+| 開 | * | `false` | **關** |
+
+設計理由：關閉 Mongo tracing 時連同 propagation 一併關閉 — 單一 kill switch；不會出現 span 為 noop 但文件仍寫 `_oteltrace` 的情況。
+
+**`ContextFromDocument`／`ContextFromRawDocument`**：process-wide、**只看 env**（三個變數都要開）。per-client option **不影響**這兩個 helper — client 可經 option 注入 `_oteltrace`，但 env 關時 `ContextFromDocument` 仍回 `ok == false`。還原 trace 請用 Collection／Cursor 路徑，或把三個 env 都打開。
+
+當有效 tracing 關閉時，wrapper 不會送 CLIENT span 到你的 TracerProvider（noop），**且**寫入文件不帶 `_oteltrace`。
 
 ### 1. 初始化 Provider 與 Propagator（應用程式負責）
 
@@ -101,11 +123,11 @@ coll := db.Collection("mycoll")
 // CRUD 與 _oteltrace 行為與 v2 包裝相同
 ```
 
-可選：**ConnectWithOptions(ctx, traceOpts, mongoOpts)**（v1）或 **ConnectWithOptions(traceOpts, mongoOpts)**（v2），搭配 **WithTracerProvider(tp)** 或 **WithPropagators(p)**。
+可選：**ConnectWithOptions(ctx, traceOpts, mongoOpts)**（v1）或 **ConnectWithOptions(traceOpts, mongoOpts)**（v2），搭配 **WithTracerProvider(tp)**、**WithPropagators(p)** 或 **WithTracingEnabled(v bool)**。
 
 ### 3. 從文件還原 trace（例如 change stream）
 
-需與寫入相同的 propagation 環境變數：**`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`、`OTEL_MONGO_TRACING_ENABLED`、`OTEL_MONGO_PROPAGATION_ENABLED` 三者都要啟用**，或兩個 tracing gate 啟用搭配 `ConnectWithOptions` 的 `WithTracePropagationEnabled(true)`。當任一 gate 關閉時，`ContextFromDocument` / `ContextFromRawDocument` 會回傳零值或不變的 ctx — 忽略 `ok` 回傳值的舊呼叫端會靜默變成 no-op。
+需 **三個環境變數都開啟**：`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`、`OTEL_MONGO_TRACING_ENABLED`、`OTEL_MONGO_PROPAGATION_ENABLED` — 見上方 **[Tracing 功能旗標](#tracing-功能旗標)**；per-client option 不會啟用它們。任一 env gate 關閉時回傳零值／`ok == false`（忽略 `ok` 的舊呼叫端會靜默 no-op）。
 
 ```go
 fullDoc := changeStreamEvent.FullDocument
@@ -129,7 +151,7 @@ client, err := otelmongo.Connect(opts)
 | 項目 | 說明 |
 |------|------|
 | **Connect / ConnectWithOptions** | 未傳入 option 時使用 `otel.GetTracerProvider()`。 |
-| **NewClient** | 可選 **WithTracerProvider**、**WithPropagators**。 |
+| **NewClient** | 可選 **WithTracerProvider**、**WithPropagators**、**WithTracingEnabled**。 |
 | **ContextFromDocument** | 從文件的 `_oteltrace` 還原 trace context。 |
 | **ScopeName / Version()** | 建立 Tracer 時使用（OTel contrib 規範）。 |
 

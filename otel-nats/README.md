@@ -49,13 +49,24 @@ otel-nats/
 - `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` (global master switch)
 - `OTEL_NATS_TRACING_ENABLED` (nats module switch)
 
-Defaults: **DISABLED** when unset — both vars must be explicitly set to a truthy value to enable tracing. Values `false/0/no/off` (case-insensitive) disable; any other set value is truthy.
+Defaults: **DISABLED** when unset — both vars must be explicitly set to a truthy value to enable tracing via env. Values `false/0/no/off` (case-insensitive) disable; any other set value is truthy.
 
-Priority:
-1. Global off disables all nats tracing regardless of module flag.
-2. Otherwise module flag controls nats tracing.
+When disabled, both span creation and W3C header propagation are turned off (there is no separate propagation option — tracing and header propagation share one gate).
 
-When disabled, both span creation and W3C header propagation are turned off.
+#### Env × `WithTracingEnabled`
+
+`WithTracingEnabled(v bool)` on `ConnectWithOptions` / `ConnectTLSWithOptions` / `ConnectWithCredentialsWithOptions` overrides the two env vars for that `Conn` only. `oteljetstream` wrappers built from that `Conn` inherit the effective state. When the option is absent, env decides.
+
+| Env (`GLOBAL` ∧ `OTEL_NATS_TRACING_ENABLED`) | `WithTracingEnabled` | Effective tracing |
+|----------------------------------------------|----------------------|-------------------|
+| off (unset or falsy) | *(absent)* | **off** |
+| off (unset or falsy) | `true` | **on** |
+| off (unset or falsy) | `false` | **off** |
+| on | *(absent)* | **on** |
+| on | `false` | **off** |
+| on | `true` | **on** |
+
+Useful for deriving NATS tracing from your application's own toggle, and for constructing both traced and untraced connections in the same test binary (the env-only gate is cached for the process lifetime).
 
 ### 1. Initialize provider and propagator (application responsibility)
 
@@ -101,7 +112,7 @@ conn.Subscribe("subject", func(m otelnats.Msg) {
 conn.QueueSubscribe("subject", "queue", handler)
 ```
 
-Optional: pass **WithTracerProvider(tp)** or **WithPropagators(p)** to **ConnectWithOptions** for per-connection overrides.
+Optional: pass **WithTracerProvider(tp)**, **WithPropagators(p)**, or **WithTracingEnabled(v bool)** to **ConnectWithOptions** for per-connection overrides.
 
 ### 3. Request/Reply
 
@@ -168,7 +179,7 @@ conn, err := otelnats.Connect(url, nil)
 | Item | Description |
 |------|-------------|
 | **Connect** | `Connect(url string, natsOpts ...nats.Option)`. Uses `otel.GetTracerProvider()` and `otel.GetTextMapPropagator()` unless overridden via ConnectWithOptions. |
-| **ConnectWithOptions** | Same with optional **WithTracerProvider(tp)** and **WithPropagators(p)**. |
+| **ConnectWithOptions** | Same with optional **WithTracerProvider(tp)**, **WithPropagators(p)**, and **WithTracingEnabled(v bool)**. |
 | **ConnectTLS** | `ConnectTLS(url, certFile, keyFile, caFile string, natsOpts ...nats.Option)`. Connects with mutual TLS. |
 | **ConnectWithCredentials** | `ConnectWithCredentials(url, credFile string, natsOpts ...nats.Option)`. Connects with JWT/NKey credentials. |
 | **ScopeName / Version()** | Used when creating Tracer (OTel contrib guideline). |
@@ -194,7 +205,7 @@ JetStream Consume handler                CONSUMER  (process, push-delivered call
 JetStream Fetch / Messages / Next        CLIENT    (linked receive, pull)
 ```
 
-JetStream `receive`/`process` spans additionally carry `messaging.consumer.name` (the durable/consumer name); core NATS spans do not.
+JetStream `receive`/`process` spans additionally carry `messaging.consumer.group.name` (the durable/consumer name); core NATS spans do not.
 
 ---
 

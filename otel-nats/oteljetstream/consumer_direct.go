@@ -2,7 +2,6 @@ package oteljetstream
 
 import (
 	"context"
-	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -39,7 +38,7 @@ func (c *directConsumer) Messages(opts ...jetstream.PullMessagesOpt) (MessagesCo
 }
 
 func (c *directConsumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (context.Context, jetstream.Msg, error) {
-	opts, err := applyCtxDeadlineToFetchOpts(ctx, opts)
+	opts, err := applyCtxToFetchOpts(ctx, opts)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -50,27 +49,42 @@ func (c *directConsumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (
 	return context.Background(), msg, nil
 }
 
-// applyCtxDeadlineToFetchOpts converts a ctx deadline to a FetchMaxWait so
-// callers retain timeout behavior (the underlying pull Next takes no ctx; we
-// avoid jetstream.FetchContext because it errors when combined with a
-// caller-passed FetchMaxWait). An already-canceled or expired ctx returns its
-// error so Next fails fast instead of blocking for jetstream's default max wait.
-func applyCtxDeadlineToFetchOpts(ctx context.Context, opts []jetstream.FetchOpt) ([]jetstream.FetchOpt, error) {
-	if ctx == nil {
+// applyCtxToFetchOpts wires ctx into the fetch via jetstream.FetchContext, so
+// Next honors both live cancellation and deadline expiry — FetchContext
+// derives the server-side expiry from ctx's own deadline (with its own
+// buffer logic), and its internal fetch goroutine selects on ctx.Done()
+// alongside message arrival, so a canceled ctx unblocks Next promptly instead
+// of waiting for the server round trip. An already-canceled or expired ctx
+// returns its error immediately so Next fails fast without a round trip.
+// A ctx that can never fire (ctx == nil, or ctx.Done() == nil as with
+// context.Background()/context.TODO()) skips the wiring entirely — this
+// matters because FetchContext cannot be combined with a caller-supplied
+// FetchMaxWait opt (jetstream returns ErrInvalidOption), and callers commonly
+// pass context.Background() alongside their own FetchMaxWait when they don't
+// need cancellation; only a genuinely cancelable ctx (WithCancel/WithTimeout/
+// WithDeadline) triggers FetchContext, so that combination still surfaces
+// jetstream's native "cannot specify both FetchContext and FetchMaxWait"
+// error — callers needing both a live ctx and a custom max wait use ctx's own
+// deadline instead of a separate FetchMaxWait opt.
+//
+// The wrapper's FetchContext is appended AFTER the caller's opts: jetstream
+// applies fetch options in order and FetchContext overwrites the request ctx,
+// so appending last makes the method parameter ctx authoritative — a
+// caller-supplied FetchContext(otherCtx) cannot silently disable Next(ctx)
+// cancellation. (A caller FetchContext whose deadline already set the request
+// expiry keeps that expiry as an effective max wait; cancellation authority
+// still comes from the method ctx.)
+func applyCtxToFetchOpts(ctx context.Context, opts []jetstream.FetchOpt) ([]jetstream.FetchOpt, error) {
+	if ctx == nil || ctx.Done() == nil {
 		return opts, nil
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	dl, ok := ctx.Deadline()
-	if !ok {
-		return opts, nil
-	}
-	d := time.Until(dl)
-	if d <= 0 {
-		return nil, context.DeadlineExceeded
-	}
-	return append([]jetstream.FetchOpt{jetstream.FetchMaxWait(d)}, opts...), nil
+	out := make([]jetstream.FetchOpt, 0, len(opts)+1)
+	out = append(out, opts...)
+	out = append(out, jetstream.FetchContext(ctx))
+	return out, nil
 }
 
 func (c *directConsumer) Fetch(batch int, opts ...jetstream.FetchOpt) (MessageBatch, error) {

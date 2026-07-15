@@ -53,12 +53,6 @@ func (c *AddrCapture) Resolve(fallbackAddr string, fallbackPort int) (addr strin
 	return c.addr, c.port
 }
 
-// Captured reports whether Started wrote a real per-command address into this
-// holder. false means Resolve will return the caller-supplied fallback.
-func (c *AddrCapture) Captured() bool {
-	return c != nil && c.addr != ""
-}
-
 func addrCaptureFromContext(ctx context.Context) *AddrCapture {
 	c, _ := ctx.Value(addrCaptureKey{}).(*AddrCapture)
 	return c

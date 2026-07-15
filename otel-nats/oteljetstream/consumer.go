@@ -4,7 +4,6 @@ import (
 	"context"
 	"sync"
 
-	nats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
@@ -50,8 +49,10 @@ type Msg struct {
 func (m Msg) Context() context.Context { return m.Ctx }
 
 // MessageBatch is the result of Fetch/FetchBytes/FetchNoWait. Use Messages() for Msg + trace context.
-// Call Error() after the channel is closed. Stop releases the internal goroutine and ends any
-// in-flight span; callers that abandon Messages() before it closes must call Stop to avoid leaks.
+// Call Error() after the channel is closed. Stop releases the internal forwarding goroutine —
+// each message's receive span has already ended before the message is delivered, so Stop has no
+// span bookkeeping to finish; callers that abandon Messages() before it closes must call Stop to
+// avoid leaks.
 type MessageBatch interface {
 	Messages() <-chan Msg
 	Error() error
@@ -85,13 +86,15 @@ type Consumer interface {
 	CachedInfo() *ConsumerInfo
 }
 
-// Attribute for distinguishing which consumer handled the message (durable/consumer name).
-const attrConsumerName = "messaging.consumer.name"
-
 // receiveBaseAttrs builds the consumer-constant span attributes — everything
 // except the per-message subject and body size — so hot loops can compute them
 // once. opType is "process" (push) or "receive" (pull). The returned slice has
 // its capacity clamped so per-message appends never alias the shared base.
+// The consumer/durable name is attached under the semconv v1.39.0 consumer-
+// group key (semconv.MessagingConsumerGroupNameKey): a JetStream durable
+// consumer is, semantically, a consumer group (multiple instances can pull
+// from the same durable). The non-semconv literal "messaging.consumer.name"
+// was used before 0.7.0; see the CHANGELOG for the migration.
 // Note: otelnats/conn.go has a parallel receiveAttrs for *nats.Msg — keep both in sync.
 func receiveBaseAttrs(opType string, serverAttrs []attribute.KeyValue, consumerName string) []attribute.KeyValue {
 	attrs := make([]attribute.KeyValue, 0, 4+len(serverAttrs))
@@ -99,7 +102,7 @@ func receiveBaseAttrs(opType string, serverAttrs []attribute.KeyValue, consumerN
 		semconv.MessagingSystemKey.String(messagingSystem),
 		attribute.String(string(semconv.MessagingOperationTypeKey), opType),
 		semconv.MessagingOperationNameKey.String(opType),
-		attribute.String(attrConsumerName, consumerName),
+		semconv.MessagingConsumerGroupNameKey.String(consumerName),
 	)
 	attrs = append(attrs, serverAttrs...)
 	return attrs[:len(attrs):len(attrs)]
@@ -131,8 +134,9 @@ func (m *directMessageBatch) Stop() {
 }
 
 // messageBatchTrace is the instrumented MessageBatch: extracts trace headers and emits
-// a consumer span per message. The span ends when the next message arrives or the
-// batch is exhausted.
+// a receive span per message. Each span starts and ends before the message is sent to
+// the wrapper channel, so consumers always observe an already-ended span
+// (IsRecording() == false at delivery).
 type messageBatchTrace struct {
 	ch       chan Msg
 	raw      jetstream.MessageBatch
@@ -147,12 +151,25 @@ func (m *messageBatchTrace) Stop() {
 }
 
 // newDirectMessageBatch wraps a raw jetstream.MessageBatch with the passthrough variant.
+// The forwarding loop selects on done both while waiting to receive from the
+// native batch and while waiting to send to the wrapper channel, so Stop()
+// takes effect promptly regardless of which side the goroutine is parked on.
 func newDirectMessageBatch(raw jetstream.MessageBatch) MessageBatch {
 	ch := make(chan Msg)
 	done := make(chan struct{})
 	go func() {
 		defer close(ch)
-		for msg := range raw.Messages() {
+		for {
+			var msg jetstream.Msg
+			var ok bool
+			select {
+			case msg, ok = <-raw.Messages():
+				if !ok {
+					return
+				}
+			case <-done:
+				return
+			}
 			select {
 			case ch <- Msg{Msg: msg, Ctx: context.Background()}:
 			case <-done:
@@ -164,29 +181,40 @@ func newDirectMessageBatch(raw jetstream.MessageBatch) MessageBatch {
 }
 
 // newTracedMessageBatch wraps a raw jetstream.MessageBatch with the instrumented variant.
+// The forwarding loop selects on done both while waiting to receive from the
+// native batch and while waiting to send to the wrapper channel, so Stop()
+// takes effect promptly regardless of which side the goroutine is parked on.
+// Each message's receive span starts and ends BEFORE the channel send — the
+// receiver must observe an already-ended span (IsRecording() == false at
+// delivery, the spec's observable contract, matching single-shot
+// Consumer.Next and MessagesContext.Next); ending after a successful send
+// would race the receiver's check across the channel rendezvous. As a
+// consequence, a span may be emitted for one final message that Stop()
+// prevents from being delivered. The ended span's SpanContext still parents
+// caller-created child spans; callers measure processing time with their own
+// child spans.
 func newTracedMessageBatch(conn *otelnats.Conn, consumerName string, raw jetstream.MessageBatch) MessageBatch {
 	ch := make(chan Msg)
 	done := make(chan struct{})
 	go func() {
 		defer close(ch)
-		var lastSpan trace.Span
-		defer func() {
-			if lastSpan != nil {
-				lastSpan.End()
-			}
-		}()
 		tracer, prop := conn.TraceContext()
 		baseAttrs := receiveBaseAttrs("receive", conn.ServerAttrs(), consumerName)
-		for msg := range raw.Messages() {
-			if lastSpan != nil {
-				lastSpan.End()
-				lastSpan = nil
+		for {
+			var msg jetstream.Msg
+			var ok bool
+			select {
+			case msg, ok = <-raw.Messages():
+				if !ok {
+					return
+				}
+			case <-done:
+				return
 			}
-			h := msg.Headers()
-			if h == nil {
-				h = make(nats.Header)
+			msgCtx := context.Background()
+			if h := msg.Headers(); h != nil {
+				msgCtx = prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: h})
 			}
-			msgCtx := prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: h})
 			originSpanCtx := trace.SpanContextFromContext(msgCtx)
 			attrs := receiveMsgAttrs(baseAttrs, msg)
 			opts := []trace.SpanStartOption{
@@ -197,11 +225,10 @@ func newTracedMessageBatch(conn *otelnats.Conn, consumerName string, raw jetstre
 				opts = append(opts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
 			}
 			ctx, span := tracer.Start(context.Background(), "receive "+msg.Subject(), opts...)
+			span.End()
 			select {
 			case ch <- Msg{Msg: msg, Ctx: ctx}:
-				lastSpan = span
 			case <-done:
-				span.End()
 				return
 			}
 		}

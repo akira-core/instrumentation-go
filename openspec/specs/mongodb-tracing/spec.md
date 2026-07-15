@@ -15,19 +15,31 @@ The `otel-mongo` (v1) and `otel-mongo/v2` packages SHALL NOT construct or own a 
 - **THEN** the client stores `tp` on the `Client` for its own spans and does not call `otel.SetTracerProvider`
 
 ### Requirement: Three-tier tracing feature-flag gating
-The package SHALL gate all wrapper CLIENT spans and `_oteltrace` document propagation behind three environment variables: `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` (global), `OTEL_MONGO_TRACING_ENABLED` (module tracing), and `OTEL_MONGO_PROPAGATION_ENABLED` (module propagation). An unset variable SHALL be treated as disabled; values `0`/`false`/`no`/`off` (case-insensitive) SHALL be treated as disabled; any other set value SHALL be treated as enabled.
+The package SHALL gate all wrapper CLIENT spans and `_oteltrace` document propagation behind three environment variables: `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` (global), `OTEL_MONGO_TRACING_ENABLED` (module tracing), and `OTEL_MONGO_PROPAGATION_ENABLED` (module propagation). An unset variable SHALL be treated as disabled; values `0`/`false`/`no`/`off` (case-insensitive) SHALL be treated as disabled; any other set value SHALL be treated as enabled. The env-derived tracing result SHALL serve as the **default**: when the caller passes the `WithTracingEnabled(v bool)` `ClientOption` to `ConnectWithOptions`, that value SHALL be authoritative for the resulting `Client` — and everything constructed from it (Databases, Collections including their strategy-split direct/traced impl selection, Cursors, ChangeStreams) — overriding the global and module tracing gates in either direction per the shared `WithTracingEnabled` decision table in `shared-feature-flags`. `WithTracePropagationEnabled` continues to govern only the propagation default, and propagation SHALL still require the client's effective tracing state to be enabled: `WithTracePropagationEnabled(true)` cannot enable propagation on a client whose effective tracing is off, whether that state came from the env gates or from `WithTracingEnabled(false)`. When effective tracing is on: absent prop option → `OTEL_MONGO_PROPAGATION_ENABLED`; prop option present → that value. Clients constructed without `WithTracingEnabled` SHALL behave exactly as before. This applies identically to v1 and v2 (parity rule). The package-level `ContextFromDocument`/`ContextFromRawDocument` gate remains env-only and is unaffected by per-client options.
 
 #### Scenario: Global flag disabled disables everything
-- **WHEN** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is unset or falsy
+- **WHEN** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is unset or falsy and no `WithTracingEnabled` option is passed
 - **THEN** the wrapper uses a noop tracer for CLIENT spans and does not inject or extract `_oteltrace`, regardless of `OTEL_MONGO_TRACING_ENABLED`, `OTEL_MONGO_PROPAGATION_ENABLED`, or `WithTracePropagationEnabled`
 
 #### Scenario: Module tracing disabled forces propagation off
-- **WHEN** the global flag is enabled but `OTEL_MONGO_TRACING_ENABLED` is unset or falsy
+- **WHEN** the global flag is enabled but `OTEL_MONGO_TRACING_ENABLED` is unset or falsy, and no `WithTracingEnabled` option is passed
 - **THEN** the wrapper uses a noop tracer for CLIENT spans and `_oteltrace` inject/extract is disabled, and `WithTracePropagationEnabled(true)` cannot override this
 
 #### Scenario: Both tracing gates on, propagation flag decides the default
 - **WHEN** the global flag and `OTEL_MONGO_TRACING_ENABLED` are both enabled
 - **THEN** `OTEL_MONGO_PROPAGATION_ENABLED` sets the default for `_oteltrace` inject/extract, and `WithTracePropagationEnabled` passed to `ConnectWithOptions` can override that default
+
+#### Scenario: Option enables tracing with env off (unset or falsy)
+- **WHEN** `ConnectWithOptions(ctx, []ClientOption{WithTracingEnabled(true)}, mongoOpts)` is called with all tracing env vars unset or explicitly falsy
+- **THEN** the client creates real CLIENT spans, its Collections select the traced impl, and `WithTracePropagationEnabled(true)` may enable `_oteltrace` propagation for that client
+
+#### Scenario: Option disables tracing despite truthy env vars
+- **WHEN** all env gates are truthy and the caller passes `WithTracingEnabled(false)`
+- **THEN** that client uses the noop tracer, its Collections select the direct (passthrough) impl, and `_oteltrace` propagation is disabled for that client regardless of `WithTracePropagationEnabled`
+
+#### Scenario: Package-level document extraction ignores per-client options
+- **WHEN** a client writes `_oteltrace` because of `WithTracingEnabled(true)` + `WithTracePropagationEnabled(true)` while the underlying env vars are off, and `ContextFromDocument` is later called on such a document
+- **THEN** `ContextFromDocument` still resolves its own env-only cached gate and returns `ok == false` — per-client options do not affect the package-level functions
 
 ### Requirement: `_oteltrace` document propagation on write
 When document propagation is enabled and an active span is present in the context, `InsertOne`, `InsertMany`, `ReplaceOne`, `UpdateOne`, `UpdateMany`, `UpdateByID`, and `BulkWrite` (for its `InsertOneModel`, `UpdateOneModel`, and `UpdateManyModel` write models) SHALL inject a reserved `_oteltrace` subdocument (`{ traceparent, tracestate }`) into the written document, or into `$set` for operator-style updates.
@@ -73,17 +85,6 @@ When document propagation is enabled and an active span is present in the contex
 - **WHEN** a caller invokes `SingleResult.Decode` exactly once on a `FindOne` result
 - **THEN** the FindOne span ends at that call and carries a link to the document's `_oteltrace` span, if present and propagation is enabled
 
-### Requirement: Deliver spans for the MongoDB service graph
-When document/tracing flags are enabled and `OTEL_EXPORTER_OTLP_ENDPOINT` is set to a valid full URL (HTTP) or `host:port` (gRPC), `Connect` and `NewClient` SHALL initialize a synthetic deliver-span `TracerProvider` with `service.name` derived from the connection's server address, and `Collection` CRUD operations plus `ChangeStream` decode SHALL emit CONSUMER/PRODUCER deliver spans representing MongoDB as a broker node. `Cursor.DecodeWithContext` is **not** part of this deliver-span path — it only creates its own `mongo.cursor.decode` INTERNAL span with an optional link (see *Cursor decode with trace linking*) and never touches the deliver tracer.
-
-#### Scenario: Endpoint configured and tracing enabled
-- **WHEN** `OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318` and the global + module tracing flags are enabled
-- **THEN** `Connect` initializes the deliver tracer and subsequent `Collection` CRUD operations emit a `db.coll deliver` CONSUMER span in addition to the CLIENT span
-
-#### Scenario: Tracing disabled
-- **WHEN** the global or module tracing flag is disabled, regardless of `OTEL_EXPORTER_OTLP_ENDPOINT`
-- **THEN** no deliver-span `TracerProvider` is initialized and no exporter is constructed
-
 ### Requirement: Disabled-mode invariant via strategy split
 `Collection`, `Cursor`, `SingleResult`, and `ChangeStream` SHALL be constructed with one of two implementations chosen once at construction time — `internal/direct` (passthrough) when tracing is disabled, `internal/traced` (instrumented) when enabled — such that `internal/direct` imports no `go.opentelemetry.io/otel` package of any kind (API, SDK, or exporters).
 
@@ -102,14 +103,4 @@ When document/tracing flags are enabled and `OTEL_EXPORTER_OTLP_ENDPOINT` is set
 - **WHEN** the same CRUD operation is invoked through the v1 wrapper and the v2 wrapper with equivalent inputs
 - **THEN** both inject/extract `_oteltrace` identically and both honor the same three-tier feature-flag gate
 
-### Requirement: Diagnostic logging via slog
-The package SHALL use `log/slog` for diagnostics with no custom handler installed, logging deliver-tracer initialization success at `DEBUG` and OTLP exporter/resource creation failures at `WARN`, using an `otelmongo:` prefix and structured `error`/`reason`/`service`/`endpoint` fields. Because Go's default `slog` handler filters at `LevelInfo`, `DEBUG`-level success logs are silent by default, but `WARN`-level failure logs print to stderr by default — the package does not suppress them.
-
-#### Scenario: Default handler silences DEBUG but not WARN
-- **WHEN** no custom `slog` handler is configured and deliver-tracer initialization succeeds
-- **THEN** no `DEBUG` log line is visible (below the default `LevelInfo` threshold)
-
-#### Scenario: OTLP exporter creation fails
-- **WHEN** `OTEL_EXPORTER_OTLP_ENDPOINT` is set to a malformed value and deliver-tracer initialization fails
-- **THEN** a `WARN`-level log entry with the `otelmongo:` prefix and an `error` field is emitted
 

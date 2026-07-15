@@ -119,8 +119,8 @@ func New(conn *otelnats.Conn) (JetStream, error) {
 // the nats.go v1.38.0→v1.50.0 range) is unset.
 const orderedConsumerName = "ordered-consumer"
 
-// orderedConsumerNameFromConfig returns the messaging.consumer.name attribute
-// value for ordered consumers: the configured NamePrefix (or a fixed fallback).
+// orderedConsumerNameFromConfig returns the messaging.consumer.group.name
+// attribute value for ordered consumers: the configured NamePrefix (or a fixed fallback).
 // The server names ordered consumers "{NamePrefix}_{serial}", with the serial
 // rotating on every internal reset, so the attribute deliberately carries the
 // stable prefix rather than the transient server-side name — a stable value

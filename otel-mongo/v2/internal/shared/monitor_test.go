@@ -42,6 +42,20 @@ func TestNewCommandMonitor_CapturesAddress(t *testing.T) {
 	assert.Equal(t, 27018, port)
 }
 
+// TestNewCommandMonitor_LastWriteWinsOnRetry pins the retry semantics: when the
+// driver fires Started more than once for one logical operation (server
+// selection retry), the span reports the server that actually executed it —
+// the last Started event wins.
+func TestNewCommandMonitor_LastWriteWinsOnRetry(t *testing.T) {
+	monitor := NewCommandMonitor(nil)
+	ctx, capture := WithAddrCapture(context.Background())
+	monitor.Started(ctx, &event.CommandStartedEvent{ConnectionID: "first-host:27017[-1]"})
+	monitor.Started(ctx, &event.CommandStartedEvent{ConnectionID: "second-host:27018[-2]"})
+	addr, port := capture.Resolve("fallback", 1)
+	assert.Equal(t, "second-host", addr)
+	assert.Equal(t, 27018, port)
+}
+
 func TestNewCommandMonitor_ChainsExistingCallbacks(t *testing.T) {
 	var startedCalled, succeededCalled, failedCalled bool
 	existing := &event.CommandMonitor{

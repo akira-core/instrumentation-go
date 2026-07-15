@@ -401,5 +401,5 @@ func TestIntegration_OrderedConsumerTraceContext(t *testing.T) {
 	}
 
 	consumer := waitSpanByNameAndKind(t, sr, "process integ.ordered.msg", oteltrace.SpanKindConsumer)
-	assertAttr(t, consumer.Attributes(), "messaging.consumer.name", "ordered-consumer")
+	assertAttr(t, consumer.Attributes(), "messaging.consumer.group.name", "ordered-consumer")
 }

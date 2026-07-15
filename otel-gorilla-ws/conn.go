@@ -8,6 +8,11 @@
 //   - Server: Upgrader.Upgrade detects "otel-ws" in the client's list and responds
 //     with "otel-ws+<negotiated>". Tracing is enabled on acceptance.
 //
+// Both sides gate negotiation on the effective tracing feature flag (env
+// gates, overridable per connection via WithTracingEnabled): a feature-off
+// side never offers or confirms otel-ws, so the peer is never committed to
+// the envelope wire format a feature-off side would not unwrap.
+//
 // Connections without otel-ws negotiation operate in passthrough mode (no envelope
 // wrapping), but send/receive spans are still created. NewConn keeps tracing on for callers
 // that manage the WebSocket handshake themselves (backwards compatibility).
@@ -64,14 +69,20 @@ func NewConn(conn *websocket.Conn, opts ...Option) *Conn {
 	return newConn(conn, true, opts...)
 }
 
-// newConn is the internal constructor used by Dial and Upgrader.Upgrade.
+// newConn wraps conn with the given negotiation outcome, resolving opts.
 func newConn(conn *websocket.Conn, tracingEnabled bool, opts ...Option) *Conn {
+	return newConnFromConfig(conn, tracingEnabled, resolveConnOptions(opts))
+}
+
+// newConnFromConfig is the constructor core shared by NewConn, Dial and
+// Upgrader.Upgrade — the latter two resolve their options before the
+// handshake (to gate otel-ws negotiation) and pass the parsed config here.
+func newConnFromConfig(conn *websocket.Conn, tracingEnabled bool, cfg connOptions) *Conn {
 	c := &Conn{
 		Conn:           conn,
 		tracingEnabled: tracingEnabled,
-		featureEnabled: wsTracingEnabled(),
 	}
-	applyOptions(c, opts)
+	configureConn(c, cfg)
 	return c
 }
 
@@ -176,14 +187,32 @@ func (c *Conn) ReadMessage(ctx context.Context) (context.Context, int, []byte, e
 //
 // If subprotocols is nil or empty, no otel-ws injection is performed and the
 // returned Conn operates in passthrough mode (Scenario E).
+//
+// When the connection's effective tracing feature is off (env gates, or
+// WithTracingEnabled(false)), otel-ws is not offered at all: a feature-off
+// side never unwraps the JSON envelope, so offering the subprotocol would
+// commit an otel-ws-aware server to a wire format this client cannot read.
+// As defense in depth for that path (and whenever subprotocols is empty),
+// any otel-ws token the caller placed in requestHeader is stripped before
+// gorilla sees it — see stripOTelSubprotocol.
 func Dial(ctx context.Context, urlStr string, requestHeader http.Header, subprotocols []string, opts ...Option) (*Conn, *http.Response, error) {
+	cfg := resolveConnOptions(opts)
+	featureOn := effectiveFeatureEnabled(cfg)
+
 	var otelInjected bool
 	dialProtos := subprotocols
-	if len(subprotocols) > 0 {
+	if featureOn && len(subprotocols) > 0 {
 		dialProtos = make([]string, 0, len(subprotocols)+1)
 		dialProtos = append(dialProtos, otelWSProtocol)
 		dialProtos = append(dialProtos, subprotocols...)
 		otelInjected = true
+	} else {
+		// gorilla's Dialer silently sends a caller-supplied
+		// Sec-Websocket-Protocol request header verbatim whenever
+		// Dialer.Subprotocols is empty (true whenever otelInjected is false
+		// here). Strip any otel-ws token so it can't smuggle an otel-ws offer
+		// past this feature-off/no-subprotocols path.
+		requestHeader = stripOTelSubprotocol(requestHeader)
 	}
 
 	dialer := websocket.Dialer{
@@ -208,7 +237,7 @@ func Dial(ctx context.Context, urlStr string, requestHeader http.Header, subprot
 	}
 	// Scenario E: otelInjected=false → tracingEnabled=false (passthrough).
 
-	return newConn(raw, tracingEnabled, opts...), resp, nil
+	return newConnFromConfig(raw, tracingEnabled, cfg), resp, nil
 }
 
 func appProtocolFromRaw(rawProto string) string {

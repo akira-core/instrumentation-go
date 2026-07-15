@@ -41,6 +41,7 @@ type clientConfig struct {
 	TracerProvider     trace.TracerProvider
 	Propagators        propagation.TextMapPropagator
 	PropagationEnabled *bool
+	TracingEnabled     *bool
 }
 
 // WithTracerProvider sets the TracerProvider for the client. Defaults to otel.GetTracerProvider().
@@ -72,9 +73,30 @@ func WithTracePropagationEnabled(v bool) ClientOption {
 	})
 }
 
+// WithTracingEnabled overrides the env-gate default (OTEL_INSTRUMENTATION_GO_TRACING_ENABLED
+// AND OTEL_MONGO_TRACING_ENABLED) for this Client only, in either direction.
+// When unset, tracing follows the env gates exactly as before. When set, this
+// value is authoritative for the resulting Client and everything constructed
+// from it — Databases, Collections (including their strategy-split direct/
+// traced impl selection), Cursors, and ChangeStreams. WithTracePropagationEnabled
+// still governs only the propagation default and still requires this
+// effective tracing state to be true — WithTracePropagationEnabled(true)
+// cannot enable propagation on a Client whose effective tracing is off,
+// whether that came from the env gates or from WithTracingEnabled(false).
+// The package-level ContextFromDocument/ContextFromRawDocument gate remains
+// env-only and is unaffected by this option.
+func WithTracingEnabled(v bool) ClientOption {
+	return clientOptionFunc(func(c *clientConfig) {
+		c.TracingEnabled = &v
+	})
+}
+
 func newClientConfig(opts []ClientOption) *clientConfig {
 	cfg := &clientConfig{}
 	for _, o := range opts {
+		if o == nil {
+			continue
+		}
 		o.apply(cfg)
 	}
 	return cfg
@@ -90,7 +112,9 @@ func Connect(ctx context.Context, opts ...*options.ClientOptions) (*Client, erro
 // stored in the Client and used for all tracing — the otel globals are never overwritten.
 // Without options, falls back to otel.GetTracerProvider()/otel.GetTextMapPropagator() at connect time.
 func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*options.ClientOptions) (*Client, error) {
-	if !mongoTracingEnabled() {
+	cfg := newClientConfig(traceOpts)
+	enabled := resolveFlag(cfg.TracingEnabled, mongoTracingEnabled())
+	if !enabled {
 		merged := options.MergeClientOptions(opts...) //nolint:staticcheck // SA1019: v1 driver deprecates struct-merging ahead of v2; still needed here to read the effective merged Monitor/URI.
 		mc, err := mongo.Connect(ctx, merged)
 		if err != nil {
@@ -108,7 +132,6 @@ func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*
 			propagationEnabled: false,
 		}, nil
 	}
-	cfg := newClientConfig(traceOpts)
 	tp := cfg.TracerProvider
 	if tp == nil {
 		tp = otel.GetTracerProvider()
@@ -117,7 +140,7 @@ func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*
 	if prop == nil {
 		prop = otel.GetTextMapPropagator()
 	}
-	propEnabled := resolveDocumentPropagation(cfg.PropagationEnabled)
+	propEnabled := resolveDocumentPropagation(enabled, cfg.PropagationEnabled)
 	tracer := tp.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
 	merged := options.MergeClientOptions(opts...) //nolint:staticcheck // SA1019: see rationale above; also needed to chain a caller-supplied SetMonitor with shared.NewCommandMonitor.
 	merged.SetMonitor(shared.NewCommandMonitor(merged.Monitor))

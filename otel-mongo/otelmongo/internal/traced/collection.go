@@ -54,9 +54,6 @@ func (t *Collection) setCapturedServerAttrs(span trace.Span, capture *shared.Add
 	if addr, port := capture.Resolve(t.ServerAddr, t.ServerPort); addr != "" {
 		span.SetAttributes(shared.ServerAttributes(addr, port)...)
 	}
-	if !capture.Captured() {
-		span.SetAttributes(shared.ServerAddressFallbackAttribute())
-	}
 }
 
 // changeStreamReaderAttrs builds the attribute set for the ChangeStream reader's
@@ -86,7 +83,9 @@ func (t *Collection) InsertOne(ctx context.Context, document any, opts ...*optio
 	if t.PropagationEnabled {
 		docWithTrace, err := shared.InjectTraceIntoDocument(ctx, document, t.Propagator)
 		if err != nil {
-			return nil, fmt.Errorf("otelmongo: inject trace: %w", err)
+			err = fmt.Errorf("otelmongo: inject trace: %w", err)
+			shared.RecordSpanError(span, err)
+			return nil, err
 		}
 		docToInsert = docWithTrace
 	}
@@ -115,7 +114,9 @@ func (t *Collection) InsertMany(ctx context.Context, documents []any, opts ...*o
 		for _, doc := range documents {
 			d, err := shared.InjectTraceIntoDocument(ctx, doc, t.Propagator)
 			if err != nil {
-				return nil, fmt.Errorf("otelmongo: inject trace: %w", err)
+				err = fmt.Errorf("otelmongo: inject trace: %w", err)
+				shared.RecordSpanError(span, err)
+				return nil, err
 			}
 			docsWithTrace = append(docsWithTrace, d)
 		}
@@ -223,7 +224,9 @@ func (t *Collection) ReplaceOne(ctx context.Context, filter any, replacement any
 	if t.PropagationEnabled {
 		replacementWithTrace, err := shared.InjectTraceIntoDocument(ctx, replacement, t.Propagator)
 		if err != nil {
-			return nil, fmt.Errorf("otelmongo: inject trace: %w", err)
+			err = fmt.Errorf("otelmongo: inject trace: %w", err)
+			shared.RecordSpanError(span, err)
+			return nil, err
 		}
 		replacementToUse = replacementWithTrace
 	}

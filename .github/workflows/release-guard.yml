@@ -1,0 +1,76 @@
+# Release guard: fails a pushed release tag if the module's reported
+# instrumentation version constant doesn't match the tag. See VERSIONING.md
+# for the tag format and the version-constant location table this workflow
+# implements. Exists because a hand-maintained constant with no automated
+# check has already shipped wrong once (otel-nats 0.5.0 reported "0.4.1" on
+# every span).
+name: Release Tag Guard
+
+on:
+  push:
+    tags:
+      - "otel-mongo/v[0-9]*"
+      - "otel-mongo/v2/v[0-9]*"
+      - "otel-nats/v[0-9]*"
+      - "otel-gorilla-ws/v[0-9]*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify-version:
+    name: Verify tag matches version constant
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Compare tag version against the module's version constant
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          echo "Tag: $TAG"
+
+          # otel-mongo/v2 must be matched before the plain otel-mongo case —
+          # bash `case` takes the first matching pattern, and
+          # otel-mongo/v2/v0.7.0 would otherwise also match otel-mongo/v*.
+          case "$TAG" in
+            otel-mongo/v2/v*)
+              MODULE="otel-mongo/v2"
+              VERSION="${TAG#otel-mongo/v2/v}"
+              FILE="otel-mongo/v2/version.go"
+              CONST_VERSION=$(grep -E '^\s*(const\s+)?instrumentationVersion\s*=' "$FILE" | sed -E 's/.*"([^"]+)".*/\1/')
+              ;;
+            otel-mongo/v*)
+              MODULE="otel-mongo"
+              VERSION="${TAG#otel-mongo/v}"
+              FILE="otel-mongo/otelmongo/version.go"
+              CONST_VERSION=$(grep -E '^\s*(const\s+)?instrumentationVersion\s*=' "$FILE" | sed -E 's/.*"([^"]+)".*/\1/')
+              ;;
+            otel-nats/v*)
+              MODULE="otel-nats"
+              VERSION="${TAG#otel-nats/v}"
+              FILE="otel-nats/otelnats/conn.go"
+              CONST_VERSION=$(grep -E '^\s*(const\s+)?instrumentationVersion\s*=' "$FILE" | sed -E 's/.*"([^"]+)".*/\1/')
+              ;;
+            otel-gorilla-ws/v*)
+              MODULE="otel-gorilla-ws"
+              VERSION="${TAG#otel-gorilla-ws/v}"
+              FILE="otel-gorilla-ws/version.go"
+              CONST_VERSION=$(grep -E '^\s*return\s*"' "$FILE" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+              ;;
+            *)
+              echo "::error::Unrecognized release tag shape: $TAG (expected <module>/vX.Y.Z per VERSIONING.md)"
+              exit 1
+              ;;
+          esac
+
+          echo "Module:           $MODULE"
+          echo "Tag version:      $VERSION"
+          echo "Constant version: $CONST_VERSION (from $FILE)"
+
+          if [ "$VERSION" != "$CONST_VERSION" ]; then
+            echo "::error::Tag $TAG declares version $VERSION but $FILE reports $CONST_VERSION — bump the constant and push a new commit before re-tagging."
+            exit 1
+          fi
+
+          echo "OK: $TAG matches the version constant in $FILE"

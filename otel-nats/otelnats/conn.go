@@ -18,7 +18,7 @@ import (
 const (
 	// ScopeName is the instrumentation scope name for Tracer creation (OTel contrib guideline).
 	ScopeName              = "instrumentation-go/otel-nats/otelnats"
-	instrumentationVersion = "0.6.2"
+	instrumentationVersion = "0.7.0"
 	messagingSystem        = "nats"
 )
 
@@ -76,11 +76,15 @@ type connConfig struct {
 	TracerProvider trace.TracerProvider
 	Propagators    propagation.TextMapPropagator
 	TraceDest      string
+	TracingEnabled *bool
 }
 
 func newConnConfig(opts ...Option) *connConfig {
 	c := &connConfig{}
 	for _, o := range opts {
+		if o == nil {
+			continue
+		}
 		o.apply(c)
 	}
 	return c
@@ -113,16 +117,43 @@ func WithTraceDestination(subject string) Option {
 	})
 }
 
+// WithTracingEnabled overrides the env-gate default (OTEL_INSTRUMENTATION_GO_TRACING_ENABLED
+// AND OTEL_NATS_TRACING_ENABLED) for this Conn only, in either direction. When
+// unset, tracing follows the env gates exactly as before. When set, this
+// value is authoritative for the resulting Conn — including everything
+// derived from it, such as oteljetstream wrappers — and takes precedence
+// over both env gates.
+//
+// This lets an application derive NATS tracing from its own toggle instead of
+// requiring every deployment to export the two env vars, and lets tests
+// construct both traced and untraced connections in the same process without
+// process-wide env manipulation (the tracing gate is otherwise cached for the
+// lifetime of the process via sync.Once).
+//
+// A Conn constructed with WithTracingEnabled(false) delegates natively with
+// no spans regardless of the env gates; a Conn constructed with
+// WithTracingEnabled(true) traces even if the env gates are off or unset.
+// Connections constructed without this option are unaffected.
+func WithTracingEnabled(v bool) Option {
+	return optionFunc(func(c *connConfig) {
+		c.TracingEnabled = &v
+	})
+}
+
 // Version returns the instrumentation module version for tracer creation (OTel contrib guideline).
 func Version() string {
 	return instrumentationVersion
 }
 
 func newConn(nc *nats.Conn, opts ...Option) *Conn {
-	if !natsTracingEnabled() {
+	cfg := newConnConfig(opts...)
+	enabled := natsTracingEnabled()
+	if cfg.TracingEnabled != nil {
+		enabled = *cfg.TracingEnabled
+	}
+	if !enabled {
 		return &Conn{nc: nc, impl: &directConn{nc: nc}}
 	}
-	cfg := newConnConfig(opts...)
 	if cfg.Propagators == nil {
 		cfg.Propagators = otel.GetTextMapPropagator()
 	}
@@ -277,7 +308,10 @@ func requestAttrs(msg *nats.Msg, serverAttrs []attribute.KeyValue) []attribute.K
 }
 
 // receiveAttrs builds consumer span attributes. opType is "process" (push) or "receive" (pull).
-// Note: oteljetstream/consumer.go has parallel receiveBaseAttrs/receiveMsgAttrs for jetstream.Msg — keep the attribute sets in sync.
+// Note: oteljetstream/consumer.go has parallel receiveBaseAttrs/receiveMsgAttrs for jetstream.Msg — keep
+// the attribute sets in sync, EXCEPT conversation_id: a JetStream message's Reply field is the native
+// $JS.ACK.<stream>.<consumer>.… acknowledgement subject, not a conversation identifier, so the JetStream
+// builders must never map it to messaging.message.conversation_id.
 func receiveAttrs(msg *nats.Msg, queue string, opType string, serverAttrs []attribute.KeyValue) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{
 		semconv.MessagingSystemKey.String(messagingSystem),
@@ -287,6 +321,9 @@ func receiveAttrs(msg *nats.Msg, queue string, opType string, serverAttrs []attr
 	}
 	if len(msg.Data) > 0 {
 		attrs = append(attrs, semconv.MessagingMessageBodySize(len(msg.Data)))
+	}
+	if msg.Reply != "" {
+		attrs = append(attrs, semconv.MessagingMessageConversationID(msg.Reply))
 	}
 	if queue != "" {
 		attrs = append(attrs, semconv.MessagingConsumerGroupName(queue))

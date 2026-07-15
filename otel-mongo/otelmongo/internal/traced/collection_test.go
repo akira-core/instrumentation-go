@@ -10,6 +10,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -28,17 +29,6 @@ func spanServerAttrs(t *testing.T, span sdktrace.ReadOnlySpan) (addr string, por
 		}
 	}
 	return addr, port, sawPort
-}
-
-// spanHasFallbackAttr reports whether a recorded span carries
-// mongodb.server_address.fallback=true (see shared.ServerAddressFallbackAttribute).
-func spanHasFallbackAttr(span sdktrace.ReadOnlySpan) bool {
-	for _, kv := range span.Attributes() {
-		if string(kv.Key) == "mongodb.server_address.fallback" {
-			return kv.Value.AsBool()
-		}
-	}
-	return false
 }
 
 // TestCollection_FallsBackToStaticAddrWhenNoCommandCaptured exercises the real
@@ -75,7 +65,6 @@ func TestCollection_FallsBackToStaticAddrWhenNoCommandCaptured(t *testing.T) {
 	assert.Equal(t, "static-fallback-host", addr)
 	require.True(t, sawPort, "expected server.port for a non-default port fallback")
 	assert.Equal(t, int64(27018), port)
-	assert.True(t, spanHasFallbackAttr(spans[0]), "expected mongodb.server_address.fallback=true")
 }
 
 // newFailingPropCollection builds a propagation-enabled Collection pointed at a lazy
@@ -102,7 +91,8 @@ func newFailingPropCollection(t *testing.T, sr *tracetest.SpanRecorder) *Collect
 }
 
 // TestCollection_InsertOne_InjectFailureKeepsStaticAddr proves InsertOne's inject-failure
-// early return still carries the static server.* fallback (regression: it used to skip it).
+// early return still carries the static server.* fallback (regression: it used to skip it)
+// and now also records the error on the span (regression: it used to skip RecordSpanError).
 func TestCollection_InsertOne_InjectFailureKeepsStaticAddr(t *testing.T) {
 	sr := tracetest.NewSpanRecorder()
 	impl := newFailingPropCollection(t, sr)
@@ -116,7 +106,50 @@ func TestCollection_InsertOne_InjectFailureKeepsStaticAddr(t *testing.T) {
 	assert.Equal(t, "static-fallback-host", addr)
 	require.True(t, sawPort, "inject-failure span must still carry server.port fallback")
 	assert.Equal(t, int64(27018), port)
-	assert.True(t, spanHasFallbackAttr(spans[0]), "expected mongodb.server_address.fallback=true")
+	assert.Equal(t, codes.Error, spans[0].Status().Code)
+	assert.Contains(t, spans[0].Status().Description, "inject trace")
+}
+
+// TestCollection_InsertMany_InjectFailureKeepsStaticAddr is the InsertMany counterpart:
+// an un-encodable document in the batch makes InjectTraceIntoDocument fail before the
+// driver call, and the failed span must still carry the static server.* fallback and a
+// recorded error status.
+func TestCollection_InsertMany_InjectFailureKeepsStaticAddr(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	impl := newFailingPropCollection(t, sr)
+
+	_, err := impl.InsertMany(context.Background(), []any{bson.M{"bad": make(chan int)}})
+	require.Error(t, err)
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	addr, port, sawPort := spanServerAttrs(t, spans[0])
+	assert.Equal(t, "static-fallback-host", addr)
+	require.True(t, sawPort, "inject-failure span must still carry server.port fallback")
+	assert.Equal(t, int64(27018), port)
+	assert.Equal(t, codes.Error, spans[0].Status().Code)
+	assert.Contains(t, spans[0].Status().Description, "inject trace")
+}
+
+// TestCollection_ReplaceOne_InjectFailureKeepsStaticAddr is the ReplaceOne counterpart:
+// an un-encodable replacement document makes InjectTraceIntoDocument fail before the
+// driver call, and the failed span must still carry the static server.* fallback and a
+// recorded error status.
+func TestCollection_ReplaceOne_InjectFailureKeepsStaticAddr(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	impl := newFailingPropCollection(t, sr)
+
+	_, err := impl.ReplaceOne(context.Background(), bson.M{"_id": 1}, bson.M{"bad": make(chan int)})
+	require.Error(t, err)
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	addr, port, sawPort := spanServerAttrs(t, spans[0])
+	assert.Equal(t, "static-fallback-host", addr)
+	require.True(t, sawPort, "inject-failure span must still carry server.port fallback")
+	assert.Equal(t, int64(27018), port)
+	assert.Equal(t, codes.Error, spans[0].Status().Code)
+	assert.Contains(t, spans[0].Status().Description, "inject trace")
 }
 
 // TestCollection_BulkWrite_InjectFailureKeepsStaticAddr is the BulkWrite counterpart:
@@ -136,5 +169,4 @@ func TestCollection_BulkWrite_InjectFailureKeepsStaticAddr(t *testing.T) {
 	assert.Equal(t, "static-fallback-host", addr)
 	require.True(t, sawPort, "inject-failure span must still carry server.port fallback")
 	assert.Equal(t, int64(27018), port)
-	assert.True(t, spanHasFallbackAttr(spans[0]), "expected mongodb.server_address.fallback=true")
 }

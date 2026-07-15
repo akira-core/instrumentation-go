@@ -12,11 +12,11 @@
 
 | 套件 | Import 路徑 | 原始碼版本 | 說明 |
 |------|-------------|------------|------|
-| **otel-mongo** (v1) | `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | 0.6.2 | MongoDB driver v1 封裝；寫入時注入 `_oteltrace`；`ContextFromDocument` 與解碼輔助。 |
-| **otel-mongo/v2** | `github.com/akira-core/instrumentation-go/otel-mongo/v2` | 0.6.2 | MongoDB driver v2 封裝；與 v1 行為對齊。 |
-| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.6.2 | 核心 NATS；W3C 脈絡在訊息標頭。 |
-| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.6.2 | JetStream 發布／消費／fetch。 |
-| **otel-gorilla-ws** | `github.com/akira-core/instrumentation-go/otel-gorilla-ws` | 0.6.0 | 在 JSON 訊息本文內傳遞 trace context（信封格式）；`NewConn` / `Dial`。 |
+| **otel-mongo** (v1) | `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | 0.7.0 | MongoDB driver v1 封裝；寫入時注入 `_oteltrace`；`ContextFromDocument` 與解碼輔助。 |
+| **otel-mongo/v2** | `github.com/akira-core/instrumentation-go/otel-mongo/v2` | 0.7.0 | MongoDB driver v2 封裝；與 v1 行為對齊。 |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.7.0 | 核心 NATS；W3C 脈絡在訊息標頭。 |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.7.0 | JetStream 發布／消費／fetch。 |
+| **otel-gorilla-ws** | `github.com/akira-core/instrumentation-go/otel-gorilla-ws` | 0.7.0 | 在 JSON 訊息本文內傳遞 trace context（信封格式）；`NewConn` / `Dial`。 |
 
 各模組詳細文件：[otel-mongo/README.md](otel-mongo/README.md)、[otel-nats/README.md](otel-nats/README.md)、[otel-gorilla-ws/README.md](otel-gorilla-ws/README.md)；三個模組皆另有繁中版：[otel-mongo/README.zh-TW.md](otel-mongo/README.zh-TW.md)、[otel-nats/README.zh-TW.md](otel-nats/README.zh-TW.md)、[otel-gorilla-ws/README.zh-TW.md](otel-gorilla-ws/README.zh-TW.md)。
 
@@ -41,11 +41,24 @@ go get github.com/akira-core/instrumentation-go/otel-gorilla-ws@otel-gorilla-ws/
 |----------|----------|----------|------|
 | `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | 全部模組 | 關 | 總開關；須開啟後，各模組追蹤旗標與（Mongo 的）文件傳播才會生效。 |
 | `OTEL_MONGO_TRACING_ENABLED` | `otel-mongo` + `otel-mongo/v2` | 關 | CLIENT span、非 noop tracer。 |
-| `OTEL_MONGO_PROPAGATION_ENABLED` | `otel-mongo` + `otel-mongo/v2` | 關 | `_oteltrace` 寫入／讀取抽取；仍受上述總開關約束。 |
+| `OTEL_MONGO_PROPAGATION_ENABLED` | `otel-mongo` + `otel-mongo/v2` | 關 | `_oteltrace` 寫入／讀取抽取；仍受有效 tracing 約束。 |
 | `OTEL_NATS_TRACING_ENABLED` | `otelnats` + `oteljetstream` | 關 | NATS／JetStream 封裝追蹤。 |
 | `OTEL_GORILLA_WS_TRACING_ENABLED` | `otel-gorilla-ws` | 關 | WebSocket 封裝追蹤。 |
 
-若**總開關**關閉，模組層旗標不會生效。Mongo 的 `WithTracePropagationEnabled` 無法在總開關關閉時繞過並啟用文件傳播。
+### Env × `WithTracingEnabled` 決策表
+
+各模組建構時皆可傳 `WithTracingEnabled(v bool)`。option **有傳**時為**最終決定**（可雙向覆寫 env）；**沒傳**時聽 env（`GLOBAL` ∧ 模組開關）。
+
+| Env（`GLOBAL` ∧ 模組） | `WithTracingEnabled` | 有效 tracing |
+|------------------------|----------------------|--------------|
+| 關（未設或 falsy） | （無） | **關** |
+| 關（未設或 falsy） | `true` | **開** |
+| 關（未設或 falsy） | `false` | **關** |
+| 開 | （無） | **開** |
+| 開 | `false` | **關** |
+| 開 | `true` | **開** |
+
+僅 Mongo：`WithTracePropagationEnabled` 只在有效 tracing **開**時控制該 client 的 `_oteltrace`；有效 tracing 關時無法單獨打開 propagation。套件層 `ContextFromDocument`／`ContextFromRawDocument` 仍**只看 env**（三個 Mongo 變數），不受 per-client option 影響。細節見 [otel-mongo/README.zh-TW.md](otel-mongo/README.zh-TW.md)。
 
 ## 目錄結構
 

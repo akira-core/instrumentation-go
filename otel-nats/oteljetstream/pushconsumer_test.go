@@ -88,19 +88,66 @@ func TestPushConsumerConsumeTraceContext(t *testing.T) {
 	assert.True(t, span.SpanContext().TraceID().IsValid(), "handler context should carry valid trace")
 
 	consumerSpan := waitSpanByNameAndKind(t, sr, "process push.test", oteltrace.SpanKindConsumer)
-	assertAttr(t, consumerSpan.Attributes(), "messaging.consumer.name", consumerName)
+	assertAttr(t, consumerSpan.Attributes(), "messaging.consumer.group.name", consumerName)
+	for _, kv := range consumerSpan.Attributes() {
+		assert.NotEqual(t, "messaging.message.conversation_id", string(kv.Key), "JetStream process span must not map the native $JS.ACK reply subject to conversation_id")
+	}
 	producerSpan := findSpanByKind(sr.Ended(), oteltrace.SpanKindProducer)
 	require.NotNil(t, producerSpan, "no producer span")
 	require.Len(t, consumerSpan.Links(), 1, "consumer span should link the producer")
 	assert.Equal(t, producerSpan.SpanContext().TraceID(), consumerSpan.Links()[0].SpanContext.TraceID())
 }
 
-// NOTE: the direct (tracing-off) push-consumer path has no runtime test here —
-// the otelnats gate is cached process-wide (flags.Gate, reset helper is
-// otelnats-package-private), so a jetstream external test cannot flip it after
-// sibling tests resolve it to enabled. directPushConsumer/directJSImpl parity
-// is compile-enforced at New()'s return sites; no direct-path runtime tests
-// exist in this package for the pull variants either (same constraint).
+// TestOteljetstreamInheritsConnTracingOption verifies a JetStream wrapper
+// built from a Conn constructed with WithTracingEnabled(false) selects the
+// direct (untraced) impl — via New()'s existing conn.TracingEnabled() check —
+// even though the process-wide env gate is on (set by startJetStreamServer,
+// already resolved true by prior tests in this binary). This is also the
+// first runtime exercise of the direct JetStream path in this package: before
+// WithTracingEnabled existed, the process-wide, sync.Once-cached env gate
+// made it impossible to construct an untraced connection once any sibling
+// test had resolved it to enabled (see the removed NOTE this replaces).
+func TestOteljetstreamInheritsConnTracingOption(t *testing.T) {
+	url := startJetStreamServer(t) // sets both tracing env vars true as a side effect
+	sr := tracetest.NewSpanRecorder()
+	tp := trace.NewTracerProvider(trace.WithSpanProcessor(sr))
+	otel.SetTracerProvider(tp)
+
+	conn, err := otelnats.ConnectWithOptions(url, nil, otelnats.WithTracingEnabled(false))
+	require.NoError(t, err)
+	defer conn.Close()
+	require.False(t, conn.TracingEnabled(), "option must override the truthy env gate")
+
+	js, err := oteljetstream.New(conn)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	_, err = js.CreateOrUpdateStream(ctx, oteljetstream.StreamConfig{
+		Name:     "OPTOVERRIDE",
+		Subjects: []string{"optoverride.>"},
+	})
+	require.NoError(t, err)
+	cons, err := js.CreateOrUpdateConsumer(ctx, "OPTOVERRIDE", oteljetstream.ConsumerConfig{
+		Durable:       "optoverride-consumer",
+		FilterSubject: "optoverride.test",
+		AckPolicy:     oteljetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	_, err = js.Publish(ctx, "optoverride.test", []byte("untraced"))
+	require.NoError(t, err)
+
+	batch, err := cons.Fetch(1, jetstream.FetchMaxWait(3*time.Second))
+	require.NoError(t, err)
+	msg, ok := <-batch.Messages()
+	require.True(t, ok, "expected one message")
+	assert.Equal(t, "untraced", string(msg.Data()))
+	assert.False(t, oteltrace.SpanFromContext(msg.Context()).SpanContext().IsValid(),
+		"direct (untraced) path must not attach a trace context")
+	_ = msg.Ack()
+
+	assert.Empty(t, sr.Ended(), "no spans should be recorded on a WithTracingEnabled(false) connection")
+}
 
 func TestMessagesContextNextOpts(t *testing.T) {
 	js, _, tp := setupTracedJS(t)
@@ -238,7 +285,7 @@ func TestOrderedConsumerNamePrefixAttr(t *testing.T) {
 	assert.Equal(t, "ordered msg", string(msg.Data()))
 
 	consumerSpan := waitSpanByNameAndKind(t, sr, "receive orderedprefix.test", oteltrace.SpanKindClient)
-	assertAttr(t, consumerSpan.Attributes(), "messaging.consumer.name", "my-ordered")
+	assertAttr(t, consumerSpan.Attributes(), "messaging.consumer.group.name", "my-ordered")
 }
 
 // TestNextFailsFastOnDoneContext verifies Consumer.Next honors an
@@ -274,4 +321,153 @@ func TestNextFailsFastOnDoneContext(t *testing.T) {
 	_, _, err = cons.Next(expiredCtx)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.Less(t, time.Since(start), 2*time.Second, "Next must fail fast on expired ctx")
+}
+
+// TestNextHonorsLiveCancellation verifies Consumer.Next aborts promptly when
+// ctx is canceled mid-wait, even with no deadline set — the fetch would
+// otherwise block for jetstream's default ~30s max wait.
+func TestNextHonorsLiveCancellation(t *testing.T) {
+	js, _, _ := setupTracedJS(t)
+	ctx := context.Background()
+
+	_, err := js.CreateOrUpdateStream(ctx, oteljetstream.StreamConfig{
+		Name:     "MIDWAITCANCEL",
+		Subjects: []string{"midwaitcancel.>"},
+	})
+	require.NoError(t, err)
+
+	cons, err := js.CreateOrUpdateConsumer(ctx, "MIDWAITCANCEL", oteljetstream.ConsumerConfig{
+		Durable:       "midwaitcancel-consumer",
+		FilterSubject: "midwaitcancel.test",
+		AckPolicy:     oteljetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	waitCtx, cancel := context.WithCancel(ctx) // no deadline
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	_, _, err = cons.Next(waitCtx) // no message ever published — would otherwise block ~30s
+	elapsed := time.Since(start)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Less(t, elapsed, 2*time.Second, "Next must honor live cancellation, not block for the default max wait")
+	assert.GreaterOrEqual(t, elapsed, 100*time.Millisecond, "Next returned before cancellation fired")
+}
+
+// TestNextDeliversMessageBeforeCancellation verifies a message that arrives
+// before ctx is canceled is still returned normally, with its receive span
+// and returned context intact.
+func TestNextDeliversMessageBeforeCancellation(t *testing.T) {
+	js, sr, tp := setupTracedJS(t)
+	ctx := context.Background()
+
+	_, err := js.CreateOrUpdateStream(ctx, oteljetstream.StreamConfig{
+		Name:     "NEXTBEFORECANCEL",
+		Subjects: []string{"nextbeforecancel.>"},
+	})
+	require.NoError(t, err)
+
+	cons, err := js.CreateOrUpdateConsumer(ctx, "NEXTBEFORECANCEL", oteljetstream.ConsumerConfig{
+		Durable:       "nextbeforecancel-consumer",
+		FilterSubject: "nextbeforecancel.test",
+		AckPolicy:     oteljetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	tracer := tp.Tracer("publisher")
+	pubCtx, pubSpan := tracer.Start(ctx, "pub-parent")
+	_, err = js.Publish(pubCtx, "nextbeforecancel.test", []byte("in time"))
+	pubSpan.End()
+	require.NoError(t, err)
+
+	nextCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	msgCtx, msg, err := cons.Next(nextCtx)
+	require.NoError(t, err)
+	assert.Equal(t, "in time", string(msg.Data()))
+	span := oteltrace.SpanFromContext(msgCtx)
+	assert.True(t, span.SpanContext().TraceID().IsValid(), "Next should return context with trace")
+
+	receiveSpan := waitSpanByNameAndKind(t, sr, "receive nextbeforecancel.test", oteltrace.SpanKindClient)
+	require.NotNil(t, receiveSpan)
+}
+
+// TestNextCancelableCtxWithFetchMaxWaitErrors pins the 0.7.0 behavior change:
+// a cancelable ctx wires jetstream.FetchContext, which upstream rejects when
+// combined with a caller-supplied FetchMaxWait (ErrInvalidOption). Callers
+// wanting both use the ctx's own deadline. A non-cancelable ctx
+// (context.Background(), Done() == nil) skips the wiring, so FetchMaxWait
+// alone keeps working.
+func TestNextCancelableCtxWithFetchMaxWaitErrors(t *testing.T) {
+	js, _, _ := setupTracedJS(t)
+	ctx := context.Background()
+
+	_, err := js.CreateOrUpdateStream(ctx, oteljetstream.StreamConfig{
+		Name:     "MAXWAITCONFLICT",
+		Subjects: []string{"maxwaitconflict.>"},
+	})
+	require.NoError(t, err)
+
+	cons, err := js.CreateOrUpdateConsumer(ctx, "MAXWAITCONFLICT", oteljetstream.ConsumerConfig{
+		Durable:       "maxwaitconflict-consumer",
+		FilterSubject: "maxwaitconflict.test",
+		AckPolicy:     oteljetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	cancelable, cancel := context.WithCancel(ctx)
+	defer cancel()
+	_, _, err = cons.Next(cancelable, jetstream.FetchMaxWait(time.Second))
+	require.ErrorIs(t, err, jetstream.ErrInvalidOption,
+		"cancelable ctx + FetchMaxWait must surface jetstream's native conflict error")
+
+	_, err = js.Publish(ctx, "maxwaitconflict.test", []byte("ok"))
+	require.NoError(t, err)
+	_, msg, err := cons.Next(ctx, jetstream.FetchMaxWait(2*time.Second))
+	require.NoError(t, err, "Background ctx + FetchMaxWait must keep working")
+	assert.Equal(t, "ok", string(msg.Data()))
+}
+
+// TestNextMethodCtxBeatsCallerFetchContext verifies the method parameter ctx
+// stays authoritative when a caller also passes jetstream.FetchContext: the
+// wrapper appends its own FetchContext last (fetch options apply in order,
+// last write to the request ctx wins), so cancelling the method ctx still
+// unblocks Next promptly instead of being shadowed by the caller's context.
+func TestNextMethodCtxBeatsCallerFetchContext(t *testing.T) {
+	js, _, _ := setupTracedJS(t)
+	ctx := context.Background()
+
+	_, err := js.CreateOrUpdateStream(ctx, oteljetstream.StreamConfig{
+		Name:     "FETCHCTXPRIORITY",
+		Subjects: []string{"fetchctxpriority.>"},
+	})
+	require.NoError(t, err)
+
+	cons, err := js.CreateOrUpdateConsumer(ctx, "FETCHCTXPRIORITY", oteljetstream.ConsumerConfig{
+		Durable:       "fetchctxpriority-consumer",
+		FilterSubject: "fetchctxpriority.test",
+		AckPolicy:     oteljetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	waitCtx, cancel := context.WithCancel(ctx) // no deadline
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+	}()
+
+	otherCtx, otherCancel := context.WithTimeout(ctx, 10*time.Second) // never canceled by the test
+	defer otherCancel()
+
+	start := time.Now()
+	_, _, err = cons.Next(waitCtx, jetstream.FetchContext(otherCtx)) // no message ever published
+	elapsed := time.Since(start)
+	require.ErrorIs(t, err, context.Canceled,
+		"method ctx cancellation must win over a caller-supplied FetchContext")
+	assert.Less(t, elapsed, 2*time.Second,
+		"Next must return on method-ctx cancellation, not wait out the caller context")
 }

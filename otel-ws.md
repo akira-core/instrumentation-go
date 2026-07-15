@@ -46,3 +46,14 @@ OTEL-WS Server 會檢查收到的協議是否帶有 `otel-ws` 前綴，決定是
 - **安全性**：強制 sub-protocol 可減少攻擊面（例如防止未經驗證的連線）。
 
 這個表格已涵蓋 Excalidraw 圖中所有矩形區塊、箭頭標籤（如 `""`、` "json"`、` "otel-ws,json"`）、側邊說明文字，以及 OTEL-WS 的隱藏注入與檢查邏輯。
+
+### 5. Feature-flag 對協商的閘控(0.7.0+)
+
+上述 C–H 情境全部以「該連線的 effective tracing feature 為 **on**」為前提。feature flag(env gates `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` × `OTEL_GORILLA_WS_TRACING_ENABLED`,可被 per-connection `WithTracingEnabled(v)` 覆寫)在 **handshake 之前**先行解析:
+
+| Feature (effective) | Dial 行為 | Upgrade 行為 | 結果 |
+| --- | --- | --- | --- |
+| **off** | 完全不注入 `otel-ws` token | 即使客戶端提出 `otel-ws` 也不回傳確認,改走一般協議選擇(等同情境 H) | 雙方都不封裝 envelope,純透傳 |
+| **on** | 依情境 C–E 注入並判定 | 依情境 F–H 判定 | 原表格行為 |
+
+**理由**:feature off 的一方不會解包 JSON envelope。若仍允許協商成功(0.7.0 之前的行為),對端會封裝每一則訊息,而 feature-off 端的 `ReadMessage` 直通路徑把原始 `{"header":...,"data":...}` bytes 交給應用層 — 靜默資料損毀。協商結果必須反映實際的 envelope 能力,故以 handshake 前解析的 effective flag 閘控 offer(Dial)與 confirm(Upgrade)。注意反向不成立:`WithTracingEnabled(true)` 無法強迫未協商 otel-ws 的對端使用 envelope(`tracingEnabled` 仍需雙方同意)。

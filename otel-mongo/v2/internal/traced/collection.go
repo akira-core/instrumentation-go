@@ -83,7 +83,9 @@ func (t *Collection) InsertOne(ctx context.Context, document any, opts ...option
 	if t.PropagationEnabled {
 		docWithTrace, err := shared.InjectTraceIntoDocument(ctx, document, t.Propagator)
 		if err != nil {
-			return nil, fmt.Errorf("otelmongo: inject trace: %w", err)
+			err = fmt.Errorf("otelmongo: inject trace: %w", err)
+			shared.RecordSpanError(span, err)
+			return nil, err
 		}
 		docToInsert = docWithTrace
 	}
@@ -112,7 +114,9 @@ func (t *Collection) InsertMany(ctx context.Context, documents []any, opts ...op
 		for _, doc := range documents {
 			d, err := shared.InjectTraceIntoDocument(ctx, doc, t.Propagator)
 			if err != nil {
-				return nil, fmt.Errorf("otelmongo: inject trace: %w", err)
+				err = fmt.Errorf("otelmongo: inject trace: %w", err)
+				shared.RecordSpanError(span, err)
+				return nil, err
 			}
 			docsWithTrace = append(docsWithTrace, d)
 		}
@@ -231,7 +235,9 @@ func (t *Collection) ReplaceOne(ctx context.Context, filter any, replacement any
 	if t.PropagationEnabled {
 		replacementWithTrace, err := shared.InjectTraceIntoDocument(ctx, replacement, t.Propagator)
 		if err != nil {
-			return nil, fmt.Errorf("otelmongo: inject trace: %w", err)
+			err = fmt.Errorf("otelmongo: inject trace: %w", err)
+			shared.RecordSpanError(span, err)
+			return nil, err
 		}
 		replacementToUse = replacementWithTrace
 	}

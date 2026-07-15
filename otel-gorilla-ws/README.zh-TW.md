@@ -36,17 +36,28 @@ go get github.com/akira-core/instrumentation-go/otel-gorilla-ws
 - `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`（全域總開關）
 - `OTEL_GORILLA_WS_TRACING_ENABLED`（ws 模組開關）
 
-預設值：未設定即停用（opt-in）— 兩個環境變數都必須明確設為 truthy 值才會啟用 tracing。值為 `false/0/no/off`（不分大小寫）會明確停用；其他任何已設定的值（包含空字串）皆視為 truthy。
+預設值：未設定即停用（opt-in）— 經 env 啟用時兩個變數都必須為 truthy。值為 `false/0/no/off`（不分大小寫）停用；其他已設定值（含空字串）視為 truthy。
 
-優先順序：
-1. 全域關閉時，無論模組旗標為何，ws tracing 一律停用。
-2. 否則由模組旗標控制 ws tracing。
+停用時，send/receive span 與 envelope 注入/抽取皆關閉（直接委派 `*websocket.Conn`）。
 
-停用時，send/receive span 與 trace-context 傳播都會關閉（連線會直接委派給底層的 `*websocket.Conn`）。
+#### Env × `WithTracingEnabled`（`featureEnabled`）
+
+`NewConn`、`Dial`、`Upgrader.Upgrade` 的 `WithTracingEnabled(v bool)` 會針對該 `Conn` 覆寫兩個環境變數（`featureEnabled` — 是否跑任何 OTel SDK 路徑）。沒傳時聽 env。
+
+| Env（`GLOBAL` ∧ `OTEL_GORILLA_WS_TRACING_ENABLED`） | `WithTracingEnabled` | 有效功能 |
+|----------------------------------------------------|----------------------|----------|
+| 關（未設或 falsy） | （無） | **關** |
+| 關（未設或 falsy） | `true` | **開** |
+| 關（未設或 falsy） | `false` | **關** |
+| 開 | （無） | **開** |
+| 開 | `false` | **關** |
+| 開 | `true` | **開** |
+
+對 `Dial`／`Upgrader.Upgrade`，**有效**功能旗標會在 handshake **之前**解析：關閉時不會 offer／confirm `otel-ws`（避免 wire 損壞）。`WithTracingEnabled(true)` 仍無法把 envelope 強加給未協商 otel-ws 的對端 — 那是 `Conn.tracingEnabled`（協商結果），與 `featureEnabled` 是兩個布林。
 
 ### NewConn 與 Dial / Upgrader 的差異
 
-上述功能旗標只控制 tracing 是否運作。至於 wire envelope（`traceparent`/`tracestate` 的 JSON 包裝）是否會被寫入/讀取，則取決於**建立 `Conn` 時使用的建構子**：
+上述有效功能旗標控制 tracing 是否運作。至於 wire envelope 是否寫入/讀取，則取決於**建立 `Conn` 的建構子**（以及 Dial/Upgrade 是否協商到 otel-ws）：
 
 - **`NewConn(rawConn, opts...)`** 包裝你自己已經 dial/upgrade 好的 `*websocket.Conn`。只要功能旗標開啟，無論 subprotocol 為何，一律啟用 envelope wrapping — 這是為了相容自行處理 handshake 的呼叫端而保留的行為。
 - **`Dial(ctx, urlStr, requestHeader, subprotocols, opts...)`** 是符合規格的 client 進入點。它會在 handshake 中注入 `otel-ws` subprotocol；只有當伺服器以 `otel-ws`/`otel-ws+<proto>` subprotocol 確認支援時，才會啟用 envelope wrapping。
