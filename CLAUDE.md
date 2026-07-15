@@ -213,6 +213,7 @@ Bump on any code change to a module before pushing release tag. Module pre-1.0 (
 - `WithTraceDestination(subject)` enables NATS 2.11+ infrastructure trace events.
 - JetStream consumer spans carry the durable/consumer name under the semconv v1.39.0 key `messaging.consumer.group.name` (0.7.0+; was the non-semconv literal `messaging.consumer.name` before).
 - `HeaderCarrier` (`otelnats/propagation.go`) implements `propagation.ValuesGetter` and falls back to the MIME-canonical header form on read (0.7.0+) — `nats.Header` is case-sensitive, unlike `http.Header`, so a canonicalizing producer's messages (including ones already sitting in a durable stream) still extract. The fallback triggers on key **absence**, not value emptiness (a verbatim key with an empty value wins over a canonical entry), identically in `Get` and `Values`.
+- Core-NATS request/reply spans carry `messaging.message.conversation_id` (0.7.0+) = the reply inbox subject, set on the requester's send span, reply-receive span, and responder's process span. On the send span it's a late `SetAttributes` in `recordReply` (the inbox isn't observable until the reply arrives) and is omitted entirely on timeout/error. `oteljetstream` spans never carry it — a JetStream message's `Reply` field is the native `$JS.ACK.…` subject, not a conversation ID.
 
 ### otel-gorilla-ws
 

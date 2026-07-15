@@ -8,6 +8,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -97,7 +98,7 @@ func (t *tracedConn) requestWithTimeout(parent context.Context, msg *nats.Msg, t
 		reqSpan.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
-	t.recordReply(reqCtx, reply)
+	t.recordReply(reqCtx, reqSpan, reply)
 	return reply, nil
 }
 
@@ -112,7 +113,7 @@ func (t *tracedConn) requestWithCtx(parent context.Context, msg *nats.Msg) (*nat
 		reqSpan.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
-	t.recordReply(reqCtx, reply)
+	t.recordReply(reqCtx, reqSpan, reply)
 	return reply, nil
 }
 
@@ -145,9 +146,21 @@ func (t *tracedConn) startRequestSpan(parent context.Context, msg *nats.Msg) (co
 // recordReply emits a CLIENT span representing reply reception (a pull
 // "receive" per the OTel messaging span-kind mapping). Extracts W3C trace
 // context from reply.Header so any responder-side trace is linked into the
-// receive span. The request span's attributes are left untouched: reply body
-// size belongs to the receive span (via receiveAttrs), not the send span.
-func (t *tracedConn) recordReply(parent context.Context, reply *nats.Msg) {
+// receive span. The request span's body-size attribute is left untouched:
+// reply body size belongs to the receive span (via receiveAttrs), not the
+// send span.
+//
+// reply.Subject is the reply inbox — the natural NATS request/reply
+// conversation ID. It becomes observable to the wrapper only once the reply
+// arrives, so both the receive span (set at start, via an explicit attribute
+// since a reply's own Reply field is empty and receiveAttrs' msg.Reply clause
+// cannot see it) and the request span (a late SetAttributes call, valid any
+// time before End()) receive it here. A request that times out or errors
+// never calls recordReply, so its send span carries no conversation_id —
+// conformant, since the semconv requirement level is Recommended, and expected
+// since samplers only observe span-start attributes.
+func (t *tracedConn) recordReply(parent context.Context, reqSpan trace.Span, reply *nats.Msg) {
+	reqSpan.SetAttributes(semconv.MessagingMessageConversationID(reply.Subject))
 	var originSC trace.SpanContext
 	receiveCtx := parent
 	if reply.Header != nil {
@@ -157,9 +170,10 @@ func (t *tracedConn) recordReply(parent context.Context, reply *nats.Msg) {
 			receiveCtx = extracted
 		}
 	}
+	attrs := append(receiveAttrs(reply, "", "receive", t.serverAttrs), semconv.MessagingMessageConversationID(reply.Subject))
 	opts := []trace.SpanStartOption{
 		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(receiveAttrs(reply, "", "receive", t.serverAttrs)...),
+		trace.WithAttributes(attrs...),
 	}
 	if originSC.IsValid() {
 		opts = append(opts, trace.WithLinks(trace.Link{SpanContext: originSC}))

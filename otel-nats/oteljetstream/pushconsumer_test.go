@@ -89,6 +89,9 @@ func TestPushConsumerConsumeTraceContext(t *testing.T) {
 
 	consumerSpan := waitSpanByNameAndKind(t, sr, "process push.test", oteltrace.SpanKindConsumer)
 	assertAttr(t, consumerSpan.Attributes(), "messaging.consumer.group.name", consumerName)
+	for _, kv := range consumerSpan.Attributes() {
+		assert.NotEqual(t, "messaging.message.conversation_id", string(kv.Key), "JetStream process span must not map the native $JS.ACK reply subject to conversation_id")
+	}
 	producerSpan := findSpanByKind(sr.Ended(), oteltrace.SpanKindProducer)
 	require.NotNil(t, producerSpan, "no producer span")
 	require.Len(t, consumerSpan.Links(), 1, "consumer span should link the producer")

@@ -27,6 +27,7 @@ All notable changes to the `otel-nats` module (`otelnats` + `oteljetstream`) are
 ### Added
 
 - `WithTracingEnabled(v bool) Option` overrides the env-gate default (`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` AND `OTEL_NATS_TRACING_ENABLED`) for a single `Conn`, in either direction. Applies to `ConnectWithOptions`, `ConnectTLSWithOptions`, and `ConnectWithCredentialsWithOptions`; `oteljetstream` wrappers built from an option-configured `Conn` inherit its effective tracing state automatically.
+- Core-NATS request/reply spans now carry `messaging.message.conversation_id` (the reply inbox subject) so the requester's send span, the requester's reply-receive span, and the responder's process span are all joinable by attribute query, not just by span link. On the send span the attribute is set only once a reply arrives (a late `SetAttributes` call before `End()`) — a request that times out or errors never observes the inbox, so its send span carries no `conversation_id`; this is spec-conformant (the attribute's semconv requirement level is Recommended) but means the value is invisible to samplers, which only see span-start attributes. `oteljetstream` spans are deliberately excluded: a JetStream message's `Reply` field is the native `$JS.ACK.…` acknowledgement subject, not a conversation ID.
 
 ## [0.6.0] - 2026-07-08
 

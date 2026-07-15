@@ -308,7 +308,10 @@ func requestAttrs(msg *nats.Msg, serverAttrs []attribute.KeyValue) []attribute.K
 }
 
 // receiveAttrs builds consumer span attributes. opType is "process" (push) or "receive" (pull).
-// Note: oteljetstream/consumer.go has parallel receiveBaseAttrs/receiveMsgAttrs for jetstream.Msg — keep the attribute sets in sync.
+// Note: oteljetstream/consumer.go has parallel receiveBaseAttrs/receiveMsgAttrs for jetstream.Msg — keep
+// the attribute sets in sync, EXCEPT conversation_id: a JetStream message's Reply field is the native
+// $JS.ACK.<stream>.<consumer>.… acknowledgement subject, not a conversation identifier, so the JetStream
+// builders must never map it to messaging.message.conversation_id.
 func receiveAttrs(msg *nats.Msg, queue string, opType string, serverAttrs []attribute.KeyValue) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{
 		semconv.MessagingSystemKey.String(messagingSystem),
@@ -318,6 +321,9 @@ func receiveAttrs(msg *nats.Msg, queue string, opType string, serverAttrs []attr
 	}
 	if len(msg.Data) > 0 {
 		attrs = append(attrs, semconv.MessagingMessageBodySize(len(msg.Data)))
+	}
+	if msg.Reply != "" {
+		attrs = append(attrs, semconv.MessagingMessageConversationID(msg.Reply))
 	}
 	if queue != "" {
 		attrs = append(attrs, semconv.MessagingConsumerGroupName(queue))

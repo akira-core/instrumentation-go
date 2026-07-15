@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -348,6 +349,123 @@ func TestRequestSpanKeepsRequestBodySize(t *testing.T) {
 	receiveSpan := findSpanByNameAndKind(spans, "receive "+reply.Subject, oteltrace.SpanKindClient)
 	require.NotNil(t, receiveSpan, "no client span for reply receive")
 	assertIntAttr(t, receiveSpan.Attributes(), "messaging.message.body.size", int64(len(replyPayload)))
+}
+
+// TestRequestReplySpansShareConversationID pins F6: the request "send" span,
+// the reply-"receive" span, and the responder's "process" span all carry the
+// same messaging.message.conversation_id (the reply inbox subject).
+func TestRequestReplySpansShareConversationID(t *testing.T) {
+	url := startServer(t)
+	tp, sr := newTestProvider()
+	prop := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{})
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(prop)
+
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	subject := "req.convid"
+	_, err = conn.Subscribe(subject, func(m otelnats.Msg) {
+		_ = m.Msg.Respond([]byte("pong"))
+	})
+	require.NoError(t, err)
+
+	reply, err := conn.Request(subject, []byte("ping"), 2*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, "pong", string(reply.Data))
+
+	inbox := reply.Subject
+	require.True(t, strings.HasPrefix(inbox, "_INBOX."), "reply subject %q should be an inbox", inbox)
+
+	spans := sr.Ended()
+	requestSpan := findSpanByNameAndKind(spans, subject+" request", oteltrace.SpanKindClient)
+	require.NotNil(t, requestSpan, "no client span for request")
+	assertAttr(t, requestSpan.Attributes(), "messaging.message.conversation_id", inbox)
+
+	receiveSpan := waitSpanByNameAndKind(t, sr, "receive "+inbox, oteltrace.SpanKindClient)
+	assertAttr(t, receiveSpan.Attributes(), "messaging.message.conversation_id", inbox)
+
+	processSpan := waitSpanByNameAndKind(t, sr, "process "+subject, oteltrace.SpanKindConsumer)
+	assertAttr(t, processSpan.Attributes(), "messaging.message.conversation_id", inbox)
+}
+
+// TestFailedRequestOmitsConversationID pins that a request with no responder
+// never observes the inbox, so no conversation_id is set on the send span.
+func TestFailedRequestOmitsConversationID(t *testing.T) {
+	url := startServer(t)
+	tp, sr := newTestProvider()
+	otel.SetTracerProvider(tp)
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	subject := "req.noresponder"
+	_, err = conn.Request(subject, []byte("ping"), 200*time.Millisecond)
+	require.Error(t, err)
+
+	spans := sr.Ended()
+	requestSpan := findSpanByNameAndKind(spans, subject+" request", oteltrace.SpanKindClient)
+	require.NotNil(t, requestSpan, "no client span for request")
+	assert.Equal(t, codes.Error, requestSpan.Status().Code, "failed request should record error status")
+	for _, kv := range requestSpan.Attributes() {
+		assert.NotEqual(t, "messaging.message.conversation_id", string(kv.Key), "conversation_id should be absent on a failed request")
+	}
+}
+
+// TestPublishMsgWithReplyCarriesConversationID pins the span-start path: a
+// manual request/reply via PublishMsg with an explicit caller-chosen Reply
+// carries conversation_id from span start (publishAttrs' msg.Reply clause).
+func TestPublishMsgWithReplyCarriesConversationID(t *testing.T) {
+	url := startServer(t)
+	tp, sr := newTestProvider()
+	otel.SetTracerProvider(tp)
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	subject := "test.manualreq"
+	replyInbox := nats.NewInbox()
+	msg := &nats.Msg{Subject: subject, Data: []byte("manual"), Reply: replyInbox}
+	err = conn.PublishMsg(context.Background(), msg)
+	require.NoError(t, err)
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	producer := spans[0]
+	require.Equal(t, oteltrace.SpanKindProducer, producer.SpanKind())
+	assertAttr(t, producer.Attributes(), "messaging.message.conversation_id", replyInbox)
+}
+
+// TestFireAndForgetProcessSpanOmitsConversationID pins that a subscribe handler
+// for a plain publish (no Reply subject) carries no conversation_id.
+func TestFireAndForgetProcessSpanOmitsConversationID(t *testing.T) {
+	url := startServer(t)
+	tp, sr := newTestProvider()
+	otel.SetTracerProvider(tp)
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	subject := "test.fireforget"
+	done := make(chan struct{}, 1)
+	_, err = conn.Subscribe(subject, func(m otelnats.Msg) {
+		done <- struct{}{}
+	})
+	require.NoError(t, err)
+
+	err = conn.Publish(context.Background(), subject, []byte("no reply expected"))
+	require.NoError(t, err)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout")
+	}
+
+	processSpan := waitSpanByNameAndKind(t, sr, "process "+subject, oteltrace.SpanKindConsumer)
+	for _, kv := range processSpan.Attributes() {
+		assert.NotEqual(t, "messaging.message.conversation_id", string(kv.Key), "conversation_id should be absent on a reply-less message")
+	}
 }
 
 func TestTraceContextReturnsTracerAndPropagator(t *testing.T) {

@@ -152,6 +152,7 @@ func TestFetchReturnsMessagesWithTraceContext(t *testing.T) {
 	assertAttr(t, receiveSpan.Attributes(), "messaging.consumer.group.name", consumerName)
 	for _, kv := range receiveSpan.Attributes() {
 		assert.NotEqual(t, "messaging.consumer.name", string(kv.Key), "receive span must not carry the pre-0.7.0 literal messaging.consumer.name")
+		assert.NotEqual(t, "messaging.message.conversation_id", string(kv.Key), "JetStream receive span must not map the native $JS.ACK reply subject to conversation_id")
 	}
 	require.NotNil(t, producerSpan, "no producer span")
 	for _, kv := range producerSpan.Attributes() {
