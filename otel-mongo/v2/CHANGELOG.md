@@ -4,7 +4,7 @@ All notable changes to the `otel-mongo/v2` module (`go.mongodb.org/mongo-driver/
 
 > **Coverage note**: this file starts at `0.6.0`. Earlier history lives only in git tags (`otel-mongo/v2/vX.Y.Z`) — see the repo root `VERSIONING.md` for the root cause and the release-tag CI guard that now keeps the version constant and tag in sync going forward.
 
-## [0.7.0] - Unreleased
+## [0.7.0] - 2026-07-15
 
 ### Fixed
 
