@@ -1,7 +1,8 @@
 # mongodb-tracing Specification
 
 ## Purpose
-TBD - created by archiving change document-otel-instrumentation. Update Purpose after archive.
+Defines the tracing behavior of `otel-mongo` (v1 `otelmongo/` and v2 `v2/`): provider/propagator fallback, feature-flag gating, `_oteltrace` document propagation, span kinds/attributes, server-address capture, and the disabled-mode invariant.
+
 ## Requirements
 ### Requirement: Provider and propagator fallback
 The `otel-mongo` (v1) and `otel-mongo/v2` packages SHALL NOT construct or own a global `TracerProvider`. `Connect`, `NewClient`, and `ConnectWithOptions` SHALL use `otel.GetTracerProvider()` and `otel.GetTextMapPropagator()` unless the caller supplies `WithTracerProvider(tp)` and/or `WithPropagators(p)`.
@@ -73,16 +74,100 @@ When document propagation is enabled and an active span is present in the contex
 - **WHEN** a caller invokes `SingleResult.Decode` exactly once on a `FindOne` result
 - **THEN** the FindOne span ends at that call and carries a link to the document's `_oteltrace` span, if present and propagation is enabled
 
-### Requirement: Deliver spans for the MongoDB service graph
-When document/tracing flags are enabled and `OTEL_EXPORTER_OTLP_ENDPOINT` is set to a valid full URL (HTTP) or `host:port` (gRPC), `Connect` and `NewClient` SHALL initialize a synthetic deliver-span `TracerProvider` with `service.name` derived from the connection's server address, and `Collection` CRUD operations plus `ChangeStream` decode SHALL emit CONSUMER/PRODUCER deliver spans representing MongoDB as a broker node. `Cursor.DecodeWithContext` is **not** part of this deliver-span path — it only creates its own `mongo.cursor.decode` INTERNAL span with an optional link (see *Cursor decode with trace linking*) and never touches the deliver tracer.
+### Requirement: No deliver spans or deliver TracerProvider
+`otel-mongo` (v1 `otelmongo/` and `v2/`) SHALL NOT emit synthetic "deliver" spans and SHALL NOT construct an independent deliver `TracerProvider`. No exported or internal identifier (`StartDeliverSpan`, `DeliverTracer`, `DeliverAttributes`, `initMongoProvider`, and any `WithDeliver*` option) SHALL remain. The packages SHALL NOT read `OTEL_EXPORTER_OTLP_ENDPOINT` for span emission.
 
-#### Scenario: Endpoint configured and tracing enabled
-- **WHEN** `OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318` and the global + module tracing flags are enabled
-- **THEN** `Connect` initializes the deliver tracer and subsequent `Collection` CRUD operations emit a `db.coll deliver` CONSUMER span in addition to the CLIENT span
+#### Scenario: No deliver span on a write
+- **WHEN** `OTEL_EXPORTER_OTLP_ENDPOINT` is set and tracing is enabled and a caller invokes `InsertOne`, `InsertMany`, `UpdateOne`, `DeleteOne`, `Aggregate`, `BulkWrite`, or `Watch`
+- **THEN** exactly one span (the operation span) SHALL be emitted for that call
+- **AND** no span named `"* deliver"` SHALL be emitted
+- **AND** no separate `BatchSpanProcessor` or OTLP exporter SHALL be created by the module
 
-#### Scenario: Tracing disabled
-- **WHEN** the global or module tracing flag is disabled, regardless of `OTEL_EXPORTER_OTLP_ENDPOINT`
-- **THEN** no deliver-span `TracerProvider` is initialized and no exporter is constructed
+#### Scenario: Deliver identifiers removed from the API
+- **WHEN** the module source is compiled
+- **THEN** no reference to `StartDeliverSpan`, `DeliverTracer`, `DeliverAttributes`, or `initMongoProvider` SHALL exist in `otelmongo/` or `v2/`
+
+### Requirement: Span kind per MongoDB operation
+The wrapper SHALL set span kind per the OTel database semantic conventions (Mongo is a database, not a messaging system): synchronous DB calls use `CLIENT`, and local-only work uses `INTERNAL`.
+
+#### Scenario: CRUD operations use CLIENT
+- **WHEN** a caller invokes any CRUD/command wrapper (`InsertOne`, `Find`, `UpdateOne`, `DeleteOne`, `ReplaceOne`, `Aggregate`, `CountDocuments`, `Distinct`, `BulkWrite`, etc.)
+- **THEN** the emitted span SHALL have `SpanKind == CLIENT`
+
+#### Scenario: Change-stream read uses CLIENT
+- **WHEN** a caller reads from a change stream (`Watch` and subsequent cursor advance/decode)
+- **THEN** the emitted operation span SHALL have `SpanKind == CLIENT`
+- **AND** it SHALL NOT use `CONSUMER` or `PRODUCER`
+
+#### Scenario: Cursor decode uses INTERNAL
+- **WHEN** the cursor performs a local decode with no round trip
+- **THEN** the emitted span SHALL have `SpanKind == INTERNAL`
+
+### Requirement: MongoDB span attribute set
+Operation spans SHALL carry only OTel database-semconv attributes: `db.system.name = "mongodb"`, `db.collection.name`, `db.operation.name`, `db.namespace` (when known), `db.operation.batch.size` (only when batch ≥ 2), and `server.address` / `server.port` (port omitted when the default 27017). On error, `db.response.status_code` and `error.type` SHALL be set. No deliver-only attribute set SHALL be produced.
+
+#### Scenario: Successful insert attributes
+- **WHEN** `InsertMany` succeeds with 5 documents against `mydb.things` on `mongodb://host:27017`
+- **THEN** the span SHALL carry `db.system.name=mongodb`, `db.collection.name=things`, `db.operation.name=insert`, `db.namespace=mydb`, `db.operation.batch.size=5`, `server.address=host`
+- **AND** `server.port` SHALL be omitted (default 27017)
+
+#### Scenario: Error attributes on write failure
+- **WHEN** a write returns a `mongo.WriteException` with code 11000
+- **THEN** the span status SHALL be `Error` and it SHALL carry `db.response.status_code=11000` and `error.type=11000`
+
+### Requirement: Per-command server address capture
+When tracing is enabled, `otel-mongo` (v1 `otelmongo/` and v2 `v2/`) SHALL derive the `server.address`/`server.port` attributes on a Collection CRUD CLIENT span from the actual MongoDB connection that carried that specific command, not from a value parsed once at `Connect` time.
+
+#### Scenario: Command served by a non-first replica-set member
+- **WHEN** a `Client` is connected with a multi-host replica-set URI and a Collection operation (e.g. `FindOne`) is served by a host other than the first host listed in the connection string
+- **THEN** the operation's CLIENT span's `server.address` (and `server.port`, when non-default) reflect the host that actually served the command, not the first host in the URI
+
+#### Scenario: Failover changes the serving host between two operations
+- **WHEN** two sequential Collection operations on the same `Client` are served by different hosts (e.g. after a primary failover)
+- **THEN** each operation's span independently reflects the host that served it — the second span's `server.address` differs from the first's if the serving host changed
+
+#### Scenario: mongodb+srv:// connection string
+- **WHEN** a `Client` is connected via a `mongodb+srv://` URI
+- **THEN** Collection operation spans carry the resolved connection's actual host, not the unresolved SRV record name
+
+#### Scenario: Retried operation
+- **WHEN** a retryable Collection operation is retried once by the driver before succeeding
+- **THEN** the operation's span's `server.address`/`server.port` reflect the connection used by the attempt that produced the returned result
+
+### Requirement: Fallback to static URI-derived address
+When no per-command server address was captured for an operation, `otel-mongo` SHALL fall back to the existing statically-parsed `Client.serverAddr`/`serverPort` (derived from the connection URI at `Connect`/`ConnectWithOptions` time) so the span still carries a best-effort `server.address` rather than omitting it.
+
+#### Scenario: No command event captured
+- **WHEN** a Collection operation completes without a corresponding `CommandStartedEvent` having been observed for its context (e.g. defensive/edge-case path)
+- **THEN** the operation's span uses the statically-parsed `Client.serverAddr`/`serverPort` as `server.address`/`server.port`, identical to pre-change behavior
+
+### Requirement: Caller-supplied CommandMonitor is chained, not replaced
+When a caller passes their own `*options.ClientOptions` with `SetMonitor(...)` already set to `Connect`/`ConnectWithOptions`, `otel-mongo` SHALL preserve the caller's monitor callbacks by chaining: the package's own address-capture logic runs first, then the caller's original `Started`/`Succeeded`/`Failed` callbacks (for whichever of those the caller set) run unmodified with the same event.
+
+#### Scenario: Caller has their own command monitor for APM
+- **WHEN** a caller constructs `*options.ClientOptions` with `SetMonitor(&event.CommandMonitor{Started: myStartedFn, Succeeded: mySucceededFn})` and passes it to `otelmongo.ConnectWithOptions`
+- **THEN** `myStartedFn` and `mySucceededFn` are still invoked for every command, receiving the same events they would have received without `otel-mongo`'s instrumentation
+
+#### Scenario: Caller sets only a subset of monitor callbacks
+- **WHEN** a caller's `event.CommandMonitor` only sets `Succeeded` (leaving `Started`/`Failed` nil)
+- **THEN** `otel-mongo`'s own `Started` callback still runs (to capture the address) and the caller's `Succeeded` callback still runs unmodified; no nil-function-call panic occurs
+
+### Requirement: No new tracing behavior when tracing is disabled
+When `OTEL_MONGO_TRACING_ENABLED` (combined with the global gate) is off, `otel-mongo` SHALL NOT register a `CommandMonitor` for address capture, consistent with the existing disabled-mode invariant that the disabled path performs no additional instrumentation-related work.
+
+#### Scenario: Disabled tracing registers no command monitor
+- **WHEN** `Connect`/`ConnectWithOptions` is called with tracing disabled (module or global gate off)
+- **THEN** no address-capture `CommandMonitor` is attached to the resulting `*mongo.Client`'s options, and any caller-supplied `SetMonitor` passes through completely untouched
+
+### Requirement: Disabled tracing emits no spans or SDK objects
+When the tracing gate is off (`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` and `OTEL_MONGO_TRACING_ENABLED` are not both truthy), the wrapper SHALL delegate to the native driver and run no OTel SDK code path — no real-tracer `Start`, no `TracerProvider`, no exporter, no `_oteltrace` inject/extract — consistent with the module-wide disabled-mode invariant. This applies to both the strategy-split path (`internal/direct/*`, which imports no `otel/sdk` or `otel/exporters`) and the cached-gate Client/Database. Removing the deliver `TracerProvider` shrinks this disabled surface (its init is gone, not merely gated off).
+
+#### Scenario: Tracing disabled delegates to native driver
+- **WHEN** the tracing gate is off and a caller invokes `InsertOne`, `Find`, `Aggregate`, or `Watch` (v1 or v2)
+- **THEN** the wrapper SHALL delegate to the native `*mongo.Collection` via the `internal/direct` impl
+- **AND** no span SHALL be emitted
+- **AND** no `TracerProvider`, `BatchSpanProcessor`, or OTLP exporter SHALL be constructed
+- **AND** no `_oteltrace` field SHALL be injected or stripped
 
 ### Requirement: Disabled-mode invariant via strategy split
 `Collection`, `Cursor`, `SingleResult`, and `ChangeStream` SHALL be constructed with one of two implementations chosen once at construction time — `internal/direct` (passthrough) when tracing is disabled, `internal/traced` (instrumented) when enabled — such that `internal/direct` imports no `go.opentelemetry.io/otel` package of any kind (API, SDK, or exporters).
@@ -101,15 +186,3 @@ When document/tracing flags are enabled and `OTEL_EXPORTER_OTLP_ENDPOINT` is set
 #### Scenario: Equivalent CRUD behavior
 - **WHEN** the same CRUD operation is invoked through the v1 wrapper and the v2 wrapper with equivalent inputs
 - **THEN** both inject/extract `_oteltrace` identically and both honor the same three-tier feature-flag gate
-
-### Requirement: Diagnostic logging via slog
-The package SHALL use `log/slog` for diagnostics with no custom handler installed, logging deliver-tracer initialization success at `DEBUG` and OTLP exporter/resource creation failures at `WARN`, using an `otelmongo:` prefix and structured `error`/`reason`/`service`/`endpoint` fields. Because Go's default `slog` handler filters at `LevelInfo`, `DEBUG`-level success logs are silent by default, but `WARN`-level failure logs print to stderr by default — the package does not suppress them.
-
-#### Scenario: Default handler silences DEBUG but not WARN
-- **WHEN** no custom `slog` handler is configured and deliver-tracer initialization succeeds
-- **THEN** no `DEBUG` log line is visible (below the default `LevelInfo` threshold)
-
-#### Scenario: OTLP exporter creation fails
-- **WHEN** `OTEL_EXPORTER_OTLP_ENDPOINT` is set to a malformed value and deliver-tracer initialization fails
-- **THEN** a `WARN`-level log entry with the `otelmongo:` prefix and an `error` field is emitted
-

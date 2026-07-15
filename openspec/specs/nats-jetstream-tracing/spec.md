@@ -1,7 +1,8 @@
 # nats-jetstream-tracing Specification
 
 ## Purpose
-TBD - created by archiving change document-otel-instrumentation. Update Purpose after archive.
+Defines the tracing behavior of `otel-nats` (`otelnats` core NATS wrapper and `oteljetstream` JetStream wrapper): provider/propagator fallback, feature-flag gating, header-based propagation, span kinds/attributes, and the disabled-mode invariant.
+
 ## Requirements
 ### Requirement: Provider and propagator fallback
 `otelnats` and `oteljetstream` SHALL NOT construct or own a global `TracerProvider`. `Connect` and `ConnectWithOptions` SHALL use `otel.GetTracerProvider()` and `otel.GetTextMapPropagator()` unless the caller supplies `WithTracerProvider(tp)` and/or `WithPropagators(p)` via `ConnectWithOptions`. `ConnectTLSWithOptions` and `ConnectWithCredentialsWithOptions` are the equivalent override entry points for TLS and credentials-file connections, respectively.
@@ -91,16 +92,52 @@ When tracing is enabled, `Publish`/`PublishMsg` (core NATS) and JetStream publis
 - **WHEN** a caller `break`s out of the `range batch.Messages()` loop before the channel closes
 - **THEN** an explicit (typically deferred) `batch.Stop()` call is required to end the in-flight span and stop the goroutine; omitting it leaks both
 
-### Requirement: Deliver spans for the NATS service graph
-When tracing is enabled and `OTEL_EXPORTER_OTLP_ENDPOINT` is set to a valid full URL (HTTP) or `host:port` (gRPC), `Connect` SHALL initialize an independent deliver-span `TracerProvider` with `service.name` set to `nc.ConnectedUrlRedacted()` (the negotiated connection URL with credentials redacted), falling back to `"nats://" + nc.ConnectedAddr()` only when `ConnectedUrlRedacted()` returns an empty string. Publish/consume operations SHALL emit CONSUMER deliver spans representing NATS as a broker node.
+### Requirement: No deliver spans or deliver TracerProvider
+`otel-nats` (`otelnats` and `oteljetstream`) SHALL NOT emit synthetic "deliver" spans and SHALL NOT construct an independent deliver `TracerProvider`. No identifier `StartDeliverSpan`, `ConsumerContextWithDeliver`, `deliverTracer`, `deliverAttrs`, or `initNATSProvider` SHALL remain. The packages SHALL NOT read `OTEL_EXPORTER_OTLP_ENDPOINT` for span emission. (The OTel messaging conventions define no `deliver` operation, so no such span has a conventional mapping.)
 
-#### Scenario: Endpoint configured and tracing enabled
-- **WHEN** `OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector:4317` (gRPC form) and both tracing flags are enabled
-- **THEN** `Connect` initializes the deliver-span provider automatically with no further configuration required
+#### Scenario: No deliver span on publish or consume
+- **WHEN** `OTEL_EXPORTER_OTLP_ENDPOINT` is set and tracing is enabled and a caller publishes or a subscriber/consumer receives a message
+- **THEN** no span named `"* deliver"` SHALL be emitted
+- **AND** no separate deliver `TracerProvider`, `BatchSpanProcessor`, or OTLP exporter SHALL be created by the module
 
-#### Scenario: Tracing disabled
-- **WHEN** either tracing flag is disabled, regardless of `OTEL_EXPORTER_OTLP_ENDPOINT`
-- **THEN** `Connect` never initializes the deliver-span `TracerProvider`
+#### Scenario: Deliver identifiers removed
+- **WHEN** the module source is compiled
+- **THEN** no reference to `StartDeliverSpan`, `ConsumerContextWithDeliver`, `deliverTracer`, `deliverAttrs`, or `initNATSProvider` SHALL exist
+
+### Requirement: Span kind per messaging operation
+Span kind SHALL follow the OTel messaging "Span kind" mapping: `send` → `PRODUCER`, request/reply (caller awaits response) → `CLIENT`, `receive` (pull) → `CLIENT`, `process` (push) → `CONSUMER`.
+
+#### Scenario: Core NATS span kinds
+- **WHEN** the wrapper emits spans for `Publish`, `Request`, reply reception, and a subscription handler
+- **THEN** `Publish` SHALL be `PRODUCER`
+- **AND** `Request` SHALL be `CLIENT`
+- **AND** the reply-reception (`receive`) span SHALL be `CLIENT`
+- **AND** the subscription-handler (`process`) span SHALL be `CONSUMER`
+
+#### Scenario: JetStream span kinds
+- **WHEN** the wrapper emits spans for JetStream publish, pull consume (`Consume` / `Fetch` / `Messages` iterator), and a push-delivered handler
+- **THEN** JetStream publish SHALL be `PRODUCER`
+- **AND** pull-consume (`receive`) spans SHALL be `CLIENT`
+- **AND** any push-delivered (`process`) span SHALL be `CONSUMER`
+
+### Requirement: NATS span attribute set
+Message spans SHALL carry OTel messaging-semconv attributes: `messaging.system`, `messaging.destination.name`, `messaging.operation.type`, `messaging.operation.name`, `messaging.message.body.size` (when body non-empty), plus `server.address` / `server.port`. Conditional attributes SHALL be set when their value exists: `messaging.message.conversation_id` (reply subject), `messaging.consumer.group.name` (queue group). `messaging.operation.type` for a pull-receive span SHALL be `receive`.
+
+JetStream consumer spans (`receive` and `process`) SHALL additionally carry `messaging.consumer.name` set to the JetStream durable/consumer name. This key is set as a literal (no semconv helper exists for it in the pinned semconv version); it is the only messaging attribute unique to `oteljetstream` — core `otelnats` spans do not carry it.
+
+#### Scenario: Publish attributes
+- **WHEN** a caller publishes a non-empty message to subject `orders.new`
+- **THEN** the span SHALL carry `messaging.system=nats`, `messaging.destination.name=orders.new`, `messaging.operation.type=send`, `messaging.operation.name=publish`, `messaging.message.body.size=<len>`
+
+#### Scenario: Pull-receive attributes and kind agree
+- **WHEN** a JetStream pull consumer receives a message
+- **THEN** the span SHALL carry `messaging.operation.type=receive`
+- **AND** the span kind SHALL be `CLIENT`
+
+#### Scenario: JetStream span carries consumer name
+- **WHEN** a JetStream consumer named `orders-worker` receives or processes a message
+- **THEN** the span SHALL additionally carry `messaging.consumer.name=orders-worker`
+- **AND** an equivalent core-NATS `Publish` / subscribe span SHALL NOT carry `messaging.consumer.name`
 
 ### Requirement: NATS 2.11+ infrastructure trace events
 `WithTraceDestination(subject)` SHALL cause `Publish`/`PublishMsg` to set the `Nats-Trace-Dest` header while tracing is enabled, so the NATS server emits infrastructure-level `TraceEvent` payloads to that subject. `SubscribeTraceEvents(conn, subject)` SHALL convert each `TraceEvent`'s `TraceHop`s into one point-in-time span per hop, started as a **parent-child** descendant of the span extracted from the embedded `traceparent` (not an OTel span link — unlike the Subscribe/Consume consumer path, which does use a link), and SHALL only emit spans when the connection's tracing gate is enabled (discarding events otherwise, while still supporting `Unsubscribe`).
@@ -114,11 +151,21 @@ When tracing is enabled and `OTEL_EXPORTER_OTLP_ENDPOINT` is set to a valid full
 - **THEN** received `TraceEvent` payloads are discarded without emitting spans, and `Unsubscribe` still functions
 
 ### Requirement: Diagnostic logging via slog
-`otelnats` SHALL use `log/slog` with no custom handler installed, logging server-address parse failures and deliver-tracer/trace-event successes at `DEBUG`, and deliver-tracer init failures or trace-event unmarshal failures at `WARN`, using an `otelnats:` prefix. Because Go's default `slog` handler filters at `LevelInfo`, `DEBUG`-level logs are silent by default but `WARN`-level logs print to stderr by default. `oteljetstream` performs no `slog` logging of its own — all diagnostic logging for this capability lives in `otelnats`.
+`otelnats` SHALL use `log/slog` with no custom handler installed, logging server-address parse failures and trace-event reception at `DEBUG`, and trace-event unmarshal failures at `WARN`, using an `otelnats:` prefix. Because Go's default `slog` handler filters at `LevelInfo`, `DEBUG`-level logs are silent by default but `WARN`-level logs print to stderr by default. `oteljetstream` performs no `slog` logging of its own — all diagnostic logging for this capability lives in `otelnats`.
 
 #### Scenario: Trace event unmarshal failure
 - **WHEN** a message on the trace-event subject fails to unmarshal as a `TraceEvent`
 - **THEN** a `WARN`-level log entry with the `otelnats:` prefix is emitted by default (visible on stderr with no custom handler) and no span is created for that message
+
+### Requirement: Disabled tracing emits no spans or SDK objects
+When the tracing gate is off (`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` and `OTEL_NATS_TRACING_ENABLED` are not both truthy), the wrapper SHALL delegate to the native NATS / JetStream client and run no OTel SDK code path — no real-tracer `Start`, no `TracerProvider`, no exporter, no propagator inject/extract — consistent with the module-wide disabled-mode invariant. Removing the deliver `TracerProvider` shrinks this disabled surface (its init is gone, not merely gated off).
+
+#### Scenario: Tracing disabled delegates to native client
+- **WHEN** the tracing gate is off and a caller invokes `Publish` or `Request`, or a subscriber / consumer receives a message
+- **THEN** the wrapper SHALL delegate to the native `*nats.Conn` / JetStream client
+- **AND** no span SHALL be emitted
+- **AND** no `TracerProvider`, `BatchSpanProcessor`, or OTLP exporter SHALL be constructed
+- **AND** the trace propagator SHALL NOT be invoked to inject or extract
 
 ### Requirement: ConsumeContext exposes the full consume-context lifecycle
 `oteljetstream.ConsumeContext` SHALL expose the complete `jetstream.ConsumeContext` method set — `Stop()`, `Drain()`, and `Closed() <-chan struct{}` — as direct passthroughs to the underlying consume context. Because the surface is complete, no `Unwrap()` escape hatch is provided (removing the escape hatch previously present is a breaking change, permitted under the pre-1.0 `0.6.0` minor bump).
@@ -140,4 +187,3 @@ When tracing is enabled and `OTEL_EXPORTER_OTLP_ENDPOINT` is set to a valid full
 #### Scenario: Downstream spans nest under the consumer receive span
 - **WHEN** `cons.Next(ctx)` returns a message with tracing enabled and the caller starts a downstream span from the returned context
 - **THEN** the downstream span is a child of the wrapper's local consumer receive span (which is linked to the producer), identical in shape to what `Messages().Next` and the `Consume` handler produce
-

@@ -1,7 +1,8 @@
 # websocket-tracing Specification
 
 ## Purpose
-TBD - created by archiving change document-otel-instrumentation. Update Purpose after archive.
+Defines the tracing behavior of `otel-gorilla-ws`: provider/propagator fallback, feature-flag gating, subprotocol negotiation and envelope wire format, span kinds/attributes, and the disabled-mode invariant.
+
 ## Requirements
 ### Requirement: Provider and propagator fallback
 `otel-gorilla-ws` SHALL NOT construct or own a global `TracerProvider`. The propagator always falls back to `otel.GetTextMapPropagator()` unless `WithPropagators(p)` is supplied. The tracer falls back to `otel.GetTracerProvider()` unless `WithTracerProvider(tp)` is supplied, **but only when the two-tier tracing feature flags (see below) are enabled** — when the flags are disabled (the default, unset state), the connection uses a `noop.NewTracerProvider()`-derived tracer instead, regardless of `WithTracerProvider` or the process-global provider, so that no OTel SDK call ever reaches the caller's real `TracerProvider` while tracing is off.
@@ -72,10 +73,30 @@ When `Dial` or `Upgrade` negotiation does not result in `otel-ws` acceptance, th
 - **WHEN** a client dials with an empty subprotocol list against a server, or a server receives a client that proposed no subprotocol
 - **THEN** the connection is established, tracing spans are still created if flags are enabled, and no envelope is applied
 
-### Requirement: Consumer span kind on read, no broker deliver span
-`ReadMessage` SHALL set `trace.WithSpanKind(trace.SpanKindConsumer)` on the read span. Unlike `otel-mongo` and `otel-nats`, `otel-gorilla-ws` SHALL NOT implement a separate deliver-span pattern or broker-service `TracerProvider`.
+### Requirement: WebSocket span kinds
+`otel-gorilla-ws` SHALL keep messaging-style span kinds because a WebSocket frame is fire-and-forget (the writer does not await a response): `WriteMessage` → `PRODUCER`, `ReadMessage` → `CONSUMER`. It SHALL NOT use `CLIENT`/`SERVER` (which per the OTel SpanKind definition require the client to await a response) and SHALL NOT construct deliver spans or a broker `TracerProvider` (it never did).
 
-#### Scenario: Reading a message
-- **WHEN** `ReadMessage` completes successfully with tracing enabled
-- **THEN** the resulting span has `SpanKind == Consumer` and no additional broker-node span is created
+#### Scenario: Write and read span kinds
+- **WHEN** a caller invokes `WriteMessage`
+- **THEN** the emitted span SHALL have `SpanKind == PRODUCER`
+
+- **WHEN** a caller invokes `ReadMessage`
+- **THEN** the emitted span SHALL have `SpanKind == CONSUMER`
+
+### Requirement: WebSocket span attribute set
+Because WebSocket is not a covered OTel messaging system, span attributes SHALL NOT use the `messaging.*` namespace. The genuinely-useful custom key `websocket.message.type` SHALL be retained. Message body size SHALL be carried under a WebSocket-scoped key (`websocket.message.body.size`), not `messaging.message.body.size`.
+
+#### Scenario: Write span attributes use websocket namespace
+- **WHEN** a caller writes a binary frame of 512 bytes
+- **THEN** the span SHALL carry `websocket.message.type=<code>` and `websocket.message.body.size=512`
+- **AND** the span SHALL NOT carry any `messaging.*` attribute
+
+### Requirement: Disabled tracing emits no spans or SDK objects
+When the connection's tracing gate is off (`tracingEnabled == false` — the otel-ws subprotocol was not negotiated, or global tracing env is disabled), `WriteMessage` / `ReadMessage` SHALL pass through to the native `*websocket.Conn` and run no OTel SDK code path — no real-tracer `Start`, no wire-envelope wrap/unwrap, no propagator inject/extract — consistent with the module-wide disabled-mode invariant. (`otel-gorilla-ws` never constructed a deliver `TracerProvider`, so none is removed here.)
+
+#### Scenario: Tracing disabled passes through to native conn
+- **WHEN** a connection has `tracingEnabled == false` and a caller invokes `WriteMessage` or `ReadMessage`
+- **THEN** the call SHALL delegate to the native `*websocket.Conn` with the original payload unchanged (no JSON envelope written or parsed)
+- **AND** no span SHALL be emitted
+- **AND** the trace propagator SHALL NOT be invoked to inject or extract
 
