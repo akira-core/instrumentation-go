@@ -184,7 +184,7 @@ Across all three JetStream consume paths — single-shot `Consumer.Next`, `Messa
 
 ## Versioning
 
-Each module is tagged independently as `<module>/v<x.y.z>`. See `VERSIONING.md` at the repo root for the full policy (pre-1.0 breaking→minor rule, where release notes live, per-module `CHANGELOG.md`). Version strings live in:
+Each module is tagged independently as `<module>/v<x.y.z>` — **except `otel-mongo/v2`**, whose module path ends in the `/v2` major-version suffix and is therefore tagged `otel-mongo/v2.x.y` (Go strips the suffix from the tag prefix and requires version major 2; `v2.MINOR.PATCH` tracks the siblings' `0.MINOR.PATCH`; the historical `otel-mongo/v2/v0.x.y` tags were never `go get`-resolvable and that shape is now rejected by the release guard). See `VERSIONING.md` at the repo root for the full policy (pre-1.0 breaking→minor rule, where release notes live, per-module `CHANGELOG.md`). Version strings live in:
 
 - `otel-nats/otelnats/conn.go` — `instrumentationVersion` const
 - `otel-mongo/otelmongo/version.go` — `instrumentationVersion` const
@@ -193,7 +193,7 @@ Each module is tagged independently as `<module>/v<x.y.z>`. See `VERSIONING.md` 
 
 A release-tag CI guard (`.github/workflows/release-guard.yml`) fails the push if a tag's version doesn't match the corresponding constant above — see the **CI** section.
 
-Bump on any code change to a module before pushing release tag. Module pre-1.0 (`0.x.y`): minor bump allowed for breaking changes.
+Bump on any code change to a module before pushing release tag. Module pre-1.0 (`0.x.y`): minor bump allowed for breaking changes. (`otel-mongo/v2`'s constant is `2.x.y` — same minor/patch discipline, fixed major.)
 
 ## Module-Specific Notes
 
@@ -229,4 +229,4 @@ Bump on any code change to a module before pushing release tag. Module pre-1.0 (
 - `test-and-lint` — matrix over all four modules: `go build`, `go test -race`, `golangci-lint`. For `otel-mongo` and `otel-mongo/v2` only, an additional "Verify direct/ has no OTel SDK imports" step greps `internal/direct/` for `go.opentelemetry.io/otel` imports and fails the build if any are found — this is the CI-enforced half of the disabled-mode invariant described above (the strategy-split package boundary is the compiler-enforced half).
 - `integration-test` — gated on `needs: test-and-lint`; matrix over `otel-nats/tests/integration`, `otel-mongo/tests/integration`, `otel-mongo/v2/tests/integration`, and `otel-gorilla-ws/tests/integration`, running `go test -v -race -timeout 120s ./...` (testcontainers-based, requires Docker).
 
-`.github/workflows/release-guard.yml` (0.7.0+) runs only on pushed tags matching one of the four module shapes (`otel-mongo/v[0-9]*`, `otel-mongo/v2/v[0-9]*`, `otel-nats/v[0-9]*`, `otel-gorilla-ws/v[0-9]*`) — see `VERSIONING.md`. It parses the module and version out of the tag and fails if they don't match that module's version constant (table above). `otel-mongo`/`otel-mongo/v2`'s constant is a standalone `const instrumentationVersion = "..."` statement; `otel-nats`'s is inside a `const (...)` block with no per-line `const` keyword — the guard's extraction regex tolerates both shapes (`^\s*(const\s+)?instrumentationVersion\s*=`).
+`.github/workflows/release-guard.yml` (0.7.0+) runs only on pushed tags matching one of the four module shapes (`otel-mongo/v[0-9]*`, `otel-mongo/v2/v[0-9]*`, `otel-nats/v[0-9]*`, `otel-gorilla-ws/v[0-9]*`) — see `VERSIONING.md`. It parses the module and version out of the tag and fails if they don't match that module's version constant (table above). Routing details: `otel-mongo/v2.*` tags validate against `otel-mongo/v2/version.go` (the v2 module's Go-resolvable shape); the deprecated `otel-mongo/v2/v*` shape fails immediately with a pointer to `otel-mongo/v2.x.y` (its trigger pattern is kept so the mistake fails loudly). `otel-mongo`/`otel-mongo/v2`'s constant is a standalone `const instrumentationVersion = "..."` statement; `otel-nats`'s is inside a `const (...)` block with no per-line `const` keyword — the guard's extraction regex tolerates both shapes (`^\s*(const\s+)?instrumentationVersion\s*=`).

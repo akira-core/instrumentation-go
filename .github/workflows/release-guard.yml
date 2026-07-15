@@ -30,13 +30,22 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           echo "Tag: $TAG"
 
-          # otel-mongo/v2 must be matched before the plain otel-mongo case —
-          # bash `case` takes the first matching pattern, and
-          # otel-mongo/v2/v0.7.0 would otherwise also match otel-mongo/v*.
+          # Case order matters — bash `case` takes the first matching pattern:
+          # the deprecated otel-mongo/v2/v* shape must fail before the plain
+          # otel-mongo/v* patterns get a chance to (mis)match it. The v2
+          # module's Go-resolvable tag shape is otel-mongo/v2.x.y (its module
+          # path ends in the /v2 major-version suffix, so Go strips the suffix
+          # from the tag prefix and requires version major 2 — see
+          # VERSIONING.md); the historical otel-mongo/v2/v0.x.y shape was
+          # never resolvable by Go tooling and is rejected outright here.
           case "$TAG" in
             otel-mongo/v2/v*)
+              echo "::error::Tag shape $TAG is not resolvable by Go tooling (a module path ending in /v2 requires tags of shape otel-mongo/v2.x.y). Delete this tag and push otel-mongo/v2.x.y instead — see VERSIONING.md."
+              exit 1
+              ;;
+            otel-mongo/v2.*)
               MODULE="otel-mongo/v2"
-              VERSION="${TAG#otel-mongo/v2/v}"
+              VERSION="${TAG#otel-mongo/v}"
               FILE="otel-mongo/v2/version.go"
               CONST_VERSION=$(grep -E '^\s*(const\s+)?instrumentationVersion\s*=' "$FILE" | sed -E 's/.*"([^"]+)".*/\1/')
               ;;
