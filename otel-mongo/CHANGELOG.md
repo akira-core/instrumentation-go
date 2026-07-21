@@ -4,6 +4,12 @@ All notable changes to the `otel-mongo` module (v1, `go.mongodb.org/mongo-driver
 
 > **Coverage note**: this file starts at `0.6.0`. Earlier history lives only in git tags (`otel-mongo/vX.Y.Z`) — see the repo root `VERSIONING.md` for the root cause and the release-tag CI guard that now keeps the version constant and tag in sync going forward.
 
+## [0.8.0] - 2026-07-21
+
+### Changed — BREAKING
+
+- Renamed the exported method `DecodeWithContext(ctx, val) (context.Context, error)` to `DecodeAndTrace(ctx, val) (context.Context, error)` on both `Cursor` and `ChangeStream`. Signature and behavior are unchanged — the new name states the trace side effect (emit a `mongo.cursor.decode` span, extract `_oteltrace`) that plain `Decode` does not have. **Migration**: replace `cursor.DecodeWithContext(...)` / `changeStream.DecodeWithContext(...)` with `DecodeAndTrace(...)`; arguments and returns are identical.
+
 ## [0.7.0] - 2026-07-15
 
 ### Fixed
