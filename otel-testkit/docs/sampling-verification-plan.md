@@ -1,6 +1,10 @@
 # Plan: 強化 otel-testkit 黑箱驗證 — 統計、結構/拓樸、wrapper+deliver 全 run 驗證、sampler 便利函式 + doc 修正
 
 > 規劃文件(尚未實作)。記錄與使用者逐輪釐清後確認的方向,供後續實作對照。
+>
+> **狀態註記(rebase 到 0.7.0 後)**:本文撰寫時 otel-mongo / otel-nats 仍會產生 deliver span;
+> upstream 已在 0.6.x 移除 deliver span,文中 deliver 相關驗證(第 5 點等)與檔案行號引用已不再適用,
+> 對應測試已改為只驗 wrapper CLIENT span。
 
 ## Context
 

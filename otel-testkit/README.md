@@ -150,7 +150,7 @@ make test-integration-http-direct
 > 常見疑問:「我用 library 做一個操作,不就產生一個 span 嗎?」——**不一定**。一次被 instrument 的呼叫可能產生**不只一個** span,而且它們來源不同、用途也不同。先分清楚這兩種:
 
 - **application span**(你開的):你在測試/應用裡 `tracer.Start(...)` 自己開的 span,並帶上 `harness.RunAttr`。它是**你定義「一次邏輯操作」的單位**——例如「svc1 處理了這筆訊息」。
-- **library-emitted span**(library 自動產生的):你呼叫一個被 instrument 的操作(`InsertOne`、`http.Get`、`publish`…)時,**library 內部自動**多開的 span —— 通常是 CLIENT / SERVER span;**某些 library 還會額外開一個 span 來模擬 broker 節點**(例如 otel-mongo / otel-nats 的「deliver span」,讓 service graph 出現一個 `mongodb://…` / `nats://…` 節點)。這種 broker span 是**個別 library 的選配產物、屬 transport 細節**,不是通用要件。
+- **library-emitted span**(library 自動產生的):你呼叫一個被 instrument 的操作(`InsertOne`、`http.Get`、`publish`…)時,**library 內部自動**多開的 span —— 通常是 CLIENT / SERVER span;**某些 library 還會額外開 span 來模擬 broker 節點**(早期版本的 otel-mongo / otel-nats 曾有這種「deliver span」,0.6.x 起已移除)。這種 broker span 是**個別 library 的選配產物、屬 transport 細節**,不是通用要件。
 
 所以「做一個操作」實際可能是:**你的 app span(可選)＋ library 自動開的一個或多個 span**。
 
@@ -187,7 +187,7 @@ make test-integration-http-direct
 | 同一條 trace 的 randomness 跨 service **不變** | `AssertConsistentRV` | **需 otel-sampler** | 幾乎每個 consistent 測試 |
 | service 依自身取樣率 **被取樣 / 被 drop**(確定性) | `AssertPresence` / `AssertAppSpanCounts`(⇔ `ExpectedSampled`) | **需 otel-sampler** | `TestMongoSamplingSuite`、`httpdirect` |
 | **拓樸無關**:parent-child 與 span-link 給出**相同**取樣決策 | 跨拓樸 `AssertConsistentRV` + present-set 比對 | **需 otel-sampler** | `TestMongoTopologyIndependence` |
-| **library-emitted span**(含模擬 broker 的 deliver span)也與 application span 同 randomness | `SpansOfRun` + 角色計數 | **需 otel-sampler** | `TestMongoFullSpanShape` |
+| **library-emitted span** 也與 application span 同 randomness | `SpansOfRun` + 角色計數 | **需 otel-sampler** | `TestMongoFullSpanShape` |
 
 這些斷言都**只看 sink 收到的 span**(讀 tracestate 的 `rv`、service.name、scope、links),與你用哪種 library 無關。
 
@@ -330,8 +330,8 @@ harness.AssertConsistentRV(t, run)
 > **單節點 replica set 連線注意**:testcontainers 的 mongo 模組會把 replica-set 成員設成容器內部 IP,
 > 並在連線字串附上 `replicaSet=rs0`,使 driver 走 SDAM 探索而連不到內部 IP。範例 `startMongo` 改用
 > `directConnection=true` 直連 mapped port(單節點即 primary,讀寫 / change stream 皆可)。
-> 又因 harness collector 是明文 gRPC,範例另設 `OTEL_EXPORTER_OTLP_INSECURE=true`,讓 wrapper 的
-> deliver-span exporter 也以 insecure 連線。
+> 又因 harness collector 是明文 gRPC,範例另設 `OTEL_EXPORTER_OTLP_INSECURE=true`,
+> 讓走 OTLP 的 exporter 以 insecure 連線。
 
 ### 範例:push 型(HTTP / gRPC)
 
@@ -477,13 +477,11 @@ producer 端的 instrumented 呼叫把當前 SpanContext(含 `tracestate` 的 `o
 
 `harness.BuildTracerProvider` 用 **`WithSyncer`** —— 你開的 application span **一 End 就匯出**,`WaitFor` 幾乎立刻拿到。
 
-但 **library 內部自帶的 TracerProvider**(例如代表 broker 節點的 deliver-span TP)常用 **batch**,或只在 **關閉 / flush** 時才送出。對這類 span 斷言時:
+但若 library **內部自帶 TracerProvider**,常用 **batch**,或只在 **關閉 / flush** 時才送出。對這類 span 斷言時:
 
 - 把 `sink.WaitFor(timeout, pred)` 的 `timeout` 設**夠長**(吸收 batch 排程延遲,通常數秒);**或**
 - 主動觸發 library 的 flush(關閉連線 / client 等),讓它把 batch 送完再斷言。
 
-> 範例:otel-mongo 的 deliver span 走 batch(預設約 5s 排程)或 `client.Disconnect` 時 flush ——
-> `TestMongoFullSpanShape` 用較長的 `WaitFor` 等它,`TestMongoDeliverSpanReachesCollector` 則先 `Disconnect` 再斷言。
 > 你的 application span 不受影響(同步即到)。
 
 ---
@@ -509,23 +507,20 @@ mongo 測試檔即示範這幾種:`TestMongoSamplingSuite`(find,parent-child)用
 `TestMongoTopologyIndependence` 再在 3-node 下跑 `[PC,PC]/[PC,link]/[link,PC]/[link,link]` 四種組合,
 斷言**最後一個 node 的 rv == head 種下的 rv**、且四種拓樸的 present-set 與 rv 完全一致。
 
-### wrapper + deliver span 也要一起驗(`SpansOfRun`)
+### wrapper span 也要一起驗(`SpansOfRun`)
 
-otel-mongo 的 `InsertOne` 會產生 **CLIENT span(producer)**,其下再掛一個 **DELIVER span**(service `mongodb://…`,
-模擬「broker 收到」);文件 `_oteltrace` 帶的是 deliver span 的 context,consumer 由此接續。它們與 application span 同一條
-trace、rv 一路繼承,所以 **producer / consumer / deliver 的 randomness 一定相同**。要一起驗:
+otel-mongo 的 `InsertOne` 會產生 **CLIENT span(producer)**;文件 `_oteltrace` 帶的是 client span 的 context,
+consumer 由此接續。它與 application span 同一條 trace、rv 一路繼承,所以 **producer / consumer / wrapper 的
+randomness 一定相同**。要一起驗:
 
 ```go
-full := harness.SpansOfRun(sink.Spans(), runID) // app + client + deliver + 經 link 的 trace
-harness.AssertConsistentRV(t, full)             // 三者 rv 全相同
-// 角色計數:用 SpansByScope(otelmongo.ScopeName) 取 wrapper、SpansByServicePrefix("mongodb") 取 deliver
+full := harness.SpansOfRun(sink.Spans(), runID) // app + wrapper client + 經 link 的 trace
+harness.AssertConsistentRV(t, full)             // rv 全相同
+// 角色計數:用 SpansByScope(otelmongo.ScopeName) 取 wrapper span
 ```
 
-> **deliver span 的取樣率 = 全域 `OTEL_TRACES_SAMPLER_ARG`,與 node rate 解耦**(目前 library 行為:deliver TP 寫死
-> `ProbabilitySamplerFromEnv(1.0)`)。`TestMongoFullSpanShape` 即驗這個現況(producer/consumer 用不同 node rate,deliver 用全域 rate)。
->
-> 另注意:mongo 的**讀取**操作(`FindOne`/`Aggregate`)以自己的 context 執行,其 client/deliver span 落在**獨立的 trace**;
-> 一條邏輯 run 裡的 deliver span 是 producer 的 **insert** delivery,consumer 的貢獻是它**接續**的 application span。
+> 另注意:mongo 的**讀取**操作(`FindOne`/`Aggregate`)以自己的 context 執行,其 client span 落在**獨立的 trace**;
+> 一條邏輯 run 裡 consumer 的貢獻是它**接續**的 application span。`TestMongoFullSpanShape` 即驗這個 span shape。
 
 ---
 
@@ -556,13 +551,13 @@ harness.AssertConsistentRV(t, full)             // 三者 rv 全相同
 
 > **disabled-mode invariant**:library 的 tracing flag 關掉時,wrapper 應改用 noop tracer → **不產生任何 library-emitted span**(無 CLIENT,也無模擬 broker 的 span);但**你自己開的 application span 照樣匯出**(它用的是測試的真 `TracerProvider`,與 library flag 無關)。這就是「關 → `AssertNoWrapperSpans` 通過、app span 仍在」的由來。
 
-> `OTEL_TRACES_SAMPLER_ARG` 同時是 sampler 的機率來源,**也是 library 內部 provider(如 broker/deliver span)的取樣率** —— 與各 service 自己的 node rate 解耦。
+> `OTEL_TRACES_SAMPLER_ARG` 是 `ProbabilitySamplerFromEnv` 的機率來源 —— 與各 service 自己的 node rate(`WithTracerProvider` 傳入的 sampler)解耦。
 
 **範例**:mongo 的完整矩陣由 `make test-integration-sampling` 跑(`OTEL_EXPORTER_OTLP_ENDPOINT` 與各 service 取樣率由測試在行程內帶入,你只需控制旗標軸 + `OTEL_TRACES_SAMPLER_ARG`):
 
 | Row | GLOBAL | MONGO_TRACING | MONGO_PROP | SAMPLER_ARG | 驗證重點 |
 |---|---|---|---|---|---|
-| 1 | 1 | 1 | 1 | 1.0 | 全鏈路 + 一致性 + deliver span |
+| 1 | 1 | 1 | 1 | 1.0 | 全鏈路 + 一致性 |
 | 2 | 1 | 1 | 1 | 0.5 | 取樣率 + 一致性 |
 | 3 | 1 | 1 | 0 | 1.0 | propagation 關:rv 不一致 |
 | 4 | 1 | 0 | 1 | 1.0 | mongo tracing 關:無 wrapper span |
@@ -627,7 +622,7 @@ svc=svc1 scope=otelmongo name=svc1 trace=3f2a9c01 span=88ab12cd parent=00000000 
 | Ryuk / reaper 在沙箱中起不來 | `export TESTCONTAINERS_RYUK_DISABLED=true` |
 | sink 收不到 span(`WaitFor` 逾時) | 確認容器能連到 host:多半是 `host.testcontainers.internal` / host-gateway 在你的 Docker / Podman 設定下不可用 |
 | mongo `ReplicaSetNoPrimary` / server selection timeout | 用 `directConnection=true` 直連 mapped port(見 pull 範例註解);別讓 driver 走 replica-set 探索到容器內部 IP |
-| deliver span 匯不出 / `tls: first record does not look like a TLS handshake` | collector 是明文 gRPC;設 `OTEL_EXPORTER_OTLP_INSECURE=true` 讓 wrapper 的 deliver exporter 走 insecure |
+| span 匯不出 / `tls: first record does not look like a TLS handshake` | collector 是明文 gRPC;設 `OTEL_EXPORTER_OTLP_INSECURE=true` 讓 OTLP exporter 走 insecure |
 | 旗標「開/關」兩種狀態互相干擾 | gate 每 process 快取一次——務必用 env 矩陣**分多次** `go test`,勿在單一 run 內切換 |
 | 一致性斷言偶發失敗且 rv 在門檻邊界 | 選 rv 時遠離 `threshold ≈ (1-p)·2^56`(範例的 rv ladder 已刻意挑大邊際) |
 | Docker daemon 卡住(volume metadata DB timeout) | 環境問題,非測試問題;清掉 stale 的 dockerd 鎖後重啟 daemon |
