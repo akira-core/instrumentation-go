@@ -68,10 +68,10 @@ When document propagation is enabled and an active span is present in the contex
 - **THEN** `ContextFromDocument`/`ContextFromRawDocument` still return `ok == false` for a document written by that collection, because the cached gate ignores the override and reflects only the environment variables
 
 ### Requirement: Cursor decode with trace linking
-`Cursor.DecodeWithContext(ctx, v)` SHALL emit a `mongo.cursor.decode` INTERNAL span on a new, detached trace, and SHALL add a span link to the origin span when the decoded document's `_oteltrace` metadata is present and propagation is enabled. Plain `Cursor.Decode` SHALL behave exactly like the underlying driver's `Decode` and SHALL ignore `_oteltrace`.
+`Cursor.DecodeAndTrace(ctx, v)` SHALL emit a `mongo.cursor.decode` INTERNAL span on a new, detached trace, and SHALL add a span link to the origin span when the decoded document's `_oteltrace` metadata is present and propagation is enabled. Plain `Cursor.Decode` SHALL behave exactly like the underlying driver's `Decode` and SHALL ignore `_oteltrace`.
 
 #### Scenario: Change-stream document with trace metadata
-- **WHEN** `DecodeWithContext` decodes a document containing `_oteltrace` and propagation is enabled
+- **WHEN** `DecodeAndTrace` decodes a document containing `_oteltrace` and propagation is enabled
 - **THEN** a `mongo.cursor.decode` span is created with a link to the document's origin span
 
 #### Scenario: Plain Decode ignores trace metadata
@@ -102,5 +102,4 @@ When document propagation is enabled and an active span is present in the contex
 #### Scenario: Equivalent CRUD behavior
 - **WHEN** the same CRUD operation is invoked through the v1 wrapper and the v2 wrapper with equivalent inputs
 - **THEN** both inject/extract `_oteltrace` identically and both honor the same three-tier feature-flag gate
-
 
