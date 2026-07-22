@@ -158,9 +158,9 @@ func TestIntegration_InsertManyAllHaveOtelTrace(t *testing.T) {
 	}
 }
 
-// TestIntegration_CursorDecodeWithContextExtractsTrace verifies that
-// Cursor.DecodeWithContext returns a context carrying the insert span's TraceID.
-func TestIntegration_CursorDecodeWithContextExtractsTrace(t *testing.T) {
+// TestIntegration_CursorDecodeAndTraceExtractsTrace verifies that
+// Cursor.DecodeAndTrace returns a context carrying the insert span's TraceID.
+func TestIntegration_CursorDecodeAndTraceExtractsTrace(t *testing.T) {
 	tp, sr := newTestProvider()
 	setupOtel(tp)
 
@@ -186,7 +186,7 @@ func TestIntegration_CursorDecodeWithContextExtractsTrace(t *testing.T) {
 	require.True(t, cursor.Next(context.Background()), "expected at least one document")
 
 	var doc bson.D
-	enrichedCtx, err := cursor.DecodeWithContext(context.Background(), &doc)
+	enrichedCtx, err := cursor.DecodeAndTrace(context.Background(), &doc)
 	require.NoError(t, err)
 
 	sc := oteltrace.SpanContextFromContext(enrichedCtx)

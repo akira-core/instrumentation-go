@@ -54,10 +54,10 @@ func (cs *ChangeStream) Next(ctx context.Context) bool { return cs.ChangeStream.
 // Decode decodes the current change document into val.
 func (cs *ChangeStream) Decode(val any) error { return cs.impl.Decode(val) }
 
-// DecodeWithContext decodes the current change document into val and returns
+// DecodeAndTrace decodes the current change document into val and returns
 // a context enriched with trace context extracted from fullDocument's "_oteltrace".
-func (cs *ChangeStream) DecodeWithContext(ctx context.Context, val any) (context.Context, error) {
-	return cs.impl.DecodeWithContext(ctx, val)
+func (cs *ChangeStream) DecodeAndTrace(ctx context.Context, val any) (context.Context, error) {
+	return cs.impl.DecodeAndTrace(ctx, val)
 }
 
 // Close closes the change stream.

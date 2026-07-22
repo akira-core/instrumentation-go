@@ -11,7 +11,7 @@ import (
 // facade collectionImpl interface can name it as a return type without
 // importing either path.
 type CursorImpl interface {
-	DecodeWithContext(ctx context.Context, val any) (context.Context, error)
+	DecodeAndTrace(ctx context.Context, val any) (context.Context, error)
 	Decode(val any) error
 }
 
@@ -24,6 +24,6 @@ type SingleResultImpl interface {
 
 // ChangeStreamImpl is the polymorphic core of the facade ChangeStream.
 type ChangeStreamImpl interface {
-	DecodeWithContext(ctx context.Context, val any) (context.Context, error)
+	DecodeAndTrace(ctx context.Context, val any) (context.Context, error)
 	Decode(val any) error
 }

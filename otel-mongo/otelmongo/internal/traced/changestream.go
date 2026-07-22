@@ -12,7 +12,7 @@ import (
 )
 
 // ChangeStream is the enabled-path impl of the otelmongo.ChangeStream
-// strategy. DecodeWithContext extracts _oteltrace from fullDocument and
+// strategy. DecodeAndTrace extracts _oteltrace from fullDocument and
 // builds a CLIENT span linked to the origin trace.
 type ChangeStream struct {
 	cs                 *mongo.ChangeStream
@@ -45,9 +45,9 @@ func NewChangeStream(cs *mongo.ChangeStream, cfg ChangeStreamConfig) *ChangeStre
 	}
 }
 
-// DecodeWithContext decodes the current change document and returns a
+// DecodeAndTrace decodes the current change document and returns a
 // context enriched with trace context from fullDocument's "_oteltrace".
-func (c *ChangeStream) DecodeWithContext(ctx context.Context, val any) (context.Context, error) {
+func (c *ChangeStream) DecodeAndTrace(ctx context.Context, val any) (context.Context, error) {
 	var originSpanCtx trace.SpanContext
 	fullDoc, err := c.cs.Current.LookupErr("fullDocument")
 	if err == nil && c.propagationEnabled {

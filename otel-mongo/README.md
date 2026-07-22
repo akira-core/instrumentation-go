@@ -162,12 +162,12 @@ client, err := otelmongo.Connect(opts)
 
 ## Span kinds
 
-MongoDB is a database, not a messaging system: every operation span uses `CLIENT` (`Watch`'s change-stream read span included — it is a synchronous `getMore` call, not an async delivery). Local-only work (`Cursor.DecodeWithContext` on a document with no round trip) uses `INTERNAL`.
+MongoDB is a database, not a messaging system: every operation span uses `CLIENT` (`Watch`'s change-stream read span included — it is a synchronous `getMore` call, not an async delivery). Local-only work (`Cursor.DecodeAndTrace` on a document with no round trip) uses `INTERNAL`.
 
 ```
 InsertOne / FindOne / UpdateOne / ... (CLIENT)
 Watch → change-stream read (CLIENT)
-Cursor.DecodeWithContext (INTERNAL, linked to the origin span when `_oteltrace` is present)
+Cursor.DecodeAndTrace (INTERNAL, linked to the origin span when `_oteltrace` is present)
 ```
 
 ---
@@ -180,7 +180,7 @@ Cursor.DecodeWithContext (INTERNAL, linked to the origin span when `_oteltrace` 
 | `NewClient` signature | `NewClient(ctx, uri, traceOpts...)` | `NewClient(uri, traceOpts...)` |
 | `Distinct` return | `([]interface{}, error)` | `*mongo.DistinctResult` |
 | `StartSession` return | `mongo.Session, error` | `*mongo.Session, error` |
-| `Cursor.DecodeWithContext` | Identical behavior in both: always emits a `mongo.cursor.decode` INTERNAL span on a new (detached) trace, with a link to the origin span when the document's `_oteltrace` metadata is present and propagation is enabled. | (same) |
+| `Cursor.DecodeAndTrace` | Identical behavior in both: always emits a `mongo.cursor.decode` INTERNAL span on a new (detached) trace, with a link to the origin span when the document's `_oteltrace` metadata is present and propagation is enabled. | (same) |
 
 ---
 
@@ -206,9 +206,9 @@ Every `InsertOne`, `InsertMany`, `ReplaceOne`, and `UpdateOne`/`UpdateMany`/`Upd
 
 `NewCollection` sets **document** `_oteltrace` behaviour from the same env gates as `Connect` (global + `OTEL_MONGO_TRACING_ENABLED` + `OTEL_MONGO_PROPAGATION_ENABLED`). When either tracing gate is off, the collection is constructed with propagation disabled. There is no per-collection functional option for propagation; use **`ConnectWithOptions`** with **`WithTracePropagationEnabled`** when you need to override the env default for a client (note: it still cannot bypass a disabled tracing gate).
 
-### DecodeWithContext vs Decode on Cursor
+### DecodeAndTrace vs Decode on Cursor
 
-`Cursor.DecodeWithContext` extracts the producer's trace context from `_oteltrace` and returns an enriched context — use it when you need to link downstream work to the document's origin trace. Plain `Cursor.Decode` works exactly like the underlying driver's `Decode` and ignores `_oteltrace`.
+`Cursor.DecodeAndTrace` extracts the producer's trace context from `_oteltrace` and returns an enriched context — use it when you need to link downstream work to the document's origin trace. Plain `Cursor.Decode` works exactly like the underlying driver's `Decode` and ignores `_oteltrace`.
 
 ### Span links on FindOne
 
