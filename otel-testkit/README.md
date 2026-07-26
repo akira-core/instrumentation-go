@@ -196,9 +196,23 @@ make test-integration-http-direct
 ## 需求
 
 - **Docker 或 Podman**(testcontainers 會拉 `mongo:7.0`、`otel/opentelemetry-collector` 等 image)。
-- Go 1.24+。
-- 可用 `OTEL_COLLECTOR_IMAGE` 覆寫 collector image(預設 `otel/opentelemetry-collector:0.119.0`)。
+- Go 1.25+(各 `go.mod` 皆 `go 1.25.0`)。
+- 可用 `OTEL_COLLECTOR_IMAGE` 覆寫 collector image(預設 `otel/opentelemetry-collector:0.147.0`)。
 - 沙箱 / DinD 環境可設 `TESTCONTAINERS_RYUK_DISABLED=true` 略過 reaper sidecar。
+
+> **collector 只收 OTLP/gRPC**:容器內 collector 只在 `4317` 開一個 **OTLP/gRPC** receiver(**無 HTTP**)。
+> 各 service 的 exporter(以及套用到真實 application 時)都必須走 **gRPC** OTLP,不能用 HTTP。
+
+### 環境變數一覽(誰設 / 誰讀)
+
+| env var | 誰設 | 誰讀 |
+|---|---|---|
+| `OTEL_COLLECTOR_IMAGE` | 你(覆寫 image 時) | `StartCollector` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `StartTelemetryEnv`(或你手動 `t.Setenv`) | **library 自建的** OTLP exporter(`BuildTracerProvider` **不讀**,它吃參數) |
+| `OTEL_EXPORTER_OTLP_INSECURE` | `WithInsecureOTLP()`(或你手動) | **library 自建的** OTLP exporter(`BuildTracerProvider` **不讀**,本來就 insecure) |
+| `OTEL_TRACES_SAMPLER_ARG` | Makefile / CI 矩陣 | `ConsistentSamplerFromEnv` / `EnvSamplerArg` |
+| 各 library 的 feature-flag 環境變數 | Makefile / CI 矩陣 | library 本身;測試經 `ExpectationFromEnv(gate)` 讀同一組來分流 |
+| `TESTCONTAINERS_RYUK_DISABLED` | 你(沙箱 / DinD 時) | testcontainers |
 
 ---
 
@@ -225,10 +239,16 @@ go test -race -timeout 600s ./sampling/
 工具箱由幾個彼此獨立、可自由組裝的元件構成(package `harness`):
 
 **基礎設施**(Core)
-- `StartTelemetryEnv(t, opts...) TelemetryEnv{Sink, Endpoint}` — 一行收齊整套環境:裝 propagator、起 sink(含 `DumpOnFailure`)、起 collector、設 `OTEL_EXPORTER_OTLP_ENDPOINT`。選項:`WithDumpOnFailure(bool)`、`WithPropagator(p)`、`WithInsecureOTLP()`。
-- `StartSink(t) *Sink` — 行程內 OTLP/gRPC sink。`Sink` 提供 `Spans()`、`WaitFor(timeout, pred)`、`ByRun(runID)`、`Port()`。
-- `StartCollector(ctx, t, sinkPort) (endpoint string)` — collector 容器,回傳 OTLP endpoint。
-- `BuildTracerProvider(t, serviceName, sampler, endpoint) *sdktrace.TracerProvider` — 一個 service 的 TP(同步匯出,sampling 決策即時可見)。接受**任意** `sdktrace.Sampler`。
+- `StartTelemetryEnv(t, opts...) TelemetryEnv{Sink, Endpoint}` — 一行收齊整套環境:裝 propagator(**預設 W3C TraceContext + Baggage**)、起 sink(`DumpOnFailure` **預設開**)、起 collector、設 `OTEL_EXPORTER_OTLP_ENDPOINT`。選項:`WithDumpOnFailure(bool)`、`WithPropagator(p)`、`WithInsecureOTLP()`(另設 `OTEL_EXPORTER_OTLP_INSECURE=true`,給 **library 自建的** OTLP exporter 用)。
+- `StartSink(t) *Sink` — 行程內 OTLP/gRPC sink。`Sink` 提供 `Spans()`、`WaitFor(timeout, pred)`(50ms 輪詢;**逾時回當前快照、不 Fatal**)、`ByRun(runID)`、`Port()`。
+- `StartCollector(ctx, t, sinkPort) (endpoint string)` — collector 容器,回傳 OTLP endpoint(裸 `host:port`,無 scheme)。
+- `BuildTracerProvider(t, serviceName, sampler, endpoint) *sdktrace.TracerProvider` — 一個 service 的 TP(同步匯出,sampling 決策即時可見)。接受**任意** `sdktrace.Sampler`。endpoint 需為**裸 `host:port`**(即 `StartCollector` 的回傳值);exporter **寫死 plaintext**(`WithInsecure()`),且**不讀任何 `OTEL_EXPORTER_OTLP_*` 環境變數** —— 那些 env 只影響 library 自建的 exporter。
+
+> **propagator 陷阱**:harness **不會自動裝** global propagator —— 只有 `StartTelemetryEnv` 會
+> (`otel.SetTextMapPropagator`,預設 TraceContext+Baggage)。若你自行組裝 `StartSink` + `StartCollector`
+> (如 mongo 的 `setup`),**必須自己**呼叫 `otel.SetTextMapPropagator(...)`;否則 OTel 的預設是
+> **no-op propagator**,library 的 inject/extract 什麼都不寫 → 載體不帶 traceparent/tracestate →
+> rv 過不了界,`AssertConsistentRV` 直接失敗。
 
 **sampler — Consistent 路徑專用(需 otel-sampler)**
 > Core 路徑直接把 stdlib sampler(`sdktrace.TraceIDRatioBased(rate)`、`sdktrace.ParentBased(...)`)傳給 `BuildTracerProvider` 即可,**不需**下面這兩個。
@@ -245,10 +265,10 @@ go test -race -timeout 600s ./sampling/
 - `RunAttrOption(runID) trace.SpanStartOption` — `tracer.Start(ctx, name, harness.RunAttrOption(runID))` 的簡寫,把 `RunAttr` 蓋上你的 app span。
 - `WaitForStable(t, sink, runID, anchorService, quiet, timeout) []Span`(Core)— 不需預測 count:等到 `anchorService`(rate 1.0 保證出現、且同步 chain 中最後 export 的 head)有 app span,再等數量靜默 `quiet` 才回;**逾時不 Fatal**(下游被 drop = 0 span 是合法結果)。非確定性 sampler 的統計測試用它。**確定性測試(count 已知)請改用 `WaitForAppSpans`**——它等齊全部 span,不靠靜默窗猜測。
 - `CountSampled(rates, rv) int`(需 otel-sampler)— 預測該 rv 下有幾個 service 會被取樣(= 該等幾個 app span)。
-- `WaitForAppSpans(t, sink, runID, want, timeout) []Span` — 等到 `want` 個帶 `RunAttr` 的 app span 到齊才回;**逾時會 dump 全部 span 並 `t.Fatalf`**(取代靜默回 partial)。需先以 `CountSampled` 預測 `want`,故偏 Consistent 路徑。
+- `WaitForAppSpans(t, sink, runID, want, timeout) []Span` — 等到 `want` 個帶 `RunAttr` 的 app span 到齊才回;**逾時會 dump 全部 span 並 `t.Fatalf`**(取代靜默回 partial)。`want` 可為 **0**(rv 不取樣任何 service 時):立即回空 slice、不等待。需先以 `CountSampled` 預測 `want`,故偏 Consistent 路徑。
 
 **分組 / 切片**
-- `SpansByAttr(spans, attr, val)`、`SpansByService(spans, name)`、`SpansByScope(spans, scope)`、`SpansByServicePrefix(spans, prefix)`。
+- `SpansByAttr(spans, attr, val)`、`SpansByService(spans, name)`、`SpansByScope(spans, scope)`、`SpansByServicePrefix(spans, prefix)`(依 `service.name` 前綴篩選;原為挑出 `mongodb://…` 型 deliver span 而設,該類 span 0.6.x 起已移除,現僅供自訂用途)。
 - `SpansOfRun(all, runID)` — 收齊整條 run 的**所有** span(app + library-emitted span + 經 span-link 連到的 trace);要連 library-emitted span 一起驗時用它。
 
 **斷言 — Core(任意 sampler;只讀拓樸 / 統計)**
@@ -261,14 +281,14 @@ go test -race -timeout 600s ./sampling/
 - `TraceIDOf(spans, service) (string, bool)` — 取某 service 的 TraceID(除錯 / 自訂斷言)。
 
 **斷言 — Consistent(需 otel-sampler;讀 `ot=rv:`)**
-- `AssertConsistentRV(t, spans) uint64` — 出現的 span 其 `ot=rv:` 全相等(核心不變式)。
+- `AssertConsistentRV(t, spans) uint64` — 出現的 span 其 `ot=rv:` 全相等(核心不變式)。**只比對帶 rv 的 span,沒有 rv 的直接忽略**(不是「每個 span 都要有 rv」);**整組都沒有任何 rv 才失敗**。失敗時自動 dump 該組 span。
 - `AssertPresence(t, spans, want, rv)` / `AssertAppSpanCounts(t, spans, want, rv, countIfSampled)` — service 出現 / 精確 span 數 ⇔ `ExpectedSampled(rate, rv)`。
 - `DistinctRVs(spans)` — 跨 span 的相異 rv(consistent 路徑 propagation 關掉時驗 rv 不一致)。
 
 > 不在乎 trace 圖形狀就只用 Core 斷言,不必傳拓樸。
 
 **flag 推導**
-- `GateEnv{Global, Tracing, Propagation}` + `ExpectationFromEnv(gate) Expectation{TracingEnabled, PropagationEnabled}` — 把當前 flag 矩陣轉成「該跑哪組斷言」。
+- `GateEnv{Global, Tracing, Propagation}` + `ExpectationFromEnv(gate) Expectation{TracingEnabled, PropagationEnabled}` — 把當前 flag 矩陣轉成「該跑哪組斷言」。`Propagation` **可留空**(該 library 沒有獨立 propagation 開關,如 otel-nats):此時 `PropagationEnabled` **跟隨** `TracingEnabled`,矩陣也就沒有 propagation-off 列。
 
 **除錯(失敗定位)**
 - `DumpOnFailure(t, sink)` — 一行掛上;測試失敗時自動把 sink 收到的全部 span 印成可讀的單行清單。
@@ -370,13 +390,20 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/akira-core/instrumentation-go/otel-testkit/harness"
 	// TODO: import 你的 instrumentation library
 )
 
 func TestMyLibSamplingConsistency(t *testing.T) {
-	// 1) 基礎設施:in-process sink + collector 容器,並把 exporter 指過去
+	// 1) 基礎設施:in-process sink + collector 容器,並把 exporter 指過去。
+	// 務必自己裝 propagator —— harness 不會自動裝(只有 StartTelemetryEnv 會);
+	// 漏了這行,OTel 預設是 no-op propagator,library 的 inject/extract 什麼都不寫,
+	// rv 過不了界。(用 harness.StartTelemetryEnv(t) 可把這整段換成一行。)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{}, propagation.Baggage{}))
 	sink := harness.StartSink(t)
 	harness.DumpOnFailure(t, sink) // 失敗時自動印出收到的全部 span
 	endpoint := harness.StartCollector(context.Background(), t, sink.Port())
@@ -449,7 +476,7 @@ for i := 0; i < N; i++ {
 
 | transport | 一次 produce 大致送出的 span | 一次 consume |
 |---|---|---|
-| MongoDB | 你的 app span + `insert` CLIENT span + `mongodb://…` DELIVER span | 你的 continuation app span(+ 讀取的 CLIENT/DELIVER span,落在讀取端自己的 trace) |
+| MongoDB | 你的 app span + `insert` CLIENT span | 你的 continuation app span(+ 讀取的 CLIENT span,落在讀取端自己的 trace) |
 | HTTP(真 otelhttp) | 你的 app span + CLIENT span | SERVER span + 你的 app span |
 | 純 propagator(本 repo 的 HTTP 範例) | 只有你的 app span | 只有你的 app span |
 
@@ -622,7 +649,7 @@ svc=svc1 scope=otelmongo name=svc1 trace=3f2a9c01 span=88ab12cd parent=00000000 
 | Ryuk / reaper 在沙箱中起不來 | `export TESTCONTAINERS_RYUK_DISABLED=true` |
 | sink 收不到 span(`WaitFor` 逾時) | 確認容器能連到 host:多半是 `host.testcontainers.internal` / host-gateway 在你的 Docker / Podman 設定下不可用 |
 | mongo `ReplicaSetNoPrimary` / server selection timeout | 用 `directConnection=true` 直連 mapped port(見 pull 範例註解);別讓 driver 走 replica-set 探索到容器內部 IP |
-| span 匯不出 / `tls: first record does not look like a TLS handshake` | collector 是明文 gRPC;設 `OTEL_EXPORTER_OTLP_INSECURE=true` 讓 OTLP exporter 走 insecure |
+| span 匯不出 / `tls: first record does not look like a TLS handshake` | collector 是明文 gRPC。`BuildTracerProvider` 建的 exporter **本來就 insecure**(寫死,不讀 env)——會撞到 TLS 的是 **library 自建的** OTLP exporter(讀 `OTEL_EXPORTER_OTLP_ENDPOINT`、預設 TLS);設 `OTEL_EXPORTER_OTLP_INSECURE=true`(或 `StartTelemetryEnv` 加 `WithInsecureOTLP()`)讓它走 insecure |
 | 旗標「開/關」兩種狀態互相干擾 | gate 每 process 快取一次——務必用 env 矩陣**分多次** `go test`,勿在單一 run 內切換 |
 | 一致性斷言偶發失敗且 rv 在門檻邊界 | 選 rv 時遠離 `threshold ≈ (1-p)·2^56`(範例的 rv ladder 已刻意挑大邊際) |
 | Docker daemon 卡住(volume metadata DB timeout) | 環境問題,非測試問題;清掉 stale 的 dockerd 鎖後重啟 daemon |
