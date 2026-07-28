@@ -18,6 +18,8 @@ jobs:
       fail-fast: false
       matrix:
         module:
+          - otel-sampler
+          - otel-testkit
           - otel-mongo
           - otel-mongo/v2
           - otel-nats
@@ -82,5 +84,53 @@ jobs:
           cache: false
 
       - name: Integration Tests
-        run: go test -v -race -timeout 120s ./...
+        run: go test -v -race -timeout 300s ./...
         working-directory: ${{ matrix.module }}
+
+  sampling-e2e:
+    name: Sampling E2E (${{ matrix.row.name }})
+    runs-on: ubuntu-latest
+    needs: test-and-lint
+    strategy:
+      fail-fast: false
+      matrix:
+        row:
+          - { name: all-on,            global: "1", mongo: "1", prop: "1", arg: "1.0" }
+          - { name: all-on-half,       global: "1", mongo: "1", prop: "1", arg: "0.5" }
+          - { name: propagation-off,   global: "1", mongo: "1", prop: "0", arg: "1.0" }
+          - { name: mongo-tracing-off, global: "1", mongo: "0", prop: "1", arg: "1.0" }
+          - { name: global-off,        global: "0", mongo: "1", prop: "1", arg: "1.0" }
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache: false
+
+      - name: Consistent-sampling E2E
+        working-directory: otel-mongo/v2/tests/integration
+        env:
+          OTEL_INSTRUMENTATION_GO_TRACING_ENABLED: ${{ matrix.row.global }}
+          OTEL_MONGO_TRACING_ENABLED: ${{ matrix.row.mongo }}
+          OTEL_MONGO_PROPAGATION_ENABLED: ${{ matrix.row.prop }}
+          OTEL_TRACES_SAMPLER_ARG: ${{ matrix.row.arg }}
+        run: go test -race -timeout 600s -run TestMongo ./sampling/
+
+  http-direct-e2e:
+    name: Sampling E2E (http-direct)
+    runs-on: ubuntu-latest
+    needs: test-and-lint
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache: false
+
+      - name: Black-box (HTTP) consistent-sampling E2E
+        working-directory: otel-testkit/examples/httpdirect
+        run: go test -race -timeout 600s -run TestHTTP ./...
