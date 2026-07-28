@@ -63,23 +63,54 @@ make test-integration-http-direct
 | — | library 會**自開 broker 節點 span 且批次匯出** → [同步 vs 非同步](#同步-vs-非同步匯出斷言計時) + `SpansOfRun` |
 | — | 想驗**統計取樣率** → [控制送幾條 trace](#控制送幾條-trace--每條幾個-span) 的統計段 |
 
+### 兩條路徑:Core(任意 sampler)vs Consistent(需 otel-sampler)
+
+工具箱分成兩層,**先選你在哪條路徑**:
+
+| | **Core**(任意 sampler) | **Consistent**(我們的 otel-sampler) |
+|---|---|---|
+| 你的 sampler | `TraceIDRatioBased`、`ParentBased`、自家 sampler —— **不寫 `ot=rv:`** | `ConsistentSampler` = `WithSingleLinkSeed(ProbabilitySampler)`,**寫 `ot=rv:`** |
+| 取樣率怎麼驗 | **統計**:大量 run,取樣比例 ≈ rate(`AssertSampledFraction`) | **確定性**:種一個 rv,精確預測哪些 service 出現(rv ladder + `AssertAppSpanCounts`) |
+| propagation 怎麼驗 | TraceID:`AssertTraceContinued` / `AssertTraceNotContinued` | 同左,或 rv 一致性(`AssertConsistentRV` / `DistinctRVs`) |
+| span link | `AssertLinkedTrace`(兩條路徑共用) | 同左 + `AssertConsistentRV`(跨 link 同 rv) |
+| feature flag | `GateEnv` + `ExpectationFromEnv` + `AssertNoWrapperSpans`(兩條路徑共用) | 同左 |
+| 範例 | `examples/httpdirect-stdlib` | `examples/httpdirect`、`otel-mongo/v2/.../sampling` |
+
+> **決策樹第一題:你的 sampler 是否寫 `ot=rv:` 並用 threshold 模型?**
+> 是 → **Consistent**;否 → **Core**。
+> Core 的斷言只讀 trace 拓樸(TraceID、span link)與統計取樣率,對任何 sampler 都成立。
+
 ### 決策樹:我該照哪個範例
 
 ```
-你的 library 怎麼傳 trace?
-├─ push(同步 RPC:HTTP / gRPC,送出即送達)
-│     → 照 examples/httpdirect(parent-child;對 head 發一個請求)
-└─ pull(消費端主動讀:DB / queue / change stream)
-      → 照 otel-mongo/v2/.../sampling(produce → consume)
-        消費端怎麼接上游?
-        ├─ 續接 remote parent(同 trace)        → parent-child
-        └─ 開新 root + link 到上游              → span-link
-        (兩者取樣決策相同,都用 AssertConsistentRV 驗)
+你的 sampler 寫 ot=rv:(consistent / threshold 模型)嗎?
+├─ 否 → Core:照 examples/httpdirect-stdlib(TraceIDRatioBased)
+│        propagation 用 AssertTraceContinued/NotContinued;取樣率用 AssertSampledFraction
+└─ 是 → Consistent:再看 library 怎麼傳 trace
+     ├─ push(同步 RPC:HTTP / gRPC,送出即送達)
+     │     → 照 examples/httpdirect(parent-child;對 head 發一個請求)
+     └─ pull(消費端主動讀:DB / queue / change stream)
+           → 照 otel-mongo/v2/.../sampling(produce → consume)
+             消費端怎麼接上游?
+             ├─ 續接 remote parent(同 trace)        → parent-child
+             └─ 開新 root + link 到上游              → span-link
+             (兩者取樣決策相同,都用 AssertConsistentRV 驗)
 
 其他軸(與上面正交,有才讀):
 • 有 tracing / propagation 開關?  → 宣告 GateEnv,跑 env 矩陣
 • library 會自開 broker 節點 span?→ 用 SpansOfRun,並拉長 WaitFor 或觸發 flush
 ```
+
+> **三個陷阱(Core 路徑)**
+> - **等待策略**:確定性測試(rate 全 1.0,app span 數已知)用 `WaitForAppSpans(runID, len(svcs))` ——
+>   它**等齊**全部 span,不論 export 多慢。**別用 `WaitForStable` 跑確定性測試**:它的靜默窗會在
+>   最後才 export 的 head span 到達前就回傳、漏掉它(同步 chain 的 head 要等下游回來才結束)。
+>   `WaitForStable` 只給 count 不可預測的統計測試,且須以保證出現的 head 當 `anchorService`。
+> - **統計取樣率測試**:head service 設 **rate 1.0** 當 anchor,每條 run 都有 app span;
+>   被量測的 service 才帶要驗的 rate。
+> - **propagation 測試**:rate 全 **1.0**,sampler 才不會把要斷言的 span 給 drop。
+>   `TraceIDRatioBased` 因 decision 由 trace ID 決定,**同一 trace ID 的各 service 天生一致**(stdlib 版的 consistent sampling,只是不寫 `ot=rv:`);
+>   若改用 `ParentBased(...)`,下游會盲從上游的 sampled flag(head-based 取樣),此時統計測的是 **head 的** rate。
 
 ---
 
@@ -146,14 +177,17 @@ make test-integration-http-direct
 
 不論你包的是什麼 transport,這個工具箱讓你對「跨 service 的取樣行為」做這幾類斷言。**先看你要驗哪一類,再去寫流程**:
 
-| 想驗什麼 | 用的 helper | 範例(在哪個測試) |
-|---|---|---|
-| 同一條 trace 的 randomness 跨 service **不變** | `AssertConsistentRV` | 幾乎每個測試 |
-| service 依自身取樣率 **被取樣 / 被 drop** | `AssertPresence` / `AssertAppSpanCounts`(⇔ `ExpectedSampled`) | `TestMongoSamplingSuite`、HTTP |
-| **拓樸無關**:parent-child 與 span-link 給出**相同**取樣決策 | 跨拓樸 `AssertConsistentRV` + present-set 比對 | `TestMongoTopologyIndependence` |
-| **統計取樣率**:大量 trace 的取樣比例 ≈ rate | `AssertSampledFraction` | `TestMongoSamplingRate` |
-| **feature flag 停用**時 library-emitted span 不出 / propagation 關時 rv 不一致 | `AssertNoWrapperSpans` / `DistinctRVs` | `TestMongoSamplingSuite` 的停用分支 |
-| **library-emitted span**(含模擬 broker 的 deliver span)也與 application span 同 randomness | `SpansOfRun` + 角色計數 | `TestMongoFullSpanShape` |
+| 想驗什麼 | 用的 helper | 路徑 | 範例(在哪個測試) |
+|---|---|---|---|
+| **propagation 生效**:下游延續上游同一條 trace | `AssertTraceContinued` | Core + Consistent | `httpdirect-stdlib` `TestPropagation` |
+| **propagation 關閉**:下游另開 trace、無 link 回上游 | `AssertTraceNotContinued` | Core + Consistent | `httpdirect-stdlib` `TestPropagationDisabled` |
+| **span link**:下游是上游的 span-link consumer | `AssertLinkedTrace` | Core + Consistent | `httpdirect-stdlib` `TestSpanLink`、`TestMongoSpanLink` |
+| **統計取樣率**:大量 trace 的取樣比例 ≈ rate | `AssertSampledFraction`(+ `WaitForStable`) | Core + Consistent | `httpdirect-stdlib` `TestSamplingRate`、`TestMongoSamplingRate` |
+| **feature flag 停用**時 library-emitted span 不出 | `AssertNoWrapperSpans` | Core + Consistent | `TestMongoSamplingSuite` 的停用分支 |
+| 同一條 trace 的 randomness 跨 service **不變** | `AssertConsistentRV` | **需 otel-sampler** | 幾乎每個 consistent 測試 |
+| service 依自身取樣率 **被取樣 / 被 drop**(確定性) | `AssertPresence` / `AssertAppSpanCounts`(⇔ `ExpectedSampled`) | **需 otel-sampler** | `TestMongoSamplingSuite`、`httpdirect` |
+| **拓樸無關**:parent-child 與 span-link 給出**相同**取樣決策 | 跨拓樸 `AssertConsistentRV` + present-set 比對 | **需 otel-sampler** | `TestMongoTopologyIndependence` |
+| **library-emitted span**(含模擬 broker 的 deliver span)也與 application span 同 randomness | `SpansOfRun` + 角色計數 | **需 otel-sampler** | `TestMongoFullSpanShape` |
 
 這些斷言都**只看 sink 收到的 span**(讀 tracestate 的 `rv`、service.name、scope、links),與你用哪種 library 無關。
 
@@ -190,12 +224,14 @@ go test -race -timeout 600s ./sampling/
 
 工具箱由幾個彼此獨立、可自由組裝的元件構成(package `harness`):
 
-**基礎設施**
+**基礎設施**(Core)
+- `StartTelemetryEnv(t, opts...) TelemetryEnv{Sink, Endpoint}` — 一行收齊整套環境:裝 propagator、起 sink(含 `DumpOnFailure`)、起 collector、設 `OTEL_EXPORTER_OTLP_ENDPOINT`。選項:`WithDumpOnFailure(bool)`、`WithPropagator(p)`、`WithInsecureOTLP()`。
 - `StartSink(t) *Sink` — 行程內 OTLP/gRPC sink。`Sink` 提供 `Spans()`、`WaitFor(timeout, pred)`、`ByRun(runID)`、`Port()`。
 - `StartCollector(ctx, t, sinkPort) (endpoint string)` — collector 容器,回傳 OTLP endpoint。
-- `BuildTracerProvider(t, serviceName, sampler, endpoint) *sdktrace.TracerProvider` — 一個 service 的 TP(同步匯出,sampling 決策即時可見)。
+- `BuildTracerProvider(t, serviceName, sampler, endpoint) *sdktrace.TracerProvider` — 一個 service 的 TP(同步匯出,sampling 決策即時可見)。接受**任意** `sdktrace.Sampler`。
 
-**sampler(務必用這個)**
+**sampler — Consistent 路徑專用(需 otel-sampler)**
+> Core 路徑直接把 stdlib sampler(`sdktrace.TraceIDRatioBased(rate)`、`sdktrace.ParentBased(...)`)傳給 `BuildTracerProvider` 即可,**不需**下面這兩個。
 - `ConsistentSampler(rate) sdktrace.Sampler` = `WithSingleLinkSeed(ProbabilitySampler(rate))`。
 - `ConsistentSamplerFromEnv(def) sdktrace.Sampler` = 同上,但機率讀 `OTEL_TRACES_SAMPLER_ARG`。
 - **一定要 `WithSingleLinkSeed` 包起來**(`ConsistentSampler` 已內含):否則 (a) span-link consumer 會自生 rv(`ProbabilitySampler` 無視 links)→ 不一致;(b) root 不會寫 `ot=rv:` → 匯出的 span 沒有 rv,`AssertConsistentRV` 找不到值。harness 不強制 sampler,但你的服務該用這顆。
@@ -207,24 +243,29 @@ go test -race -timeout 600s ./sampling/
 
 **驅動一條 run**
 - `RunAttrOption(runID) trace.SpanStartOption` — `tracer.Start(ctx, name, harness.RunAttrOption(runID))` 的簡寫,把 `RunAttr` 蓋上你的 app span。
-- `CountSampled(rates, rv) int` — 預測該 rv 下有幾個 service 會被取樣(= 該等幾個 app span)。
-- `WaitForAppSpans(t, sink, runID, want, timeout) []Span` — 等到 `want` 個帶 `RunAttr` 的 app span 到齊才回;**逾時會 dump 全部 span 並 `t.Fatalf`**(取代靜默回 partial)。
+- `WaitForStable(t, sink, runID, anchorService, quiet, timeout) []Span`(Core)— 不需預測 count:等到 `anchorService`(rate 1.0 保證出現、且同步 chain 中最後 export 的 head)有 app span,再等數量靜默 `quiet` 才回;**逾時不 Fatal**(下游被 drop = 0 span 是合法結果)。非確定性 sampler 的統計測試用它。**確定性測試(count 已知)請改用 `WaitForAppSpans`**——它等齊全部 span,不靠靜默窗猜測。
+- `CountSampled(rates, rv) int`(需 otel-sampler)— 預測該 rv 下有幾個 service 會被取樣(= 該等幾個 app span)。
+- `WaitForAppSpans(t, sink, runID, want, timeout) []Span` — 等到 `want` 個帶 `RunAttr` 的 app span 到齊才回;**逾時會 dump 全部 span 並 `t.Fatalf`**(取代靜默回 partial)。需先以 `CountSampled` 預測 `want`,故偏 Consistent 路徑。
 
 **分組 / 切片**
 - `SpansByAttr(spans, attr, val)`、`SpansByService(spans, name)`、`SpansByScope(spans, scope)`、`SpansByServicePrefix(spans, prefix)`。
 - `SpansOfRun(all, runID)` — 收齊整條 run 的**所有** span(app + library-emitted span + 經 span-link 連到的 trace);要連 library-emitted span 一起驗時用它。
 
-**斷言 — 拓樸無關核心(只需 rates)**
-- `AssertConsistentRV(t, spans) uint64` — 出現的 span 其 `ot=rv:` 全相等(核心不變式)。
-- `AssertPresence(t, spans, want, rv)` / `AssertAppSpanCounts(t, spans, want, rv, countIfSampled)` — service 出現 / 精確 span 數 ⇔ `ExpectedSampled(rate, rv)`。
-- `SampledFraction(runs, service)` / `AssertSampledFraction(t, runs, service, rate, delta)` — 多條隨機 rv run 的取樣比例 ≈ rate。
-- `AssertNoWrapperSpans(t, spans, scope)`(flag 停用)、`DistinctRVs(spans)`(propagation 關掉時驗 rv 不一致)。
-
-**斷言 — 結構性(需知該段是 PC 或 link;選用)**
+**斷言 — Core(任意 sampler;只讀拓樸 / 統計)**
+- `AssertTraceContinued(t, spans, upstream, downstream)` — 兩個 service 的 app span 同一條 trace(propagation 生效)。針對服務對,不受流程他處 span-link hop 影響。
+- `AssertTraceNotContinued(t, spans, upstream, downstream)` — 下游另開 trace 且**無 link** 回上游(propagation 關閉;排除「其實是 span-link」)。**取代** 對 `DistinctRVs` 的依賴。
 - `AssertSameTrace(t, spans)` — 全部同一 TraceID(parent-child 段)。
 - `AssertLinkedTrace(t, spans, fromService, toService)` — `to` 是 `from` 的 span-link consumer(不同 trace、且有 `Link` 指向 `from` 的 trace)。
+- `SampledFraction(runs, service)` / `AssertSampledFraction(t, runs, service, rate, delta)` — 多條隨機 run 的取樣比例 ≈ rate。
+- `AssertNoWrapperSpans(t, spans, scope)` — flag 停用時 library-emitted span 不出。
+- `TraceIDOf(spans, service) (string, bool)` — 取某 service 的 TraceID(除錯 / 自訂斷言)。
 
-> 不在乎 trace 圖形狀就只用核心斷言,不必傳拓樸。
+**斷言 — Consistent(需 otel-sampler;讀 `ot=rv:`)**
+- `AssertConsistentRV(t, spans) uint64` — 出現的 span 其 `ot=rv:` 全相等(核心不變式)。
+- `AssertPresence(t, spans, want, rv)` / `AssertAppSpanCounts(t, spans, want, rv, countIfSampled)` — service 出現 / 精確 span 數 ⇔ `ExpectedSampled(rate, rv)`。
+- `DistinctRVs(spans)` — 跨 span 的相異 rv(consistent 路徑 propagation 關掉時驗 rv 不一致)。
+
+> 不在乎 trace 圖形狀就只用 Core 斷言,不必傳拓樸。
 
 **flag 推導**
 - `GateEnv{Global, Tracing, Propagation}` + `ExpectationFromEnv(gate) Expectation{TracingEnabled, PropagationEnabled}` — 把當前 flag 矩陣轉成「該跑哪組斷言」。
