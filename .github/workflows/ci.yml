@@ -118,6 +118,37 @@ jobs:
           OTEL_TRACES_SAMPLER_ARG: ${{ matrix.row.arg }}
         run: go test -race -timeout 600s -run TestMongo ./sampling/
 
+  nats-sampling-e2e:
+    name: NATS Sampling E2E (${{ matrix.row.name }})
+    runs-on: ubuntu-latest
+    needs: test-and-lint
+    strategy:
+      fail-fast: false
+      matrix:
+        # otel-nats has a single tracing gate (no independent propagation
+        # flag), so the matrix has 4 rows instead of mongo's 5.
+        row:
+          - { name: all-on,           global: "1", nats: "1", arg: "1.0" }
+          - { name: all-on-half,      global: "1", nats: "1", arg: "0.5" }
+          - { name: nats-tracing-off, global: "1", nats: "0", arg: "1.0" }
+          - { name: global-off,       global: "0", nats: "1", arg: "1.0" }
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache: false
+
+      - name: NATS consistent-sampling E2E
+        working-directory: otel-nats/tests/integration
+        env:
+          OTEL_INSTRUMENTATION_GO_TRACING_ENABLED: ${{ matrix.row.global }}
+          OTEL_NATS_TRACING_ENABLED: ${{ matrix.row.nats }}
+          OTEL_TRACES_SAMPLER_ARG: ${{ matrix.row.arg }}
+        run: go test -race -timeout 600s -run TestNats ./sampling/
+
   http-direct-e2e:
     name: Sampling E2E (http-direct)
     runs-on: ubuntu-latest

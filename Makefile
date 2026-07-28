@@ -26,14 +26,15 @@ INTEGRATION_MODULES := \
 
 SAMPLING_DIR := otel-mongo/v2/tests/integration
 SAMPLING_PKG := ./sampling/
+NATS_SAMPLING_DIR := otel-nats/tests/integration
 HTTP_DIRECT_DIR := otel-testkit/examples/httpdirect
 HTTP_STDLIB_DIR := otel-testkit/examples/httpdirect-stdlib
 
 .PHONY: help modules examples integration \
 	build test lint verify \
 	build-examples test-examples lint-examples verify-examples \
-	test-integration test-integration-sampling test-integration-http-direct \
-	test-integration-http-stdlib \
+	test-integration test-integration-sampling test-integration-nats-sampling \
+	test-integration-http-direct test-integration-http-stdlib \
 	test-sampler test-gorilla-ws test-mongo test-mongo-v2 test-nats
 
 help:
@@ -51,6 +52,7 @@ help:
 		'  make test-examples     Run tests in example modules' \
 		'  make test-integration  Run integration tests (requires Docker/Podman)' \
 		'  make test-integration-sampling  Run consistent-sampling E2E flag matrix (Docker)' \
+		'  make test-integration-nats-sampling  Run NATS consistent-sampling E2E flag matrix (Docker)' \
 		'  make test-integration-http-direct  Run direct-mode (HTTP) consistent-sampling demo (Docker)' \
 		'  make test-integration-http-stdlib  Run Core (stdlib TraceIDRatioBased) demo (Docker)' \
 		'' \
@@ -112,6 +114,18 @@ test-integration-sampling:
 	run "row3 propagation-off"       OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=1 OTEL_MONGO_TRACING_ENABLED=1 OTEL_MONGO_PROPAGATION_ENABLED=0 OTEL_TRACES_SAMPLER_ARG=1.0; \
 	run "row4 mongo-tracing-off"     OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=1 OTEL_MONGO_TRACING_ENABLED=0 OTEL_MONGO_PROPAGATION_ENABLED=1 OTEL_TRACES_SAMPLER_ARG=1.0; \
 	run "row5 global-off"            OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=0 OTEL_MONGO_TRACING_ENABLED=1 OTEL_MONGO_PROPAGATION_ENABLED=1 OTEL_TRACES_SAMPLER_ARG=1.0
+
+# NATS consistent-sampling end-to-end suite. otel-nats has a single tracing
+# gate (no independent propagation flag), so the matrix has 4 rows instead of
+# mongo's 5. Requires Docker/Podman (real NATS 2.11 + OTel Collector).
+test-integration-nats-sampling:
+	@set -e; cd $(NATS_SAMPLING_DIR); \
+	run() { desc="$$1"; shift; printf '\n==> nats sampling matrix: %s\n' "$$desc"; \
+		env "$$@" $(GO) test -race -timeout 600s -run TestNats $(SAMPLING_PKG); }; \
+	run "row1 all-on arg=1.0"        OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=1 OTEL_NATS_TRACING_ENABLED=1 OTEL_TRACES_SAMPLER_ARG=1.0; \
+	run "row2 all-on arg=0.5"        OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=1 OTEL_NATS_TRACING_ENABLED=1 OTEL_TRACES_SAMPLER_ARG=0.5; \
+	run "row3 nats-tracing-off"      OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=1 OTEL_NATS_TRACING_ENABLED=0 OTEL_TRACES_SAMPLER_ARG=1.0; \
+	run "row4 global-off"            OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=0 OTEL_NATS_TRACING_ENABLED=1 OTEL_TRACES_SAMPLER_ARG=1.0
 
 # Black-box demonstration: the consistent-sampling checks over a synchronous
 # HTTP transport. No broker container; requires Docker for the OTel Collector.
