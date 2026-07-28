@@ -2,7 +2,6 @@ package sampling
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 
@@ -94,8 +93,12 @@ func TestMongoAggregateDelivery(t *testing.T) {
 
 	run := waitRun(t, sink, runID, 2)
 	harness.AssertPresence(t, run, want, rv)
-	harness.AssertConsistentRV(t, run)                            // rv survives the aggregate/decode link path
-	harness.AssertLinkedTrace(t, run, svcs[0].name, svcs[1].name) // DecodeWithContext links svc1 to svc0's trace
+	// The link from svc1's trace to svc0's lives on the wrapper's
+	// "mongo.cursor.decode" span (no RunAttr), so assert over the full run
+	// expansion, not just the app spans.
+	full := harness.SpansOfRun(sink.Spans(), runID)
+	harness.AssertConsistentRV(t, full)                            // rv survives the aggregate/decode link path
+	harness.AssertLinkedTrace(t, full, svcs[0].name, svcs[1].name) // DecodeWithContext links svc1 to svc0's trace
 }
 
 // TestMongoSpanLinkConsistency shows the span-link delivery topology: a consumer
@@ -205,15 +208,13 @@ func TestMongoSamplingRate(t *testing.T) {
 }
 
 // TestMongoFullSpanShape verifies the full set of spans the producer→consumer
-// trace produces — the producer's application span, its wrapper CLIENT span, its
-// synthetic DELIVER span, and the consumer's continuation app span — all share one
-// randomness, with counts matching. Producer and consumer use different node rates;
-// the DELIVER span's rate is the global OTEL_TRACES_SAMPLER_ARG (decoupled from node
-// rate — current library behavior, asserted via separate rate variables).
+// trace produces — the producer's application span, its wrapper CLIENT span, and
+// the consumer's continuation app span — all share one randomness, with counts
+// matching. Producer and consumer use different node rates.
 //
-// Note: the consumer's read (FindOne) emits its own CLIENT + DELIVER spans in a
-// separate trace (the read runs with its own context), so they are not part of the
-// logical producer→consumer run; the run's deliver span is the producer's insert.
+// Note: the consumer's read (FindOne) emits its own CLIENT span in a separate
+// trace (the read runs with its own context), so it is not part of the logical
+// producer→consumer run.
 func TestMongoFullSpanShape(t *testing.T) {
 	if !harness.ExpectationFromEnv(gate).PropagationEnabled {
 		t.Skip("needs mongo tracing + propagation enabled")
@@ -225,22 +226,15 @@ func TestMongoFullSpanShape(t *testing.T) {
 
 	runID, _ := driveChain(t, sink, svcs, []float64{rp, rc}, allPC(1), rv)
 
-	deliverRate := harness.EnvSamplerArg(1.0) // deliver TP reads OTEL_TRACES_SAMPLER_ARG
-	wantInsertDeliver := 0
-	if harness.ExpectedSampled(deliverRate, rv) {
-		wantInsertDeliver = 1 // the producer's insert deliver span
-	}
-
-	// Deliver spans are batched (deliver TP uses WithBatcher); wait for the run —
-	// producer client + the expected insert-deliver span — to settle.
+	// Wait for the producer's wrapper client span to settle at the sink.
 	snapshot := sink.WaitFor(20*time.Second, func(ss []harness.Span) bool {
 		f := harness.SpansOfRun(ss, runID)
 		producerClient := harness.SpansByService(harness.SpansByScope(f, otelmongo.ScopeName), svcs[0].name)
-		return len(producerClient) >= 1 && len(harness.SpansByServicePrefix(f, "mongodb")) >= wantInsertDeliver
+		return len(producerClient) >= 1
 	})
 	full := harness.SpansOfRun(snapshot, runID)
 
-	// Producer app + client + deliver AND the consumer's continuation all share rv.
+	// Producer app + client AND the consumer's continuation all share rv.
 	require.Equal(t, rv, harness.AssertConsistentRV(t, full))
 
 	wrapper := harness.SpansByScope(full, otelmongo.ScopeName)
@@ -252,8 +246,6 @@ func TestMongoFullSpanShape(t *testing.T) {
 	// its read (find) client span lives in a separate trace, not here.
 	require.Len(t, harness.SpansByService(appSpans, svcs[1].name), 1, "consumer continuation app span")
 	require.Empty(t, harness.SpansByService(wrapper, svcs[1].name), "consumer read span is a separate trace")
-	// the producer's insert deliver span — gated by the global rate, not rp.
-	require.Len(t, harness.SpansByServicePrefix(full, "mongodb"), wantInsertDeliver, "insert deliver span (global rate)")
 }
 
 // presentSet reports which of the named services have ≥1 span in run.
@@ -263,46 +255,4 @@ func presentSet(run []harness.Span, want map[string]float64) map[string]bool {
 		out[name] = len(harness.SpansByService(run, name)) > 0
 	}
 	return out
-}
-
-// TestMongoDeliverSpanReachesCollector verifies the mongo-specific deliver span
-// ("mongodb://host:port" service node) is exported end-to-end when tracing is on.
-func TestMongoDeliverSpanReachesCollector(t *testing.T) {
-	if !harness.ExpectationFromEnv(gate).TracingEnabled {
-		t.Skip("deliver spans require mongo tracing enabled")
-	}
-	sink, endpoint, uri := setup(t)
-
-	tp := harness.BuildTracerProvider(t, "deliver-svc", harness.ConsistentSampler(1.0), endpoint)
-	client, err := otelmongo.NewClient(uri, otelmongo.WithTracerProvider(tp))
-	require.NoError(t, err)
-	coll := client.Database("testkit").Collection("chain")
-
-	ctx := context.Background()
-	for i := 0; i < 10; i++ {
-		nctx, span := tp.Tracer("chain").Start(ctx, "deliver-root")
-		_, err := coll.InsertOne(nctx, bson.D{{Key: "key", Value: "deliver"}})
-		require.NoError(t, err)
-		span.End()
-	}
-	dctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	require.NoError(t, client.Disconnect(dctx)) // flush the internal deliver TracerProvider
-
-	spans := sink.WaitFor(15*time.Second, func(ss []harness.Span) bool {
-		for _, s := range ss {
-			if strings.HasPrefix(s.ServiceName, "mongodb") {
-				return true
-			}
-		}
-		return false
-	})
-	found := false
-	for _, s := range spans {
-		if strings.HasPrefix(s.ServiceName, "mongodb") {
-			found = true
-			break
-		}
-	}
-	require.True(t, found, "expected a mongodb:// deliver span at the collector")
 }
