@@ -28,9 +28,9 @@ func NewCursor(cur *mongo.Cursor, tracer trace.Tracer, propagator propagation.Te
 	}
 }
 
-// DecodeWithContext decodes the current document and returns a context
+// DecodeAndTrace decodes the current document and returns a context
 // enriched with the trace context extracted from the document's "_oteltrace".
-func (c *Cursor) DecodeWithContext(ctx context.Context, val any) (context.Context, error) {
+func (c *Cursor) DecodeAndTrace(ctx context.Context, val any) (context.Context, error) {
 	if err := c.cur.Decode(val); err != nil {
 		return ctx, err
 	}

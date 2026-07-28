@@ -4,6 +4,12 @@ All notable changes to the `otel-mongo/v2` module (`go.mongodb.org/mongo-driver/
 
 > **Coverage note**: this file starts at `0.6.0`. Earlier history lives only in git tags (`otel-mongo/v2/vX.Y.Z`) — see the repo root `VERSIONING.md` for the root cause and the release-tag CI guard that now keeps the version constant and tag in sync going forward.
 
+## [2.8.0] - 2026-07-21
+
+### Changed — BREAKING
+
+- Renamed the exported method `DecodeWithContext(ctx, val) (context.Context, error)` to `DecodeAndTrace(ctx, val) (context.Context, error)` on both `Cursor` and `ChangeStream` (parity with v1 `0.8.0`). Signature and behavior are unchanged — the new name states the trace side effect (emit a `mongo.cursor.decode` span, extract `_oteltrace`) that plain `Decode` does not have. **Migration**: replace `cursor.DecodeWithContext(...)` / `changeStream.DecodeWithContext(...)` with `DecodeAndTrace(...)`; arguments and returns are identical.
+
 ## [2.7.0] - 2026-07-15
 
 Re-versioning of the `0.7.0` content (below) under the module's Go-resolvable `v2.x.y` tag line — the module path ends in the `/v2` major-version suffix, so Go requires version major 2 and the tag shape `otel-mongo/v2.x.y`; every old `otel-mongo/v2/v0.x.y` tag was never resolvable by `go get`. `v2.MINOR.PATCH` tracks the sibling modules' `0.MINOR.PATCH` — see `VERSIONING.md`. No code change relative to `0.7.0` other than the version constant: `otel.scope.version` on emitted spans now reports `2.7.0`.

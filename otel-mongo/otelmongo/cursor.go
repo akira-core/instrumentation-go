@@ -19,19 +19,19 @@ var (
 )
 
 // Cursor wraps *mongo.Cursor with optional trace propagation. The embedded
-// *mongo.Cursor preserves the upstream API; DecodeWithContext + Decode delegate
+// *mongo.Cursor preserves the upstream API; DecodeAndTrace + Decode delegate
 // to a strategy impl chosen at construction time.
 type Cursor struct {
 	*mongo.Cursor
 	impl shared.CursorImpl
 }
 
-// DecodeWithContext decodes the current document into val and returns a
+// DecodeAndTrace decodes the current document into val and returns a
 // context enriched with the trace context extracted from the document's
 // "_oteltrace" field. When tracing is off (or the field is absent) the
 // returned context is unchanged.
-func (c *Cursor) DecodeWithContext(ctx context.Context, val any) (context.Context, error) {
-	return c.impl.DecodeWithContext(ctx, val)
+func (c *Cursor) DecodeAndTrace(ctx context.Context, val any) (context.Context, error) {
+	return c.impl.DecodeAndTrace(ctx, val)
 }
 
 // Decode decodes the current document into val.

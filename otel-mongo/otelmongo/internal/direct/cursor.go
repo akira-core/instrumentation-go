@@ -16,8 +16,8 @@ type Cursor struct {
 // NewCursor wraps cur with the disabled-path passthrough Cursor impl.
 func NewCursor(cur *mongo.Cursor) *Cursor { return &Cursor{cur: cur} }
 
-// DecodeWithContext decodes the current document and returns ctx unchanged.
-func (c *Cursor) DecodeWithContext(ctx context.Context, val any) (context.Context, error) {
+// DecodeAndTrace decodes the current document and returns ctx unchanged.
+func (c *Cursor) DecodeAndTrace(ctx context.Context, val any) (context.Context, error) {
 	if err := c.cur.Decode(val); err != nil {
 		return ctx, err
 	}

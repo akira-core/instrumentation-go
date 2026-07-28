@@ -35,7 +35,7 @@ func buildDocWithTrace(t *testing.T, ctx context.Context) bson.Raw { //nolint:re
 	return raw
 }
 
-func TestCursorDecodeWithContext_ExtractsTrace(t *testing.T) {
+func TestCursorDecodeAndTrace_ExtractsTrace(t *testing.T) {
 	otel.SetTextMapPropagator(stdProp)
 
 	sr := tracetest.NewSpanRecorder()
@@ -62,7 +62,7 @@ func TestCursorDecodeWithContext_ExtractsTrace(t *testing.T) {
 	}
 
 	var result bson.D
-	_, err = c.DecodeWithContext(context.Background(), &result)
+	_, err = c.DecodeAndTrace(context.Background(), &result)
 	require.NoError(t, err)
 
 	ended := sr.Ended()
@@ -79,7 +79,7 @@ func TestCursorDecodeWithContext_ExtractsTrace(t *testing.T) {
 	assert.Equal(t, originSpanCtx.TraceID(), links[0].SpanContext.TraceID())
 }
 
-func TestCursorDecodeWithContext_NoTrace(t *testing.T) {
+func TestCursorDecodeAndTrace_NoTrace(t *testing.T) {
 	sr := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
 	otel.SetTracerProvider(tp)
@@ -102,7 +102,7 @@ func TestCursorDecodeWithContext_NoTrace(t *testing.T) {
 	}
 
 	var result bson.D
-	_, err = c.DecodeWithContext(baseCtx, &result)
+	_, err = c.DecodeAndTrace(baseCtx, &result)
 	require.NoError(t, err)
 
 	ended := sr.Ended()
@@ -117,7 +117,7 @@ func TestCursorDecodeWithContext_NoTrace(t *testing.T) {
 	assert.Empty(t, decodeSpan.Links(), "no links expected when document has no trace")
 }
 
-func TestCursorDecodeWithContext_NoFlagsNoSpan(t *testing.T) {
+func TestCursorDecodeAndTrace_NoFlagsNoSpan(t *testing.T) {
 	t.Setenv(envGlobalTracingEnabled, "false")
 	t.Setenv(envMongoTracingEnabled, "false")
 	t.Setenv(envMongoPropagationEnabled, "true")
@@ -144,7 +144,7 @@ func TestCursorDecodeWithContext_NoFlagsNoSpan(t *testing.T) {
 	}
 
 	var result bson.D
-	enrichedCtx, err := c.DecodeWithContext(context.Background(), &result)
+	enrichedCtx, err := c.DecodeAndTrace(context.Background(), &result)
 	require.NoError(t, err)
 	assert.False(t, trace.SpanContextFromContext(enrichedCtx).IsValid(), "expected passthrough to avoid creating span context")
 

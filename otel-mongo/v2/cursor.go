@@ -27,11 +27,11 @@ type Cursor struct {
 	impl shared.CursorImpl
 }
 
-// DecodeWithContext decodes the current document into val and returns a
+// DecodeAndTrace decodes the current document into val and returns a
 // context enriched with the trace context extracted from the document's
 // "_oteltrace" field.
-func (c *Cursor) DecodeWithContext(ctx context.Context, val any) (context.Context, error) {
-	return c.impl.DecodeWithContext(ctx, val)
+func (c *Cursor) DecodeAndTrace(ctx context.Context, val any) (context.Context, error) {
+	return c.impl.DecodeAndTrace(ctx, val)
 }
 
 // Decode decodes the current document into val.

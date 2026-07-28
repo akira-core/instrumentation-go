@@ -159,12 +159,12 @@ client, err := otelmongo.Connect(opts)
 
 ## Span kind
 
-MongoDB 是資料庫，不是訊息系統：每個操作 span 一律使用 `CLIENT`（`Watch` 的 change-stream 讀取 span 也不例外 — 它是同步的 `getMore` 呼叫，不是非同步遞送）。純本地端工作（`Cursor.DecodeWithContext` 未觸發往返時）使用 `INTERNAL`。
+MongoDB 是資料庫，不是訊息系統：每個操作 span 一律使用 `CLIENT`（`Watch` 的 change-stream 讀取 span 也不例外 — 它是同步的 `getMore` 呼叫，不是非同步遞送）。純本地端工作（`Cursor.DecodeAndTrace` 未觸發往返時）使用 `INTERNAL`。
 
 ```
 InsertOne / FindOne / UpdateOne / ... (CLIENT)
 Watch → change-stream 讀取 (CLIENT)
-Cursor.DecodeWithContext (INTERNAL；文件帶 `_oteltrace` 時連結回原始 span)
+Cursor.DecodeAndTrace (INTERNAL；文件帶 `_oteltrace` 時連結回原始 span)
 ```
 
 ---
@@ -177,7 +177,7 @@ Cursor.DecodeWithContext (INTERNAL；文件帶 `_oteltrace` 時連結回原始 s
 | `NewClient` 簽名 | `NewClient(ctx, uri, traceOpts...)` | `NewClient(uri, traceOpts...)` |
 | `Distinct` 回傳值 | `([]interface{}, error)` | `*mongo.DistinctResult` |
 | `StartSession` 回傳值 | `mongo.Session, error` | `*mongo.Session, error` |
-| `Cursor.DecodeWithContext` | 兩者行為一致：一律在新（detached）trace 上發出 `mongo.cursor.decode` INTERNAL span，若文件的 `_oteltrace` metadata 存在且 propagation 已啟用，則附上指向來源 span 的 link。 | （同左） |
+| `Cursor.DecodeAndTrace` | 兩者行為一致：一律在新（detached）trace 上發出 `mongo.cursor.decode` INTERNAL span，若文件的 `_oteltrace` metadata 存在且 propagation 已啟用，則附上指向來源 span 的 link。 | （同左） |
 
 ---
 
@@ -203,9 +203,9 @@ Cursor.DecodeWithContext (INTERNAL；文件帶 `_oteltrace` 時連結回原始 s
 
 `NewCollection` 會依照與 `Connect` 相同的環境變數 gate（全域 + `OTEL_MONGO_TRACING_ENABLED` + `OTEL_MONGO_PROPAGATION_ENABLED`）設定**文件層級**的 `_oteltrace` 行為。當任一 tracing gate 關閉時，該 collection 會以停用 propagation 的狀態建立。並沒有針對單一 collection 的 propagation functional option；若需覆寫某個 client 的環境預設值，請使用 **`ConnectWithOptions`** 搭配 **`WithTracePropagationEnabled`**（注意：仍無法跨越已停用的 tracing gate）。
 
-### Cursor 上的 DecodeWithContext 與 Decode
+### Cursor 上的 DecodeAndTrace 與 Decode
 
-`Cursor.DecodeWithContext` 會從 `_oteltrace` 擷取來源的 trace context 並回傳強化過的 context — 當你需要將後續工作連結回文件的來源 trace 時使用。單純的 `Cursor.Decode` 行為與底層 driver 的 `Decode` 完全相同，會忽略 `_oteltrace`。
+`Cursor.DecodeAndTrace` 會從 `_oteltrace` 擷取來源的 trace context 並回傳強化過的 context — 當你需要將後續工作連結回文件的來源 trace 時使用。單純的 `Cursor.Decode` 行為與底層 driver 的 `Decode` 完全相同，會忽略 `_oteltrace`。
 
 ### FindOne 上的 span link
 

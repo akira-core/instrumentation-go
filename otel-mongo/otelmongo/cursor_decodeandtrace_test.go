@@ -19,7 +19,7 @@ import (
 	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/traced"
 )
 
-func TestCursorDecodeWithContext_NewTraceIDAndLinksOriginTrace(t *testing.T) {
+func TestCursorDecodeAndTrace_NewTraceIDAndLinksOriginTrace(t *testing.T) {
 	enableTracing(t)
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
 
@@ -55,8 +55,8 @@ func TestCursorDecodeWithContext_NewTraceIDAndLinksOriginTrace(t *testing.T) {
 	}
 
 	var out bson.D
-	enrichedCtx, err := wrapped.DecodeWithContext(context.Background(), &out)
-	require.NoError(t, err, "DecodeWithContext")
+	enrichedCtx, err := wrapped.DecodeAndTrace(context.Background(), &out)
+	require.NoError(t, err, "DecodeAndTrace")
 
 	recovered := trace.SpanContextFromContext(enrichedCtx)
 	require.True(t, recovered.IsValid(), "expected returned context to contain a valid span context")
@@ -77,7 +77,53 @@ func TestCursorDecodeWithContext_NewTraceIDAndLinksOriginTrace(t *testing.T) {
 	require.True(t, found, "expected a span named %q", "mongo.cursor.decode")
 }
 
-func TestCursorDecodeWithContext_NoFlagsNoSpan(t *testing.T) {
+func TestCursorDecodeAndTrace_NoTrace(t *testing.T) {
+	enableTracing(t)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithSpanProcessor(sr),
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+	)
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	otel.SetTracerProvider(tp)
+
+	tracer := tp.Tracer("test")
+	prop := otel.GetTextMapPropagator()
+
+	// Document without _oteltrace metadata: tracing is on, so a decode span is
+	// still emitted, but with no link (nothing to link to). Parity with v2.
+	rawDoc, err := bson.Marshal(bson.D{{Key: "field", Value: "v"}})
+	require.NoError(t, err, "bson.Marshal plain doc")
+
+	cur, err := mongo.NewCursorFromDocuments([]interface{}{rawDoc}, nil, nil)
+	require.NoError(t, err, "NewCursorFromDocuments")
+	defer func() { _ = cur.Close(context.Background()) }()
+	require.True(t, cur.Next(context.Background()), "expected cursor.Next=true")
+
+	wrapped := &Cursor{
+		Cursor: cur,
+		impl:   traced.NewCursor(cur, tracer, prop, true),
+	}
+
+	var out bson.D
+	_, err = wrapped.DecodeAndTrace(context.Background(), &out)
+	require.NoError(t, err, "DecodeAndTrace")
+
+	var found bool
+	for _, s := range sr.Ended() {
+		if s.Name() != "mongo.cursor.decode" {
+			continue
+		}
+		found = true
+		assert.Empty(t, s.Links(), "no link expected when document has no _oteltrace")
+		break
+	}
+	require.True(t, found, "expected a span named %q", "mongo.cursor.decode")
+}
+
+func TestCursorDecodeAndTrace_NoFlagsNoSpan(t *testing.T) {
 	t.Setenv(envGlobalTracingEnabled, "false")
 	t.Setenv(envMongoTracingEnabled, "false")
 	t.Setenv(envMongoPropagationEnabled, "true")
@@ -113,7 +159,7 @@ func TestCursorDecodeWithContext_NoFlagsNoSpan(t *testing.T) {
 	}
 
 	var out bson.D
-	enrichedCtx, err := wrapped.DecodeWithContext(context.Background(), &out)
+	enrichedCtx, err := wrapped.DecodeAndTrace(context.Background(), &out)
 	require.NoError(t, err)
 	assert.False(t, trace.SpanContextFromContext(enrichedCtx).IsValid(), "expected passthrough path to avoid creating span context")
 

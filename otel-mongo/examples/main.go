@@ -1,7 +1,7 @@
 // Example demonstrates how to initialize the OpenTelemetry TracerProvider and
 // TextMapPropagator at process startup, then use otelmongo to:
 //   - Insert a document with automatic trace context injection (_oteltrace field)
-//   - Query documents and extract trace context with DecodeWithContext
+//   - Query documents and extract trace context with DecodeAndTrace
 //
 // The instrumentation package does NOT provide InitTracer; the application is
 // responsible for creating and setting the global provider and propagator
@@ -105,10 +105,10 @@ func main() {
 	log.Printf("Inserted document ID: %v", result.InsertedID)
 
 	// ---------------------------------------------------------------
-	// 4) Find + Cursor.DecodeWithContext — trace extraction from
+	// 4) Find + Cursor.DecodeAndTrace — trace extraction from
 	//    documents.
 	//
-	//    DecodeWithContext decodes the current cursor document into the
+	//    DecodeAndTrace decodes the current cursor document into the
 	//    target struct AND extracts the "_oteltrace" field to return a
 	//    context enriched with the original trace context. This lets
 	//    you create child spans that join the trace that produced the
@@ -131,12 +131,12 @@ func main() {
 
 	for cursor.Next(context.Background()) {
 		var msg Message
-		// DecodeWithContext returns a context carrying the trace from
+		// DecodeAndTrace returns a context carrying the trace from
 		// the document's _oteltrace field, allowing child spans to
 		// continue the original trace.
-		docCtx, err := cursor.DecodeWithContext(ctx, &msg)
+		docCtx, err := cursor.DecodeAndTrace(ctx, &msg)
 		if err != nil {
-			log.Printf("DecodeWithContext: %v", err)
+			log.Printf("DecodeAndTrace: %v", err)
 			continue
 		}
 
@@ -149,14 +149,14 @@ func main() {
 	}
 
 	// ---------------------------------------------------------------
-	// 5) Watch + ChangeStream.DecodeWithContext (comment only).
+	// 5) Watch + ChangeStream.DecodeAndTrace (comment only).
 	//
 	//    For change stream consumers, the pattern is similar:
 	//
 	//      cs, err := coll.Watch(ctx, pipeline)
 	//      for cs.Next(ctx) {
 	//          var event ChangeEvent
-	//          docCtx, err := cs.DecodeWithContext(ctx, &event)
+	//          docCtx, err := cs.DecodeAndTrace(ctx, &event)
 	//          // docCtx carries the trace from the changed document.
 	//          // Start child spans from docCtx to continue the trace.
 	//      }

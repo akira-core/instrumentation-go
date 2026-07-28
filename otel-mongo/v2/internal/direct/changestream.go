@@ -14,8 +14,8 @@ type ChangeStream struct {
 // NewChangeStream wraps cs with the disabled-path passthrough ChangeStream.
 func NewChangeStream(cs *mongo.ChangeStream) *ChangeStream { return &ChangeStream{cs: cs} }
 
-// DecodeWithContext decodes the current change document and returns ctx unchanged.
-func (c *ChangeStream) DecodeWithContext(ctx context.Context, val any) (context.Context, error) {
+// DecodeAndTrace decodes the current change document and returns ctx unchanged.
+func (c *ChangeStream) DecodeAndTrace(ctx context.Context, val any) (context.Context, error) {
 	if err := c.cs.Decode(val); err != nil {
 		return ctx, err
 	}
