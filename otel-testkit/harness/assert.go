@@ -56,6 +56,11 @@ func DistinctRVs(spans []Span) []uint64 {
 func AssertConsistentRV(t *testing.T, spans []Span) uint64 {
 	t.Helper()
 	rvs := DistinctRVs(spans)
+	if len(rvs) != 1 {
+		// Dump the spans before failing so the cause (missing rv vs. several rv
+		// values) is visible without re-running with DumpSpans by hand.
+		DumpSpans(t, "AssertConsistentRV failed", spans)
+	}
 	require.NotEmpty(t, rvs, "no span carried a tracestate rv (ot=rv:)")
 	require.Len(t, rvs, 1, "spans carried inconsistent rv values: %x", rvs)
 	return rvs[0]
