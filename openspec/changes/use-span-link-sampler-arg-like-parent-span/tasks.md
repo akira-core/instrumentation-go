@@ -20,8 +20,22 @@
 - [x] 4.1 Expose `harness.ConsistentSampler` / `ConsistentSamplerFromEnv` as the recommended composition
 - [x] 4.2 Add/adjust E2E and example suites that assert consistent rv across span-link topologies
 
-## 5. Spec conformance check
+## 5. Code-review follow-ups
 
-- [ ] 5.1 Re-run `cd otel-sampler && go test -v -race ./...` and `golangci-lint run ./...` against the two capability specs
-- [ ] 5.2 Confirm every scenario in `consistent-probability-sampling` and `span-link-sampling-seed` maps to an existing test name (gap list or done)
-- [ ] 5.3 Archive this change into `openspec/specs/` when the branch is merged (`/opsx:archive`)
+Findings from the branch review in `reviews/code-review-use-span-link-sampler-arg-like-parent-span.zh-TW.html`.
+
+- [x] 5.1 P1/S4: rename the remaining `DecodeWithContext` call sites and README references to `DecodeAndTrace` (the API was renamed on `main`; the sampling package no longer compiled)
+- [x] 5.2 N4/N9/S6: `WithSingleLinkSeed` seeds with the link's `ot=rv:` only (no vendor members, no upstream `th:`) and preserves the caller's `ParentContext`; godoc + design D3 document what crosses a link and warn against `ParentBased`
+- [x] 5.3 N3: `jsBatchDeliver` scopes each batch to a closure with `defer batch.Stop()` and fetches 1 message, per the CLAUDE.md early-return rule
+- [x] 5.4 N5: `harness.envTruthy` matches `flags.EnvEnabled` on set-but-empty values, pinned by a golden table
+- [x] 5.5 N6/N7/N8: `WaitForAppSpans(want=0)` settles before asserting; `AssertAllSpansCarryRV` catches a lost rv; rate checks use deterministic `UniformRVs` and a 4σ tolerance floor
+- [x] 5.6 N1/N2: `SpansOfRun` expands span links in both directions; the manual span-link test is named honestly and a real `Watch`/`DecodeAndTrace` change-stream E2E was added
+- [x] 5.7 N10/N11/F1: `serviceName` uses `Sprintf`; the `th:`/`rv:` tracestate writers merged into one helper; dead `Delete("ot")` branch removed; harness predicts decisions via exported `otelsampler.Threshold`/`Sampled`
+- [x] 5.8 S1/S3/F3: generic integration jobs exclude `./sampling`; `otel-sampler`/`otel-testkit` raised to OTel v1.44 + testcontainers v0.43; the stdlib baseline example gained a CI job and both examples are linted
+- [x] 5.9 S2/S5: `otel-sampler` gained a version constant, CHANGELOG and release-guard pattern (starting at `0.2.0`, since the published `v0.1.0` is superseded); root docs describe six modules, Go 1.25 and the current CI shape
+
+## 6. Spec conformance check
+
+- [x] 6.1 Re-run `cd otel-sampler && go test -v -race ./...` and `golangci-lint run ./...` against the two capability specs
+- [ ] 6.2 Confirm every scenario in `consistent-probability-sampling` and `span-link-sampling-seed` maps to an existing test name (gap list or done)
+- [ ] 6.3 Archive this change into `openspec/specs/` when the branch is merged (`/opsx:archive`)

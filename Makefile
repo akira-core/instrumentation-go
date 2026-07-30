@@ -13,10 +13,17 @@ MODULES := \
 	otel-mongo/v2 \
 	otel-nats
 
+# The httpdirect* modules are reference templates users copy, so they are linted
+# with the rest of the examples even though their tests need Docker (those run
+# via test-integration-http-direct / -http-stdlib, not test-examples).
 EXAMPLE_MODULES := \
 	otel-gorilla-ws/examples \
 	otel-mongo/examples \
 	otel-nats/examples
+
+LINT_ONLY_EXAMPLE_MODULES := \
+	otel-testkit/examples/httpdirect \
+	otel-testkit/examples/httpdirect-stdlib
 
 INTEGRATION_MODULES := \
 	otel-gorilla-ws/tests/integration \
@@ -96,11 +103,15 @@ test-examples:
 
 lint-examples:
 	$(call run_in_modules,$(EXAMPLE_MODULES),golangci-lint,$(GOLANGCI_LINT) run $(GO_PACKAGES))
+	$(call run_in_modules,$(LINT_ONLY_EXAMPLE_MODULES),golangci-lint,$(GOLANGCI_LINT) run $(GO_PACKAGES))
 
 verify-examples: build-examples test-examples lint-examples
 
+# The ./sampling packages are excluded on purpose — they are the feature-flag
+# matrix suites, owned by test-integration-sampling / -nats-sampling. Running
+# them here too doubles the Docker cost and hides which job actually covers them.
 test-integration:
-	$(call run_in_modules,$(INTEGRATION_MODULES),go test,$(GO) test $(GO_TEST_FLAGS) $(GO_PACKAGES))
+	$(call run_in_modules,$(INTEGRATION_MODULES),go test,$(GO) test $(GO_TEST_FLAGS) $$($(GO) list $(GO_PACKAGES) | grep -v '/sampling$$'))
 
 # Consistent-sampling end-to-end suite, run once per feature-flag combination
 # (the gates cache per process, so each flag state needs its own go test run).

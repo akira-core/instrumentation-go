@@ -5,20 +5,24 @@ import (
 	"strings"
 )
 
-func insertOrUpdateTraceStateThKeyValue(existingOT, thkv string) string {
+// insertOrUpdateOTSubKey returns the "ot" member value with the sub-key that
+// starts with prefix (e.g. "th:" or "rv:") replaced by kv, moved to the front.
+// When the sub-key is absent, kv is prepended. existingOT is the raw value of
+// the tracestate "ot" member (sub-keys separated by ";").
+func insertOrUpdateOTSubKey(existingOT, prefix, kv string) string {
 	if existingOT == "" {
-		return thkv
+		return kv
 	}
 
 	start := -1
 	var end int
-	if strings.HasPrefix(existingOT, "th:") {
+	if strings.HasPrefix(existingOT, prefix) {
 		start = 0
-	} else if idx := strings.Index(existingOT, ";th:"); idx != -1 {
+	} else if idx := strings.Index(existingOT, ";"+prefix); idx != -1 {
 		start = idx + 1
 	}
 	if start == -1 {
-		return thkv + ";" + existingOT
+		return kv + ";" + existingOT
 	}
 
 	for end = start; end < len(existingOT); end++ {
@@ -29,9 +33,9 @@ func insertOrUpdateTraceStateThKeyValue(existingOT, thkv string) string {
 	}
 
 	if end == len(existingOT) {
-		return strings.TrimSuffix(thkv+";"+existingOT[:start], ";")
+		return strings.TrimSuffix(kv+";"+existingOT[:start], ";")
 	}
-	return thkv + ";" + existingOT[:start] + existingOT[end:]
+	return kv + ";" + existingOT[:start] + existingOT[end:]
 }
 
 func tracestateRandomness(otts string) (randomness uint64, hasRandomness bool) {

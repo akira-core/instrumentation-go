@@ -31,15 +31,33 @@ func CountSampled(rates []float64, rv uint64) int {
 	return n
 }
 
+// NoSpanSettle is how long WaitForAppSpans waits before concluding that a run
+// which should produce no application spans really produced none. The SDK
+// exports synchronously, but the collector → sink hop is asynchronous, so
+// returning immediately would assert against a sink that has not had a chance
+// to receive an over-sampled span yet.
+const NoSpanSettle = 2 * time.Second
+
 // WaitForAppSpans blocks until at least want application spans tagged with
 // RunAttr == runID arrive at the sink, then returns them. On timeout it dumps
 // every span the sink received and fails the test with a got/want message —
 // replacing a silent partial return that makes downstream assertions confusing.
 //
-// want may be 0 (when the seeded rv samples no service): the predicate is
-// satisfied immediately and an empty slice is returned without waiting.
+// want may be 0 (when the seeded rv samples no service). That case cannot be
+// satisfied by waiting for arrivals — "at least 0" is true before anything is
+// received — so it instead waits out NoSpanSettle and returns whatever landed.
+// This is what makes the rv=0 rung of the ladder a real assertion: it is the
+// only rung that can catch over-sampling, and an immediate return made it vacuous.
 func WaitForAppSpans(t *testing.T, sink *Sink, runID string, want int, timeout time.Duration) []Span {
 	t.Helper()
+	if want == 0 {
+		settle := NoSpanSettle
+		if timeout < settle {
+			settle = timeout
+		}
+		time.Sleep(settle)
+		return SpansByAttr(sink.Spans(), RunAttr, runID)
+	}
 	spans := sink.WaitFor(timeout, func(ss []Span) bool {
 		return len(SpansByAttr(ss, RunAttr, runID)) >= want
 	})

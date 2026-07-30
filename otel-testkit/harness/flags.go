@@ -2,10 +2,11 @@ package harness
 
 import (
 	"fmt"
-	"math"
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/akira-core/instrumentation-go/otel-sampler/otelsampler"
 )
 
 // GateEnv names the feature-flag environment variables a plugin's instrumentation
@@ -33,8 +34,16 @@ func ExpectationFromEnv(g GateEnv) Expectation {
 	return Expectation{TracingEnabled: tracing, PropagationEnabled: prop}
 }
 
-// envTruthy mirrors the modules' flags.EnvEnabled semantics: a present value is
-// truthy unless it is a recognized falsy token; an absent value is false.
+// envTruthy mirrors the modules' internal flags.EnvEnabled semantics exactly: an
+// absent value is false; a present value is truthy unless it is one of the
+// recognized falsy tokens ("0", "false", "no", "off", case-insensitive, after
+// trimming). A set-but-empty value is therefore TRUE — the same as the modules
+// treat it. Any divergence here makes the matrix assert the wrong branch, so
+// TestEnvTruthyMatchesModuleFlags pins the whole table.
+//
+// NOTE: this is effectively a fifth copy of internal/flags.EnvEnabled (the four
+// modules vendor byte-identical copies and cannot export theirs). Keep it in
+// sync when that semantics changes.
 func envTruthy(key string) bool {
 	if key == "" {
 		return false
@@ -44,39 +53,23 @@ func envTruthy(key string) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "", "0", "false", "no", "off":
+	case "0", "false", "no", "off":
 		return false
 	default:
 		return true
 	}
 }
 
-// Consistent-sampling constants (mirror otel-sampler/otelsampler).
-const (
-	maxAdjustedCount = uint64(1) << 56
-	randomnessMask   = maxAdjustedCount - 1
-)
+// randomnessMask masks a value down to the 56 randomness bits.
+const randomnessMask = (uint64(1) << 56) - 1
 
-// simpleThreshold returns threshold ≈ (1-p)·2^56. A span is sampled iff its
-// randomness value rv >= threshold. The harness only asserts predicted
-// decisions for rv values chosen with large margins, so the sampler's
-// sub-threshold precision rounding never flips a predicted decision.
-func simpleThreshold(p float64) uint64 {
-	if p >= 1.0 {
-		return 0
-	}
-	if p <= 0 {
-		return maxAdjustedCount
-	}
-	return uint64(math.Round((1 - p) * float64(maxAdjustedCount)))
-}
-
-// ExpectedSampled reports whether sampling probability p samples randomness rv
-// (i.e. rv ≥ threshold(p)). Use it to predict which services should appear for a
-// chosen rv. Choose rv values with a large margin from the threshold so the
-// sampler's sub-threshold rounding never flips a predicted decision.
+// ExpectedSampled reports whether sampling probability p samples randomness rv.
+// It delegates to the sampler's own threshold arithmetic (otelsampler.Sampled),
+// so the prediction matches the real decision for every rv — including values
+// sitting exactly on a threshold boundary, where a re-derived "(1-p)·2^56"
+// approximation diverges from the sampler's precision rounding.
 func ExpectedSampled(p float64, rv uint64) bool {
-	return rv >= simpleThreshold(p)
+	return otelsampler.Sampled(p, rv)
 }
 
 // formatRV renders rv the way the sampler writes it into tracestate ("%014x").

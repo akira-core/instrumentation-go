@@ -59,8 +59,8 @@ func TestMongoSamplingSuite(t *testing.T) {
 }
 
 // TestMongoAggregateDelivery shows a different read command (Aggregate +
-// Cursor.DecodeWithContext) carrying the trace: the same harness assertions hold
-// without any harness change. DecodeWithContext links the consumer to the origin
+// Cursor.DecodeAndTrace) carrying the trace: the same harness assertions hold
+// without any harness change. DecodeAndTrace links the consumer to the origin
 // (a new trace, span-link topology), so the rv still propagates consistently.
 func TestMongoAggregateDelivery(t *testing.T) {
 	if !harness.ExpectationFromEnv(gate).PropagationEnabled {
@@ -84,7 +84,7 @@ func TestMongoAggregateDelivery(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, cur.Next(ctx), "aggregate should return the document")
 	var decoded bson.M
-	rctx, err := cur.DecodeWithContext(ctx, &decoded)
+	rctx, err := cur.DecodeAndTrace(ctx, &decoded)
 	require.NoError(t, err)
 	require.NoError(t, cur.Close(ctx))
 
@@ -98,14 +98,17 @@ func TestMongoAggregateDelivery(t *testing.T) {
 	// expansion, not just the app spans.
 	full := harness.SpansOfRun(sink.Spans(), runID)
 	harness.AssertConsistentRV(t, full)                            // rv survives the aggregate/decode link path
-	harness.AssertLinkedTrace(t, full, svcs[0].name, svcs[1].name) // DecodeWithContext links svc1 to svc0's trace
+	harness.AssertLinkedTrace(t, full, svcs[0].name, svcs[1].name) // DecodeAndTrace links svc1 to svc0's trace
 }
 
-// TestMongoSpanLinkConsistency shows the span-link delivery topology: a consumer
-// that links to (rather than continues) the producer — as an async change-stream
-// reader would. The consistent sampler reads rv from the link seed, so the same
-// rv still propagates and the invariant holds across a new trace ID.
-func TestMongoSpanLinkConsistency(t *testing.T) {
+// TestMongoManualSpanLinkConsistency shows the span-link delivery topology
+// built by hand: the consumer reads with FindOne and starts a new root linked
+// to the extracted producer context, rather than continuing it. This exercises
+// the sampler's single-link seed path — it does NOT exercise the wrapper's
+// ChangeStream machinery; TestMongoChangeStreamSpanLinkConsistency covers that.
+// The consistent sampler reads rv from the link seed, so the same rv still
+// propagates and the invariant holds across a new trace ID.
+func TestMongoManualSpanLinkConsistency(t *testing.T) {
 	if !harness.ExpectationFromEnv(gate).PropagationEnabled {
 		t.Skip("needs mongo tracing + propagation enabled")
 	}
@@ -133,6 +136,57 @@ func TestMongoSpanLinkConsistency(t *testing.T) {
 	harness.AssertPresence(t, run, want, rv)
 	harness.AssertConsistentRV(t, run)                            // same rv across the link
 	harness.AssertLinkedTrace(t, run, svcs[0].name, svcs[1].name) // svc1 really links to svc0's trace
+}
+
+// TestMongoChangeStreamSpanLinkConsistency drives the wrapper's real async
+// change-stream path: svc1 opens Collection.Watch, svc0 inserts, and svc1 reads
+// the change with ChangeStream.DecodeAndTrace. That call extracts "_oteltrace"
+// from the change document and hands back a context linked to the producer, so
+// the consumer's span is a new root carrying the producer's rv.
+//
+// Unlike TestMongoManualSpanLinkConsistency, the link here is built by the
+// library, not by the test — this is what proves the wrapper's change-stream
+// extraction and link construction stay consistent under sampling.
+func TestMongoChangeStreamSpanLinkConsistency(t *testing.T) {
+	if !harness.ExpectationFromEnv(gate).PropagationEnabled {
+		t.Skip("needs mongo tracing + propagation enabled")
+	}
+	sink, endpoint, uri := setup(t)
+	rates := []float64{0.9, 0.9}
+	svcs, want := buildServices(t, uri, endpoint, rates)
+	rv := uint64(1) << 55
+	runID := uuid.NewString()
+	ctx := context.Background()
+
+	// Open the change stream before inserting so the insert is observed.
+	cs, err := svcs[1].coll.Watch(ctx, mongo.Pipeline{})
+	require.NoError(t, err, "watch")
+	defer func() { _ = cs.Close(ctx) }()
+
+	c0, s0 := svcs[0].tracer.Start(harness.SeedContextRV(rv), svcs[0].name, runAttr(runID))
+	_, err = svcs[0].coll.InsertOne(c0, bson.D{{Key: "run", Value: runID}, {Key: "hop", Value: 0}, {Key: "payload", Value: "x"}})
+	require.NoError(t, err)
+	s0.End()
+
+	// Next blocks until the insert shows up on the stream.
+	nctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	require.True(t, cs.Next(nctx), "change stream should deliver the insert: %v", cs.Err())
+
+	var change bson.M
+	rctx, err := cs.DecodeAndTrace(ctx, &change)
+	require.NoError(t, err, "decode and trace")
+
+	_, s1 := svcs[1].tracer.Start(rctx, svcs[1].name, runAttr(runID))
+	s1.End()
+
+	run := waitRun(t, sink, runID, 2)
+	harness.AssertPresence(t, run, want, rv)
+	// The library-built link lives on the wrapper's change-stream decode span
+	// (no RunAttr), so assert over the full run expansion.
+	full := harness.SpansOfRun(sink.Spans(), runID)
+	harness.AssertConsistentRV(t, full)
+	harness.AssertLinkedTrace(t, full, svcs[0].name, svcs[1].name)
 }
 
 // TestMongoTopologyIndependence drives a 3-node chain under every combination of
@@ -182,9 +236,15 @@ func TestMongoTopologyIndependence(t *testing.T) {
 	}
 }
 
-// TestMongoSamplingRate drives many random-rv traces at a single rate (read from
-// OTEL_TRACES_SAMPLER_ARG) and checks the sampled fraction matches the rate, with
-// each trace consistent (all three nodes sampled, or none).
+// TestMongoSamplingRate drives one trace per evenly-spaced rv at a single rate
+// (read from OTEL_TRACES_SAMPLER_ARG) and checks the sampled fraction matches
+// the rate, with each trace consistent (all three nodes sampled, or none).
+//
+// The rv values come from harness.UniformRVs rather than RandomRV: with a
+// random draw the fraction is binomial, so at m=40 a meaningful tolerance sits
+// around 2.5σ and the line flakes roughly 1% of every CI run. Sweeping the
+// randomness space evenly makes the fraction land within 1/m of the rate every
+// time while still failing on a wrong threshold.
 func TestMongoSamplingRate(t *testing.T) {
 	if !harness.ExpectationFromEnv(gate).PropagationEnabled {
 		t.Skip("needs mongo tracing + propagation enabled")
@@ -196,15 +256,15 @@ func TestMongoSamplingRate(t *testing.T) {
 
 	const m = 40
 	runs := make([][]harness.Span, 0, m)
-	for k := 0; k < m; k++ {
-		run := driveFindChain(t, sink, svcs, rates, harness.RandomRV())
+	for _, rv := range harness.UniformRVs(m) {
+		run := driveFindChain(t, sink, svcs, rates, rv)
 		require.Containsf(t, []int{0, 3}, len(run), "single rate → all or none (got %d)", len(run))
 		if len(run) > 0 {
 			harness.AssertConsistentRV(t, run)
 		}
 		runs = append(runs, run)
 	}
-	harness.AssertSampledFraction(t, runs, "svc0", rate, 0.2)
+	harness.AssertSampledFraction(t, runs, "svc0", rate, 2.0/m)
 }
 
 // TestMongoFullSpanShape verifies the full set of spans the producer→consumer
@@ -236,6 +296,9 @@ func TestMongoFullSpanShape(t *testing.T) {
 
 	// Producer app + client AND the consumer's continuation all share rv.
 	require.Equal(t, rv, harness.AssertConsistentRV(t, full))
+	// Every span on this path is expected to carry the seeded rv, so assert the
+	// strict form: AssertConsistentRV alone would pass even if one hop lost it.
+	harness.AssertAllSpansCarryRV(t, full, rv)
 
 	wrapper := harness.SpansByScope(full, otelmongo.ScopeName)
 	appSpans := harness.SpansByAttr(full, harness.RunAttr, runID)

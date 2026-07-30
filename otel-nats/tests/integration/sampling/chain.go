@@ -489,17 +489,29 @@ func jsConsumerNext(t *testing.T, prod, cons service, prodCtx context.Context, s
 // jsBatchDeliver drains one message from the batches returned by fetch,
 // retrying until the published message lands (JetStream persistence is
 // asynchronous relative to the publish ack observed by the test).
+//
+// Each batch's lifetime is scoped to a closure so `defer batch.Stop()` runs on
+// the early return: per the repo CLAUDE.md, a caller that breaks out of
+// Messages() instead of draining it to channel close MUST Stop() the batch, or
+// the forwarding goroutine stays parked on a send nobody will ever receive.
 func jsBatchDeliver(t *testing.T, fetch func() (oteljetstream.MessageBatch, error), what string) context.Context {
 	t.Helper()
 	deadline := time.Now().Add(deliverTimeout)
 	for {
-		batch, err := fetch()
-		require.NoError(t, err, "%s", what)
-		for m := range batch.Messages() {
-			_ = m.Ack()
-			return m.Context()
+		msgCtx, ok := func() (context.Context, bool) {
+			batch, err := fetch()
+			require.NoError(t, err, "%s", what)
+			defer batch.Stop()
+			for m := range batch.Messages() {
+				_ = m.Ack()
+				return m.Context(), true
+			}
+			require.NoError(t, batch.Error(), "%s batch error", what)
+			return nil, false
+		}()
+		if ok {
+			return msgCtx
 		}
-		require.NoError(t, batch.Error(), "%s batch error", what)
 		if time.Now().After(deadline) {
 			t.Fatalf("%s: no message within %s", what, deliverTimeout)
 		}
@@ -536,7 +548,10 @@ func jsFetchNoWait(t *testing.T, prod, cons service, prodCtx context.Context, su
 	_, err := prod.js.Publish(prodCtx, subject, []byte("payload"))
 	require.NoError(t, err, "js publish")
 	return jsBatchDeliver(t, func() (oteljetstream.MessageBatch, error) {
-		return c.FetchNoWait(5)
+		// Ask for exactly the one message the test consumes: a larger batch
+		// would emit receive spans for messages nobody takes delivery of, and
+		// leave them un-Acked for redelivery into a later subtest.
+		return c.FetchNoWait(1)
 	}, "fetchnowait")
 }
 

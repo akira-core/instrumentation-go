@@ -123,3 +123,95 @@ func equalStrings(a, b []string) bool {
 	}
 	return true
 }
+
+// TestSpansOfRunFollowsInboundLinks pins the real async direction: only the
+// producer carries RunAttr, and the consumer's span in a new trace links back
+// to it. Following outbound links alone would miss the consumer entirely,
+// silently shrinking the span set every "whole picture" assertion runs on.
+func TestSpansOfRunFollowsInboundLinks(t *testing.T) {
+	spans := []Span{
+		{Name: "producer", TraceID: "aaaa", SpanID: "a1", Attributes: map[string]string{RunAttr: "run1"}},
+		{Name: "consumer", TraceID: "bbbb", SpanID: "b1", Links: []Link{{TraceID: "aaaa"}}},
+		{Name: "consumer-child", TraceID: "bbbb", SpanID: "b2", ParentSpanID: "b1"},
+		{Name: "unrelated", TraceID: "cccc", SpanID: "c1"},
+	}
+	got := names(SpansOfRun(spans, "run1"))
+	want := []string{"consumer", "consumer-child", "producer"}
+	if !equalStrings(got, want) {
+		t.Errorf("SpansOfRun(run1) = %v, want %v", got, want)
+	}
+}
+
+// TestSpansOfRunFollowsInboundLinksTransitively pins a multi-hop link chain
+// where every hop points backwards (consumer → producer), as NATS/Mongo
+// span-link consumers do.
+func TestSpansOfRunFollowsInboundLinksTransitively(t *testing.T) {
+	spans := []Span{
+		{Name: "hop0", TraceID: "aaaa", SpanID: "a1", Attributes: map[string]string{RunAttr: "run1"}},
+		{Name: "hop1", TraceID: "bbbb", SpanID: "b1", Links: []Link{{TraceID: "aaaa"}}},
+		{Name: "hop2", TraceID: "cccc", SpanID: "c1", Links: []Link{{TraceID: "bbbb"}}},
+		{Name: "unrelated", TraceID: "dddd", SpanID: "d1"},
+	}
+	got := names(SpansOfRun(spans, "run1"))
+	want := []string{"hop0", "hop1", "hop2"}
+	if !equalStrings(got, want) {
+		t.Errorf("SpansOfRun(run1) = %v, want %v", got, want)
+	}
+}
+
+// TestAssertAllSpansCarryRV checks the happy path: every span carries the rv.
+func TestAssertAllSpansCarryRV(t *testing.T) {
+	spans := []Span{
+		{Name: "a", TraceState: "ot=rv:0000000000002a"},
+		{Name: "b", TraceState: "ot=th:8;rv:0000000000002a"},
+	}
+	AssertAllSpansCarryRV(t, spans, 0x2a)
+}
+
+// TestCountRVCoverage checks the with/without split reported in the
+// AssertConsistentRV failure message — the signal that tells "rv lost on one
+// hop" apart from "two different rv values".
+func TestCountRVCoverage(t *testing.T) {
+	spans := []Span{
+		{TraceState: "ot=rv:0000000000002a"},
+		{TraceState: ""},
+		{TraceState: "ot=th:8"},
+	}
+	with, without := countRVCoverage(spans)
+	if with != 1 || without != 2 {
+		t.Errorf("countRVCoverage = %d with, %d without; want 1, 2", with, without)
+	}
+}
+
+// TestUniformRVsCoversRateDeterministically pins that one run per UniformRVs
+// value makes the sampled fraction match the rate within 1/n — the property
+// that lets the E2E rate check drop its statistical tolerance.
+func TestUniformRVsCoversRateDeterministically(t *testing.T) {
+	const n = 40
+	rvs := UniformRVs(n)
+	if len(rvs) != n {
+		t.Fatalf("UniformRVs(%d) returned %d values", n, len(rvs))
+	}
+	for _, rate := range []float64{0.1, 0.25, 0.5, 0.9, 1.0} {
+		sampled := 0
+		for _, rv := range rvs {
+			if ExpectedSampled(rate, rv) {
+				sampled++
+			}
+		}
+		frac := float64(sampled) / float64(n)
+		if diff := frac - rate; diff > 1.0/n || diff < -1.0/n {
+			t.Errorf("rate %.2f: sampled fraction %.3f differs by more than 1/%d", rate, frac, n)
+		}
+	}
+}
+
+// TestUniformRVsEmpty pins the n <= 0 guard.
+func TestUniformRVsEmpty(t *testing.T) {
+	if got := UniformRVs(0); got != nil {
+		t.Errorf("UniformRVs(0) = %v, want nil", got)
+	}
+	if got := UniformRVs(-1); got != nil {
+		t.Errorf("UniformRVs(-1) = %v, want nil", got)
+	}
+}

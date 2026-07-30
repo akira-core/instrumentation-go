@@ -259,29 +259,34 @@ go test -race -timeout 600s ./sampling/
 **rv 與取樣**
 > `rv`(randomness value)是 consistent probabilistic sampling 寫在 `tracestate` 裡的 56-bit 隨機數;一個 span 被取樣 iff `rv ≥ threshold(rate)`。它是什麼、為何讓不同 rate 的 service 對同一條 trace 做出一致決策,見 [otel-sampler](../otel-sampler)。
 - `SeedContextRV(rv) context.Context` — 回一個帶 `ot=rv:` tracestate 的 remote root context,當流程的頭(等同正常 inbound 載體帶 rv)。
-- `RandomRV() uint64`、`ExpectedSampled(rate, rv) bool`、`EnvSamplerArg(def) float64`。
+- `RandomRV() uint64` — 均勻隨機 rv。**統計**測試用;取樣比例會是二項分布,斷言得留寬容差。
+- `UniformRVs(n) []uint64` — n 個平均鋪滿 56-bit 空間的 rv(每桶中點）。**一個 rv 跑一條 run**,任何 rate 的取樣比例都落在 `1/n` 之內 → 取樣率測試變**確定性**、不再週期性 flake。CI 上優先用它。
+- `ExpectedSampled(rate, rv) bool` — 直接委派 `otelsampler.Sampled`,連 sampler 的精度取整都一致,因此**任意** rv(含剛好落在門檻上的)預測都與實際決策相同。
+- `EnvSamplerArg(def) float64`。
 
 **驅動一條 run**
 - `RunAttrOption(runID) trace.SpanStartOption` — `tracer.Start(ctx, name, harness.RunAttrOption(runID))` 的簡寫,把 `RunAttr` 蓋上你的 app span。
 - `WaitForStable(t, sink, runID, anchorService, quiet, timeout) []Span`(Core)— 不需預測 count:等到 `anchorService`(rate 1.0 保證出現、且同步 chain 中最後 export 的 head)有 app span,再等數量靜默 `quiet` 才回;**逾時不 Fatal**(下游被 drop = 0 span 是合法結果)。非確定性 sampler 的統計測試用它。**確定性測試(count 已知)請改用 `WaitForAppSpans`**——它等齊全部 span,不靠靜默窗猜測。
 - `CountSampled(rates, rv) int`(需 otel-sampler)— 預測該 rv 下有幾個 service 會被取樣(= 該等幾個 app span)。
-- `WaitForAppSpans(t, sink, runID, want, timeout) []Span` — 等到 `want` 個帶 `RunAttr` 的 app span 到齊才回;**逾時會 dump 全部 span 並 `t.Fatalf`**(取代靜默回 partial)。`want` 可為 **0**(rv 不取樣任何 service 時):立即回空 slice、不等待。需先以 `CountSampled` 預測 `want`,故偏 Consistent 路徑。
+- `WaitForAppSpans(t, sink, runID, want, timeout) []Span` — 等到 `want` 個帶 `RunAttr` 的 app span 到齊才回;**逾時會 dump 全部 span 並 `t.Fatalf`**(取代靜默回 partial)。需先以 `CountSampled` 預測 `want`,故偏 Consistent 路徑。
+  - `want == 0`(rv 不取樣任何 service)無法靠「等到齊」滿足——「至少 0 個」在收到任何東西之前就成立。此時改為**等滿 `NoSpanSettle`(2s)** 再回傳當下的 span。collector → sink 這一跳是非同步的,立即回傳會讓「rv=0 那一階」變成空斷言,而那正是整條 ladder 中**唯一**能抓到「取樣過度」的一階。
 
 **分組 / 切片**
 - `SpansByAttr(spans, attr, val)`、`SpansByService(spans, name)`、`SpansByScope(spans, scope)`、`SpansByServicePrefix(spans, prefix)`(依 `service.name` 前綴篩選;原為挑出 `mongodb://…` 型 deliver span 而設,該類 span 0.6.x 起已移除,現僅供自訂用途)。
-- `SpansOfRun(all, runID)` — 收齊整條 run 的**所有** span(app + library-emitted span + 經 span-link 連到的 trace);要連 library-emitted span 一起驗時用它。
+- `SpansOfRun(all, runID)` — 收齊整條 run 的**所有** span(app + library-emitted span + 經 span-link 連到的 trace);要連 library-emitted span 一起驗時用它。link 展開是**雙向**的:真實非同步拓樸是 consumer link 回 producer,只跟著「已收錄 span 的出站 link」走的話,當只有 producer 帶 `RunAttr` 時永遠收不到 consumer 那條 trace。
 
 **斷言 — Core(任意 sampler;只讀拓樸 / 統計)**
 - `AssertTraceContinued(t, spans, upstream, downstream)` — 兩個 service 的 app span 同一條 trace(propagation 生效)。針對服務對,不受流程他處 span-link hop 影響。
 - `AssertTraceNotContinued(t, spans, upstream, downstream)` — 下游另開 trace 且**無 link** 回上游(propagation 關閉;排除「其實是 span-link」)。**取代** 對 `DistinctRVs` 的依賴。
 - `AssertSameTrace(t, spans)` — 全部同一 TraceID(parent-child 段)。
 - `AssertLinkedTrace(t, spans, fromService, toService)` — `to` 是 `from` 的 span-link consumer(不同 trace、且有 `Link` 指向 `from` 的 trace)。
-- `SampledFraction(runs, service)` / `AssertSampledFraction(t, runs, service, rate, delta)` — 多條隨機 run 的取樣比例 ≈ rate。
+- `SampledFraction(runs, service)` / `AssertSampledFraction(t, runs, service, rate, delta)` — 多條 run 的取樣比例 ≈ rate。`delta` 是**下限**而非實際容差:實際用 `max(delta, 4σ)`(`σ = sqrt(rate·(1-rate)/n)`)。硬寫的 delta 常只有 ~2.5σ,每個測試每次約 1% 機率紅燈,久了會被當成「這條線本來就會 flake」。搭 `UniformRVs` 可直接變確定性。
 - `AssertNoWrapperSpans(t, spans, scope)` — flag 停用時 library-emitted span 不出。
 - `TraceIDOf(spans, service) (string, bool)` — 取某 service 的 TraceID(除錯 / 自訂斷言)。
 
 **斷言 — Consistent(需 otel-sampler;讀 `ot=rv:`)**
-- `AssertConsistentRV(t, spans) uint64` — 出現的 span 其 `ot=rv:` 全相等(核心不變式)。**只比對帶 rv 的 span,沒有 rv 的直接忽略**(不是「每個 span 都要有 rv」);**整組都沒有任何 rv 才失敗**。失敗時自動 dump 該組 span。
+- `AssertConsistentRV(t, spans) uint64` — 出現的 span 其 `ot=rv:` 全相等(核心不變式)。**只比對帶 rv 的 span,沒有 rv 的直接忽略**(不是「每個 span 都要有 rv」);**整組都沒有任何 rv 才失敗**。失敗時自動 dump 該組 span,並在訊息中同時報「有 rv / 無 rv」的 span 數,好分辨「rv 值不一致」與「某一跳把 rv 弄丟了」。
+- `AssertAllSpansCarryRV(t, spans, want)` — **每一個** span 都必須帶 `ot=rv:want`。全鏈都該有 rv 的路徑(如 full-span-shape 測試)用它:「rv 在某一跳整個消失」是最典型的回歸型態,而上面那個寬鬆版本看不到。
 - `AssertPresence(t, spans, want, rv)` / `AssertAppSpanCounts(t, spans, want, rv, countIfSampled)` — service 出現 / 精確 span 數 ⇔ `ExpectedSampled(rate, rv)`。
 - `DistinctRVs(spans)` — 跨 span 的相異 rv(consistent 路徑 propagation 關掉時驗 rv 不一致)。
 
@@ -490,7 +495,7 @@ for i := 0; i < N; i++ {
 
 | transport | 載體 | producer | consumer |
 |---|---|---|---|
-| MongoDB | 文件的 `_oteltrace` 欄位 | 寫入時 inject | 讀回時 `TraceContext()` / `DecodeWithContext()` extract |
+| MongoDB | 文件的 `_oteltrace` 欄位 | 寫入時 inject | 讀回時 `TraceContext()` / `DecodeAndTrace()` extract |
 | NATS / JetStream | message headers | publish 時 inject | 收到時從 header extract |
 | HTTP / gRPC | request headers / metadata | 送出時 `Inject` | server middleware / interceptor `Extract` |
 
@@ -521,11 +526,11 @@ producer 端的 instrumented 呼叫把當前 SpanContext(含 `tracestate` 的 `o
 | library | 傳遞方法 | 拓樸(由消費端怎麼接決定) |
 |---|---|---|
 | MongoDB | `InsertOne`→`FindOne`(`SingleResult.TraceContext`) | parent-child(同一 trace 續接) |
-| MongoDB | `InsertOne`→`Aggregate`(`Cursor.DecodeWithContext`) | **span-link**(新 trace,link 到 origin) |
+| MongoDB | `InsertOne`→`Aggregate`(`Cursor.DecodeAndTrace`) | **span-link**(新 trace,link 到 origin) |
 | MongoDB | 模擬 change-stream consumer(讀回後手動開 root + link) | **span-link**(新 trace id) |
 | HTTP | 不同 endpoint / method | parent-child |
 
-> 注意:`Cursor.DecodeWithContext` 內部會 detach 當前 span、用 origin 開一個 **link**([traced/cursor.go](../otel-mongo/v2/internal/traced/cursor.go)),
+> 注意:`Cursor.DecodeAndTrace` 內部會 detach 當前 span、用 origin 開一個 **link**([traced/cursor.go](../otel-mongo/v2/internal/traced/cursor.go)),
 > 所以 `Aggregate` 路徑是 span-link 而非 parent-child;`SingleResult.TraceContext` 才是 parent-child 續接。
 > 「change-stream」那列目前以 `FindOne` 讀回後**手動開 linked root** 模擬(尚未直接驅動 `Watch`)。
 

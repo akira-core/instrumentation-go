@@ -1,6 +1,62 @@
 package harness
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
+
+// TestEnvTruthyMatchesModuleFlags is the golden table pinning envTruthy against
+// the modules' internal flags.EnvEnabled. The modules vendor internal copies
+// that cannot be imported, so the semantics can only be held together by this
+// table. The set-but-empty row is the one that used to diverge: an empty value
+// is TRUTHY (docker `-e VAR`, or a mistyped GitHub Actions matrix key, produces
+// exactly that), and reading it as falsy makes the whole matrix assert the
+// disabled branch against an enabled wrapper.
+func TestEnvTruthyMatchesModuleFlags(t *testing.T) {
+	const key = "OTEL_TESTKIT_ENVTRUTHY_PROBE"
+	cases := []struct {
+		name  string
+		value string
+		set   bool
+		want  bool
+	}{
+		{name: "unset", set: false, want: false},
+		{name: "set-but-empty", value: "", set: true, want: true},
+		{name: "whitespace", value: "  ", set: true, want: true},
+		{name: "zero", value: "0", set: true, want: false},
+		{name: "false", value: "false", set: true, want: false},
+		{name: "FALSE", value: "FALSE", set: true, want: false},
+		{name: "no", value: "no", set: true, want: false},
+		{name: "off", value: "off", set: true, want: false},
+		{name: "padded-zero", value: " 0 ", set: true, want: false},
+		{name: "one", value: "1", set: true, want: true},
+		{name: "true", value: "true", set: true, want: true},
+		{name: "arbitrary", value: "x", set: true, want: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv(key, "")
+			if c.set {
+				t.Setenv(key, c.value)
+			} else {
+				if err := os.Unsetenv(key); err != nil {
+					t.Fatalf("unset %s: %v", key, err)
+				}
+			}
+			if got := envTruthy(key); got != c.want {
+				t.Errorf("envTruthy(%s=%q set=%v) = %v, want %v", key, c.value, c.set, got, c.want)
+			}
+		})
+	}
+}
+
+// TestEnvTruthyEmptyKey pins that an empty GateEnv field (a transport with no
+// independent propagation gate) never reads the environment.
+func TestEnvTruthyEmptyKey(t *testing.T) {
+	if envTruthy("") {
+		t.Error("envTruthy(\"\") = true, want false")
+	}
+}
 
 // TestExpectedSampled checks the threshold boundary: a span is sampled iff
 // rv >= threshold(p) ≈ (1-p)·2^56. The rv ladder used by the integration tests

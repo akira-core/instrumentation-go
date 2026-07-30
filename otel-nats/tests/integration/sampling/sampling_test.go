@@ -300,9 +300,15 @@ func spanNames(spans []harness.Span) []string {
 	return out
 }
 
-// TestNatsSamplingRate drives many random-rv runs at the env-provided rate
-// (OTEL_TRACES_SAMPLER_ARG) and checks the all-or-none invariant per run plus
-// the statistical sampled fraction.
+// TestNatsSamplingRate drives one run per evenly-spaced rv at the env-provided
+// rate (OTEL_TRACES_SAMPLER_ARG) and checks the all-or-none invariant per run
+// plus the sampled fraction.
+//
+// The rv values come from harness.UniformRVs rather than RandomRV: with a
+// random draw the fraction is binomial, so at m=40 a meaningful tolerance sits
+// around 2.5σ and the line flakes roughly 1% of every CI run. Sweeping the
+// randomness space evenly makes the fraction land within 1/m of the rate every
+// time while still failing on a wrong threshold.
 func TestNatsSamplingRate(t *testing.T) {
 	exp := harness.ExpectationFromEnv(gate)
 	if !exp.PropagationEnabled {
@@ -314,9 +320,9 @@ func TestNatsSamplingRate(t *testing.T) {
 	svcs, _ := buildServices(t, url, endpoint, "svc", rates)
 
 	const m = 40
+	rvs := harness.UniformRVs(m)
 	runs := make([][]harness.Span, 0, m)
-	for i := 0; i < m; i++ {
-		rv := harness.RandomRV()
+	for _, rv := range rvs {
 		_, run := driveChain(t, sink, svcs, rates, scenario{"rate", coreSubscribe}, rv)
 		// Same rate + same rv ⇒ the two services must agree: 0 or 2 app spans.
 		require.Contains(t, []int{0, 2}, len(run), "run must be all-or-none")
@@ -325,7 +331,7 @@ func TestNatsSamplingRate(t *testing.T) {
 		}
 		runs = append(runs, run)
 	}
-	harness.AssertSampledFraction(t, runs, svcs[0].name, rate, 0.2)
+	harness.AssertSampledFraction(t, runs, svcs[0].name, rate, 2.0/m)
 }
 
 // TestNatsFullSpanShape pins the exact span shape of one publish→subscribe
@@ -353,6 +359,9 @@ func TestNatsFullSpanShape(t *testing.T) {
 
 	full := harness.SpansOfRun(snapshot, runID)
 	require.Equal(t, rv, harness.AssertConsistentRV(t, full))
+	// Every span on this path is expected to carry the seeded rv, so assert the
+	// strict form: AssertConsistentRV alone would pass even if one hop lost it.
+	harness.AssertAllSpansCarryRV(t, full, rv)
 
 	wrapper := harness.SpansByScope(full, otelnats.ScopeName)
 	require.Len(t, harness.SpansByService(wrapper, svcs[0].name), 1, "producer: one send span")

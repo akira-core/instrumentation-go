@@ -54,18 +54,27 @@ TracerProvider sampler =
 | Condition | Behavior |
 |---|---|
 | Valid parent in `ParentContext` | Pass params unchanged to delegate (links ignored for seeding). |
-| No valid parent, **exactly one** valid link | Set `ParentContext` to remote span context of that link; set `params.TraceID` to the link's TraceID for the delegate call only; after delegate returns, write `ot=rv:` from link randomness (prefer link `ot=rv`, else link TraceID low 56 bits). |
+| No valid parent, **exactly one** valid link | Add the link's span context to the **caller's** `ParentContext` as a remote parent, carrying **only** `ot=rv:` (see below); set `params.TraceID` to the link's TraceID for the delegate call only; after delegate returns, write `ot=rv:` from link randomness (prefer link `ot=rv`, else link TraceID low 56 bits). |
 | Zero or multiple valid links | Pass params unchanged; for roots still ensure `ot=rv:` is written from the **current** TraceID randomness. |
 
 Invalid link SpanContexts are skipped when counting "valid" links.
 
-**Critical invariant:** the wrapper only changes **sampler input**. The SDK still creates a new root with its own TraceID; links on the span are unchanged. SDK integration tests assert `linked.TraceID != upstream.TraceID` while `ot=rv` matches.
+**Critical invariant:** the wrapper changes **sampler input**, and on root paths writes an explicit `ot=rv:` into the returned `SamplingResult.Tracestate`. It never changes parentage or span links: the SDK still creates a new root with its own TraceID, and links on the span are unchanged. SDK integration tests assert `linked.TraceID != upstream.TraceID` while `ot=rv` matches.
+
+**What does and does not cross a link.** The synthesized remote parent carries only the link's `ot=rv:` randomness:
+
+- **Crosses:** `ot=rv:` — that is the whole point of the seed.
+- **Does not cross:** foreign vendor tracestate members (`congo=…`, `rojo=…`) and the upstream `ot=th:`. A linked root is a **new, unrelated trace**; copying the link's whole tracestate would propagate a third party's entry down that new trace, and on the Drop path would leave the upstream `th:` on the span so a downstream exporter computes the adjusted count from the *upstream* probability.
+- **Preserved:** the caller's own `ParentContext` values (baggage, tenant IDs, …). The wrapper adds the remote span context to that context rather than replacing it with `context.Background()`, so a value-reading delegate decides the same way it would on the parent-child path.
+
+**Composition warning:** do not wrap `sdktrace.ParentBased`. The seed is presented as a *valid remote parent*, so `ParentBased` takes its `RemoteParentSampled`/`RemoteParentNotSampled` branch and decides from the link's sampled flag — the probability is ignored and consistent sampling degrades to head-based. Wrap `ProbabilitySampler` directly.
 
 ### D4. Randomness / threshold encoding
 
 - Randomness mask: `2^56 - 1` (56 bits), matching #8123.
 - `ot=rv:` value: exactly 14 lowercase hex digits.
-- On record: insert/update `ot=th:<threshold hex>` via `insertOrUpdateTraceStateThKeyValue`; preserve other `ot` subkeys (including `rv` when present).
+- On record: insert/update `ot=th:<threshold hex>` via `insertOrUpdateOTSubKey(existingOT, "th:", …)`; preserve other `ot` subkeys (including `rv` when present). The same helper writes `rv:`, so the two sub-key writers cannot drift apart.
+- Exported `Threshold(p)` / `Sampled(p, rv)` expose the sampler's exact threshold arithmetic (including its precision rounding) so test harnesses predict decisions rather than re-deriving `(1-p)·2^56`, which disagrees on boundary randomness values.
 - On drop: `ProbabilitySampler` leaves tracestate as found (typically no new `th`); `WithSingleLinkSeed` may still attach `rv` on roots so dropped-but-propagated contexts remain consistent for downstream services with higher rates.
 - Invalid / malformed `rv` → ignore and fall back to TraceID randomness (same as missing `rv`).
 

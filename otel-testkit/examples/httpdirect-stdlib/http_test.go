@@ -24,6 +24,7 @@ package httpdirectstdlib
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -115,7 +116,9 @@ func startChain(t *testing.T, endpoint string, specs []spec) (headURL string, wa
 	return next, want
 }
 
-func serviceName(i int) string { return "svc" + string(rune('0'+i)) }
+// serviceName names chain node i. Sprintf (not rune arithmetic) so a chain
+// longer than 10 nodes still yields "svc10", not "svc:".
+func serviceName(i int) string { return fmt.Sprintf("svc%d", i) }
 
 // send fires one request through the chain from a fresh (random trace ID) head
 // and returns the run ID.

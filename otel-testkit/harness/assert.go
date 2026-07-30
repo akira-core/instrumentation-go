@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"math"
 	"sort"
 	"strings"
 	"testing"
@@ -49,21 +50,67 @@ func DistinctRVs(spans []Span) []uint64 {
 	return out
 }
 
-// AssertConsistentRV asserts every span that carries a tracestate rv carries the
-// same one, and returns it. This is the core consistent-sampling invariant: a
-// trace's randomness must survive inject→extract unchanged across every service.
-// Fails if no span carries an rv. Spans without an rv are ignored.
+// AssertConsistentRV asserts that no two spans carry conflicting rv values, and
+// returns the single rv found.
+//
+// It does NOT check that every span carries an rv: spans without one are
+// ignored, because some wrapper spans legitimately have none. A regression that
+// loses the rv on one hop therefore passes here — use AssertAllSpansCarryRV for
+// paths where every span is expected to carry it.
+//
+// Fails if no span carries an rv at all.
 func AssertConsistentRV(t *testing.T, spans []Span) uint64 {
 	t.Helper()
 	rvs := DistinctRVs(spans)
+	withRV, withoutRV := countRVCoverage(spans)
 	if len(rvs) != 1 {
 		// Dump the spans before failing so the cause (missing rv vs. several rv
 		// values) is visible without re-running with DumpSpans by hand.
 		DumpSpans(t, "AssertConsistentRV failed", spans)
 	}
-	require.NotEmpty(t, rvs, "no span carried a tracestate rv (ot=rv:)")
-	require.Len(t, rvs, 1, "spans carried inconsistent rv values: %x", rvs)
+	require.NotEmptyf(t, rvs, "no span carried a tracestate rv (ot=rv:) — %d spans, all without rv", withoutRV)
+	require.Lenf(t, rvs, 1, "spans carried inconsistent rv values: %x (%d spans with rv, %d without)",
+		rvs, withRV, withoutRV)
 	return rvs[0]
+}
+
+// AssertAllSpansCarryRV asserts every span carries the tracestate rv want. Use
+// it on paths where the randomness is expected to survive every hop — losing it
+// on one hop is the canonical consistent-sampling regression, and the looser
+// AssertConsistentRV cannot see it.
+func AssertAllSpansCarryRV(t *testing.T, spans []Span, want uint64) {
+	t.Helper()
+	require.NotEmpty(t, spans, "AssertAllSpansCarryRV: no spans")
+	ok := true
+	for _, s := range spans {
+		rv, has := s.RV()
+		if !has {
+			ok = false
+			assert.Failf(t, "span carries no rv",
+				"span %q (service %q, scope %q) has no ot=rv: in its tracestate", s.Name, s.ServiceName, s.Scope)
+			continue
+		}
+		if rv != want {
+			ok = false
+			assert.Failf(t, "span carries the wrong rv",
+				"span %q (service %q) has rv=%x, want %x", s.Name, s.ServiceName, rv, want)
+		}
+	}
+	if !ok {
+		DumpSpans(t, "AssertAllSpansCarryRV failed", spans)
+	}
+}
+
+// countRVCoverage reports how many spans do and do not carry an rv.
+func countRVCoverage(spans []Span) (withRV, withoutRV int) {
+	for _, s := range spans {
+		if _, ok := s.RV(); ok {
+			withRV++
+		} else {
+			withoutRV++
+		}
+	}
+	return withRV, withoutRV
 }
 
 // AssertPresence asserts that, among spans, a service is present (has ≥1 span)
@@ -103,7 +150,9 @@ func SpansByScope(spans []Span, scope string) []Span {
 }
 
 // SpansByServicePrefix returns the spans whose ServiceName starts with prefix.
-// Use it to select synthetic deliver spans (service "mongodb://…", "nats://…").
+// Use it when a library names services by URL prefix. (It was added for the
+// synthetic "mongodb://…" / "nats://…" deliver spans this repo's wrappers
+// emitted before 0.6.x removed them; it is general-purpose now.)
 func SpansByServicePrefix(spans []Span, prefix string) []Span {
 	out := make([]Span, 0, len(spans))
 	for _, s := range spans {
@@ -116,10 +165,15 @@ func SpansByServicePrefix(spans []Span, prefix string) []Span {
 
 // SpansOfRun returns every span belonging to one logical run: the application
 // spans tagged with RunAttr == runID, plus all spans sharing their trace IDs
-// (wrapper client + deliver spans), plus spans in traces reachable via span
-// links (span-link hops start a new trace ID). Use it when an assertion must
-// see the whole picture — not just the application spans — e.g. to check that
-// producer, consumer, and deliver spans all carry the same randomness.
+// (wrapper client spans), plus spans in traces connected by span links in
+// either direction (span-link hops start a new trace ID). Use it when an
+// assertion must see the whole picture — not just the application spans — e.g.
+// to check that producer and consumer spans all carry the same randomness.
+//
+// The link expansion is deliberately bidirectional. Real async topologies point
+// the link from the consumer back at the producer, so following only outbound
+// links from already-collected spans would never reach a consumer trace when
+// only the producer carries RunAttr.
 func SpansOfRun(all []Span, runID string) []Span {
 	traceIDs := map[string]bool{}
 	for _, s := range SpansByAttr(all, RunAttr, runID) {
@@ -127,16 +181,23 @@ func SpansOfRun(all []Span, runID string) []Span {
 			traceIDs[s.TraceID] = true
 		}
 	}
-	// Transitively pull in linked traces (span-link consumers are new roots).
+	// Transitively pull in linked traces, following links both ways: outbound
+	// (a collected span links to another trace) and inbound (a span in some
+	// other trace links back into a collected trace).
 	for changed := true; changed; {
 		changed = false
 		for _, s := range all {
-			if !traceIDs[s.TraceID] {
-				continue
-			}
+			inRun := traceIDs[s.TraceID]
 			for _, l := range s.Links {
-				if l.TraceID != "" && !traceIDs[l.TraceID] {
+				if l.TraceID == "" {
+					continue
+				}
+				switch {
+				case inRun && !traceIDs[l.TraceID]:
 					traceIDs[l.TraceID] = true
+					changed = true
+				case !inRun && traceIDs[l.TraceID] && s.TraceID != "":
+					traceIDs[s.TraceID] = true
 					changed = true
 				}
 			}
@@ -169,12 +230,25 @@ func SampledFraction(runs [][]Span, service string) float64 {
 
 // AssertSampledFraction asserts the fraction of runs in which service appears is
 // within delta of rate (statistical sampling-rate check).
+//
+// delta is a floor, not the tolerance actually applied: the effective tolerance
+// is max(delta, 4σ) where σ = sqrt(rate·(1-rate)/n). A hard-coded delta that
+// works out to ~2.5σ fails roughly 1% of the time per test, which reads as "this
+// CI line is just flaky" and erodes trust in the whole suite. 4σ puts the
+// false-failure rate near 6e-5. Drive the runs with UniformRVs instead of
+// RandomRV when you want the check to be deterministic rather than statistical.
 func AssertSampledFraction(t *testing.T, runs [][]Span, service string, rate, delta float64) {
 	t.Helper()
 	frac := SampledFraction(runs, service)
-	assert.InDeltaf(t, rate, frac, delta,
-		"service %q sampled fraction %.3f should be near rate %.3f over %d runs",
-		service, frac, rate, len(runs))
+	n := len(runs)
+	sigma := 0.0
+	if n > 0 {
+		sigma = math.Sqrt(rate * (1 - rate) / float64(n))
+	}
+	tolerance := math.Max(delta, 4*sigma)
+	assert.InDeltaf(t, rate, frac, tolerance,
+		"service %q sampled fraction %.3f should be near rate %.3f over %d runs (tolerance %.3f, σ=%.3f)",
+		service, frac, rate, n, tolerance, sigma)
 }
 
 // AssertAppSpanCounts asserts each service has exactly the expected number of

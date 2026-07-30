@@ -42,9 +42,14 @@ var gate = harness.GateEnv{
 	Propagation: "OTEL_MONGO_PROPAGATION_ENABLED",
 }
 
-// setup starts the in-process sink + collector and points exporters (including
-// the wrapper's deliver-span TracerProvider) at it; returns sink + collector
-// endpoint + mongo URI.
+// setup starts the in-process sink + collector and points the tests' exporters
+// at it; returns sink + collector endpoint + mongo URI.
+//
+// The wrapper builds no exporter of its own (the deliver-span TracerProvider
+// was removed in 0.6.x), so nothing here reads OTEL_EXPORTER_OTLP_ENDPOINT —
+// harness.BuildTracerProvider takes the endpoint as an argument and always
+// connects insecurely. The env var is set only to match the harness convention
+// for suites whose library does build its own exporter.
 func setup(t *testing.T) (*harness.Sink, string, string) {
 	t.Helper()
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
@@ -55,10 +60,6 @@ func setup(t *testing.T) (*harness.Sink, string, string) {
 	harness.DumpOnFailure(t, sink) // dump every collected span if the test fails
 	endpoint := harness.StartCollector(ctx, t, sink.Port())
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint)
-	// The harness collector speaks plaintext gRPC. The wrapper's deliver-span
-	// exporter is built from OTEL_EXPORTER_OTLP_ENDPOINT (a bare host:port → gRPC)
-	// and otherwise defaults to TLS; this tells it to connect insecurely.
-	t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "true")
 	return sink, endpoint, startMongo(ctx, t)
 }
 

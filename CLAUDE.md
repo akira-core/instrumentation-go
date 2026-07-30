@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Four independent Go modules providing OpenTelemetry instrumentation for MongoDB, NATS/JetStream, and gorilla/websocket. Each module has its own `go.mod`, versioning, and CI job — they are developed and tagged separately.
+Four independent Go modules providing OpenTelemetry instrumentation for MongoDB, NATS/JetStream, and gorilla/websocket, plus two supporting modules (`otel-sampler`, `otel-testkit`). Each module has its own `go.mod`, versioning, and CI job — they are developed and tagged separately.
 
 | Module dir | Import path suffix | What it wraps |
 |---|---|---|
@@ -13,7 +13,14 @@ Four independent Go modules providing OpenTelemetry instrumentation for MongoDB,
 | `otel-nats/` | `.../otel-nats/otelnats` + `oteljetstream` | NATS core + JetStream |
 | `otel-gorilla-ws/` | `.../otel-gorilla-ws` | gorilla/websocket |
 
-Each module also has `examples/` and `tests/integration/` sub-modules with their own `go.mod`. Integration tests use **testcontainers-go** (require Docker/Podman running). (`otel-mongo/v2` has no separate `examples/` of its own — the single `otel-mongo/examples/` module imports and demos the v2 package.)
+Two supporting modules sit alongside them (no instrumentation, no spans of their own):
+
+| Module dir | Import path suffix | Purpose | Released? |
+|---|---|---|---|
+| `otel-sampler/` | `.../otel-sampler/otelsampler` | Consistent probability sampler (`ProbabilitySampler`, `WithSingleLinkSeed`, exported `Threshold`/`Sampled`) — applications install it as their `sdktrace.Sampler` | **Yes**, `otel-sampler/vX.Y.Z`; start at `0.2.0` (`v0.1.0` is superseded) |
+| `otel-testkit/` | `.../otel-testkit/harness` | Black-box E2E harness: in-process OTLP sink, collector container, span assertions | No — untagged, test-only |
+
+Each instrumentation module also has `examples/` and `tests/integration/` sub-modules with their own `go.mod`. Integration tests use **testcontainers-go** (require Docker/Podman running). (`otel-mongo/v2` has no separate `examples/` of its own — the single `otel-mongo/examples/` module imports and demos the v2 package.) `otel-testkit/examples/httpdirect` and `httpdirect-stdlib` are reference templates with their own `go.mod`; they are linted in CI and run by the `http-direct-e2e` job, not by `test-and-lint`.
 
 ## Common Commands
 
@@ -190,6 +197,7 @@ Each module is tagged independently as `<module>/v<x.y.z>` — **except `otel-mo
 - `otel-mongo/otelmongo/version.go` — `instrumentationVersion` const
 - `otel-mongo/v2/version.go` — `instrumentationVersion` const
 - `otel-gorilla-ws/version.go` — return literal from `Version()`
+- `otel-sampler/otelsampler/version.go` — `instrumentationVersion` const (not an instrumentation scope — this module emits no spans; the constant exists for the release guard and for callers recording which sampler build they run). `otel-sampler/v0.1.0` is published but points at a pre-rebase commit, so it is superseded and unusable — releases start at `0.2.0`. `otel-testkit` is deliberately untagged.
 
 A release-tag CI guard (`.github/workflows/release-guard.yml`) fails the push if a tag's version doesn't match the corresponding constant above — see the **CI** section.
 
@@ -226,7 +234,9 @@ Bump on any code change to a module before pushing release tag. Module pre-1.0 (
 
 `.github/workflows/ci.yml` runs on every push/PR to `main`, `master`, or `feat/*`, Go 1.25 on Ubuntu, with two jobs:
 
-- `test-and-lint` — matrix over all four modules: `go build`, `go test -race`, `golangci-lint`. For `otel-mongo` and `otel-mongo/v2` only, an additional "Verify direct/ has no OTel SDK imports" step greps `internal/direct/` for `go.opentelemetry.io/otel` imports and fails the build if any are found — this is the CI-enforced half of the disabled-mode invariant described above (the strategy-split package boundary is the compiler-enforced half).
-- `integration-test` — gated on `needs: test-and-lint`; matrix over `otel-nats/tests/integration`, `otel-mongo/tests/integration`, `otel-mongo/v2/tests/integration`, and `otel-gorilla-ws/tests/integration`, running `go test -v -race -timeout 120s ./...` (testcontainers-based, requires Docker).
+- `test-and-lint` — matrix over all six modules (`otel-sampler`, `otel-testkit`, `otel-mongo`, `otel-mongo/v2`, `otel-nats`, `otel-gorilla-ws`): `go build`, `go test -race`, `golangci-lint`. For `otel-mongo` and `otel-mongo/v2` only, an additional "Verify direct/ has no OTel SDK imports" step greps `internal/direct/` for `go.opentelemetry.io/otel` imports and fails the build if any are found — this is the CI-enforced half of the disabled-mode invariant described above (the strategy-split package boundary is the compiler-enforced half).
+- `integration-test` — gated on `needs: test-and-lint`; matrix over `otel-nats/tests/integration`, `otel-mongo/tests/integration`, `otel-mongo/v2/tests/integration`, and `otel-gorilla-ws/tests/integration`, running `go test -v -race -timeout 300s` over `go list ./...` **minus `/sampling`** (testcontainers-based, requires Docker). The `./sampling` packages are excluded on purpose — they belong to the dedicated flag-matrix jobs below, and running them here too doubles the Docker cost and squeezes a 600s suite into a 300s budget. The same exclusion is mirrored in the Makefile's `test-integration`.
+- `sampling-e2e` / `nats-sampling-e2e` — the feature-flag × `OTEL_TRACES_SAMPLER_ARG` matrices, the only place `./sampling` runs (600s budget).
+- `http-direct-e2e` — lints and runs both `otel-testkit/examples/httpdirect` (consistent sampler) and `httpdirect-stdlib` (sampler-agnostic baseline).
 
-`.github/workflows/release-guard.yml` (0.7.0+) runs only on pushed tags matching one of the four module shapes (`otel-mongo/v[0-9]*`, `otel-mongo/v2/v[0-9]*`, `otel-nats/v[0-9]*`, `otel-gorilla-ws/v[0-9]*`) — see `VERSIONING.md`. It parses the module and version out of the tag and fails if they don't match that module's version constant (table above). Routing details: `otel-mongo/v2.*` tags validate against `otel-mongo/v2/version.go` (the v2 module's Go-resolvable shape); the deprecated `otel-mongo/v2/v*` shape fails immediately with a pointer to `otel-mongo/v2.x.y` (its trigger pattern is kept so the mistake fails loudly). `otel-mongo`/`otel-mongo/v2`'s constant is a standalone `const instrumentationVersion = "..."` statement; `otel-nats`'s is inside a `const (...)` block with no per-line `const` keyword — the guard's extraction regex tolerates both shapes (`^\s*(const\s+)?instrumentationVersion\s*=`).
+`.github/workflows/release-guard.yml` (0.7.0+) runs only on pushed tags matching one of the five module shapes (`otel-mongo/v[0-9]*`, `otel-mongo/v2/v[0-9]*`, `otel-nats/v[0-9]*`, `otel-gorilla-ws/v[0-9]*`, `otel-sampler/v[0-9]*`) — see `VERSIONING.md`. It parses the module and version out of the tag and fails if they don't match that module's version constant (table above). Routing details: `otel-mongo/v2.*` tags validate against `otel-mongo/v2/version.go` (the v2 module's Go-resolvable shape); the deprecated `otel-mongo/v2/v*` shape fails immediately with a pointer to `otel-mongo/v2.x.y` (its trigger pattern is kept so the mistake fails loudly). `otel-mongo`/`otel-mongo/v2`'s constant is a standalone `const instrumentationVersion = "..."` statement; `otel-nats`'s is inside a `const (...)` block with no per-line `const` keyword — the guard's extraction regex tolerates both shapes (`^\s*(const\s+)?instrumentationVersion\s*=`).

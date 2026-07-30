@@ -51,11 +51,9 @@ func (ps *probabilitySampler) ShouldSample(params sdktrace.SamplingParameters) s
 		}
 	}
 
-	newOT := insertOrUpdateTraceStateThKeyValue(existingOT, ps.thkv)
-	if newOT == "" {
-		state = state.Delete("ot")
-		return sdktrace.SamplingResult{Decision: sdktrace.RecordAndSample, Tracestate: state}
-	}
+	// ps.thkv always starts with "th:" and is never empty, so newOT is never
+	// empty either — there is no "ot" member to delete on this path.
+	newOT := insertOrUpdateOTSubKey(existingOT, "th:", ps.thkv)
 	if existingOT == newOT {
 		return sdktrace.SamplingResult{Decision: sdktrace.RecordAndSample, Tracestate: state}
 	}
@@ -80,10 +78,6 @@ func (ps *probabilitySampler) Description() string {
 // otherwise derives randomness from the least significant 56 bits of the trace
 // ID, and writes the selected threshold to "ot=th:..." when recording.
 func ProbabilitySampler(probability float64) sdktrace.Sampler {
-	const (
-		maxPrecision = 14
-		hexBits      = 4
-	)
 	if probability >= 1.0 {
 		return &probabilitySampler{
 			threshold:   0,
@@ -95,12 +89,28 @@ func ProbabilitySampler(probability float64) sdktrace.Sampler {
 		return sdktrace.NeverSample()
 	}
 
+	threshold, tvalue := thresholdFor(probability)
+	return &probabilitySampler{
+		threshold:   threshold,
+		thkv:        "th:" + tvalue,
+		description: fmt.Sprintf("ProbabilitySampler{%g}", probability),
+	}
+}
+
+// thresholdFor computes the rejection threshold and its "th:" t-value encoding
+// for a probability in (probabilityZeroThreshold, 1). Callers must handle the
+// p >= 1 and p < probabilityZeroThreshold cases before calling.
+func thresholdFor(probability float64) (threshold uint64, tvalue string) {
+	const (
+		maxPrecision = 14
+		hexBits      = 4
+	)
 	_, expF := math.Frexp(probability)
 	_, expR := math.Frexp(1 - probability)
 	precision := min(maxPrecision, max(defaultSamplingPrecision+expF/-hexBits, defaultSamplingPrecision+expR/-hexBits))
 
 	scaled := uint64(math.Round(probability * float64(maxAdjustedCount)))
-	threshold := uint64(maxAdjustedCount) - scaled
+	threshold = uint64(maxAdjustedCount) - scaled
 	if shift := hexBits * (maxPrecision - precision); shift != 0 {
 		half := uint64(1) << (shift - 1)
 		threshold += half
@@ -108,12 +118,32 @@ func ProbabilitySampler(probability float64) sdktrace.Sampler {
 		threshold <<= shift
 	}
 
-	tvalue := strings.TrimRight(strconv.FormatUint(uint64(maxAdjustedCount)+threshold, 16)[1:], "0")
-	return &probabilitySampler{
-		threshold:   threshold,
-		thkv:        "th:" + tvalue,
-		description: fmt.Sprintf("ProbabilitySampler{%g}", probability),
+	return threshold, strings.TrimRight(strconv.FormatUint(uint64(maxAdjustedCount)+threshold, 16)[1:], "0")
+}
+
+// Threshold returns the rejection threshold ProbabilitySampler(probability)
+// compares randomness against, including the sub-threshold precision rounding
+// the sampler applies. A span is sampled exactly when its 56-bit randomness
+// value is >= Threshold(probability).
+//
+// Use it (or Sampled) to predict a sampler decision — reimplementing the
+// threshold arithmetic elsewhere diverges on boundary randomness values.
+func Threshold(probability float64) uint64 {
+	if probability >= 1.0 {
+		return 0
 	}
+	if math.IsNaN(probability) || probability < probabilityZeroThreshold {
+		// NeverSample: no 56-bit randomness value can reach this threshold.
+		return uint64(maxAdjustedCount)
+	}
+	threshold, _ := thresholdFor(probability)
+	return threshold
+}
+
+// Sampled reports whether ProbabilitySampler(probability) samples the 56-bit
+// randomness value rv. It is the exact predicate the sampler applies.
+func Sampled(probability float64, rv uint64) bool {
+	return rv&randomnessMask >= Threshold(probability)
 }
 
 // ProbabilitySamplerFromEnv returns ProbabilitySampler configured from
