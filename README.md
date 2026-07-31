@@ -2,7 +2,7 @@
 
 OpenTelemetry instrumentation for **NATS** (core + JetStream), **MongoDB** (driver v1 and v2), and **gorilla/websocket**, aligned with [OTel Go Contrib instrumentation guidelines](https://github.com/open-telemetry/opentelemetry-go-contrib/tree/main/instrumentation).
 
-This repository contains **four independent Go modules** (`go.mod` per module), each **versioned and tagged separately**. Modules target **Go 1.24**. CI runs `go build`, `go test -race`, and **golangci-lint** per module, then **integration** jobs (testcontainers; Docker required) — see [.github/workflows/ci.yml](.github/workflows/ci.yml).
+This repository contains **four independent instrumentation modules** (`go.mod` per module), each **versioned and tagged separately**, plus **two supporting modules** — `otel-sampler` (a released consistent-probability sampler applications import) and `otel-testkit` (an untagged, test-only E2E harness). Modules target **Go 1.25**. CI runs `go build`, `go test -race`, and **golangci-lint** per module, then **integration** and **consistent-sampling E2E** jobs (testcontainers; Docker required) — see [.github/workflows/ci.yml](.github/workflows/ci.yml).
 
 Instrumentation packages **do not** create a global `TracerProvider`. They use `otel.GetTracerProvider()` / `otel.GetTextMapPropagator()` unless you pass `WithTracerProvider` / `WithPropagators`. **Applications** must install a provider and W3C propagator at startup (see each module’s **examples/**).
 
@@ -17,6 +17,15 @@ Instrumentation packages **do not** create a global `TracerProvider`. They use `
 | **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.7.0 | Core NATS; W3C context in message headers. |
 | **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.7.0 | JetStream publish/consume/fetch. |
 | **otel-gorilla-ws** | `github.com/akira-core/instrumentation-go/otel-gorilla-ws` | 0.7.0 | Trace context in JSON message body (envelope); `NewConn` / `Dial`. |
+
+### Supporting modules
+
+| Package | Import path | Version (source) | Description |
+|---------|-------------|------------------|-------------|
+| **otel-sampler** | `github.com/akira-core/instrumentation-go/otel-sampler/otelsampler` | 0.1.1 | Consistent probability sampler (`ot=th:`/`ot=rv:`) + `WithSingleLinkSeed`, so span-link consumers sample like parent-child ones. Emits no spans. |
+| **otel-testkit** | `github.com/akira-core/instrumentation-go/otel-testkit/harness` | untagged | Black-box E2E harness (in-process OTLP sink + collector + assertions) used by this repo's sampling suites. Test-only, no stability guarantee. |
+
+`otel-sampler`'s published `v0.1.0` tag points at a pre-rebase commit and is superseded — start at `0.1.1`. See [VERSIONING.md](VERSIONING.md).
 
 Per-module docs: [otel-mongo/README.md](otel-mongo/README.md), [otel-nats/README.md](otel-nats/README.md), [otel-gorilla-ws/README.md](otel-gorilla-ws/README.md) (each also ships a [README.zh-TW.md](otel-mongo/README.zh-TW.md): [otel-nats](otel-nats/README.zh-TW.md), [otel-gorilla-ws](otel-gorilla-ws/README.zh-TW.md)).
 

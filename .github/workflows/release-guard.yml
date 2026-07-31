@@ -13,6 +13,7 @@ on:
       - "otel-mongo/v2/v[0-9]*"
       - "otel-nats/v[0-9]*"
       - "otel-gorilla-ws/v[0-9]*"
+      - "otel-sampler/v[0-9]*"
 
 permissions:
   contents: read
@@ -66,6 +67,12 @@ jobs:
               VERSION="${TAG#otel-gorilla-ws/v}"
               FILE="otel-gorilla-ws/version.go"
               CONST_VERSION=$(grep -E '^\s*return\s*"' "$FILE" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+              ;;
+            otel-sampler/v*)
+              MODULE="otel-sampler"
+              VERSION="${TAG#otel-sampler/v}"
+              FILE="otel-sampler/otelsampler/version.go"
+              CONST_VERSION=$(grep -E '^\s*(const\s+)?instrumentationVersion\s*=' "$FILE" | sed -E 's/.*"([^"]+)".*/\1/')
               ;;
             *)
               echo "::error::Unrecognized release tag shape: $TAG (expected <module>/vX.Y.Z per VERSIONING.md)"
