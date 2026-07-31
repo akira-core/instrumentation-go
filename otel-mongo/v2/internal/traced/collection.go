@@ -25,7 +25,7 @@ type Collection struct {
 	Coll               *mongo.Collection
 	Tracer             trace.Tracer
 	Propagator         propagation.TextMapPropagator
-	PropagationEnabled bool
+	PropagationEnabled func() bool
 	ServerAddr         string
 	ServerPort         int
 }
@@ -80,7 +80,7 @@ func (t *Collection) InsertOne(ctx context.Context, document any, opts ...option
 	defer t.setCapturedServerAttrs(span, capture)
 
 	docToInsert := document
-	if t.PropagationEnabled {
+	if t.propagationOn() {
 		docWithTrace, err := shared.InjectTraceIntoDocument(ctx, document, t.Propagator)
 		if err != nil {
 			err = fmt.Errorf("otelmongo: inject trace: %w", err)
@@ -109,7 +109,7 @@ func (t *Collection) InsertMany(ctx context.Context, documents []any, opts ...op
 	defer t.setCapturedServerAttrs(span, capture)
 
 	docsToInsert := documents
-	if t.PropagationEnabled {
+	if t.propagationOn() {
 		docsWithTrace := make([]any, 0, len(documents))
 		for _, doc := range documents {
 			d, err := shared.InjectTraceIntoDocument(ctx, doc, t.Propagator)
@@ -159,7 +159,7 @@ func (t *Collection) FindOne(ctx context.Context, filter any, opts ...options.Li
 	ctx, capture := shared.WithAddrCapture(ctx)
 	sr := t.Coll.FindOne(ctx, filter, opts...)
 	t.setCapturedServerAttrs(span, capture)
-	return sr, NewSingleResult(sr, span, ctx, t.Propagator, t.PropagationEnabled)
+	return sr, NewSingleResult(sr, span, ctx, t.Propagator, t.propagationOn())
 }
 
 // UpdateOne updates one matching document; wraps *mongo.Collection with a CLIENT span (and propagation when enabled).
@@ -174,7 +174,7 @@ func (t *Collection) UpdateOne(ctx context.Context, filter any, update any, opts
 	defer t.setCapturedServerAttrs(span, capture)
 
 	updateWithTrace := update
-	if t.PropagationEnabled {
+	if t.propagationOn() {
 		var err error
 		updateWithTrace, err = shared.InjectTraceIntoUpdate(ctx, update, t.Propagator)
 		if err != nil {
@@ -203,7 +203,7 @@ func (t *Collection) UpdateMany(ctx context.Context, filter any, update any, opt
 	defer t.setCapturedServerAttrs(span, capture)
 
 	updateWithTrace := update
-	if t.PropagationEnabled {
+	if t.propagationOn() {
 		var err error
 		updateWithTrace, err = shared.InjectTraceIntoUpdate(ctx, update, t.Propagator)
 		if err != nil {
@@ -232,7 +232,7 @@ func (t *Collection) ReplaceOne(ctx context.Context, filter any, replacement any
 	defer t.setCapturedServerAttrs(span, capture)
 
 	replacementToUse := replacement
-	if t.PropagationEnabled {
+	if t.propagationOn() {
 		replacementWithTrace, err := shared.InjectTraceIntoDocument(ctx, replacement, t.Propagator)
 		if err != nil {
 			err = fmt.Errorf("otelmongo: inject trace: %w", err)
@@ -349,7 +349,7 @@ func (t *Collection) UpdateByID(ctx context.Context, id any, update any, opts ..
 	defer t.setCapturedServerAttrs(span, capture)
 
 	updateWithTrace := update
-	if t.PropagationEnabled {
+	if t.propagationOn() {
 		var err error
 		updateWithTrace, err = shared.InjectTraceIntoUpdate(ctx, update, t.Propagator)
 		if err != nil {
@@ -378,7 +378,7 @@ func (t *Collection) BulkWrite(ctx context.Context, models []mongo.WriteModel, o
 	defer t.setCapturedServerAttrs(span, capture)
 
 	modelsToWrite := models
-	if t.PropagationEnabled {
+	if t.propagationOn() {
 		injected, err := shared.BuildBulkWriteModelsWithTrace(ctx, models, t.Propagator)
 		if err != nil {
 			shared.RecordSpanError(span, err)
@@ -392,6 +392,31 @@ func (t *Collection) BulkWrite(ctx context.Context, models []mongo.WriteModel, o
 		return nil, err
 	}
 	return res, nil
+}
+
+// propagationOn resolves the per-call propagation flag, treating an unset
+// PropagationEnabled as disabled so a partially-built Collection cannot panic.
+func (t *Collection) propagationOn() bool {
+	return t.PropagationEnabled != nil && t.PropagationEnabled()
+}
+
+// NewChangeStreamFor builds the instrumented ChangeStream impl for an already
+// opened change stream, deriving the same span name and reader attributes Watch
+// would. The facade uses it to construct the instrumented half of a dual
+// ChangeStream even when the passthrough path executed the Watch, so a relay
+// flag change reaches a change stream that can outlive many such changes.
+func (t *Collection) NewChangeStreamFor(cs *mongo.ChangeStream) *ChangeStream {
+	dbName, collName := t.dbAndColl()
+	return NewChangeStream(cs, ChangeStreamConfig{
+		Tracer:             t.Tracer,
+		Propagator:         t.Propagator,
+		PropagationEnabled: t.PropagationEnabled,
+		SpanName:           shared.DBSpanName("aggregate", collName),
+		BaseSpanOpts: []trace.SpanStartOption{
+			trace.WithSpanKind(trace.SpanKindClient),
+			trace.WithAttributes(t.changeStreamReaderAttrs(dbName, collName)...),
+		},
+	})
 }
 
 // Watch starts a change stream on the collection; wraps *mongo.Collection with a CLIENT span (and propagation when enabled).

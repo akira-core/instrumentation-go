@@ -115,7 +115,7 @@ func TestChangeStreamDecodeAndTrace_LinksOriginFromFullDocument(t *testing.T) {
 		cs:                 &mongo.ChangeStream{Current: bson.Raw(rawEvent)},
 		tracer:             tracer,
 		propagator:         prop,
-		propagationEnabled: true,
+		propagationEnabled: alwaysTrue,
 		spanName:           "mongo.cursor.decode",
 	}
 
@@ -158,7 +158,7 @@ func TestChangeStreamDecodeAndTrace_NoLinkWhenNoTraceMetadata(t *testing.T) {
 		cs:                 &mongo.ChangeStream{Current: bson.Raw(rawEvent)},
 		tracer:             tracer,
 		propagator:         prop,
-		propagationEnabled: true,
+		propagationEnabled: alwaysTrue,
 		spanName:           "mongo.cursor.decode",
 	}
 

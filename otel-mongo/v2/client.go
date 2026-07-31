@@ -20,12 +20,47 @@ import (
 // falling back to otel globals when not provided. The globals are never overwritten.
 type Client struct {
 	*mongo.Client
-	serverAddr         string
-	serverPort         int
-	tracer             trace.Tracer                  // derived from option or otel.GetTracerProvider()
-	propagator         propagation.TextMapPropagator // from option or otel.GetTextMapPropagator()
-	tracingEnabled     bool                          // cached mongoTracingEnabled() result; gates wrapper CLIENT spans
-	propagationEnabled bool
+	serverAddr          string
+	serverPort          int
+	tracer              trace.Tracer                  // derived from option or otel.GetTracerProvider()
+	propagator          propagation.TextMapPropagator // from option or otel.GetTextMapPropagator()
+	tracingOverride     *bool
+	propagationOverride *bool
+	tracedBuilt         bool
+}
+
+// effectiveTracing reports whether THIS call should be instrumented. Read per
+// operation, not cached: without an override it follows the relay within the
+// resolver's TTL. A non-nil tracingOverride makes the client fully STATIC — no
+// OpenFeature evaluation runs for it and no relay change reaches it.
+func (c *Client) effectiveTracing() bool {
+	if !c.tracedBuilt {
+		return false
+	}
+	if c.tracingOverride != nil {
+		return *c.tracingOverride
+	}
+	return mongoTracingEnabled()
+}
+
+// effectivePropagation reports whether THIS call should inject or extract
+// _oteltrace. Propagation always requires effective tracing first, so a relay
+// flag that stops spans also stops document propagation.
+//
+// A static client (non-nil tracingOverride) never evaluates OpenFeature: its
+// propagation default is the env var alone. This is not just the documented
+// "override suppresses evaluation" contract — with the global kill switch off,
+// the override is the only reason tracing is on at all, and consulting the
+// resolver here would be the one path where a relay value reaches a process
+// whose kill switch is off.
+func (c *Client) effectivePropagation() bool {
+	if c.tracingOverride != nil {
+		if !c.effectiveTracing() {
+			return false
+		}
+		return resolveFlag(c.propagationOverride, mongoPropagationEnvOnly())
+	}
+	return resolveDocumentPropagation(c.effectiveTracing(), c.propagationOverride)
 }
 
 // ClientOption configures Connect/NewClient. Per OTel contrib: accept TracerProvider and Propagators.
@@ -114,8 +149,13 @@ func Connect(opts ...*options.ClientOptions) (*Client, error) {
 // Without options, falls back to otel.GetTracerProvider()/otel.GetTextMapPropagator() at connect time.
 func ConnectWithOptions(traceOpts []ClientOption, opts ...*options.ClientOptions) (*Client, error) {
 	cfg := newClientConfig(traceOpts)
-	enabled := resolveFlag(cfg.TracingEnabled, mongoTracingEnabled())
-	if !enabled {
+	// Which implementations to build is necessarily static. An explicit override
+	// decides it; otherwise the global kill switch does — NOT the relay, which may
+	// flip at any time. dynamicTracingPossible, not mongoTracingEnabled: with the
+	// global switch on and the module flag off the instrumented path is still
+	// built, and effectiveTracing keeps it unused until the flag says otherwise.
+	buildTraced := resolveFlag(cfg.TracingEnabled, dynamicTracingPossible())
+	if !buildTraced {
 		merged := options.MergeClientOptions(opts...)
 		mc, err := mongo.Connect(merged)
 		if err != nil {
@@ -124,13 +164,12 @@ func ConnectWithOptions(traceOpts []ClientOption, opts ...*options.ClientOptions
 		addr, port := parseServerFromURI(merged.GetURI())
 		tracer := noop.NewTracerProvider().Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
 		return &Client{
-			Client:             mc,
-			serverAddr:         addr,
-			serverPort:         port,
-			tracer:             tracer,
-			propagator:         otel.GetTextMapPropagator(),
-			tracingEnabled:     false,
-			propagationEnabled: false,
+			Client:      mc,
+			serverAddr:  addr,
+			serverPort:  port,
+			tracer:      tracer,
+			propagator:  otel.GetTextMapPropagator(),
+			tracedBuilt: false,
 		}, nil
 	}
 	tp := cfg.TracerProvider
@@ -141,7 +180,6 @@ func ConnectWithOptions(traceOpts []ClientOption, opts ...*options.ClientOptions
 	if prop == nil {
 		prop = otel.GetTextMapPropagator()
 	}
-	propEnabled := resolveDocumentPropagation(enabled, cfg.PropagationEnabled)
 	tracer := tp.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
 	// Driver v2's MergeClientOptions returns the caller's own *ClientOptions
 	// when exactly one is passed (v1 always builds a fresh struct); merge
@@ -155,13 +193,14 @@ func ConnectWithOptions(traceOpts []ClientOption, opts ...*options.ClientOptions
 	}
 	addr, port := parseServerFromURI(merged.GetURI())
 	return &Client{
-		Client:             mc,
-		serverAddr:         addr,
-		serverPort:         port,
-		tracer:             tracer,
-		propagator:         prop,
-		tracingEnabled:     true,
-		propagationEnabled: propEnabled,
+		Client:              mc,
+		serverAddr:          addr,
+		serverPort:          port,
+		tracer:              tracer,
+		propagator:          prop,
+		tracingOverride:     cfg.TracingEnabled,
+		propagationOverride: cfg.PropagationEnabled,
+		tracedBuilt:         true,
 	}, nil
 }
 
@@ -237,12 +276,13 @@ func parseServerFromURI(uri string) (addr string, port int) {
 // Database returns a wrapped Database for document-level tracing.
 func (c *Client) Database(name string, opts ...options.Lister[options.DatabaseOptions]) *Database {
 	return &Database{
-		Database:           c.Client.Database(name, opts...),
-		serverAddr:         c.serverAddr,
-		serverPort:         c.serverPort,
-		tracer:             c.tracer,
-		propagator:         c.propagator,
-		tracingEnabled:     c.tracingEnabled,
-		propagationEnabled: c.propagationEnabled,
+		Database:            c.Client.Database(name, opts...),
+		serverAddr:          c.serverAddr,
+		serverPort:          c.serverPort,
+		tracer:              c.tracer,
+		propagator:          c.propagator,
+		tracingOverride:     c.tracingOverride,
+		propagationOverride: c.propagationOverride,
+		tracedBuilt:         c.tracedBuilt,
 	}
 }

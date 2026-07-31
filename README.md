@@ -44,30 +44,73 @@ Then import subpackages as needed (`.../otelmongo`, `.../otelnats`, `.../oteljet
 
 ## Tracing feature flags
 
-Switches are **opt-in via environment variables**: if a variable is **unset**, it is treated as **off**. Set it to any value other than `0`, `false`, `no`, or `off` (case-insensitive) to turn **on**.
+Switches resolve at **runtime** through [OpenFeature](https://openfeature.dev), so an operator can turn tracing on or off through a GO Feature Flag relay proxy **without restarting the application**. When no OpenFeature provider is installed, every switch falls back to its environment variable and behavior is identical to before dynamic flags existed.
 
-| Env var | Scope | When unset | Effect |
-|---------|-------|------------|--------|
-| `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | All modules | off | Global gate. Must be on for module-level tracing flags and (for Mongo) document propagation to apply. |
-| `OTEL_MONGO_TRACING_ENABLED` | `otel-mongo` + `otel-mongo/v2` | off | CLIENT spans, non-noop tracer for the wrapper. |
-| `OTEL_MONGO_PROPAGATION_ENABLED` | `otel-mongo` + `otel-mongo/v2` | off | Inject/extract `_oteltrace` on writes/reads; still gated by effective tracing. |
-| `OTEL_NATS_TRACING_ENABLED` | `otelnats` + `oteljetstream` | off | NATS/JetStream wrapper tracing. |
-| `OTEL_GORILLA_WS_TRACING_ENABLED` | `otel-gorilla-ws` | off | WebSocket wrapper tracing. |
+Environment variables are **opt-in**: if a variable is **unset**, it is treated as **off**. Set it to any value other than `0`, `false`, `no`, or `off` (case-insensitive) to turn **on**.
 
-### Env × `WithTracingEnabled` decision table
+| OpenFeature flag key | Fallback env var | Scope | Effect |
+|---|---|---|---|
+| *(none — env only)* | `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | All modules | **Kill switch.** Off ⇒ no OpenFeature evaluation at all and no relay value can enable anything. |
+| `otel-mongo-tracing` | `OTEL_MONGO_TRACING_ENABLED` | `otel-mongo` + `otel-mongo/v2` | CLIENT spans for the wrapper. |
+| `otel-mongo-propagation` | `OTEL_MONGO_PROPAGATION_ENABLED` | `otel-mongo` + `otel-mongo/v2` | Inject/extract `_oteltrace` on writes/reads; still gated by effective tracing. |
+| `otel-nats-tracing` | `OTEL_NATS_TRACING_ENABLED` | `otelnats` + `oteljetstream` | NATS/JetStream wrapper tracing. |
+| `otel-gorilla-ws-tracing` | `OTEL_GORILLA_WS_TRACING_ENABLED` | `otel-gorilla-ws` | WebSocket span creation. |
 
-Every module accepts `WithTracingEnabled(v bool)` at construction (`ConnectWithOptions` / `NewConn` / `Dial` / `Upgrade`, etc.). When the option is **present**, it is **authoritative** (overrides env in either direction). When **absent**, env decides (`GLOBAL` AND module switch).
+The global switch deliberately has **no relay counterpart**: it is the out-of-band brake that still works when the relay is unreachable or misconfigured.
 
-| Env (`GLOBAL` ∧ module) | `WithTracingEnabled` | Effective tracing |
-|-------------------------|----------------------|-------------------|
-| off (unset or falsy) | *(absent)* | **off** |
-| off (unset or falsy) | `true` | **on** |
-| off (unset or falsy) | `false` | **off** |
-| on | *(absent)* | **on** |
-| on | `false` | **off** |
-| on | `true` | **on** |
+### Wiring a provider
 
-Mongo-only: `WithTracePropagationEnabled` controls `_oteltrace` on that client only while effective tracing is **on**; it cannot enable propagation when effective tracing is off. Package-level `ContextFromDocument` / `ContextFromRawDocument` stay **env-only** (all three Mongo env vars) and ignore per-client options. See [otel-mongo/README.md](otel-mongo/README.md) for the propagation sub-table.
+The instrumentation modules never install an OpenFeature provider — the same rule that keeps them from initializing a `TracerProvider`. Applications wire one at startup, next to their existing OTel setup:
+
+```go
+import (
+    "github.com/open-feature/go-sdk/openfeature"
+    gofeatureflag "github.com/open-feature/go-sdk-contrib/providers/go-feature-flag/pkg"
+)
+
+provider, err := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{
+    Endpoint: "http://relay-proxy:1031",
+})
+if err != nil {
+    return err
+}
+if err := openfeature.SetProviderAndWait(provider); err != nil {
+    return err
+}
+// optional, for process-level targeting on the relay:
+openfeature.SetEvaluationContext(openfeature.NewTargetlessEvaluationContext(map[string]any{
+    "service.name": "checkout-api",
+}))
+```
+
+The GO Feature Flag provider is an **application** dependency; the instrumentation modules depend only on `github.com/open-feature/go-sdk`.
+
+Resolved values are cached per module for **one second**, so hot paths never enter the OpenFeature evaluation pipeline. Because that cache is process-wide, targeting can key on process-level attributes (service, environment, host) but **not** on per-request attributes.
+
+### Precedence
+
+| Priority | Source | Notes |
+|---|---|---|
+| 1 | `WithTracingEnabled(v)` | Connection/client becomes fully **static** — no OpenFeature evaluation runs for it and no relay change reaches it. |
+| 2 | `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | Kill switch. Off ⇒ off, unconditionally. |
+| 3 | Relay flag | Decides when the relay has an opinion. |
+| 4 | Module env var | The value passed to OpenFeature as the evaluation default. |
+
+Every module accepts `WithTracingEnabled(v bool)` at construction (`ConnectWithOptions` / `NewConn` / `Dial` / `Upgrade`, etc.):
+
+| Kill switch | Relay / module flag | `WithTracingEnabled` | Effective tracing |
+|---|---|---|---|
+| off | any | *(absent)* | **off** — no evaluation performed |
+| off | any | `true` | **on** |
+| off | any | `false` | **off** |
+| on | on | *(absent)* | **on** |
+| on | off | *(absent)* | **off** |
+| on | any | `false` | **off** |
+| on | any | `true` | **on** |
+
+Mongo-only: `WithTracePropagationEnabled` controls `_oteltrace` on that client only while effective tracing is **on**; it cannot enable propagation when effective tracing is off. Package-level `ContextFromDocument` / `ContextFromRawDocument` follow the relay (they have no client to consult, so they ignore per-client options). See [otel-mongo/README.md](otel-mongo/README.md) for the propagation sub-table.
+
+WebSocket-only: `otel-ws` subprotocol negotiation is gated on the **kill switch alone**, never on the relay flag. The handshake cannot be revisited, so a connection established while the relay flag is off would otherwise never be able to propagate trace context after it flips on. Consequence: two peers both running this library with the kill switch on exchange the JSON envelope even while tracing is off.
 
 ## Layout
 

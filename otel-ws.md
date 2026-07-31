@@ -47,13 +47,26 @@ OTEL-WS Server 會檢查收到的協議是否帶有 `otel-ws` 前綴，決定是
 
 這個表格已涵蓋 Excalidraw 圖中所有矩形區塊、箭頭標籤（如 `""`、` "json"`、` "otel-ws,json"`）、側邊說明文字，以及 OTEL-WS 的隱藏注入與檢查邏輯。
 
-### 5. Feature-flag 對協商的閘控(0.7.0+)
+### 5. Feature-flag 對協商的閘控(0.7.0+;0.8.0 起區分兩個閘)
 
-上述 C–H 情境全部以「該連線的 effective tracing feature 為 **on**」為前提。feature flag(env gates `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` × `OTEL_GORILLA_WS_TRACING_ENABLED`,可被 per-connection `WithTracingEnabled(v)` 覆寫)在 **handshake 之前**先行解析:
+上述 C–H 情境全部以「該連線具備 envelope 能力」為前提。自 0.8.0 起,**協商**與**span 產生**由兩個不同的閘決定 —— 這個區分是動態 flag 的直接後果,必須分開理解:
 
-| Feature (effective) | Dial 行為 | Upgrade 行為 | 結果 |
+| 閘 | 決定什麼 | 由誰決定 | 何時解析 |
+| --- | --- | --- | --- |
+| **negotiation capability** | Dial 是否 offer、Upgrade 是否 confirm `otel-ws` | `WithTracingEnabled(v)`(若有),否則**僅** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | handshake **之前**,終生不變 |
+| **span gate** | 每次 `WriteMessage`/`ReadMessage` 是否建 span、是否 inject/extract | `WithTracingEnabled(v)`(若有),否則全域開關 **AND** 動態 flag `otel-gorilla-ws-tracing` | **每次呼叫**,連線存活期間可變 |
+
+協商表:
+
+| Capability | Dial 行為 | Upgrade 行為 | 結果 |
 | --- | --- | --- | --- |
 | **off** | 完全不注入 `otel-ws` token | 即使客戶端提出 `otel-ws` 也不回傳確認,改走一般協議選擇(等同情境 H) | 雙方都不封裝 envelope,純透傳 |
 | **on** | 依情境 C–E 注入並判定 | 依情境 F–H 判定 | 原表格行為 |
 
-**理由**:feature off 的一方不會解包 JSON envelope。若仍允許協商成功(0.7.0 之前的行為),對端會封裝每一則訊息,而 feature-off 端的 `ReadMessage` 直通路徑把原始 `{"header":...,"data":...}` bytes 交給應用層 — 靜默資料損毀。協商結果必須反映實際的 envelope 能力,故以 handshake 前解析的 effective flag 閘控 offer(Dial)與 confirm(Upgrade)。注意反向不成立:`WithTracingEnabled(true)` 無法強迫未協商 otel-ws 的對端使用 envelope(`tracingEnabled` 仍需雙方同意)。
+**為什麼 capability 不看動態 flag。** 協商只發生在 handshake,事後無法重來。若以動態值閘控,則「flag 關著的期間建立的連線」永遠無法在 flag 打開後傳遞 trace context —— 而 WebSocket 連線動輒存活數小時。代價是:兩端都使用本 library 且全域開關為 on 時,即使 tracing 動態關閉,每則訊息仍帶 envelope。這是刻意的取捨,參見 `design.md` D9。
+
+**為什麼 capability off 時不能協商。** capability off 的一方不會解包 JSON envelope。若仍允許協商成功(0.7.0 之前的行為),對端會封裝每一則訊息,而 capability-off 端的 `ReadMessage` 直通路徑把原始 `{"header":...,"data":...}` bytes 交給應用層 —— 靜默資料損毀。
+
+**反向不成立。** `WithTracingEnabled(true)` 或動態 flag 打開,都無法強迫未協商 otel-ws 的對端使用 envelope;`Conn.tracingEnabled`(協商結果)仍需雙方同意。
+
+**中途翻轉的行為。** 已協商 otel-ws 的連線在動態 flag 關閉後:仍照常寫出 envelope(對端預期如此),但 header 為空、不建 span。讀取端的 `tryUnmarshalWire` 是探測式的,非 envelope 訊息會回退成原始 payload,所以任一方向都不會壞。

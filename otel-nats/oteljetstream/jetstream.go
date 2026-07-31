@@ -73,8 +73,9 @@ const (
 	AckAllPolicy      = jetstream.AckAllPolicy
 )
 
-// JetStream is the main interface for JetStream with tracing. Two impls exist:
-// tracedJSImpl applies full instrumentation; directJSImpl is a passthrough.
+// JetStream is the main interface for JetStream with tracing. One impl exists:
+// tracedJSImpl, which resolves the tracing flag per call and delegates straight
+// to the native jetstream.JetStream when it resolves off.
 type JetStream interface {
 	Publish(ctx context.Context, subject string, data []byte, opts ...jetstream.PublishOpt) (*PubAck, error)
 	PublishMsg(ctx context.Context, msg *nats.Msg, opts ...jetstream.PublishOpt) (*PubAck, error)
@@ -99,8 +100,19 @@ type JetStream interface {
 }
 
 // New returns a JetStream interface that propagates trace context across publishes
-// and consumer paths. The returned impl is chosen by conn.TracingEnabled() —
-// tracedJSImpl when on, directJSImpl when off — so per-method gates disappear.
+// and consumer paths.
+//
+// The impl is NOT chosen by the flag value at construction time. An application
+// creates its JetStream handle once at startup and keeps it for the process
+// lifetime, so pinning the choice here would make the flag effectively static for
+// everything derived from it. Instead tracedJSImpl is returned unconditionally and
+// resolves the flag per call.
+//
+// This costs nothing when the connection can never trace: tracedJSImpl holds no
+// OTel state of its own, and every gate consults conn.TracingEnabled(), which is
+// permanently false for a Conn built with the global kill switch off or with
+// WithTracingEnabled(false). Such a connection never constructed a real tracer, so
+// no OTel SDK code path is reachable through this wrapper either.
 //
 // Usage: js, err := oteljetstream.New(otelnatsConn)
 func New(conn *otelnats.Conn) (JetStream, error) {
@@ -108,10 +120,7 @@ func New(conn *otelnats.Conn) (JetStream, error) {
 	if err != nil {
 		return nil, err
 	}
-	if conn.TracingEnabled() {
-		return &tracedJSImpl{conn: conn, js: js}, nil
-	}
-	return &directJSImpl{js: js}, nil
+	return &tracedJSImpl{conn: conn, js: js}, nil
 }
 
 // orderedConsumerName is the fallback consumer-name attribute applied to

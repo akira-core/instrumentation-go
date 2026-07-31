@@ -15,7 +15,7 @@ import (
 )
 
 func resetWSGateForTest() {
-	wsGate.ResetForTest()
+	wsResolver = newWSResolver()
 }
 
 func TestWSTracingEnabled_DefaultFalse(t *testing.T) {
@@ -103,7 +103,7 @@ func TestFeatureDisabled_PassesThroughToNativeConn(t *testing.T) {
 	t.Cleanup(func() { _ = rawConn.Close() })
 
 	conn := newConn(rawConn, false)
-	if conn.featureEnabled {
+	if conn.featureEnabled() {
 		t.Fatal("expected featureEnabled false")
 	}
 

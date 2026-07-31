@@ -75,7 +75,7 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 	// Gate negotiation on the effective feature flag, resolved BEFORE the
 	// handshake — the wire format each side speaks must match what it
 	// advertises.
-	negotiateOTel := otelRequested && effectiveFeatureEnabled(cfg)
+	negotiateOTel := otelRequested && effectiveCapability(cfg)
 
 	// Work on a copy of Inner so we never mutate the caller's upgrader.
 	inner := u.Inner

@@ -12,12 +12,37 @@ import (
 // without re-reading env.
 type Database struct {
 	*mongo.Database
-	serverAddr         string
-	serverPort         int
-	tracer             trace.Tracer
-	propagator         propagation.TextMapPropagator
-	tracingEnabled     bool
-	propagationEnabled bool
+	serverAddr          string
+	serverPort          int
+	tracer              trace.Tracer
+	propagator          propagation.TextMapPropagator
+	tracingOverride     *bool
+	propagationOverride *bool
+	tracedBuilt         bool
+}
+
+// effectiveTracing reports whether THIS call should be instrumented.
+func (d *Database) effectiveTracing() bool {
+	if !d.tracedBuilt {
+		return false
+	}
+	if d.tracingOverride != nil {
+		return *d.tracingOverride
+	}
+	return mongoTracingEnabled()
+}
+
+// effectivePropagation reports whether THIS call should inject or extract
+// _oteltrace. Static databases (inherited tracingOverride) use the env-only
+// propagation default — see Client.effectivePropagation for why.
+func (d *Database) effectivePropagation() bool {
+	if d.tracingOverride != nil {
+		if !d.effectiveTracing() {
+			return false
+		}
+		return resolveFlag(d.propagationOverride, mongoPropagationEnvOnly())
+	}
+	return resolveDocumentPropagation(d.effectiveTracing(), d.propagationOverride)
 }
 
 // Collection returns a Collection with document-level trace propagation.

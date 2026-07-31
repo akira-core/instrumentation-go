@@ -8,11 +8,13 @@ import (
 func TestMongoTracingEnabled_DefaultFalse(t *testing.T) {
 	prev, existed := os.LookupEnv(envMongoTracingEnabled)
 	_ = os.Unsetenv(envMongoTracingEnabled)
+	resetPropEnabledCacheForTest()
 	t.Cleanup(func() {
 		if existed {
 			_ = os.Setenv(envMongoTracingEnabled, prev)
 		} else {
 			_ = os.Unsetenv(envMongoTracingEnabled)
+			resetPropEnabledCacheForTest()
 		}
 	})
 	if mongoTracingEnabled() {
@@ -23,6 +25,7 @@ func TestMongoTracingEnabled_DefaultFalse(t *testing.T) {
 func TestMongoTracingEnabled_EmptyStringIsEnabled(t *testing.T) {
 	t.Setenv(envGlobalTracingEnabled, "")
 	t.Setenv(envMongoTracingEnabled, "")
+	resetPropEnabledCacheForTest()
 	if !mongoTracingEnabled() {
 		t.Fatal("expected empty string to mean enabled")
 	}
@@ -31,6 +34,7 @@ func TestMongoTracingEnabled_EmptyStringIsEnabled(t *testing.T) {
 func TestMongoTracingEnabled_FalseTokens(t *testing.T) {
 	for _, v := range []string{"false", "0", "off", "no"} {
 		t.Setenv(envMongoTracingEnabled, v)
+		resetPropEnabledCacheForTest()
 		if mongoTracingEnabled() {
 			t.Fatalf("expected disabled for value %q", v)
 		}
@@ -40,6 +44,7 @@ func TestMongoTracingEnabled_FalseTokens(t *testing.T) {
 func TestMongoTracingEnabled_GlobalOffOverridesModule(t *testing.T) {
 	t.Setenv(envGlobalTracingEnabled, "false")
 	t.Setenv(envMongoTracingEnabled, "true")
+	resetPropEnabledCacheForTest()
 	if mongoTracingEnabled() {
 		t.Fatal("expected global flag to disable mongo tracing")
 	}
@@ -49,6 +54,7 @@ func TestMongoPropagationEnabled(t *testing.T) {
 	t.Run("unset global and propagation -> false", func(t *testing.T) {
 		_ = os.Unsetenv(envGlobalTracingEnabled)
 		_ = os.Unsetenv(envMongoPropagationEnabled)
+		resetPropEnabledCacheForTest()
 		if mongoPropagationEnabled() {
 			t.Fatal("expected propagation disabled when env vars are unset")
 		}
@@ -58,6 +64,7 @@ func TestMongoPropagationEnabled(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "true")
 		t.Setenv(envMongoTracingEnabled, "false")
 		t.Setenv(envMongoPropagationEnabled, "true")
+		resetPropEnabledCacheForTest()
 		if mongoPropagationEnabled() {
 			t.Fatal("expected propagation disabled when mongo tracing is off")
 		}
@@ -67,6 +74,7 @@ func TestMongoPropagationEnabled(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "true")
 		t.Setenv(envMongoTracingEnabled, "true")
 		_ = os.Unsetenv(envMongoPropagationEnabled)
+		resetPropEnabledCacheForTest()
 		if mongoPropagationEnabled() {
 			t.Fatal("expected propagation disabled when module flag is unset")
 		}
@@ -76,6 +84,7 @@ func TestMongoPropagationEnabled(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "true")
 		t.Setenv(envMongoTracingEnabled, "true")
 		t.Setenv(envMongoPropagationEnabled, "true")
+		resetPropEnabledCacheForTest()
 		if !mongoPropagationEnabled() {
 			t.Fatal("expected propagation enabled")
 		}
@@ -103,6 +112,7 @@ func TestConnectPropagationResolution(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "false")
 		t.Setenv(envMongoTracingEnabled, "true")
 		t.Setenv(envMongoPropagationEnabled, "true")
+		resetPropEnabledCacheForTest()
 		cfg := newClientConfig([]ClientOption{WithTracePropagationEnabled(true)})
 		if resolveDocumentPropagation(mongoTracingEnabled(), cfg.PropagationEnabled) {
 			t.Fatal("expected propagation disabled when global tracing is off")
@@ -113,6 +123,7 @@ func TestConnectPropagationResolution(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "true")
 		t.Setenv(envMongoTracingEnabled, "false")
 		t.Setenv(envMongoPropagationEnabled, "true")
+		resetPropEnabledCacheForTest()
 		cfg := newClientConfig([]ClientOption{WithTracePropagationEnabled(true)})
 		if resolveDocumentPropagation(mongoTracingEnabled(), cfg.PropagationEnabled) {
 			t.Fatal("expected propagation disabled when mongo tracing is off")
@@ -123,6 +134,7 @@ func TestConnectPropagationResolution(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "true")
 		t.Setenv(envMongoTracingEnabled, "true")
 		t.Setenv(envMongoPropagationEnabled, "true")
+		resetPropEnabledCacheForTest()
 		cfg := newClientConfig([]ClientOption{WithTracePropagationEnabled(false)})
 		if resolveDocumentPropagation(mongoTracingEnabled(), cfg.PropagationEnabled) {
 			t.Fatal("expected WithTracePropagationEnabled(false) to disable propagation")
@@ -133,6 +145,7 @@ func TestConnectPropagationResolution(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "true")
 		t.Setenv(envMongoTracingEnabled, "true")
 		_ = os.Unsetenv(envMongoPropagationEnabled)
+		resetPropEnabledCacheForTest()
 		cfg := newClientConfig([]ClientOption{WithTracePropagationEnabled(true)})
 		if !resolveDocumentPropagation(mongoTracingEnabled(), cfg.PropagationEnabled) {
 			t.Fatal("expected WithTracePropagationEnabled(true) to enable propagation when tracing is on")
@@ -244,6 +257,7 @@ func TestWithTracingEnabled_EnvOptionMatrix(t *testing.T) {
 			case envOff:
 				t.Setenv(envGlobalTracingEnabled, "false")
 				t.Setenv(envMongoTracingEnabled, "false")
+				resetPropEnabledCacheForTest()
 				unsetEnvRestore(t, envMongoPropagationEnabled)
 				resetPropEnabledCacheForTest()
 				t.Cleanup(resetPropEnabledCacheForTest)
@@ -309,17 +323,21 @@ func TestWithTracePropagationEnabled_EnvOptionMatrix(t *testing.T) {
 				case envOn:
 					t.Setenv(envGlobalTracingEnabled, "1")
 					t.Setenv(envMongoTracingEnabled, "1")
+					resetPropEnabledCacheForTest()
 				case envOff:
 					t.Setenv(envGlobalTracingEnabled, "false")
 					t.Setenv(envMongoTracingEnabled, "false")
+					resetPropEnabledCacheForTest()
 				}
 				switch prop {
 				case envUnset:
 					unsetEnvRestore(t, envMongoPropagationEnabled)
 				case envOn:
 					t.Setenv(envMongoPropagationEnabled, "1")
+					resetPropEnabledCacheForTest()
 				case envOff:
 					t.Setenv(envMongoPropagationEnabled, "false")
+					resetPropEnabledCacheForTest()
 				}
 				resetPropEnabledCacheForTest()
 				t.Cleanup(resetPropEnabledCacheForTest)

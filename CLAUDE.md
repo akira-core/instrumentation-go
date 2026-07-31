@@ -90,17 +90,19 @@ Applications call `otelsetup.Init()` at startup to configure the global provider
 
 ### Feature Flags (otel-mongo)
 
-Three env vars plus optional `ConnectWithOptions` override (all default **disabled** when unset for the module-specific vars):
+Three switches plus optional `ConnectWithOptions` overrides. Since 0.9.0 the two module switches are **dynamic** — the env var is the fallback the relay overrides, not the final say (see **Dynamic feature flags** below).
 
-| Env var | Scope |
+| Switch | Scope |
 |---|---|
-| `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | global master switch (must be truthy for any mongo module flag or `WithTracePropagationEnabled` to apply) |
-| `OTEL_MONGO_TRACING_ENABLED` | gates **both** wrapper **CLIENT** spans (noop vs real tracer) **and** `_oteltrace` document propagation for this package |
-| `OTEL_MONGO_PROPAGATION_ENABLED` | only consulted when both global and `OTEL_MONGO_TRACING_ENABLED` are on; final say on `_oteltrace` inject/extract on Collection/Cursor/ChangeStream and **ContextFromDocument** / **ContextFromRawDocument** |
+| `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` (env only) | global kill switch. Off ⇒ no OpenFeature evaluation, no relay value can enable anything, and only the passthrough implementations are constructed |
+| `otel-mongo-tracing` (relay; default `OTEL_MONGO_TRACING_ENABLED`) | gates **both** wrapper **CLIENT** spans **and** `_oteltrace` document propagation for this package |
+| `otel-mongo-propagation` (relay; default `OTEL_MONGO_PROPAGATION_ENABLED`) | only consulted when the global switch and `otel-mongo-tracing` are on; final say on `_oteltrace` inject/extract on Collection/Cursor/ChangeStream and **ContextFromDocument** / **ContextFromRawDocument** |
 
-`flags.EnvEnabled()` (from the shared `internal/flags` package — see below) returns `false` when a var is absent. When `OTEL_MONGO_TRACING_ENABLED` is unset/disabled, this package uses a noop tracer for its wrapper spans **and** force-disables `_oteltrace` propagation — Mongo tracing and Mongo trace propagation share a single kill switch. `WithTracePropagationEnabled` only overrides the propagation default while both tracing gates are on; it **cannot** enable propagation when global or module tracing is off.
+Both module flags live in **one** `flags.Resolver` so they always come from the same snapshot instant — a torn read reporting tracing off while propagation read on could never correspond to a relay state.
 
-`WithTracingEnabled(v bool)` (0.7.0+) overrides the two tracing env vars above for a single `Client`, in either direction — see **Per-connection tracing override** below.
+When `otel-mongo-tracing` resolves off, this package emits no wrapper spans **and** force-disables `_oteltrace` propagation — Mongo tracing and Mongo trace propagation share a single kill switch. `WithTracePropagationEnabled` only overrides the propagation default while tracing resolves on; it **cannot** enable propagation when the global switch or `otel-mongo-tracing` is off.
+
+`WithTracingEnabled(v bool)` (0.7.0+) overrides all of the above for a single `Client`, in either direction, and makes that client fully static — see **Per-connection tracing override** below.
 
 ### Per-connection tracing override (all four modules, 0.7.0+)
 
@@ -115,10 +117,44 @@ Three module-specific pitfalls to know if you touch this:
 
 ### Shared `internal/flags` package
 
-All four modules vendor their own copy of `internal/flags` (`flags.go` + `flags_test.go`); its doc comment requires the file contents (excluding the `package` line) to stay byte-identical across every copy. It exports two primitives used by both the strategy-split and cached-gate enforcement patterns below:
+All four modules vendor their own copy of `internal/flags` (`flags.go` + `flags_test.go`); its doc comment requires the file contents (excluding the `package` line) to stay byte-identical across every copy. It exports two primitives:
 
 - `EnvEnabled(name string) bool` — default-off env var read; unset or falsy (`0`/`false`/`no`/`off`, case-insensitive) → `false`.
-- `Gate` — caches a resolver function's result once via `sync.Once`/`atomic.Bool`. `NewGate(fn)` constructs one, `Enabled()` returns the cached value, and `ResetForTest()` (not parallel-safe) exists only for tests that toggle env vars with `t.Setenv`.
+- `Resolver` — resolves a module's dynamic flags through the process-global OpenFeature client and caches them in an immutable snapshot behind an `atomic.Pointer` with a **fixed one-second TTL**. `NewResolver(domain, WithSpecs(...), WithClock(...))` constructs one; `Enabled(i)` reads spec `i`. `WithClock` is test-only.
+
+`Gate`/`NewGate`/`ResetForTest` were **removed in 0.8.0/0.9.0** — a process-lifetime cache is incompatible with runtime flag changes.
+
+Each `Spec` pairs an OpenFeature key with the env var passed as the evaluation **default**, so `client.Boolean(ctx, key, EnvEnabled(envVar), ...)` expresses the whole fallback policy in one call: the relay decides when it has an opinion, otherwise the environment does. `Client.Boolean` returns the default on every failure path (no provider, not ready, flag absent, evaluation error), so there is no error handling and no undefined state.
+
+The file names no module: flag keys and env var names live in each module's own `env_flags.go` and are passed in as `Spec` values.
+
+### Dynamic feature flags (0.8.0/0.9.0+)
+
+Tracing and Mongo propagation are resolved at **runtime** through [OpenFeature](https://openfeature.dev), so an operator can flip them via a GO Feature Flag relay proxy without restarting the application.
+
+| OpenFeature key | Fallback env var | Modules |
+|---|---|---|
+| `otel-mongo-tracing` | `OTEL_MONGO_TRACING_ENABLED` | `otel-mongo`, `otel-mongo/v2` |
+| `otel-mongo-propagation` | `OTEL_MONGO_PROPAGATION_ENABLED` | `otel-mongo`, `otel-mongo/v2` |
+| `otel-nats-tracing` | `OTEL_NATS_TRACING_ENABLED` | `otel-nats` |
+| `otel-gorilla-ws-tracing` | `OTEL_GORILLA_WS_TRACING_ENABLED` | `otel-gorilla-ws` |
+
+Precedence, highest first:
+
+1. **`WithTracingEnabled(v)`** — when present the connection/client is fully **static**: implementation fixed at construction, no OpenFeature evaluation ever runs for it, no relay change reaches it.
+2. **`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`** — an out-of-band **kill switch with no relay counterpart**. Off ⇒ no evaluation happens at all and no relay value can enable anything. It is the only brake that works when the relay is unreachable or misconfigured.
+3. **The relay flag**, defaulting to the module env var when the relay has no opinion.
+
+**Never call `openfeature.SetProvider`** (or `SetNamedProvider`/`SetEvaluationContext`/`AddHooks`/`Shutdown`) from library code — same rule as never initializing a `TracerProvider`. Applications install a provider at startup:
+
+```go
+provider, _ := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{Endpoint: "http://relay:1031"})
+_ = openfeature.SetProviderAndWait(provider)
+```
+
+With no provider installed, every module behaves exactly as it did before dynamic flags. The library passes an empty `EvaluationContext{}`; targeting is the application's job via `SetEvaluationContext`. Because the snapshot is process-wide, only process-scoped targeting attributes are meaningful — **per-request targeting is not supported**.
+
+**Tests that toggle env vars or install a provider must re-arm the module's resolver** (`resetPropEnabledCacheForTest` in otel-mongo, `resetNATSGateForTest`, `resetWSGateForTest`) and **must not call `t.Parallel`** — the provider, the environment and the resolver are all process-global.
 
 ### Consumer Context
 
@@ -134,7 +170,9 @@ When any feature flag returns false, **no OTel SDK code path may run**: no `trac
 
 **1. Strategy split (preferred — otel-mongo Collection / Cursor / SingleResult / ChangeStream).** The facade type holds an `impl` interface satisfied by either `internal/direct.X` (passthrough) or `internal/traced.X` (instrumented). Construction picks the impl once; per-method runtime gates disappear. `internal/direct/*.go` imports no `go.opentelemetry.io/otel/sdk/*` and no `otel/exporters/*` — the disabled path is **compiler-enforced** by package boundary.
 
-**2. Cached gate (otel-nats, otel-gorilla-ws, and otel-mongo Client/Database).** Connect/constructor reads env once → caches `tracingEnabled bool` on the wrapper struct. Every public method starts with `if !c.tracingEnabled { /* delegate to native */ }`. Reviewer-enforced. Migration of these wrappers to the strategy-split pattern is planned but not yet tracked in a written design doc.
+**2. Per-call gate (otel-nats `oteljetstream`, otel-gorilla-ws).** Every public method starts with `if !c.on() { /* delegate to native */ }`, where `on()` re-resolves the flag. Reviewer-enforced. These packages have no `internal/direct` boundary — direct and traced live in the same package — so there is nothing for the compiler to enforce.
+
+**Which switch selects the implementation.** Since 0.8.0/0.9.0 the choice is `option != nil ? *option : EnvEnabled(GLOBAL)` — the **global switch alone**, not the module flag. This is load-bearing: keying it on the module flag would make `WithTracingEnabled(true)` with every env var off select the passthrough path, so the option could never produce a span. Consequence: a process with the global switch on and a module flag off now allocates the instrumented wrapper and pays one atomic load plus one clock read per operation. It still emits no spans.
 
 Independent of pattern:
 - For otel-mongo, `Connect` substitutes `noop.NewTracerProvider()` when disabled so any stray `tracer.Start` is inert.
@@ -146,7 +184,9 @@ Independent of pattern:
 
 Compile-time `var _ shared.CursorImpl = (*traced.Cursor)(nil)` assertions in facade `cursor.go` / `results.go` (and `var _ collectionImpl = (*traced.Collection)(nil)` in `collection.go`) fail the build if any impl misses a method.
 
-**Adding a new public method to a cached-gate wrapper** (otel-nats, otel-gorilla-ws) — fast-path gate is the first statement: `if !c.tracingEnabled { return c.nc.Publish(...) }`. Examples to copy: `otelnats.Conn.Publish`, `otelgorillaws.Conn.WriteMessage`.
+**Adding a new public method to a per-call-gate wrapper** (otel-nats `oteljetstream`, otel-gorilla-ws) — fast-path gate is the first statement, calling the **method** not a cached field: `if !c.on() { return c.js.Publish(...) }`. Examples to copy: `tracedJSImpl.Publish`, `tracedConsumer.Fetch`, `otelgorillaws.Conn.WriteMessage`.
+
+**Methods that RETURN a wrapper must not be gated** (`tracedJSImpl.Consumer`, `tracedStream.CreateConsumer`, …). They always hand back the instrumented wrapper, which gates its own methods. Returning a passthrough wrapper because the flag happened to be off would pin that consumer or stream forever — exactly what per-call resolution exists to avoid.
 
 ### Strategy-split layout (otel-mongo)
 
@@ -166,7 +206,9 @@ otelmongo/
 ```
 
 Key rules:
-- `internal/shared/impls.go` declares the polymorphic interfaces (`CursorImpl`, `SingleResultImpl`, `ChangeStreamImpl`) satisfied by both `internal/direct.X` and `internal/traced.X`. Facade `Cursor` / `SingleResult` / `ChangeStream` hold an `impl shared.XImpl` field.
+- `internal/shared/impls.go` declares the polymorphic interfaces (`CursorImpl`, `SingleResultImpl`, `ChangeStreamImpl`) satisfied by both `internal/direct.X` and `internal/traced.X`.
+- **Dual implementation (0.9.0+).** Facade `Collection`, `Cursor` and `ChangeStream` hold **both** a `direct` and a `traced` field plus a `tracing func() bool`, and select per operation via `impl()`. `traced` is nil when the global kill switch was off at construction, so no OTel path is reachable. `SingleResult` is the **documented exception**: `traced.SingleResult` holds the live `FindOne` span (ended once on the first `Decode`/`TraceContext`/`Raw`), so a passthrough `FindOne` leaves nothing to wrap and a mid-flight flip would strand an unended span — its implementation stays fixed by the path that ran the `FindOne`.
+- `traced.Collection.PropagationEnabled` is a `func() bool` (not a `bool`), read per call via the nil-safe `t.propagationOn()`. Same for `traced.Cursor` / `traced.ChangeStream`'s `propagationEnabled`.
 - Facade `collectionImpl` interface returns raw driver types (`*mongo.Cursor`, `*mongo.SingleResult`, `*mongo.ChangeStream`) + `shared.XImpl` — the impl packages never need to import the facade, preventing any facade ↔ internal cycle. Facade methods wrap raw types into facade wrappers (`&Cursor{Cursor: raw, impl: cImpl}`).
 - `internal/traced.Collection` has **exported fields** (`Coll`, `Tracer`, `Propagator`, `PropagationEnabled`, `ServerAddr`, `ServerPort`) so facade-package tests can build literals and call them directly.
 - v1/v2 parity extends to `internal/{direct,traced,shared}/`. The helpers in `internal/shared/{bulkwrite.go,semconv.go,tracing.go,impls.go,monitor.go,hostport.go}` are intentionally duplicated across modules (separate `internal/` trees cannot share). A drift-check CI step to catch divergence between the two copies is planned but not yet implemented.
@@ -174,7 +216,7 @@ Key rules:
 
 ### Propagation flag caching (otel-mongo)
 
-`ContextFromDocument` / `ContextFromRawDocument` (`tracing.go`, both v1 and v2) call `cachedPropagationEnabled()`, which reads env **once** via `sync.Once` and stores in `atomic.Bool` (`env_flags.go`). The cached value reflects the full gate: `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` AND `OTEL_MONGO_TRACING_ENABLED` AND `OTEL_MONGO_PROPAGATION_ENABLED`. **Env changes after first call are ignored.** Tests that toggle any of those three vars via `t.Setenv` **must** call `resetPropEnabledCacheForTest()` after the Setenv to reset the cache. Helpers `enableTracing` / `enableDocumentPropagation` in `tracing_test.go` already invoke reset + `t.Cleanup` (and `enableDocumentPropagation` now sets all three flags). Do **not** add `t.Parallel()` to tests that touch these env vars — the reset is not parallel-safe.
+`ContextFromDocument` / `ContextFromRawDocument` (`tracing.go`, both v1 and v2) call `cachedPropagationEnabled()`, which resolves through the module's `flags.Resolver` snapshot (`env_flags.go`) — the global env kill switch AND the dynamic `otel-mongo-tracing` AND `otel-mongo-propagation` values. **They follow the relay within the resolver's TTL** (changed in 0.9.0; previously a permanently cached env-only gate), so a flag that stops the `Collection` path also stops a change-stream reader in the same loop. They still ignore per-connection options — they are package-level functions with no client to consult. Tests that toggle any of those three vars via `t.Setenv` **must** call `resetPropEnabledCacheForTest()` after the Setenv to reset the cache. Helpers `enableTracing` / `enableDocumentPropagation` in `tracing_test.go` already invoke reset + `t.Cleanup` (and `enableDocumentPropagation` now sets all three flags). Do **not** add `t.Parallel()` to tests that touch these env vars — the reset is not parallel-safe.
 
 ### `oteljetstream.MessageBatch.Stop()`
 

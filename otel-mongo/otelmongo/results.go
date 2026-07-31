@@ -63,20 +63,33 @@ func (r *SingleResult) Raw() (bson.Raw, error) { return r.impl.Raw() }
 // ChangeStream wraps *mongo.ChangeStream with optional trace propagation.
 type ChangeStream struct {
 	*mongo.ChangeStream
-	impl shared.ChangeStreamImpl
+
+	// A change stream can stay open across many flag changes, so the
+	// implementation is selected per call rather than at Watch time. direct is
+	// always present; traced is nil when the instrumented path was never built.
+	direct  shared.ChangeStreamImpl
+	traced  shared.ChangeStreamImpl
+	tracing func() bool
+}
+
+func (cs *ChangeStream) impl() shared.ChangeStreamImpl {
+	if cs.traced != nil && cs.tracing() {
+		return cs.traced
+	}
+	return cs.direct
 }
 
 // Next advances the change stream to the next change document.
 func (cs *ChangeStream) Next(ctx context.Context) bool { return cs.ChangeStream.Next(ctx) }
 
 // Decode decodes the current change document into val.
-func (cs *ChangeStream) Decode(val any) error { return cs.impl.Decode(val) }
+func (cs *ChangeStream) Decode(val any) error { return cs.impl().Decode(val) }
 
 // DecodeAndTrace decodes the current change document into val and returns
 // a context enriched with trace context extracted from fullDocument's
 // "_oteltrace" field.
 func (cs *ChangeStream) DecodeAndTrace(ctx context.Context, val any) (context.Context, error) {
-	return cs.impl.DecodeAndTrace(ctx, val)
+	return cs.impl().DecodeAndTrace(ctx, val)
 }
 
 // Close closes the change stream.

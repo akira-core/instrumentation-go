@@ -49,11 +49,11 @@ func TestConnectWithOptions_TracingEnabledOption_True_OverridesEnvUnset(t *testi
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Disconnect(context.Background()) })
 
-	assert.True(t, c.tracingEnabled, "option must override the disabled env gate")
+	assert.True(t, c.effectiveTracing(), "option must override the disabled env gate")
 
 	coll := c.Database("otelmongo_test").Collection("option_true_overrides_env")
 	t.Cleanup(func() { _ = coll.Drop(context.Background()) })
-	assert.IsType(t, &traced.Collection{}, coll.impl, "Collection must select the traced impl")
+	assert.IsType(t, &traced.Collection{}, coll.impl(), "Collection must select the traced impl")
 }
 
 // TestConnectWithOptions_TracingEnabledOption_False_OverridesEnvTruthy
@@ -76,12 +76,12 @@ func TestConnectWithOptions_TracingEnabledOption_False_OverridesEnvTruthy(t *tes
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Disconnect(context.Background()) })
 
-	assert.False(t, c.tracingEnabled, "option must override the truthy env gates")
-	assert.False(t, c.propagationEnabled, "propagation cannot be enabled when effective tracing is off, even via WithTracePropagationEnabled")
+	assert.False(t, c.effectiveTracing(), "option must override the truthy env gates")
+	assert.False(t, c.effectivePropagation(), "propagation cannot be enabled when effective tracing is off, even via WithTracePropagationEnabled")
 
 	coll := c.Database("otelmongo_test").Collection("option_false_overrides_env")
 	t.Cleanup(func() { _ = coll.Drop(context.Background()) })
-	assert.IsType(t, &direct.Collection{}, coll.impl, "Collection must select the direct impl")
+	assert.IsType(t, &direct.Collection{}, coll.impl(), "Collection must select the direct impl")
 }
 
 // TestConnectWithOptions_TracingEnabledOption_True_PropagationOverrideWorks
@@ -102,8 +102,8 @@ func TestConnectWithOptions_TracingEnabledOption_True_PropagationOverrideWorks(t
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Disconnect(context.Background()) })
 
-	assert.True(t, c.tracingEnabled)
-	assert.True(t, c.propagationEnabled, "WithTracePropagationEnabled must take effect when WithTracingEnabled(true) supplies the effective tracing state, even though the env gates are unset")
+	assert.True(t, c.effectiveTracing())
+	assert.True(t, c.effectivePropagation(), "WithTracePropagationEnabled must take effect when WithTracingEnabled(true) supplies the effective tracing state, even though the env gates are unset")
 }
 
 // TestConnectWithOptions_TracingEnabledOption_Absent_MatchesEnvGate verifies
@@ -117,7 +117,7 @@ func TestConnectWithOptions_TracingEnabledOption_Absent_MatchesEnvGate(t *testin
 		c, err := ConnectWithOptions(nil, options.Client().ApplyURI(uri))
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = c.Disconnect(context.Background()) })
-		assert.False(t, c.tracingEnabled)
+		assert.False(t, c.effectiveTracing())
 	})
 
 	t.Run("env enabled", func(t *testing.T) {
@@ -128,7 +128,7 @@ func TestConnectWithOptions_TracingEnabledOption_Absent_MatchesEnvGate(t *testin
 		c, err := ConnectWithOptions(nil, options.Client().ApplyURI(uri))
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = c.Disconnect(context.Background()) })
-		assert.True(t, c.tracingEnabled)
+		assert.True(t, c.effectiveTracing())
 	})
 }
 

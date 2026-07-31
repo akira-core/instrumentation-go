@@ -7,7 +7,7 @@ import (
 
 // Stream mirrors jetstream.Stream in full for managing consumers and messages
 // with tracing. Two impls exist: tracedStream wraps every consumer-returning
-// method; directStream constructs passthrough variants. Message-management and
+// method. Message-management and
 // consumer-admin methods (GetMsg, Purge, PauseConsumer, ...) are pure
 // passthroughs — no trace propagation applies to these control-plane calls.
 type Stream interface {

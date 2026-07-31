@@ -56,10 +56,7 @@ func TestCursorDecodeAndTrace_ExtractsTrace(t *testing.T) {
 
 	require.True(t, cursor.Next(context.Background()))
 
-	c := &Cursor{
-		Cursor: cursor,
-		impl:   traced.NewCursor(cursor, tracer, stdProp, true),
-	}
+	c := &Cursor{Cursor: cursor, direct: traced.NewCursor(cursor, tracer, stdProp, alwaysTrue), traced: traced.NewCursor(cursor, tracer, stdProp, alwaysTrue), tracing: alwaysTrue}
 
 	var result bson.D
 	_, err = c.DecodeAndTrace(context.Background(), &result)
@@ -96,10 +93,7 @@ func TestCursorDecodeAndTrace_NoTrace(t *testing.T) {
 	require.True(t, cursor.Next(context.Background()))
 
 	baseCtx := context.Background()
-	c := &Cursor{
-		Cursor: cursor,
-		impl:   traced.NewCursor(cursor, tracer, stdProp, false),
-	}
+	c := &Cursor{Cursor: cursor, direct: traced.NewCursor(cursor, tracer, stdProp, alwaysFalse), traced: traced.NewCursor(cursor, tracer, stdProp, alwaysFalse), tracing: alwaysTrue}
 
 	var result bson.D
 	_, err = c.DecodeAndTrace(baseCtx, &result)
@@ -121,6 +115,7 @@ func TestCursorDecodeAndTrace_NoFlagsNoSpan(t *testing.T) {
 	t.Setenv(envGlobalTracingEnabled, "false")
 	t.Setenv(envMongoTracingEnabled, "false")
 	t.Setenv(envMongoPropagationEnabled, "true")
+	resetPropEnabledCacheForTest()
 	otel.SetTextMapPropagator(stdProp)
 
 	sr := tracetest.NewSpanRecorder()
@@ -138,10 +133,7 @@ func TestCursorDecodeAndTrace_NoFlagsNoSpan(t *testing.T) {
 
 	// Disabled path: use direct.NewCursor — passthrough impl with no OTel SDK reachable.
 	_ = noop.NewTracerProvider()
-	c := &Cursor{
-		Cursor: cursor,
-		impl:   direct.NewCursor(cursor),
-	}
+	c := &Cursor{Cursor: cursor, direct: direct.NewCursor(cursor), traced: direct.NewCursor(cursor), tracing: alwaysTrue}
 
 	var result bson.D
 	enrichedCtx, err := c.DecodeAndTrace(context.Background(), &result)
@@ -233,7 +225,7 @@ func TestCursorDecode(t *testing.T) {
 
 	require.True(t, cursor.Next(context.Background()))
 
-	c := &Cursor{Cursor: cursor, impl: direct.NewCursor(cursor)}
+	c := &Cursor{Cursor: cursor, direct: direct.NewCursor(cursor), traced: direct.NewCursor(cursor), tracing: alwaysTrue}
 
 	var result bson.D
 	err = c.Decode(&result)

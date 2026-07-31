@@ -8,7 +8,7 @@ import (
 )
 
 func resetNATSGateForTest() {
-	natsGate.ResetForTest()
+	natsResolver = newNATSResolver()
 }
 
 func TestNATSTracingEnabled_DefaultFalse(t *testing.T) {
@@ -84,8 +84,8 @@ func TestNewConn_TracingDisabled_UsesDirectConn(t *testing.T) {
 	t.Cleanup(resetNATSGateForTest)
 
 	conn := newConn(&nats.Conn{})
-	if _, ok := conn.impl.(*directConn); !ok {
-		t.Fatalf("expected *directConn impl when tracing gate is off, got %T", conn.impl)
+	if _, ok := conn.impl().(*directConn); !ok {
+		t.Fatalf("expected *directConn impl when tracing gate is off, got %T", conn.impl())
 	}
 	if conn.TracingEnabled() {
 		t.Fatal("expected TracingEnabled() false")

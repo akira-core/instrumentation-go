@@ -58,7 +58,7 @@ func TestConfigureConn_TracingEnabledFalse_UsesNoopTracer(t *testing.T) {
 
 	c := &Conn{}
 	configureConn(c, resolveConnOptions([]Option{WithTracingEnabled(false)}))
-	if c.featureEnabled {
+	if c.featureEnabled() {
 		t.Fatal("expected featureEnabled false")
 	}
 	_, span := c.tracer.Start(context.Background(), "option-disabled")
@@ -124,14 +124,19 @@ func TestWithTracingEnabled_EnvOptionMatrix(t *testing.T) {
 			}
 
 			cfg := resolveConnOptions(opts)
-			if got := effectiveFeatureEnabled(cfg); got != tc.want {
-				t.Fatalf("effectiveFeatureEnabled = %v, want %v", got, tc.want)
+
+			// Capability is the static half — it gates otel-ws negotiation and
+			// tracer construction, and reads the global switch only. Across this
+			// table it coincides with the per-operation flag because
+			// enableWSTracingEnv sets both env vars together.
+			if got := effectiveCapability(cfg); got != tc.want {
+				t.Fatalf("effectiveCapability = %v, want %v", got, tc.want)
 			}
 
 			c := &Conn{}
 			configureConn(c, cfg)
-			if c.featureEnabled != tc.want {
-				t.Fatalf("featureEnabled = %v, want %v", c.featureEnabled, tc.want)
+			if c.featureEnabled() != tc.want {
+				t.Fatalf("featureEnabled = %v, want %v", c.featureEnabled(), tc.want)
 			}
 		})
 	}
@@ -171,7 +176,7 @@ func TestNewConn_WithTracingEnabled_OverridesEnvGate(t *testing.T) {
 	t.Cleanup(func() { _ = rawConn.Close() })
 
 	conn := NewConn(rawConn, WithTracingEnabled(true))
-	if !conn.featureEnabled {
+	if !conn.featureEnabled() {
 		t.Fatal("expected featureEnabled true: option must override the disabled env gate")
 	}
 
@@ -207,7 +212,7 @@ func TestUpgrader_Upgrade_WithTracingEnabled_OverridesEnvGate(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		if !conn.featureEnabled {
+		if !conn.featureEnabled() {
 			t.Error("expected featureEnabled true on the server-side Conn: option must override the disabled env gate")
 		}
 		if err := conn.WriteMessage(context.Background(), websocket.TextMessage, []byte("server hello")); err != nil {

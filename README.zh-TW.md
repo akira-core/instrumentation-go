@@ -44,30 +44,73 @@ go get github.com/akira-core/instrumentation-go/otel-gorilla-ws@otel-gorilla-ws/
 
 ## 追蹤功能開關
 
-環境變數為**未設定視為關閉**。設成 `0`、`false`、`no`、`off`（不分大小寫）亦為關閉；其餘非空字串視為**開啟**。
+開關透過 [OpenFeature](https://openfeature.dev) 於**執行期**解析,operator 可經由 GO Feature Flag relay proxy **不重啟應用程式**即開關追蹤。未安裝 OpenFeature provider 時,每個開關回退到對應環境變數,行為與導入動態旗標之前完全相同。
 
-| 環境變數 | 作用範圍 | 未設定時 | 說明 |
-|----------|----------|----------|------|
-| `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | 全部模組 | 關 | 總開關；須開啟後，各模組追蹤旗標與（Mongo 的）文件傳播才會生效。 |
-| `OTEL_MONGO_TRACING_ENABLED` | `otel-mongo` + `otel-mongo/v2` | 關 | CLIENT span、非 noop tracer。 |
-| `OTEL_MONGO_PROPAGATION_ENABLED` | `otel-mongo` + `otel-mongo/v2` | 關 | `_oteltrace` 寫入／讀取抽取；仍受有效 tracing 約束。 |
-| `OTEL_NATS_TRACING_ENABLED` | `otelnats` + `oteljetstream` | 關 | NATS／JetStream 封裝追蹤。 |
-| `OTEL_GORILLA_WS_TRACING_ENABLED` | `otel-gorilla-ws` | 關 | WebSocket 封裝追蹤。 |
+環境變數為**未設定視為關閉**。設成 `0`、`false`、`no`、`off`(不分大小寫)亦為關閉;其餘非空字串視為**開啟**。
 
-### Env × `WithTracingEnabled` 決策表
+| OpenFeature flag key | 對應環境變數 | 作用範圍 | 說明 |
+|---|---|---|---|
+| *(無 —— 僅環境變數)* | `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | 全部模組 | **總斷路器**。關閉時完全不進行 OpenFeature 求值,relay 上任何值都無法開啟。 |
+| `otel-mongo-tracing` | `OTEL_MONGO_TRACING_ENABLED` | `otel-mongo` + `otel-mongo/v2` | CLIENT span。 |
+| `otel-mongo-propagation` | `OTEL_MONGO_PROPAGATION_ENABLED` | `otel-mongo` + `otel-mongo/v2` | `_oteltrace` 寫入／讀取抽取;仍受有效 tracing 約束。 |
+| `otel-nats-tracing` | `OTEL_NATS_TRACING_ENABLED` | `otelnats` + `oteljetstream` | NATS／JetStream 封裝追蹤。 |
+| `otel-gorilla-ws-tracing` | `OTEL_GORILLA_WS_TRACING_ENABLED` | `otel-gorilla-ws` | WebSocket span 產生。 |
 
-各模組建構時皆可傳 `WithTracingEnabled(v bool)`。option **有傳**時為**最終決定**（可雙向覆寫 env）；**沒傳**時聽 env（`GLOBAL` ∧ 模組開關）。
+總開關刻意**在 relay 上沒有對應 flag**:它是 relay 無法連線或設定寫錯時仍然有效的 out-of-band 煞車。
 
-| Env（`GLOBAL` ∧ 模組） | `WithTracingEnabled` | 有效 tracing |
-|------------------------|----------------------|--------------|
-| 關（未設或 falsy） | （無） | **關** |
-| 關（未設或 falsy） | `true` | **開** |
-| 關（未設或 falsy） | `false` | **關** |
-| 開 | （無） | **開** |
-| 開 | `false` | **關** |
-| 開 | `true` | **開** |
+### 接上 provider
 
-僅 Mongo：`WithTracePropagationEnabled` 只在有效 tracing **開**時控制該 client 的 `_oteltrace`；有效 tracing 關時無法單獨打開 propagation。套件層 `ContextFromDocument`／`ContextFromRawDocument` 仍**只看 env**（三個 Mongo 變數），不受 per-client option 影響。細節見 [otel-mongo/README.zh-TW.md](otel-mongo/README.zh-TW.md)。
+instrumentation 模組**永不**安裝 OpenFeature provider —— 這與「模組永不初始化 `TracerProvider`」是同一條規則。由應用程式在啟動時接上,位置就在既有的 OTel 初始化旁邊:
+
+```go
+import (
+    "github.com/open-feature/go-sdk/openfeature"
+    gofeatureflag "github.com/open-feature/go-sdk-contrib/providers/go-feature-flag/pkg"
+)
+
+provider, err := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{
+    Endpoint: "http://relay-proxy:1031",
+})
+if err != nil {
+    return err
+}
+if err := openfeature.SetProviderAndWait(provider); err != nil {
+    return err
+}
+// 選用:讓 relay 依行程層級屬性做分流
+openfeature.SetEvaluationContext(openfeature.NewTargetlessEvaluationContext(map[string]any{
+    "service.name": "checkout-api",
+}))
+```
+
+GO Feature Flag provider 是**應用程式端**依賴;instrumentation 模組只依賴 `github.com/open-feature/go-sdk`。
+
+解析結果以模組為單位快取 **1 秒**,因此 hot path 永遠不會進入 OpenFeature 的求值管線。也因為該快取是行程層級的,分流可依行程屬性(service、environment、host)進行,但**無法**依單一請求的屬性分流。
+
+### 優先順序
+
+| 優先 | 來源 | 說明 |
+|---|---|---|
+| 1 | `WithTracingEnabled(v)` | 該連線／client 成為完全**靜態** —— 不進行任何 OpenFeature 求值,relay 的變更也影響不到它。 |
+| 2 | `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | 斷路器。關閉即關閉,無條件。 |
+| 3 | relay flag | relay 有值時由它決定。 |
+| 4 | 模組環境變數 | 作為 OpenFeature 求值的 default value。 |
+
+各模組建構時皆可傳 `WithTracingEnabled(v bool)`:
+
+| 斷路器 | relay／模組 flag | `WithTracingEnabled` | 有效 tracing |
+|---|---|---|---|
+| 關 | 任意 | *(未傳)* | **關** —— 不進行求值 |
+| 關 | 任意 | `true` | **開** |
+| 關 | 任意 | `false` | **關** |
+| 開 | 開 | *(未傳)* | **開** |
+| 開 | 關 | *(未傳)* | **關** |
+| 開 | 任意 | `false` | **關** |
+| 開 | 任意 | `true` | **開** |
+
+Mongo 專屬:`WithTracePropagationEnabled` 僅在有效 tracing 為**開**時控制該 client 的 `_oteltrace`;有效 tracing 為關時無法用它開啟傳播。package-level 的 `ContextFromDocument` / `ContextFromRawDocument` 跟隨 relay(它們沒有 client 可查,因此忽略 per-client option)。傳播子表見 [otel-mongo/README.md](otel-mongo/README.md)。
+
+WebSocket 專屬:`otel-ws` subprotocol 協商**僅**由斷路器閘控,不看 relay flag。handshake 無法事後重來,若以 relay 值閘控,則 flag 關閉期間建立的連線在 flag 打開後將永遠無法傳遞 trace context。代價是:兩端都使用本 library 且斷路器為開時,即使 tracing 關閉,訊息仍帶 JSON envelope。
 
 ## 目錄結構
 

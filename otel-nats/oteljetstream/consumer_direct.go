@@ -134,29 +134,3 @@ func (m *directMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context
 
 func (m *directMessagesContext) Stop()  { m.iter.Stop() }
 func (m *directMessagesContext) Drain() { m.iter.Drain() }
-
-// directPushConsumer is the passthrough PushConsumer impl used when tracing is off.
-type directPushConsumer struct {
-	c jetstream.PushConsumer
-}
-
-func (c *directPushConsumer) Consume(handler MsgHandler, opts ...jetstream.PushConsumeOpt) (ConsumeContext, error) {
-	return wrapConsumeContext(c.c.Consume(directHandler(handler), opts...))
-}
-
-func (c *directPushConsumer) Info(ctx context.Context) (*ConsumerInfo, error) {
-	return c.c.Info(ctx)
-}
-
-func (c *directPushConsumer) CachedInfo() *ConsumerInfo {
-	return c.c.CachedInfo()
-}
-
-// wrapDirectPushConsumer wraps a raw jetstream.PushConsumer (and its
-// constructor error) as the passthrough PushConsumer impl.
-func wrapDirectPushConsumer(cons jetstream.PushConsumer, err error) (PushConsumer, error) {
-	if err != nil {
-		return nil, err
-	}
-	return &directPushConsumer{c: cons}, nil
-}

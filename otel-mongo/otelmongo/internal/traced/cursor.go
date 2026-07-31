@@ -16,11 +16,11 @@ type Cursor struct {
 	cur                *mongo.Cursor
 	tracer             trace.Tracer
 	propagator         propagation.TextMapPropagator
-	propagationEnabled bool
+	propagationEnabled func() bool
 }
 
 // NewCursor wraps cur with the enabled-path Cursor impl.
-func NewCursor(cur *mongo.Cursor, tracer trace.Tracer, propagator propagation.TextMapPropagator, propagationEnabled bool) *Cursor {
+func NewCursor(cur *mongo.Cursor, tracer trace.Tracer, propagator propagation.TextMapPropagator, propagationEnabled func() bool) *Cursor {
 	return &Cursor{
 		cur:                cur,
 		tracer:             tracer,
@@ -39,7 +39,7 @@ func (c *Cursor) DecodeAndTrace(ctx context.Context, val any) (context.Context, 
 	}
 	raw := c.cur.Current
 	var originSpanCtx trace.SpanContext
-	if c.propagationEnabled {
+	if c.propagationEnabled != nil && c.propagationEnabled() {
 		if meta, ok := shared.ExtractMetadataFromRaw(raw); ok {
 			originCtx := shared.ContextFromTraceMetadata(context.Background(), meta, c.propagator)
 			originSpanCtx = trace.SpanContextFromContext(originCtx)

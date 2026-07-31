@@ -95,11 +95,11 @@ func TestWithTracingEnabled_EnvOptionMatrix(t *testing.T) {
 				t.Fatalf("TracingEnabled() = %v, want %v", got, tc.want)
 			}
 			if tc.want {
-				if _, ok := conn.impl.(*tracedConn); !ok {
-					t.Fatalf("expected *tracedConn, got %T", conn.impl)
+				if _, ok := conn.impl().(*tracedConn); !ok {
+					t.Fatalf("expected *tracedConn, got %T", conn.impl())
 				}
-			} else if _, ok := conn.impl.(*directConn); !ok {
-				t.Fatalf("expected *directConn, got %T", conn.impl)
+			} else if _, ok := conn.impl().(*directConn); !ok {
+				t.Fatalf("expected *directConn, got %T", conn.impl())
 			}
 		})
 	}

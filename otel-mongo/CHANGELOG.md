@@ -4,6 +4,38 @@ All notable changes to the `otel-mongo` module (v1, `go.mongodb.org/mongo-driver
 
 > **Coverage note**: this file starts at `0.6.0`. Earlier history lives only in git tags (`otel-mongo/vX.Y.Z`) — see the repo root `VERSIONING.md` for the root cause and the release-tag CI guard that now keeps the version constant and tag in sync going forward.
 
+## [0.9.0] - 2026-07-31
+
+### Changed
+
+- **BREAKING** The module's tracing environment variable is demoted from *final say* to the **default value** used when the relay proxy has no opinion. A relay flag can now turn this module on when the environment variable leaves it off, and off when the environment variable turns it on. Operators who relied on setting it to `false` as a hard guarantee must use `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=false` (whole process) or `WithTracingEnabled(false)` (one connection) instead — neither can be crossed by the relay.
+- **BREAKING** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` alone now decides whether the instrumented or the passthrough implementation is constructed. A process running with the global switch on and this module's switch off previously took the zero-cost passthrough path; it now allocates the instrumented wrapper and performs one atomic load plus one monotonic clock read per operation. It still emits no spans.
+
+### Added
+
+- Tracing is resolved at runtime through [OpenFeature](https://openfeature.dev) instead of once at process start, so an operator can turn it on or off through a GO Feature Flag relay proxy without restarting the application. Values are cached in a per-module snapshot with a fixed one-second TTL; hot paths never enter the OpenFeature evaluation pipeline.
+- Applications opt in by installing a provider at startup — the library never calls `openfeature.SetProvider`, exactly as it never initializes a `TracerProvider`:
+
+  ```go
+  provider, _ := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{Endpoint: "http://relay:1031"})
+  _ = openfeature.SetProviderAndWait(provider)
+  ```
+
+  With no provider installed, behavior is identical to the previous release.
+- `github.com/open-feature/go-sdk` is a new dependency. The GO Feature Flag provider is an application-side dependency, not a library one.
+
+- **BREAKING** `ContextFromDocument` and `ContextFromRawDocument` now resolve through the same snapshot as the `Collection` path instead of a permanently cached, environment-only gate. A relay flag that disables Mongo propagation now also stops change-stream readers from extracting trace context, matching the `Collection` path in the same loop. They still ignore per-connection options, as documented.
+- `Collection`, `Cursor` and `ChangeStream` now hold both the passthrough and the instrumented implementation and select between them per operation, so a long-lived change stream follows a flag change without being reopened. `SingleResult` is the exception: it holds the live `FindOne` span, so its implementation stays fixed by whichever path executed the `FindOne`.
+
+### Flag keys
+
+| OpenFeature key | Fallback environment variable |
+|---|---|
+| `otel-mongo-tracing` | `OTEL_MONGO_TRACING_ENABLED` |
+| `otel-mongo-propagation` | `OTEL_MONGO_PROPAGATION_ENABLED` |
+
+`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` has **no** relay counterpart: it is an out-of-band kill switch that works when the relay is unreachable or misconfigured.
+
 ## [0.8.0] - 2026-07-21
 
 ### Changed — BREAKING

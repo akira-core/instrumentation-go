@@ -16,7 +16,7 @@ type ChangeStream struct {
 	cs                 *mongo.ChangeStream
 	tracer             trace.Tracer
 	propagator         propagation.TextMapPropagator
-	propagationEnabled bool
+	propagationEnabled func() bool
 	spanName           string
 	baseSpanOpts       []trace.SpanStartOption
 }
@@ -25,7 +25,7 @@ type ChangeStream struct {
 type ChangeStreamConfig struct {
 	Tracer             trace.Tracer
 	Propagator         propagation.TextMapPropagator
-	PropagationEnabled bool
+	PropagationEnabled func() bool
 	SpanName           string
 	BaseSpanOpts       []trace.SpanStartOption
 }
@@ -47,7 +47,7 @@ func NewChangeStream(cs *mongo.ChangeStream, cfg ChangeStreamConfig) *ChangeStre
 func (c *ChangeStream) DecodeAndTrace(ctx context.Context, val any) (context.Context, error) {
 	var originSpanCtx trace.SpanContext
 	fullDoc, err := c.cs.Current.LookupErr("fullDocument")
-	if err == nil && c.propagationEnabled {
+	if err == nil && c.propagationEnabled != nil && c.propagationEnabled() {
 		docRaw, ok := fullDoc.DocumentOK()
 		if ok {
 			if meta, ok := shared.ExtractMetadataFromRaw(docRaw); ok {

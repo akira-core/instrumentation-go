@@ -124,10 +124,11 @@ func hopTypeName(t string) string {
 // The publisher must set Nats-Trace-Dest on each message (or use WithTraceDestination option).
 // Requires NATS server 2.11+.
 //
-// The subscription handler is picked by the Conn's impl — tracedConn emits hop
-// spans, directConn discards events.
+// The handler follows the tracing flag per event — tracedConn emits hop spans,
+// directConn discards events — so an existing trace-event subscription starts
+// or stops emitting when the relay flag changes, like every other consumer path.
 func SubscribeTraceEvents(conn *Conn, subject string) (*nats.Subscription, error) {
-	return conn.nc.Subscribe(subject, conn.impl.traceEventHandler())
+	return conn.nc.Subscribe(subject, conn.traceEventMsgHandler())
 }
 
 // buildTraceEventHandler returns the instrumented closure that decodes a

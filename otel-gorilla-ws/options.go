@@ -37,19 +37,25 @@ func WithTracerProvider(tp trace.TracerProvider) Option {
 	}
 }
 
-// WithTracingEnabled overrides the env-gate default (OTEL_INSTRUMENTATION_GO_TRACING_ENABLED
-// AND OTEL_GORILLA_WS_TRACING_ENABLED) for this Conn only, in either
-// direction. When unset, tracing follows the env gates exactly as before.
-// When set, this value is authoritative — it controls featureEnabled, the
-// flag gating whether any OTel SDK code path runs at all (span creation,
-// propagator inject/extract via the wire envelope).
+// WithTracingEnabled overrides flag resolution for this Conn only, in either
+// direction. When set, this value is authoritative — it takes precedence over
+// the global env kill switch, the module env var and any value the relay proxy
+// serves, and it controls whether any OTel SDK code path runs at all (span
+// creation, propagator inject/extract via the wire envelope).
 //
-// In Dial and Upgrader.Upgrade the effective feature flag also gates otel-ws
-// subprotocol negotiation: a connection whose effective tracing is off never
+// An overridden Conn is fully STATIC: no OpenFeature evaluation ever runs for
+// it, so a later relay change cannot start or stop its tracing. Connections
+// constructed WITHOUT this option resolve span creation per operation and do
+// follow the relay.
+//
+// In Dial and Upgrader.Upgrade this option also gates otel-ws subprotocol
+// negotiation: a connection constructed with WithTracingEnabled(false) never
 // offers (Dial) or confirms (Upgrade) otel-ws, so the peer is never committed
-// to the JSON envelope wire format that this side would not unwrap. The
-// reverse does not hold — WithTracingEnabled(true) cannot force the envelope
-// onto a connection whose peer did not negotiate otel-ws; negotiation outcome
+// to the JSON envelope wire format that this side would not unwrap. Without the
+// option, negotiation follows the global env switch alone and NOT the relay
+// value — see wsNegotiationPossible. The reverse does not hold —
+// WithTracingEnabled(true) cannot force the envelope onto a connection whose
+// peer did not negotiate otel-ws; the negotiation outcome
 // (Conn.tracingEnabled) still requires both sides to agree.
 func WithTracingEnabled(v bool) Option {
 	return func(o *connOptions) {
@@ -69,16 +75,22 @@ func resolveConnOptions(opts []Option) connOptions {
 	return cfg
 }
 
-// effectiveFeatureEnabled resolves the feature flag for a connection: the
-// WithTracingEnabled override when present, otherwise the env gates.
-func effectiveFeatureEnabled(cfg connOptions) bool {
+// effectiveCapability resolves whether a connection may EVER trace: the
+// WithTracingEnabled override when present, otherwise the global env kill
+// switch. It deliberately does not consult the relay.
+//
+// This is the static half of the decision. It answers two questions that cannot
+// be revisited after construction — whether to negotiate the otel-ws subprotocol
+// during the handshake, and whether to build a real tracer at all — so it must
+// not depend on a value that can change a second later.
+func effectiveCapability(cfg connOptions) bool {
 	if cfg.featureEnabled != nil {
 		return *cfg.featureEnabled
 	}
-	return wsTracingEnabled()
+	return wsNegotiationPossible()
 }
 
-// configureConn applies cfg to c: propagator, featureEnabled and tracer.
+// configureConn applies cfg to c: propagator, feature override and tracer.
 func configureConn(c *Conn, cfg connOptions) {
 	if cfg.propagator != nil {
 		c.propagator = cfg.propagator
@@ -86,10 +98,12 @@ func configureConn(c *Conn, cfg connOptions) {
 		c.propagator = otel.GetTextMapPropagator()
 	}
 
-	c.featureEnabled = effectiveFeatureEnabled(cfg)
+	c.featureOverride = cfg.featureEnabled
+	c.capable = effectiveCapability(cfg)
 
-	if !c.featureEnabled {
-		// Feature flag off ⇒ no OTel SDK call on caller's TracerProvider; use noop tracer.
+	if !c.capable {
+		// This connection can never trace ⇒ no OTel SDK call on the caller's
+		// TracerProvider; use a noop tracer.
 		c.tracer = noop.NewTracerProvider().Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
 		return
 	}

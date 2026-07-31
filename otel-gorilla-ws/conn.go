@@ -51,7 +51,37 @@ type Conn struct {
 	propagator     propagation.TextMapPropagator
 	tracer         trace.Tracer
 	tracingEnabled bool // true only after successful otel-ws subprotocol negotiation
-	featureEnabled bool // env feature flag controlling both span and propagation
+
+	// featureOverride is the WithTracingEnabled value when the option was passed.
+	// When non-nil the connection is static: featureEnabled returns it verbatim
+	// and no OpenFeature evaluation runs. When nil, featureEnabled resolves the
+	// dynamic flag per call so a relay change reaches this live connection.
+	featureOverride *bool
+
+	// capable records whether this connection could EVER trace — the override
+	// when present, otherwise the global kill switch at construction. False ⇒
+	// pure passthrough: no envelope handling, no spans, no OpenFeature
+	// evaluation, exactly the pre-dynamic disabled behavior. Distinct from both
+	// tracingEnabled (the negotiation outcome) and featureEnabled() (the
+	// per-call span gate): a capable, negotiated connection whose dynamic flag
+	// is off still speaks the envelope wire format, because the peer committed
+	// to it at the handshake.
+	capable bool
+}
+
+// featureEnabled reports whether this call should create spans and inject or
+// extract trace context.
+//
+// Distinct from tracingEnabled, which is the otel-ws subprotocol NEGOTIATION
+// outcome and is fixed for the connection's lifetime. A connection can have
+// tracingEnabled true (peer agreed to envelopes) while featureEnabled is false
+// (relay turned tracing off): it keeps writing envelopes, because the peer
+// expects them, but injects nothing and creates no span.
+func (c *Conn) featureEnabled() bool {
+	if c.featureOverride != nil {
+		return *c.featureOverride
+	}
+	return wsTracingEnabled()
 }
 
 // Subprotocol returns the application protocol negotiated for this connection.
@@ -86,60 +116,86 @@ func newConnFromConfig(conn *websocket.Conn, tracingEnabled bool, cfg connOption
 	return c
 }
 
-// WriteMessage sends a message over the WebSocket connection and always creates
-// a "websocket.send" producer span. Trace context injection into the wire envelope
-// happens only when otel-ws propagation is enabled.
+// WriteMessage sends a message over the WebSocket connection. A "websocket.send"
+// producer span is created while the dynamic span gate is on. On a connection
+// that negotiated otel-ws the JSON envelope is ALWAYS written — the peer parses
+// every frame as an envelope, so the wire format cannot follow a flag that may
+// flip mid-connection; while the gate is off the envelope carries an empty
+// header and no span is created.
 func (c *Conn) WriteMessage(ctx context.Context, messageType int, data []byte) error {
-	if !c.featureEnabled {
+	if !c.capable {
+		// This connection can never trace: pure passthrough, no envelope.
 		return c.Conn.WriteMessage(messageType, data)
 	}
-	ctx, span := c.tracer.Start(ctx, "websocket.send",
-		trace.WithSpanKind(trace.SpanKindProducer),
-		trace.WithAttributes(
-			attribute.Int("websocket.message.type", messageType),
-			attribute.Int("websocket.message.body.size", len(data)),
-		),
-	)
-	defer span.End()
+	feature := c.featureEnabled()
+
+	var span trace.Span
+	if feature {
+		ctx, span = c.tracer.Start(ctx, "websocket.send",
+			trace.WithSpanKind(trace.SpanKindProducer),
+			trace.WithAttributes(
+				attribute.Int("websocket.message.type", messageType),
+				attribute.Int("websocket.message.body.size", len(data)),
+			),
+		)
+		defer span.End()
+	}
 
 	payload := data
 	if c.tracingEnabled {
+		// Negotiated peer ⇒ envelope unconditionally. Writing raw bytes here
+		// while the gate is off would hand the peer's tryUnmarshalWire an
+		// unwrapped payload — and any application payload shaped like
+		// {"header":...,"data":...} would be silently dismembered by a peer
+		// whose gate is on (e.g. pinned on via WithTracingEnabled(true)).
 		carrier := make(propagation.MapCarrier)
-		c.propagator.Inject(ctx, carrier)
-
+		if feature {
+			c.propagator.Inject(ctx, carrier)
+		}
 		encoded, err := marshalWire(carrier, data)
 		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
+			if span != nil {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+			}
 			return err
 		}
 		payload = encoded
 	}
 	if err := c.Conn.WriteMessage(messageType, payload); err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+		if span != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
 		return err
 	}
 	return nil
 }
 
-// ReadMessage reads the next message from the WebSocket connection and always
-// creates a "websocket.receive" consumer span. Trace context extraction from
-// the wire envelope happens only when otel-ws propagation is enabled.
+// ReadMessage reads the next message from the WebSocket connection. A
+// "websocket.receive" consumer span is created while the dynamic span gate is
+// on. On a connection that negotiated otel-ws the envelope is ALWAYS unwrapped —
+// the peer envelopes every frame regardless of this side's gate, so skipping
+// the unwrap would hand raw {"header":...,"data":...} bytes to the application
+// whenever the gate is off while the peer still envelopes (a pinned-on peer,
+// TTL skew, or in-flight messages written before a flip).
 func (c *Conn) ReadMessage(ctx context.Context) (context.Context, int, []byte, error) {
-	if !c.featureEnabled {
+	if !c.capable {
 		msgType, raw, err := c.Conn.ReadMessage()
 		return ctx, msgType, raw, err
 	}
+	feature := c.featureEnabled()
 	msgType, raw, err := c.Conn.ReadMessage()
 	if err != nil {
-		_, span := c.tracer.Start(ctx, "websocket.receive",
-			trace.WithSpanKind(trace.SpanKindConsumer),
-			trace.WithAttributes(attribute.Int("websocket.message.type", msgType)),
-		)
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		span.End()
+		if feature {
+			_, span := c.tracer.Start(ctx, "websocket.receive",
+				trace.WithSpanKind(trace.SpanKindConsumer),
+				trace.WithAttributes(attribute.Int("websocket.message.type", msgType)),
+			)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			span.End()
+		}
 		return ctx, msgType, raw, err
 	}
 
@@ -154,13 +210,19 @@ func (c *Conn) ReadMessage(ctx context.Context) (context.Context, int, []byte, e
 		if ok {
 			payload = decoded
 
-			carrier := propagation.MapCarrier(hdrs)
-			senderCtx := c.propagator.Extract(ctx, carrier)
-			if sc := trace.SpanContextFromContext(senderCtx); sc.IsValid() {
-				startOpts = append(startOpts, trace.WithLinks(trace.Link{SpanContext: sc}))
+			if feature {
+				carrier := propagation.MapCarrier(hdrs)
+				senderCtx := c.propagator.Extract(ctx, carrier)
+				if sc := trace.SpanContextFromContext(senderCtx); sc.IsValid() {
+					startOpts = append(startOpts, trace.WithLinks(trace.Link{SpanContext: sc}))
+				}
+				outCtx = senderCtx
 			}
-			outCtx = senderCtx
 		}
+	}
+
+	if !feature {
+		return outCtx, msgType, payload, nil
 	}
 
 	outCtx, span := c.tracer.Start(outCtx, "websocket.receive",
@@ -197,7 +259,7 @@ func (c *Conn) ReadMessage(ctx context.Context) (context.Context, int, []byte, e
 // gorilla sees it — see stripOTelSubprotocol.
 func Dial(ctx context.Context, urlStr string, requestHeader http.Header, subprotocols []string, opts ...Option) (*Conn, *http.Response, error) {
 	cfg := resolveConnOptions(opts)
-	featureOn := effectiveFeatureEnabled(cfg)
+	featureOn := effectiveCapability(cfg)
 
 	var otelInjected bool
 	dialProtos := subprotocols

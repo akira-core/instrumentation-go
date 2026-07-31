@@ -21,7 +21,43 @@ import (
 // reachable from the direct path) is compiler-enforced by package boundary.
 type Collection struct {
 	*mongo.Collection
-	impl collectionImpl
+
+	// direct is always present; traced is nil when the instrumented path was
+	// never built (global kill switch off with no override). tracing is read per
+	// operation, so a relay change reaches this Collection without it being
+	// rebuilt.
+	direct  *direct.Collection
+	traced  *traced.Collection
+	tracing func() bool
+}
+
+// impl returns the implementation this operation runs through.
+func (c *Collection) impl() collectionImpl {
+	if c.traced != nil && c.tracing() {
+		return c.traced
+	}
+	return c.direct
+}
+
+// newCursor wraps raw in a facade Cursor carrying both implementations, so
+// iteration follows the flag rather than the value it held at Find time.
+func (c *Collection) newCursor(raw *mongo.Cursor) *Cursor {
+	cur := &Cursor{Cursor: raw, direct: direct.NewCursor(raw), tracing: c.tracing}
+	if c.traced != nil {
+		cur.traced = traced.NewCursor(raw, c.traced.Tracer, c.traced.Propagator, c.traced.PropagationEnabled)
+	}
+	return cur
+}
+
+// newChangeStream wraps raw in a facade ChangeStream carrying both
+// implementations. This matters more than for Cursor: a change stream can stay
+// open across many flag changes.
+func (c *Collection) newChangeStream(raw *mongo.ChangeStream) *ChangeStream {
+	cs := &ChangeStream{ChangeStream: raw, direct: direct.NewChangeStream(raw), tracing: c.tracing}
+	if c.traced != nil {
+		cs.traced = c.traced.NewChangeStreamFor(raw)
+	}
+	return cs
 }
 
 // collectionImpl is the polymorphic core of Collection. Methods return raw
@@ -58,43 +94,49 @@ var (
 // gate is off the returned wrapper is a passthrough — no spans, no
 // _oteltrace, no propagator extract.
 func NewCollection(coll *mongo.Collection, tracer trace.Tracer, propagator propagation.TextMapPropagator) *Collection {
-	if !mongoTracingEnabled() {
-		return &Collection{Collection: coll, impl: direct.NewCollection(coll)}
-	}
-	return &Collection{
+	c := &Collection{
 		Collection: coll,
-		impl: &traced.Collection{
-			Coll:               coll,
-			Tracer:             tracer,
-			Propagator:         propagator,
-			PropagationEnabled: mongoPropagationEnabled(),
-		},
+		direct:     direct.NewCollection(coll),
+		tracing:    mongoTracingEnabled,
 	}
+	if !dynamicTracingPossible() {
+		return c
+	}
+	c.traced = &traced.Collection{
+		Coll:               coll,
+		Tracer:             tracer,
+		Propagator:         propagator,
+		PropagationEnabled: mongoPropagationEnabled,
+	}
+	return c
 }
 
 // newCollectionForDatabase builds the collectionImpl that Database.Collection
 // hands to its Collection facade. Uses the Database's cached gates so a single
 // Connect-time decision flows through.
 func newCollectionForDatabase(d *Database, raw *mongo.Collection) *Collection {
-	if !d.tracingEnabled {
-		return &Collection{Collection: raw, impl: direct.NewCollection(raw)}
-	}
-	return &Collection{
+	c := &Collection{
 		Collection: raw,
-		impl: &traced.Collection{
-			Coll:               raw,
-			Tracer:             d.tracer,
-			Propagator:         d.propagator,
-			PropagationEnabled: d.propagationEnabled,
-			ServerAddr:         d.serverAddr,
-			ServerPort:         d.serverPort,
-		},
+		direct:     direct.NewCollection(raw),
+		tracing:    d.effectiveTracing,
 	}
+	if !d.tracedBuilt {
+		return c
+	}
+	c.traced = &traced.Collection{
+		Coll:               raw,
+		Tracer:             d.tracer,
+		Propagator:         d.propagator,
+		PropagationEnabled: d.effectivePropagation,
+		ServerAddr:         d.serverAddr,
+		ServerPort:         d.serverPort,
+	}
+	return c
 }
 
 // InsertOne inserts a document.
 func (c *Collection) InsertOne(ctx context.Context, document any, opts ...options.Lister[options.InsertOneOptions]) (*InsertOneResult, error) {
-	res, err := c.impl.InsertOne(ctx, document, opts...)
+	res, err := c.impl().InsertOne(ctx, document, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +145,7 @@ func (c *Collection) InsertOne(ctx context.Context, document any, opts ...option
 
 // InsertMany inserts multiple documents.
 func (c *Collection) InsertMany(ctx context.Context, documents []any, opts ...options.Lister[options.InsertManyOptions]) (*InsertManyResult, error) {
-	res, err := c.impl.InsertMany(ctx, documents, opts...)
+	res, err := c.impl().InsertMany(ctx, documents, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -112,22 +154,25 @@ func (c *Collection) InsertMany(ctx context.Context, documents []any, opts ...op
 
 // Find executes a find command and returns a Cursor.
 func (c *Collection) Find(ctx context.Context, filter any, opts ...options.Lister[options.FindOptions]) (*Cursor, error) {
-	raw, cImpl, err := c.impl.Find(ctx, filter, opts...)
+	raw, _, err := c.impl().Find(ctx, filter, opts...)
 	if err != nil {
 		return nil, err
 	}
-	return &Cursor{Cursor: raw, impl: cImpl}, nil
+	return c.newCursor(raw), nil
 }
 
 // FindOne executes a find command returning at most one document.
 func (c *Collection) FindOne(ctx context.Context, filter any, opts ...options.Lister[options.FindOneOptions]) *SingleResult {
-	raw, sImpl := c.impl.FindOne(ctx, filter, opts...)
+	// SingleResult is the documented exception to per-call selection: the
+	// instrumented impl holds the live FindOne span, so its implementation is
+	// fixed by whichever path executed the FindOne. See design.md D8.
+	raw, sImpl := c.impl().FindOne(ctx, filter, opts...)
 	return &SingleResult{SingleResult: raw, impl: sImpl}
 }
 
 // UpdateOne updates one matching document.
 func (c *Collection) UpdateOne(ctx context.Context, filter any, update any, opts ...options.Lister[options.UpdateOneOptions]) (*UpdateResult, error) {
-	res, err := c.impl.UpdateOne(ctx, filter, update, opts...)
+	res, err := c.impl().UpdateOne(ctx, filter, update, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +181,7 @@ func (c *Collection) UpdateOne(ctx context.Context, filter any, update any, opts
 
 // UpdateMany updates all matching documents.
 func (c *Collection) UpdateMany(ctx context.Context, filter any, update any, opts ...options.Lister[options.UpdateManyOptions]) (*UpdateResult, error) {
-	res, err := c.impl.UpdateMany(ctx, filter, update, opts...)
+	res, err := c.impl().UpdateMany(ctx, filter, update, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +190,7 @@ func (c *Collection) UpdateMany(ctx context.Context, filter any, update any, opt
 
 // ReplaceOne replaces one matching document.
 func (c *Collection) ReplaceOne(ctx context.Context, filter any, replacement any, opts ...options.Lister[options.ReplaceOptions]) (*UpdateResult, error) {
-	res, err := c.impl.ReplaceOne(ctx, filter, replacement, opts...)
+	res, err := c.impl().ReplaceOne(ctx, filter, replacement, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +199,7 @@ func (c *Collection) ReplaceOne(ctx context.Context, filter any, replacement any
 
 // DeleteOne deletes one matching document.
 func (c *Collection) DeleteOne(ctx context.Context, filter any, opts ...options.Lister[options.DeleteOneOptions]) (*DeleteResult, error) {
-	res, err := c.impl.DeleteOne(ctx, filter, opts...)
+	res, err := c.impl().DeleteOne(ctx, filter, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +208,7 @@ func (c *Collection) DeleteOne(ctx context.Context, filter any, opts ...options.
 
 // DeleteMany deletes all documents matching filter.
 func (c *Collection) DeleteMany(ctx context.Context, filter any, opts ...options.Lister[options.DeleteManyOptions]) (*DeleteResult, error) {
-	res, err := c.impl.DeleteMany(ctx, filter, opts...)
+	res, err := c.impl().DeleteMany(ctx, filter, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -172,26 +217,26 @@ func (c *Collection) DeleteMany(ctx context.Context, filter any, opts ...options
 
 // CountDocuments counts documents matching filter.
 func (c *Collection) CountDocuments(ctx context.Context, filter any, opts ...options.Lister[options.CountOptions]) (int64, error) {
-	return c.impl.CountDocuments(ctx, filter, opts...)
+	return c.impl().CountDocuments(ctx, filter, opts...)
 }
 
 // Distinct returns distinct values for fieldName.
 func (c *Collection) Distinct(ctx context.Context, fieldName string, filter any, opts ...options.Lister[options.DistinctOptions]) *mongo.DistinctResult {
-	return c.impl.Distinct(ctx, fieldName, filter, opts...)
+	return c.impl().Distinct(ctx, fieldName, filter, opts...)
 }
 
 // Aggregate runs an aggregation pipeline and returns a Cursor.
 func (c *Collection) Aggregate(ctx context.Context, pipeline any, opts ...options.Lister[options.AggregateOptions]) (*Cursor, error) {
-	raw, cImpl, err := c.impl.Aggregate(ctx, pipeline, opts...)
+	raw, _, err := c.impl().Aggregate(ctx, pipeline, opts...)
 	if err != nil {
 		return nil, err
 	}
-	return &Cursor{Cursor: raw, impl: cImpl}, nil
+	return c.newCursor(raw), nil
 }
 
 // UpdateByID updates one document by _id.
 func (c *Collection) UpdateByID(ctx context.Context, id any, update any, opts ...options.Lister[options.UpdateOneOptions]) (*UpdateResult, error) {
-	res, err := c.impl.UpdateByID(ctx, id, update, opts...)
+	res, err := c.impl().UpdateByID(ctx, id, update, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +260,7 @@ func (c *Collection) FindByIDs(ctx context.Context, ids []any, opts ...options.L
 
 // BulkWrite runs multiple write operations.
 func (c *Collection) BulkWrite(ctx context.Context, models []mongo.WriteModel, opts ...options.Lister[options.BulkWriteOptions]) (*BulkWriteResult, error) {
-	res, err := c.impl.BulkWrite(ctx, models, opts...)
+	res, err := c.impl().BulkWrite(ctx, models, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -224,9 +269,9 @@ func (c *Collection) BulkWrite(ctx context.Context, models []mongo.WriteModel, o
 
 // Watch starts a change stream on the collection.
 func (c *Collection) Watch(ctx context.Context, pipeline any, opts ...options.Lister[options.ChangeStreamOptions]) (*ChangeStream, error) {
-	raw, csImpl, err := c.impl.Watch(ctx, pipeline, opts...)
+	raw, _, err := c.impl().Watch(ctx, pipeline, opts...)
 	if err != nil {
 		return nil, err
 	}
-	return &ChangeStream{ChangeStream: raw, impl: csImpl}, nil
+	return c.newChangeStream(raw), nil
 }
