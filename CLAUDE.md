@@ -17,7 +17,7 @@ Two supporting modules sit alongside them (no instrumentation, no spans of their
 
 | Module dir | Import path suffix | Purpose | Released? |
 |---|---|---|---|
-| `otel-sampler/` | `.../otel-sampler/otelsampler` | Consistent probability sampler (`ProbabilitySampler`, `WithSingleLinkSeed`, exported `Threshold`/`Sampled`) — applications install it as their `sdktrace.Sampler` | **Yes**, `otel-sampler/vX.Y.Z`; start at `0.2.0` (`v0.1.0` is superseded) |
+| `otel-sampler/` | `.../otel-sampler/otelsampler` | Consistent probability sampler (`ProbabilitySampler`, `WithSingleLinkSeed`, exported `Threshold`/`Sampled`) — applications install it as their `sdktrace.Sampler` | **Yes**, `otel-sampler/vX.Y.Z`; start at `0.1.1` (`v0.1.0` is superseded) |
 | `otel-testkit/` | `.../otel-testkit/harness` | Black-box E2E harness: in-process OTLP sink, collector container, span assertions | No — untagged, test-only |
 
 Each instrumentation module also has `examples/` and `tests/integration/` sub-modules with their own `go.mod`. Integration tests use **testcontainers-go** (require Docker/Podman running). (`otel-mongo/v2` has no separate `examples/` of its own — the single `otel-mongo/examples/` module imports and demos the v2 package.) `otel-testkit/examples/httpdirect` and `httpdirect-stdlib` are reference templates with their own `go.mod`; they are linted in CI and run by the `http-direct-e2e` job, not by `test-and-lint`.
@@ -197,7 +197,7 @@ Each module is tagged independently as `<module>/v<x.y.z>` — **except `otel-mo
 - `otel-mongo/otelmongo/version.go` — `instrumentationVersion` const
 - `otel-mongo/v2/version.go` — `instrumentationVersion` const
 - `otel-gorilla-ws/version.go` — return literal from `Version()`
-- `otel-sampler/otelsampler/version.go` — `instrumentationVersion` const (not an instrumentation scope — this module emits no spans; the constant exists for the release guard and for callers recording which sampler build they run). `otel-sampler/v0.1.0` is published but points at a pre-rebase commit, so it is superseded and unusable — releases start at `0.2.0`. `otel-testkit` is deliberately untagged.
+- `otel-sampler/otelsampler/version.go` — `instrumentationVersion` const (not an instrumentation scope — this module emits no spans; the constant exists for the release guard and for callers recording which sampler build they run). `otel-sampler/v0.1.0` is published but points at a pre-rebase commit, so it is superseded and unusable — releases start at `0.1.1`. `otel-testkit` is deliberately untagged.
 
 A release-tag CI guard (`.github/workflows/release-guard.yml`) fails the push if a tag's version doesn't match the corresponding constant above — see the **CI** section.
 

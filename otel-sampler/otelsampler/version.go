@@ -3,7 +3,7 @@ package otelsampler
 // instrumentationVersion is this module's released version. It is validated
 // against the pushed release tag by .github/workflows/release-guard.yml — see
 // VERSIONING.md. Bump it in the same commit as the release's code changes.
-const instrumentationVersion = "0.2.0"
+const instrumentationVersion = "0.1.1"
 
 // Version returns the otel-sampler module version.
 //

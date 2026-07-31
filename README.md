@@ -22,10 +22,10 @@ Instrumentation packages **do not** create a global `TracerProvider`. They use `
 
 | Package | Import path | Version (source) | Description |
 |---------|-------------|------------------|-------------|
-| **otel-sampler** | `github.com/akira-core/instrumentation-go/otel-sampler/otelsampler` | 0.2.0 | Consistent probability sampler (`ot=th:`/`ot=rv:`) + `WithSingleLinkSeed`, so span-link consumers sample like parent-child ones. Emits no spans. |
+| **otel-sampler** | `github.com/akira-core/instrumentation-go/otel-sampler/otelsampler` | 0.1.1 | Consistent probability sampler (`ot=th:`/`ot=rv:`) + `WithSingleLinkSeed`, so span-link consumers sample like parent-child ones. Emits no spans. |
 | **otel-testkit** | `github.com/akira-core/instrumentation-go/otel-testkit/harness` | untagged | Black-box E2E harness (in-process OTLP sink + collector + assertions) used by this repo's sampling suites. Test-only, no stability guarantee. |
 
-`otel-sampler`'s published `v0.1.0` tag points at a pre-rebase commit and is superseded — start at `0.2.0`. See [VERSIONING.md](VERSIONING.md).
+`otel-sampler`'s published `v0.1.0` tag points at a pre-rebase commit and is superseded — start at `0.1.1`. See [VERSIONING.md](VERSIONING.md).
 
 Per-module docs: [otel-mongo/README.md](otel-mongo/README.md), [otel-nats/README.md](otel-nats/README.md), [otel-gorilla-ws/README.md](otel-gorilla-ws/README.md) (each also ships a [README.zh-TW.md](otel-mongo/README.zh-TW.md): [otel-nats](otel-nats/README.zh-TW.md), [otel-gorilla-ws](otel-gorilla-ws/README.zh-TW.md)).
 

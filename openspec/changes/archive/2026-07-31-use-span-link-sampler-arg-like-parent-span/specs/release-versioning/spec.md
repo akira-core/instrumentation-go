@@ -1,9 +1,10 @@
-# release-versioning Specification
+# release-versioning Delta: use-span-link-sampler-arg-like-parent-span
 
-## Purpose
-Per-module release and versioning policy: module-level CHANGELOGs shipped in the module zip, the written VERSIONING.md policy (independent module tags, pre-1.0 breaking-to-minor rule, version-constant locations), and the CI release-tag version guard.
+This change adds `otel-sampler` as a fifth released module (and `otel-testkit` as a
+deliberately untagged one), so the CHANGELOG, policy and guard requirements are
+widened from four modules to five.
 
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Module-level CHANGELOG ships in the module zip
 

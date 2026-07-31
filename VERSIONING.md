@@ -13,9 +13,11 @@ This is a multi-module repository. Two groups of modules live here:
 
 `examples/` and `tests/integration/` sub-modules follow their parent module's version informally (they are not separately tagged) and are expected to build against the parent's `HEAD`.
 
-### `otel-sampler/v0.1.0` is superseded — start at `0.2.0`
+### `otel-sampler/v0.1.0` is superseded — start at `0.1.1`
 
-The published `otel-sampler/v0.1.0` tag points at a pre-rebase commit that is **not** an ancestor of `main`, so `go get …/otel-sampler@v0.1.0` resolves content that no longer matches the repository. The Go module proxy caches versions immutably, so that number cannot be re-cut: `0.2.0` is the first `otel-sampler` version whose content matches this repo, and the first cut under the policy on this page.
+The published `otel-sampler/v0.1.0` tag points at a pre-rebase commit that is **not** an ancestor of `main`, so `go get …/otel-sampler@v0.1.0` resolves content that no longer matches the repository. The Go module proxy caches versions immutably, so that number cannot be re-cut: `0.1.1` is the first `otel-sampler` version whose content matches this repo, and the first cut under the policy on this page.
+
+`0.1.1` is a **patch** bump even though it carries behavioral changes that the [pre-1.0 rule](#pre-10-0x-policy) would otherwise push to a minor. That is deliberate and specific to this one release: because `0.1.0` never resolved to matching content, no caller can have depended on the behavior being changed. Later `otel-sampler` releases follow the normal rule.
 
 ## Tag format
 

@@ -4,10 +4,16 @@ All notable changes to the `otel-sampler` module. This module follows the
 repo-wide pre-1.0 policy in [VERSIONING.md](../VERSIONING.md): a breaking change
 warrants at least a minor bump while the module is on `0.x`.
 
-## 0.2.0
+## 0.1.1
 
 First version released under the repo's versioning policy (version constant,
 CHANGELOG, and release-guard coverage).
+
+The behavioral changes below would normally warrant a minor bump under the
+pre-1.0 rule in [VERSIONING.md](../VERSIONING.md). A patch bump is used instead
+because `0.1.0` never pointed at content matching this repository (see the
+`0.1.0` entry), so there is no released behavior for a caller to have depended
+on — the "breaking" changes are relative to an unusable tag.
 
 ### Added
 
@@ -51,5 +57,5 @@ CHANGELOG, and release-guard coverage).
 Initial tag. Cut before the module stabilized and **superseded** — the published
 `otel-sampler/v0.1.0` tag points at a pre-rebase commit that is not an ancestor
 of `main`. Because the Go module proxy caches versions immutably, that version
-number cannot be reused; `0.2.0` is the first version whose content matches the
-repository. Use `0.2.0` or later.
+number cannot be reused; `0.1.1` is the first version whose content matches the
+repository. Use `0.1.1` or later.

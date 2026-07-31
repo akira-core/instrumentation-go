@@ -32,10 +32,37 @@ Findings from the branch review in `reviews/code-review-use-span-link-sampler-ar
 - [x] 5.6 N1/N2: `SpansOfRun` expands span links in both directions; the manual span-link test is named honestly and a real `Watch`/`DecodeAndTrace` change-stream E2E was added
 - [x] 5.7 N10/N11/F1: `serviceName` uses `Sprintf`; the `th:`/`rv:` tracestate writers merged into one helper; dead `Delete("ot")` branch removed; harness predicts decisions via exported `otelsampler.Threshold`/`Sampled`
 - [x] 5.8 S1/S3/F3: generic integration jobs exclude `./sampling`; `otel-sampler`/`otel-testkit` raised to OTel v1.44 + testcontainers v0.43; the stdlib baseline example gained a CI job and both examples are linted
-- [x] 5.9 S2/S5: `otel-sampler` gained a version constant, CHANGELOG and release-guard pattern (starting at `0.2.0`, since the published `v0.1.0` is superseded); root docs describe six modules, Go 1.25 and the current CI shape
+- [x] 5.9 S2/S5: `otel-sampler` gained a version constant, CHANGELOG and release-guard pattern (starting at `0.1.1`, since the published `v0.1.0` is superseded); root docs describe six modules, Go 1.25 and the current CI shape
 
 ## 6. Spec conformance check
 
 - [x] 6.1 Re-run `cd otel-sampler && go test -v -race ./...` and `golangci-lint run ./...` against the two capability specs
-- [ ] 6.2 Confirm every scenario in `consistent-probability-sampling` and `span-link-sampling-seed` maps to an existing test name (gap list or done)
-- [ ] 6.3 Archive this change into `openspec/specs/` when the branch is merged (`/opsx:archive`)
+- [x] 6.2 Confirm every scenario maps to an existing test name — **no gaps**, all 14 covered:
+
+  `consistent-probability-sampling`
+  | Scenario | Test |
+  |---|---|
+  | Explicit parent rv overrides TraceID | `TestProbabilitySamplerUsesExplicitRandomnessBeforeTraceID` |
+  | TraceID randomness used when rv absent | `TestProbabilitySamplerFallsBackToTraceIDRandomness` |
+  | Invalid rv falls back to TraceID | `TestProbabilitySamplerInvalidRandomnessFallsBackToTraceID` |
+  | Higher rates include lower-rate samples | `TestProbabilitySamplerDeterministicSubset` |
+  | Same TraceID is stable | `TestProbabilitySamplerSameTraceIDProducesSameDecision` |
+  | Env arg selects never-sample | `TestProbabilitySamplerFromEnv` |
+
+  `span-link-sampling-seed`
+  | Scenario | Test |
+  |---|---|
+  | Single valid link seeds randomness like a parent | `TestWithSingleLinkSeedUsesLinkRandomness` |
+  | Link without rv uses link TraceID | `TestWithSingleLinkSeedUsesLinkTraceIDWhenRandomnessAbsent` |
+  | Parent takes precedence over links | `TestWithSingleLinkSeedUsesParentBeforeLink` |
+  | Multiple valid links skip link seeding | `TestWithSingleLinkSeedFallsBackWithoutExactlyOneValidLink` |
+  | Root always emits explicit rv | `TestWithSingleLinkSeedWritesRootRandomness`, `TestSDKRootSpanInjectsRandomnessTraceState` |
+  | Linked chain preserves rv and decision shape | `TestWithSingleLinkSeedPreservesRandomnessAcrossLinkedChain`, `TestWithSingleLinkSeedServiceThresholdChain` |
+  | Linked SDK span keeps new TraceID and upstream rv | `TestSDKLinkedSpanUsesUpstreamRandomness` |
+  | Dropped linked span still propagates rv | `TestSDKDroppedLinkedSpanStillPropagatesRandomness` |
+
+  Beyond-spec coverage added by the review follow-ups: `TestWithSingleLinkSeedDropsLinkVendorTraceState`,
+  `TestWithSingleLinkSeedDropPathOmitsUpstreamThreshold`, `TestWithSingleLinkSeedPreservesParentContextValues`,
+  `TestWithSingleLinkSeedParentBasedDegradesToHeadBased`, `TestThresholdMatchesSamplerDecision`.
+
+- [x] 6.3 Archive this change into `openspec/specs/`
