@@ -1,105 +1,81 @@
 # shared-feature-flags Specification
 
 ## Purpose
-TBD - created by archiving change document-otel-instrumentation. Update Purpose after archive.
+Shared feature-flag primitives used by all instrumentation modules: environment
+reads, OpenFeature-backed `Resolver` snapshots, and per-connection overrides.
+
 ## Requirements
-### Requirement: Default-off environment variable reading
-`flags.EnvEnabled(name string) bool` SHALL return `false` when the named environment variable is unset. When set, it SHALL return `false` for the case-insensitive, whitespace-trimmed values `0`, `false`, `no`, `off`, and `true` for any other set value.
-
-#### Scenario: Unset variable
-- **WHEN** the named environment variable has never been set
-- **THEN** `EnvEnabled` returns `false`
-
-#### Scenario: Falsy value
-- **WHEN** the variable is set to `"False"` (mixed case) or `" off "` (with whitespace)
-- **THEN** `EnvEnabled` returns `false`
-
-#### Scenario: Truthy value
-- **WHEN** the variable is set to any value other than `0`/`false`/`no`/`off` (e.g. `"1"`, `"yes"`, or an arbitrary non-empty string)
-- **THEN** `EnvEnabled` returns `true`
-
-#### Scenario: Empty-string value is truthy
-- **WHEN** the variable is explicitly set to the empty string (e.g. via `t.Setenv(name, "")`)
-- **THEN** `EnvEnabled` returns `true` — being *set* to empty is distinct from being *unset*, and only the four named falsy strings disable
-
-### Requirement: Cached gate resolution
-`flags.Gate` (constructed via `NewGate(fn func() bool)`) SHALL invoke its resolver function at most once per process lifetime, using `sync.Once` and `atomic.Bool`, and `Enabled()` SHALL return the cached boolean on every call after the first.
-
-#### Scenario: First call evaluates the resolver
-- **WHEN** `Enabled()` is called on a freshly constructed `Gate` for the first time
-- **THEN** the resolver function `fn` is invoked exactly once and its result is cached
-
-#### Scenario: Subsequent calls use the cache
-- **WHEN** `Enabled()` is called again after the first call, even if the underlying environment variables have changed
-- **THEN** the previously cached value is returned and `fn` is not re-invoked
-
-### Requirement: Test-only cache reset
-`Gate.ResetForTest()` SHALL clear the cached `sync.Once` and reset the cached boolean to `false`, so the next `Enabled()` call re-invokes the resolver. This method SHALL be documented as not parallel-safe and reserved for tests that toggle environment variables via `t.Setenv`.
-
-#### Scenario: Test toggles an env var
-- **WHEN** a test calls `t.Setenv` to change a flag's underlying env var and then calls `gate.ResetForTest()`
-- **THEN** the next `gate.Enabled()` call re-evaluates the resolver against the new environment value
-
-#### Scenario: Not called in production paths
-- **WHEN** `ResetForTest` is invoked outside of a test context or concurrently with other goroutines calling `Enabled()`
-- **THEN** behavior is undefined — the method is documented as test-only and not parallel-safe, and production code paths SHALL NOT call it
-
 ### Requirement: Byte-identical vendoring across modules
-Every module (`otel-mongo`, `otel-mongo/v2`, `otel-nats`, `otel-gorilla-ws`) SHALL vendor its own copy of the `internal/flags` package (`flags.go` + `flags_test.go`), and the file contents excluding the `package` declaration line SHALL remain byte-identical across all four copies.
+Every module (`otel-mongo`, `otel-mongo/v2`, `otel-nats`, `otel-gorilla-ws`) SHALL vendor its own copy of the `internal/flags` package (`flags.go` + `flags_test.go`), and the file contents excluding the `package` declaration line SHALL remain byte-identical across all four copies. This rule SHALL cover the `Resolver` snapshot and refresh logic added for dynamic flag resolution, which is the shared logic most at risk of silent divergence.
 
 #### Scenario: A module's flags.go is modified
 - **WHEN** a change modifies the body of `flags.go` in one module's `internal/flags/` copy
 - **THEN** the same change SHALL be applied to the other three modules' `internal/flags/` copies to preserve byte-identical content
 
+#### Scenario: Resolver logic is modified
+- **WHEN** the TTL comparison, snapshot construction, or environment-default fallback in one copy's `Resolver` is changed
+- **THEN** the identical change SHALL be applied to the other three copies
+
 ### Requirement: Composed per-module gates
-`otel-nats` and `otel-gorilla-ws` SHALL each compose a package-level `Gate` (`natsGate`, `wsGate`) via `NewGate` with a resolver that logically ANDs the global master switch and the module-specific switch, and SHALL call that `Gate.Enabled()` once per wrapper construction rather than per method call. `otel-mongo` (v1 and v2) SHALL use a different composition: its primary tracing decision (`mongoTracingEnabled()`, ANDing the global and `OTEL_MONGO_TRACING_ENABLED` switches) is a plain, uncached function — **not** wrapped in a `Gate` — called directly at each `Client`/`Collection` construction site; only its propagation decision is `Gate`-wrapped (`propEnabledGate`, wrapping `mongoPropagationEnabled`), and that `Gate` is invoked per-call from the package-level `ContextFromDocument`/`ContextFromRawDocument` functions (e.g. once per change-stream document decode), not once per wrapper construction.
+Each module SHALL construct exactly one package-level `flags.Resolver` at package initialization, supplying one `flags.Spec` per dynamic flag it owns, and SHALL read it through `Resolver.Enabled(i)` at each decision point rather than caching the result on a wrapper struct. `otel-nats` and `otel-gorilla-ws` SHALL each own a single tracing `Spec`; `otel-mongo` (v1 and v2) SHALL own a tracing `Spec` and a propagation `Spec` so both resolve from one snapshot store. The global switch `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` SHALL be read via `flags.GlobalTracingPossible()` (or equivalent `EnvEnabled` of that name) and ANDed ahead of the resolver read, never expressed as a `Spec`.
 
-#### Scenario: otel-nats / otel-gorilla-ws — global and module flags combined via a Gate
-- **WHEN** `otelnats` or `otel-gorilla-ws` constructs its tracing gate as `NewGate(func() bool { return EnvEnabled("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED") && EnvEnabled("OTEL_<MODULE>_TRACING_ENABLED") })`
-- **THEN** `Enabled()` returns `true` only when both environment variables resolve to truthy, and the resolver runs at most once for that `Gate`'s lifetime
+#### Scenario: otel-nats / otel-gorilla-ws compose one tracing spec
+- **WHEN** `otelnats` or `otel-gorilla-ws` resolves its effective tracing state for a connection with no `WithTracingEnabled` option
+- **THEN** it returns `flags.GlobalTracingPossible() && resolver.Enabled(tracingIndex)` (equivalently `EnvEnabled` of the global kill-switch name)
 
-#### Scenario: otel-mongo — tracing decision is not Gate-wrapped
-- **WHEN** `otel-mongo` (v1 or v2) evaluates whether wrapper CLIENT spans are enabled
-- **THEN** it calls the plain function `mongoTracingEnabled()` directly (re-evaluating `EnvEnabled` on every call site), rather than reading a cached `Gate.Enabled()` value
+#### Scenario: otel-mongo composes tracing and propagation in one resolver
+- **WHEN** `otel-mongo` (v1 or v2) evaluates both its tracing and its propagation decision for the same operation
+- **THEN** the propagation decision reuses the operation's already-resolved tracing boolean (or both values from one snapshot load), so a single operation does not combine tracing from snapshot T0 with a post-TTL refresh for the same tracing index
 
-#### Scenario: otel-mongo — propagation Gate is read per document, not per construction
-- **WHEN** `ContextFromDocument` or `ContextFromRawDocument` is called on a decoded document
-- **THEN** it reads `propEnabledGate.Enabled()` at that call site (the resolver itself still runs only once, per `Gate` semantics, but the read happens on every document decode rather than once at `Client`/`Collection` construction)
+#### Scenario: Values are read per decision, not cached per construction
+- **WHEN** a relay flag changes after a `Client` or `Conn` has been constructed without `WithTracingEnabled`
+- **THEN** the next operation on that wrapper observes the new value within the resolver's TTL, without reconstruction
 
 ### Requirement: Per-connection override composes above the gates
-Each wrapper module SHALL offer a construction-time functional option, `WithTracingEnabled(v bool)`, that overrides the env-gate default for that connection/client only. The override SHALL compose **above** the `internal/flags` primitives at the wrapper layer: when the option is present its value is authoritative (overriding both the global and module env gates in either direction — including when the env vars are explicitly falsy, not merely unset); when absent, the existing gate resolution applies unchanged. The `internal/flags` package itself (`EnvEnabled`, `Gate`) SHALL NOT change for this feature, no new exported test-reset hooks SHALL be added, and the byte-identical vendoring rule continues to apply to the unchanged `flags` copies. Resolution SHALL happen once at construction, feeding the same cached per-wrapper `tracingEnabled` decision (or strategy-split impl selection) the modules already use, so the disabled-mode invariant is inherited without new per-method checks.
+Each wrapper module SHALL offer a construction-time functional option, `WithTracingEnabled(v bool)`, that overrides the flag resolution for that connection/client only. When the option is present its value SHALL be authoritative, SHALL be resolved once at construction, and SHALL suppress all OpenFeature evaluation for that connection — the connection is fully static and no relay change can affect it. When the option is absent, the global environment switch SHALL be ANDed with the module's dynamic resolver value, re-read per operation. The option's presence SHALL also decide which implementation a strategy-split wrapper is constructed with, so that `WithTracingEnabled(true)` still produces spans when the global environment switch is off.
 
-Effective tracing SHALL follow this decision table (`Env` = `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` AND the module switch; unset or falsy → off):
+Effective tracing SHALL follow this decision table (`Env` = `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`; `Flag` = the module's dynamic value, itself defaulting to the module environment variable):
 
-| Env | `WithTracingEnabled` | Effective tracing |
-|-----|----------------------|-------------------|
-| off (unset or falsy) | absent | off |
-| off (unset or falsy) | `true` | on |
-| off (unset or falsy) | `false` | off |
-| on | absent | on |
-| on | `false` | off |
-| on | `true` | on |
+| Env | `Flag` | `WithTracingEnabled` | Effective tracing |
+|-----|--------|----------------------|-------------------|
+| off (unset or falsy) | any | absent | off — no evaluation performed |
+| off (unset or falsy) | any | `true` | on |
+| off (unset or falsy) | any | `false` | off |
+| on | on | absent | on |
+| on | off | absent | off |
+| on | any | `false` | off |
+| on | any | `true` | on |
 
-#### Scenario: Option absent preserves gate behavior bit-for-bit
+#### Scenario: Option absent defers to the global switch and the dynamic flag
 - **WHEN** a wrapper is constructed without `WithTracingEnabled`
-- **THEN** its tracing decision comes from the existing gate resolution (`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` AND the module switch), identical to behavior before this option existed
+- **THEN** its tracing decision is `EnvEnabled(GLOBAL) && resolver.Enabled(tracing)`, re-read per operation
 
 #### Scenario: Option true enables tracing despite env off
-- **WHEN** a wrapper is constructed with `WithTracingEnabled(true)` while both env gates are unset or explicitly falsy
-- **THEN** the option's value decides tracing for that connection/client; other connections in the same process still follow the env gates
+- **WHEN** a wrapper is constructed with `WithTracingEnabled(true)` while the global env switch is unset or explicitly falsy
+- **THEN** the wrapper is constructed on the instrumented path, produces spans, and performs no OpenFeature evaluation
 
-#### Scenario: Option false disables tracing despite env on
-- **WHEN** a wrapper is constructed with `WithTracingEnabled(false)` while both env gates are truthy
-- **THEN** tracing is disabled for that connection/client
+#### Scenario: Option false disables tracing despite env on and flag on
+- **WHEN** the global env switch is truthy, the relay resolves the module flag to `true`, and the caller passes `WithTracingEnabled(false)`
+- **THEN** tracing is disabled for that connection/client and remains disabled for its lifetime
 
 #### Scenario: Option true with env already on stays on
-- **WHEN** both env gates are truthy and the caller also passes `WithTracingEnabled(true)`
-- **THEN** tracing remains enabled for that connection/client
+- **WHEN** the global env switch is truthy and the caller also passes `WithTracingEnabled(true)`
+- **THEN** tracing remains enabled for that connection/client and no relay change can disable it
 
 #### Scenario: Downstream test controls gating without process-global state
 - **WHEN** a downstream test suite constructs one traced and one untraced connection in the same process by passing the option
-- **THEN** both behave per their option values with no environment manipulation, no `TestMain` env setup, and no reset hooks required
+- **THEN** both behave per their option values with no environment manipulation, no OpenFeature provider, and no reset hooks required
 
-#### Scenario: flags package remains untouched
-- **WHEN** the option feature is implemented across the four modules
-- **THEN** every module's `internal/flags/flags.go` body is unchanged (still byte-identical across copies), and the override logic lives entirely in each module's wrapper-layer construction code
+#### Scenario: Option makes a connection immune to relay changes
+- **WHEN** a connection constructed with `WithTracingEnabled(true)` is in use and the relay flips the module flag to `false`
+- **THEN** that connection continues to trace, while connections constructed without the option stop tracing within the TTL
+
+## REMOVED Requirements
+
+### Requirement: Cached gate resolution
+**Reason**: `flags.Gate` / `NewGate` / `ResetForTest` were removed; process-lifetime
+caching is incompatible with dynamic OpenFeature resolution. See the change
+`openfeature-dynamic-flags` for migration notes.
+
+### Requirement: Test-only cache reset
+**Reason**: Replaced by `Resolver` + `WithClock` for TTL-boundary tests.

@@ -21,7 +21,7 @@ All notable changes to the `otel-mongo` module (v1, `go.mongodb.org/mongo-driver
   _ = openfeature.SetProviderAndWait(provider)
   ```
 
-  With no provider installed, behavior is identical to the previous release.
+  With no provider installed, span/propagation on/off still follows the environment variables as before.
 - `github.com/open-feature/go-sdk` is a new dependency. The GO Feature Flag provider is an application-side dependency, not a library one.
 
 - **BREAKING** `ContextFromDocument` and `ContextFromRawDocument` now resolve through the same snapshot as the `Collection` path instead of a permanently cached, environment-only gate. A relay flag that disables Mongo propagation now also stops change-stream readers from extracting trace context, matching the `Collection` path in the same loop. They still ignore per-connection options, as documented.

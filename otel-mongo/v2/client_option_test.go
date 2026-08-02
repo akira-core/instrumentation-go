@@ -17,8 +17,8 @@ import (
 
 // clearMongoTracingEnv unsets all three tracing env vars for the duration of
 // the test, restoring their prior values on cleanup. mongoTracingEnabled is a
-// plain, uncached function (unlike otel-nats/otel-gorilla-ws's Gate), but the
-// process-wide propEnabledGate does cache these vars, so the cache is reset
+// function that resolves through the module Resolver (1s TTL). The resolver
+// snapshot caches these vars, so the cache is reset
 // here and again on cleanup (per the CLAUDE.md rule for tests that toggle
 // them).
 func clearMongoTracingEnv(t *testing.T) {

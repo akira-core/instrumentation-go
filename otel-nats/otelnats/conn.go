@@ -13,6 +13,8 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/akira-core/instrumentation-go/otel-nats/otelnats/internal/flags"
 )
 
 const (
@@ -58,6 +60,8 @@ type Conn struct {
 }
 
 // impl returns the implementation this operation runs through.
+// Dynamic-path flag condition must stay lockstep with msgHandler and
+// traceEventMsgHandler (static? / natsTracingEnabled?) — do not change one alone.
 func (c *Conn) impl() connImpl {
 	if c.static != nil {
 		return c.static
@@ -219,7 +223,7 @@ func newConn(nc *nats.Conn, opts ...Option) *Conn {
 	if cfg.TracingEnabled != nil && !*cfg.TracingEnabled {
 		return &Conn{nc: nc, static: direct}
 	}
-	if cfg.TracingEnabled == nil && !dynamicTracingPossible() {
+	if cfg.TracingEnabled == nil && !flags.GlobalTracingPossible() {
 		return &Conn{nc: nc, static: direct}
 	}
 

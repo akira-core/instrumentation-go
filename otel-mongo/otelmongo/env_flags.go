@@ -5,7 +5,9 @@ import (
 )
 
 const (
-	envGlobalTracingEnabled    = "OTEL_INSTRUMENTATION_GO_TRACING_ENABLED"
+	// envGlobalTracingEnabled aliases the shared kill-switch name so the literal
+	// has exactly one home (internal/flags) and cannot drift from it.
+	envGlobalTracingEnabled    = flags.EnvGlobalTracing
 	envMongoTracingEnabled     = "OTEL_MONGO_TRACING_ENABLED"
 	envMongoPropagationEnabled = "OTEL_MONGO_PROPAGATION_ENABLED"
 )
@@ -18,9 +20,11 @@ const (
 	flagKeyMongoPropagation = "otel-mongo-propagation"
 )
 
-// Indices into mongoResolver's specs. Both flags live in one resolver so they
-// always come from the same snapshot instant — a torn read reporting tracing off
-// while propagation still read on could never correspond to a relay state.
+// Indices into mongoResolver's specs. Both flags live in one resolver so a
+// single refresh evaluates them together: any one snapshot always holds a
+// combination that existed on the relay. Two Enabled calls that straddle a TTL
+// refresh still read two different snapshots — operation-scoped consistency is
+// the call site's job (design R5), not the resolver's.
 const (
 	idxTracing = iota
 	idxPropagation
@@ -52,18 +56,10 @@ func newMongoResolver() *flags.Resolver {
 // it did a second ago: callers MUST read it per operation rather than caching it
 // on a wrapper struct.
 func mongoTracingEnabled() bool {
-	if !flags.EnvEnabled(envGlobalTracingEnabled) {
+	if !flags.GlobalTracingPossible() {
 		return false
 	}
 	return mongoResolver.Enabled(idxTracing)
-}
-
-// dynamicTracingPossible reports whether this process may ever trace Mongo —
-// i.e. whether the instrumented implementations must be constructed at all.
-// It reads the global kill switch only, never the relay, because the choice of
-// which implementations to build is necessarily static.
-func dynamicTracingPossible() bool {
-	return flags.EnvEnabled(envGlobalTracingEnabled)
 }
 
 // mongoPropagationEnvOnly reports OTEL_MONGO_PROPAGATION_ENABLED alone, without
@@ -84,7 +80,27 @@ func mongoPropagationResolved() bool {
 }
 
 func mongoPropagationEnabled() bool {
+	// Resolve tracing once, then propagation — never re-enter mongoTracingEnabled
+	// inside resolveDocumentPropagation (design R5).
 	return resolveDocumentPropagation(mongoTracingEnabled(), nil)
+}
+
+// mongoFlagsPair returns tracing and then propagation for the package-level
+// document helpers.
+//
+// The two Enabled reads are consecutive, NOT atomic: if the snapshot TTL expires
+// between them the propagation value can come from a newer refresh than the
+// tracing value. A truly single-snapshot read would need a multi-value accessor
+// on flags.Resolver, which does not exist yet.
+func mongoFlagsPair() (tracing, propagation bool) {
+	if !flags.GlobalTracingPossible() {
+		return false, false
+	}
+	tracing = mongoResolver.Enabled(idxTracing)
+	if !tracing {
+		return false, false
+	}
+	return true, mongoResolver.Enabled(idxPropagation)
 }
 
 // resolveDocumentPropagation returns the effective _oteltrace propagation flag
@@ -127,5 +143,6 @@ func resolveFlag(override *bool, envDefault bool) bool {
 // Caching lives in the resolver, so repeated calls in a hot decode loop do not
 // re-enter the OpenFeature evaluation pipeline.
 func cachedPropagationEnabled() bool {
-	return mongoPropagationEnabled()
+	_, prop := mongoFlagsPair()
+	return prop
 }

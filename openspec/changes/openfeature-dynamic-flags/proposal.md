@@ -24,7 +24,7 @@ OpenFeature (with the GO Feature Flag provider and its relay proxy) gives us a s
 
 ### otel-gorilla-ws negotiates otel-ws whenever the global switch is on
 
-- **BREAKING** `Dial` offers, and `Upgrader.Upgrade` confirms, the `otel-ws` subprotocol whenever `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is on, independent of the dynamic value. The subprotocol negotiation is the one thing that cannot be changed after a connection is established, so it must be available for a relay flag to be able to enable propagation on a live connection. Consequence: connections between two peers that both use this library with the global switch on now carry the JSON envelope on every message even while tracing is off. Peers that do not negotiate `otel-ws` are unaffected — the wire is unchanged for them.
+- **BREAKING** `Dial` offers, and `Upgrader.Upgrade` confirms, the `otel-ws` subprotocol whenever `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is on, independent of the dynamic value (and independent of `OTEL_GORILLA_WS_TRACING_ENABLED`). The subprotocol negotiation is the one thing that cannot be changed after a connection is established, so it must be available for a relay flag to be able to enable propagation on a live connection. Consequence: connections between two peers that both use this library with the global switch on now carry the JSON envelope on every message even while tracing is off. This is also the documented exception to "upgrade without a provider changes nothing": env-only global-on + module-off now negotiates otel-ws. Peers that do not negotiate `otel-ws` — including `NewConn` wrappers whose raw subprotocol is not otel-ws — see raw payloads (envelope is negotiation-proven only; see design R1).
 
 ### Mongo document helpers follow the relay
 

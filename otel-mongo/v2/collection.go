@@ -9,6 +9,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/direct"
+	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/flags"
 	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/shared"
 	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/traced"
 )
@@ -31,7 +32,10 @@ type Collection struct {
 	tracing func() bool
 }
 
-// impl returns the implementation this operation runs through.
+// impl returns the implementation this operation runs through. The nil check
+// stays adjacent to the return on purpose: hoisting it into a generic ternary
+// would box a possibly-nil *traced.Collection into a non-nil interface at the
+// call site, turning a compile-time-obvious mistake into a nil-receiver panic.
 func (c *Collection) impl() collectionImpl {
 	if c.traced != nil && c.tracing() {
 		return c.traced
@@ -67,7 +71,7 @@ func (c *Collection) newChangeStream(raw *mongo.ChangeStream) *ChangeStream {
 type collectionImpl interface {
 	InsertOne(ctx context.Context, document any, opts ...options.Lister[options.InsertOneOptions]) (*mongo.InsertOneResult, error)
 	InsertMany(ctx context.Context, documents []any, opts ...options.Lister[options.InsertManyOptions]) (*mongo.InsertManyResult, error)
-	Find(ctx context.Context, filter any, opts ...options.Lister[options.FindOptions]) (*mongo.Cursor, shared.CursorImpl, error)
+	Find(ctx context.Context, filter any, opts ...options.Lister[options.FindOptions]) (*mongo.Cursor, error)
 	FindOne(ctx context.Context, filter any, opts ...options.Lister[options.FindOneOptions]) (*mongo.SingleResult, shared.SingleResultImpl)
 	UpdateOne(ctx context.Context, filter, update any, opts ...options.Lister[options.UpdateOneOptions]) (*mongo.UpdateResult, error)
 	UpdateMany(ctx context.Context, filter, update any, opts ...options.Lister[options.UpdateManyOptions]) (*mongo.UpdateResult, error)
@@ -76,10 +80,10 @@ type collectionImpl interface {
 	DeleteMany(ctx context.Context, filter any, opts ...options.Lister[options.DeleteManyOptions]) (*mongo.DeleteResult, error)
 	CountDocuments(ctx context.Context, filter any, opts ...options.Lister[options.CountOptions]) (int64, error)
 	Distinct(ctx context.Context, fieldName string, filter any, opts ...options.Lister[options.DistinctOptions]) *mongo.DistinctResult
-	Aggregate(ctx context.Context, pipeline any, opts ...options.Lister[options.AggregateOptions]) (*mongo.Cursor, shared.CursorImpl, error)
+	Aggregate(ctx context.Context, pipeline any, opts ...options.Lister[options.AggregateOptions]) (*mongo.Cursor, error)
 	UpdateByID(ctx context.Context, id, update any, opts ...options.Lister[options.UpdateOneOptions]) (*mongo.UpdateResult, error)
 	BulkWrite(ctx context.Context, models []mongo.WriteModel, opts ...options.Lister[options.BulkWriteOptions]) (*mongo.BulkWriteResult, error)
-	Watch(ctx context.Context, pipeline any, opts ...options.Lister[options.ChangeStreamOptions]) (*mongo.ChangeStream, shared.ChangeStreamImpl, error)
+	Watch(ctx context.Context, pipeline any, opts ...options.Lister[options.ChangeStreamOptions]) (*mongo.ChangeStream, error)
 }
 
 var (
@@ -99,13 +103,23 @@ func NewCollection(coll *mongo.Collection, tracer trace.Tracer, propagator propa
 		direct:     direct.NewCollection(coll),
 		tracing:    mongoTracingEnabled,
 	}
-	if !dynamicTracingPossible() {
+	if !flags.GlobalTracingPossible() {
 		return c
 	}
 	c.traced = &traced.Collection{
-		Coll:               coll,
-		Tracer:             tracer,
-		Propagator:         propagator,
+		Coll:       coll,
+		Tracer:     tracer,
+		Propagator: propagator,
+		// Full three-tier resolve (includes tracing) so PropagationEnabled
+		// remains correct when inspected with tracing off (pinned by
+		// collection_test.go / dynamic_flags_test.go).
+		//
+		// KNOWN GAP (design R5): this re-resolves tracing, which impl() has
+		// already resolved for the same operation, so one operation can straddle
+		// a TTL refresh and emit a CLIENT span while skipping _oteltrace
+		// injection. Closing it needs the operation's resolved tracing value
+		// threaded into propagationOn (see gateState.propagationGiven, currently
+		// unused for that purpose).
 		PropagationEnabled: mongoPropagationEnabled,
 	}
 	return c
@@ -120,13 +134,15 @@ func newCollectionForDatabase(d *Database, raw *mongo.Collection) *Collection {
 		direct:     direct.NewCollection(raw),
 		tracing:    d.effectiveTracing,
 	}
-	if !d.tracedBuilt {
+	if !d.gate.tracedBuilt {
 		return c
 	}
 	c.traced = &traced.Collection{
-		Coll:               raw,
-		Tracer:             d.tracer,
-		Propagator:         d.propagator,
+		Coll:       raw,
+		Tracer:     d.tracer,
+		Propagator: d.propagator,
+		// effectivePropagation re-resolves tracing internally — see the R5 known
+		// gap noted in NewCollection above.
 		PropagationEnabled: d.effectivePropagation,
 		ServerAddr:         d.serverAddr,
 		ServerPort:         d.serverPort,
@@ -154,7 +170,7 @@ func (c *Collection) InsertMany(ctx context.Context, documents []any, opts ...op
 
 // Find executes a find command and returns a Cursor.
 func (c *Collection) Find(ctx context.Context, filter any, opts ...options.Lister[options.FindOptions]) (*Cursor, error) {
-	raw, _, err := c.impl().Find(ctx, filter, opts...)
+	raw, err := c.impl().Find(ctx, filter, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -227,7 +243,7 @@ func (c *Collection) Distinct(ctx context.Context, fieldName string, filter any,
 
 // Aggregate runs an aggregation pipeline and returns a Cursor.
 func (c *Collection) Aggregate(ctx context.Context, pipeline any, opts ...options.Lister[options.AggregateOptions]) (*Cursor, error) {
-	raw, _, err := c.impl().Aggregate(ctx, pipeline, opts...)
+	raw, err := c.impl().Aggregate(ctx, pipeline, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -269,7 +285,7 @@ func (c *Collection) BulkWrite(ctx context.Context, models []mongo.WriteModel, o
 
 // Watch starts a change stream on the collection.
 func (c *Collection) Watch(ctx context.Context, pipeline any, opts ...options.Lister[options.ChangeStreamOptions]) (*ChangeStream, error) {
-	raw, _, err := c.impl().Watch(ctx, pipeline, opts...)
+	raw, err := c.impl().Watch(ctx, pipeline, opts...)
 	if err != nil {
 		return nil, err
 	}

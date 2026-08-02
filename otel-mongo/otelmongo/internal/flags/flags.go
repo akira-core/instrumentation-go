@@ -3,9 +3,11 @@
 // MUST be byte-identical across every module copy of this package — drift is
 // caught by CI.
 //
-// Two primitives are exported:
+// Exported primitives:
 //
 //   - EnvEnabled reads a single env var with default-off semantics.
+//   - EnvGlobalTracing / GlobalTracingPossible name and read the process-wide
+//     kill switch (the only OTEL_* name allowed in this shared file).
 //   - Resolver resolves a module's flags through the process-global OpenFeature
 //     client, using each flag's env var as the OpenFeature default value, and
 //     caches the results in an immutable per-module snapshot with a one-second
@@ -23,10 +25,10 @@
 //
 // Each module composes one Resolver at package init, supplying its own flag keys
 // and env var names (which cannot live in this shared file), and reads it at each
-// decision point. The global switch OTEL_INSTRUMENTATION_GO_TRACING_ENABLED is
-// read with EnvEnabled and ANDed ahead of the Resolver, never expressed as a
-// Spec: it is an out-of-band kill switch with no relay counterpart, and while it
-// is off no OpenFeature code path runs at all.
+// decision point. The global switch is read via GlobalTracingPossible and ANDed
+// ahead of the Resolver, never expressed as a Spec: it is an out-of-band kill
+// switch with no relay counterpart, and while it is off no OpenFeature code path
+// runs at all.
 package flags
 
 import (
@@ -61,6 +63,17 @@ func EnvEnabled(name string) bool {
 	default:
 		return true
 	}
+}
+
+// EnvGlobalTracing is the process-wide kill-switch environment variable.
+// It is the only OTEL_* name allowed in this shared file; module-scoped
+// env vars and OpenFeature keys live in each module's env_flags.go.
+const EnvGlobalTracing = "OTEL_INSTRUMENTATION_GO_TRACING_ENABLED"
+
+// GlobalTracingPossible reports whether this process may ever run instrumented
+// paths or negotiate otel-ws. It reads EnvGlobalTracing only (never OpenFeature).
+func GlobalTracingPossible() bool {
+	return EnvEnabled(EnvGlobalTracing)
 }
 
 // Spec identifies one dynamic flag: the OpenFeature key to evaluate and the
@@ -161,10 +174,13 @@ func (r *Resolver) Enabled(i int) bool {
 
 // refresh evaluates every Spec and stores a fresh snapshot.
 //
-// Concurrent refreshes are deliberately not serialized: evaluation is idempotent,
-// the last store wins, and a lock on this path would cost more than the duplicate
-// work it prevents.
+// Concurrent refreshes are deliberately not serialized: the last store wins,
+// and a lock on this path would cost more than the duplicate work it prevents.
+// The snapshot timestamp is taken at the start of evaluation (not after) so a
+// slower refresh that observed older relay values cannot stamp a newer
+// completion time and keep stale values marked fresh for a full TTL.
 func (r *Resolver) refresh() *snapshot {
+	at := r.now()
 	ctx := context.Background()
 	client := r.evaluator()
 
@@ -178,7 +194,7 @@ func (r *Resolver) refresh() *snapshot {
 		values[i] = client.Boolean(ctx, spec.Key, EnvEnabled(spec.EnvVar), openfeature.EvaluationContext{})
 	}
 
-	s := &snapshot{at: r.now(), values: values}
+	s := &snapshot{at: at, values: values}
 	r.snap.Store(s)
 	return s
 }

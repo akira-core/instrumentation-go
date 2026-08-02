@@ -35,6 +35,8 @@ import (
 
 const jsTracingFlagKey = "otel-nats-tracing"
 
+// relayFlag builds an in-memory OpenFeature boolean flag with on/off variants.
+// Duplicated per module on purpose — see the note in otelnats' boolFlag.
 func relayFlag(v bool) memprovider.InMemoryFlag {
 	variant := "off"
 	if v {
@@ -49,6 +51,7 @@ func relayFlag(v bool) memprovider.InMemoryFlag {
 
 func setJSRelay(t *testing.T, tracing bool) {
 	t.Helper()
+	// No resolver rearm: this suite proves TTL re-read via awaitTTL.
 	require.NoError(t, openfeature.SetProviderAndWait(memprovider.NewInMemoryProvider(
 		map[string]memprovider.InMemoryFlag{jsTracingFlagKey: relayFlag(tracing)},
 	)))

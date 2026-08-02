@@ -27,6 +27,14 @@ The dynamic value SHALL be read per operation rather than cached on the wrapper 
 - **WHEN** a `MessagesContext` iterator or a `MessageBatch` forwarder created before a relay change is still delivering messages after the resolver's TTL expires
 - **THEN** messages delivered after the change are handled per the new value, without the consumer being recreated
 
+#### Scenario: MessageBatch does not freeze the flag at Fetch time
+- **WHEN** `Fetch` / `FetchBytes` / `FetchNoWait` returns a `MessageBatch` while tracing is on, and the relay later resolves `otel-nats-tracing` to off (or the reverse) and the TTL elapses before the batch finishes delivering
+- **THEN** subsequent messages from that same batch follow the new value (no spans/extract when off; spans/extract when on), without recreating the consumer or the batch handle
+
+#### Scenario: Traced hot path does not rebuild constant attrs per message
+- **WHEN** a dynamic JetStream consume path is tracing on for consecutive messages on the same consumer
+- **THEN** tracer, propagator, and receive base attributes that are constant for the traced connection are not reallocated solely to re-read the dynamic flag (the flag itself is still consulted per message to decide whether to emit)
+
 #### Scenario: Option enables tracing with env off (unset or falsy)
 - **WHEN** `ConnectWithOptions(url, nil, WithTracingEnabled(true))` is called with both tracing env vars unset or explicitly falsy
 - **THEN** the connection creates spans and propagates trace context, and no OpenFeature evaluation is performed for that connection

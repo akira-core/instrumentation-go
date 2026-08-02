@@ -21,8 +21,17 @@ All notable changes to the `otel-gorilla-ws` module are documented here. Format 
   _ = openfeature.SetProviderAndWait(provider)
   ```
 
-  With no provider installed, behavior is identical to the previous release.
+  With no provider installed, **span on/off** still follows the environment variables as before.
+  **Exception:** otel-ws negotiation is gated on the global kill switch alone (not
+  `GLOBAL && OTEL_GORILLA_WS_TRACING_ENABLED`), so env-only global-on + module-off
+  may negotiate the envelope between library peers. Non-negotiating peers and
+  `NewConn` without an otel-ws subprotocol still see raw wire payloads.
 - `github.com/open-feature/go-sdk` is a new dependency. The GO Feature Flag provider is an application-side dependency, not a library one.
+
+- **BREAKING** `NewConn` no longer forces the wire envelope on. It previously wrapped any `*websocket.Conn` with `tracingEnabled = true`, so two peers that both used `NewConn` exchanged the JSON envelope and propagated trace context even though neither had negotiated `otel-ws`. It now derives the envelope decision from the raw connection's *negotiated subprotocol* (`otel-ws` / `otel-ws+<proto>`), and construction additionally clamps it to false whenever the connection is not capable. Consequences:
+  - Callers that manage the handshake themselves and do **not** negotiate `otel-ws` lose WebSocket trace propagation entirely — `ReadMessage` no longer unwraps and `WriteMessage` no longer writes the envelope. Spans are still created while the feature gate is on, but carry no remote parent/link. To keep propagation, negotiate `otel-ws` in your own handshake, or switch to `Dial` / `Upgrader.Upgrade`.
+  - `WithTracingEnabled(true)` does **not** restore the envelope: it sets capability only, and the negotiation outcome still requires a proven `otel-ws` subprotocol.
+  - Conversely, on a connection whose peer *did* negotiate `otel-ws`, a capability-off wrapper (`WithTracingEnabled(false)`, or the global kill switch off) hands the peer's envelope bytes to the application unparsed. Do not wrap an `otel-ws` connection with tracing disabled.
 
 - **BREAKING** `Dial` now offers, and `Upgrader.Upgrade` now confirms, the `otel-ws` subprotocol whenever `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is on — independent of the dynamic flag. Negotiation happens during the handshake and cannot be revisited, so gating it on a value that may flip a second later would leave every connection established during an "off" window permanently unable to propagate trace context. Consequence: two peers that both run this library with the global switch on now exchange the JSON envelope on every message even while tracing is off. Peers that do not negotiate `otel-ws` — including all non-library clients — see no change on the wire.
 - A connection that negotiated `otel-ws` and is then dynamically disabled keeps writing envelopes (the peer expects them) with an empty header and creates no spans.

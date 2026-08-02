@@ -6,6 +6,7 @@ import (
 
 	"github.com/nats-io/nats.go/jetstream"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 
@@ -133,9 +134,10 @@ func (m *directMessageBatch) Stop() {
 	m.stopOnce.Do(func() { close(m.done) })
 }
 
-// messageBatchTrace is the instrumented MessageBatch: extracts trace headers and emits
-// a receive span per message. Each span starts and ends before the message is sent to
-// the wrapper channel, so consumers always observe an already-ended span
+// messageBatchTrace is the dynamic MessageBatch: for every message it re-checks
+// the connection's tracing gate and, when on, extracts trace headers and emits a
+// receive span. Each span starts and ends before the message is sent to the
+// wrapper channel, so consumers always observe an already-ended span
 // (IsRecording() == false at delivery).
 type messageBatchTrace struct {
 	ch       chan Msg
@@ -150,90 +152,101 @@ func (m *messageBatchTrace) Stop() {
 	m.stopOnce.Do(func() { close(m.done) })
 }
 
+// forwardBatch is the MessageBatch forwarding loop shared by the passthrough and
+// the dynamic wrapper: it drains raw, converts each message with wrap, and sends
+// the result on ch. It selects on done both while waiting to receive from the
+// native batch and while waiting to send to the wrapper channel, so Stop() takes
+// effect promptly regardless of which side the goroutine is parked on.
+//
+// wrap is evaluated as the send-case operand, i.e. before the select blocks, so a
+// span it creates is always started AND ended before the receiver can observe the
+// message (IsRecording() == false at delivery). The trade-off is unchanged: a
+// span may be emitted for one final message that Stop() prevents from being
+// delivered.
+func forwardBatch(raw jetstream.MessageBatch, ch chan<- Msg, done <-chan struct{}, wrap func(jetstream.Msg) Msg) {
+	defer close(ch)
+	for {
+		var msg jetstream.Msg
+		var ok bool
+		select {
+		case msg, ok = <-raw.Messages():
+			if !ok {
+				return
+			}
+		case <-done:
+			return
+		}
+		select {
+		case ch <- wrap(msg):
+		case <-done:
+			return
+		}
+	}
+}
+
 // newDirectMessageBatch wraps a raw jetstream.MessageBatch with the passthrough variant.
-// The forwarding loop selects on done both while waiting to receive from the
-// native batch and while waiting to send to the wrapper channel, so Stop()
-// takes effect promptly regardless of which side the goroutine is parked on.
 func newDirectMessageBatch(raw jetstream.MessageBatch) MessageBatch {
 	ch := make(chan Msg)
 	done := make(chan struct{})
-	go func() {
-		defer close(ch)
-		for {
-			var msg jetstream.Msg
-			var ok bool
-			select {
-			case msg, ok = <-raw.Messages():
-				if !ok {
-					return
-				}
-			case <-done:
-				return
-			}
-			select {
-			case ch <- Msg{Msg: msg, Ctx: context.Background()}:
-			case <-done:
-				return
-			}
-		}
-	}()
+	go forwardBatch(raw, ch, done, func(msg jetstream.Msg) Msg {
+		return Msg{Msg: msg, Ctx: context.Background()}
+	})
 	return &directMessageBatch{ch: ch, raw: raw, done: done}
 }
 
-// newTracedMessageBatch wraps a raw jetstream.MessageBatch with the instrumented variant.
-// The forwarding loop selects on done both while waiting to receive from the
-// native batch and while waiting to send to the wrapper channel, so Stop()
-// takes effect promptly regardless of which side the goroutine is parked on.
-// Each message's receive span starts and ends BEFORE the channel send — the
-// receiver must observe an already-ended span (IsRecording() == false at
-// delivery, the spec's observable contract, matching single-shot
-// Consumer.Next and MessagesContext.Next); ending after a successful send
-// would race the receiver's check across the channel rendezvous. As a
-// consequence, a span may be emitted for one final message that Stop()
-// prevents from being delivered. The ended span's SpanContext still parents
-// caller-created child spans; callers measure processing time with their own
-// child spans.
-func newTracedMessageBatch(conn *otelnats.Conn, consumerName string, raw jetstream.MessageBatch) MessageBatch {
+// newDynamicMessageBatch wraps a raw jetstream.MessageBatch with a forwarder
+// that re-checks the connection tracing gate per message (design R2). Construction
+// never freezes direct vs traced for the batch lifetime.
+func newDynamicMessageBatch(conn *otelnats.Conn, consumerName string, raw jetstream.MessageBatch) MessageBatch {
 	ch := make(chan Msg)
 	done := make(chan struct{})
-	go func() {
-		defer close(ch)
-		tracer, prop := conn.TraceContext()
-		baseAttrs := receiveBaseAttrs("receive", conn.ServerAttrs(), consumerName)
-		for {
-			var msg jetstream.Msg
-			var ok bool
-			select {
-			case msg, ok = <-raw.Messages():
-				if !ok {
-					return
-				}
-			case <-done:
-				return
-			}
-			msgCtx := context.Background()
-			if h := msg.Headers(); h != nil {
-				msgCtx = prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: h})
-			}
-			originSpanCtx := trace.SpanContextFromContext(msgCtx)
-			attrs := receiveMsgAttrs(baseAttrs, msg)
-			opts := []trace.SpanStartOption{
-				trace.WithSpanKind(trace.SpanKindClient),
-				trace.WithAttributes(attrs...),
-			}
-			if originSpanCtx.IsValid() {
-				opts = append(opts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
-			}
-			ctx, span := tracer.Start(context.Background(), "receive "+msg.Subject(), opts...)
-			span.End()
-			select {
-			case ch <- Msg{Msg: msg, Ctx: ctx}:
-			case <-done:
-				return
-			}
-		}
-	}()
+	spanner := &receiveSpanner{conn: conn, consumerName: consumerName}
+	go forwardBatch(raw, ch, done, spanner.wrap)
 	return &messageBatchTrace{ch: ch, raw: raw, done: done}
+}
+
+// receiveSpanner turns a jetstream.Msg into a wrapper Msg, emitting a receive
+// span whenever the connection's tracing gate is on at that moment.
+//
+// The tracer, propagator and base attribute set are resolved lazily on the first
+// message that finds the gate ON, then reused: they answer through the Conn's
+// impl(), so resolving them eagerly could freeze the noop tracer into the
+// forwarder, while re-resolving them per message costs one attribute-slice
+// allocation per delivered message on the JetStream hot path. Once the gate has
+// been observed on, the traced impl behind them is immutable for the Conn's life.
+type receiveSpanner struct {
+	conn         *otelnats.Conn
+	consumerName string
+
+	resolved  bool
+	tracer    trace.Tracer
+	prop      propagation.TextMapPropagator
+	baseAttrs []attribute.KeyValue
+}
+
+func (s *receiveSpanner) wrap(msg jetstream.Msg) Msg {
+	if !s.conn.TracingEnabled() {
+		return Msg{Msg: msg, Ctx: context.Background()}
+	}
+	if !s.resolved {
+		s.tracer, s.prop = s.conn.TraceContext()
+		s.baseAttrs = receiveBaseAttrs("receive", s.conn.ServerAttrs(), s.consumerName)
+		s.resolved = true
+	}
+	msgCtx := context.Background()
+	if h := msg.Headers(); h != nil {
+		msgCtx = s.prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: h})
+	}
+	opts := []trace.SpanStartOption{
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(receiveMsgAttrs(s.baseAttrs, msg)...),
+	}
+	if originSpanCtx := trace.SpanContextFromContext(msgCtx); originSpanCtx.IsValid() {
+		opts = append(opts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
+	}
+	ctx, span := s.tracer.Start(context.Background(), "receive "+msg.Subject(), opts...)
+	span.End()
+	return Msg{Msg: msg, Ctx: ctx}
 }
 
 // wrapConsumeContext adapts the (jetstream.ConsumeContext, error) pair from an

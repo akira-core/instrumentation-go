@@ -9,7 +9,7 @@ No package in this repository SHALL call `openfeature.SetProvider`, `openfeature
 
 #### Scenario: No provider installed by the application
 - **WHEN** an application imports an instrumentation module but never installs an OpenFeature provider
-- **THEN** every flag resolves to its environment-variable default and the module's observable behavior is identical to the release preceding this change
+- **THEN** every flag resolves to its environment-variable default and span on/off behavior matches that environment-only resolution, except where a design-documented env-only rule change applies (otel-gorilla-ws negotiation gated on the global switch alone; see `websocket-tracing` and design D9/R4)
 
 #### Scenario: Application installs a module-scoped provider
 - **WHEN** an application calls `openfeature.SetNamedProvider("otel-mongo", p)` in addition to a default provider
@@ -46,7 +46,7 @@ Each dynamic flag SHALL be resolved as `client.Boolean(ctx, spec.Key, flags.EnvE
 - **THEN** tracing remains disabled without depending on any relay interaction
 
 ### Requirement: Per-module snapshot with a one-second TTL
-`internal/flags` SHALL expose a `Resolver` that holds an immutable snapshot of every flag value for one module in an `atomic.Pointer`, together with the instant the snapshot was taken. `Resolver.Enabled(i int)` SHALL load the pointer, compare that instant against the resolver's clock, and return the cached value when the snapshot is younger than the TTL. When the snapshot is absent or expired, the calling goroutine SHALL evaluate every `Spec` of that module and store a new snapshot. Refreshes SHALL NOT be serialized — concurrent refreshes are permitted, evaluation is idempotent, and the last store wins. The TTL SHALL be fixed at one second and SHALL NOT be configurable through any exported API or environment variable.
+`internal/flags` SHALL expose a `Resolver` that holds an immutable snapshot of every flag value for one module in an `atomic.Pointer`, together with the instant the snapshot was taken. `Resolver.Enabled(i int)` SHALL load the pointer, compare that instant against the resolver's clock, and return the cached value when the snapshot is younger than the TTL. When the snapshot is absent or expired, the calling goroutine SHALL evaluate every `Spec` of that module and store a new snapshot. Refreshes SHALL NOT be serialized — concurrent refreshes are permitted and the last store wins. The snapshot's `at` timestamp SHALL be recorded at the **start** of the refresh (before any `client.Boolean` call), not after evaluation completes, so a slower refresh that observed older relay values cannot stamp a newer completion time over a fresher snapshot and keep stale values marked fresh for a full TTL. The TTL SHALL be fixed at one second and SHALL NOT be configurable through any exported API or environment variable. Specs within one refresh MAY be evaluated sequentially; parallel fan-out is not required.
 
 #### Scenario: Repeated reads within the TTL do not re-evaluate
 - **WHEN** `Enabled` is called many times within one second of a snapshot being taken
@@ -64,12 +64,20 @@ Each dynamic flag SHALL be resolved as `client.Boolean(ctx, spec.Key, flags.EnvE
 - **WHEN** `Enabled` is called for the first time on a freshly constructed `Resolver`
 - **THEN** every `Spec` is evaluated once and the resulting snapshot is stored before the value is returned
 
+#### Scenario: Snapshot timestamp is taken before evaluation
+- **WHEN** two concurrent refreshes run and the later-finishing refresh began earlier and read older provider values
+- **THEN** its stored snapshot's `at` reflects its start time (not completion), so it cannot appear strictly fresher than a refresh that started later solely by finishing later
+
 ### Requirement: Module-specific flag identity lives outside the shared file
-`internal/flags` SHALL NOT contain any flag key or environment variable name. `Resolver` SHALL accept them as `Spec` values (`Key` for the OpenFeature flag key, `EnvVar` for the fallback environment variable), supplied by each module's own non-shared `env_flags.go`. The byte-identical vendoring rule SHALL continue to apply to the whole of `internal/flags`, including the new `Resolver` code.
+`internal/flags` SHALL NOT contain module-scoped OpenFeature flag keys or module-scoped environment variable names. `Resolver` SHALL accept those as `Spec` values (`Key` for the OpenFeature flag key, `EnvVar` for the fallback environment variable), supplied by each module's own non-shared `env_flags.go`. The shared file MAY define the single process-wide kill-switch name `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` as `EnvGlobalTracing` and MAY export `GlobalTracingPossible() bool` as `EnvEnabled(EnvGlobalTracing)`. The byte-identical vendoring rule SHALL continue to apply to the whole of `internal/flags`, including the new `Resolver` code.
 
 #### Scenario: Shared file names no module
 - **WHEN** `internal/flags/flags.go` is inspected in any of the four modules
-- **THEN** it contains no occurrence of `otel-mongo`, `otel-nats`, `otel-gorilla-ws`, or any `OTEL_*` environment variable name
+- **THEN** it contains no occurrence of `otel-mongo`, `otel-nats`, `otel-gorilla-ws`, or any module-scoped `OTEL_MONGO_*` / `OTEL_NATS_*` / `OTEL_GORILLA_WS_*` name
+
+#### Scenario: Shared file may name only the global kill switch
+- **WHEN** `internal/flags/flags.go` is inspected
+- **THEN** the only `OTEL_*` environment variable name it may contain is `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`, exposed as `EnvGlobalTracing` / `GlobalTracingPossible`
 
 #### Scenario: Resolver code stays byte-identical
 - **WHEN** the refresh, fallback, or TTL logic in one module's `internal/flags/flags.go` is modified

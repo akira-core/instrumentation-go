@@ -20,6 +20,13 @@ import (
 // Not parallel-safe: the OpenFeature provider, the process environment and
 // natsResolver are all process-global. No t.Parallel in this file.
 
+// boolFlag builds an in-memory OpenFeature boolean flag with on/off variants.
+//
+// Deliberately duplicated per module rather than extracted into a shared test
+// helper module: the four instrumentation modules are published independently,
+// so importing a helper from the untagged otel-testkit module would put an
+// unresolvable requirement in a released go.mod (`go mod tidy` in any consumer
+// pulls test dependencies of imported packages).
 func boolFlag(v bool) memprovider.InMemoryFlag {
 	variant := "off"
 	if v {

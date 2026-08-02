@@ -31,6 +31,13 @@ import (
 // Not parallel-safe: the OpenFeature provider, the process environment and
 // wsResolver are all process-global. No t.Parallel in this file.
 
+// relayFlag builds an in-memory OpenFeature boolean flag with on/off variants.
+//
+// Deliberately duplicated per module rather than extracted into a shared test
+// helper module: the four instrumentation modules are published independently,
+// so importing a helper from the untagged otel-testkit module would put an
+// unresolvable requirement in a released go.mod (`go mod tidy` in any consumer
+// pulls test dependencies of imported packages).
 func relayFlag(v bool) memprovider.InMemoryFlag {
 	variant := "off"
 	if v {
@@ -302,8 +309,7 @@ func TestNegotiatedPairSurvivesAsymmetricDynamicFlags(t *testing.T) {
 }
 
 // TestIncapableConnStaysRawPassthrough pins the pre-dynamic disabled behavior:
-// with the kill switch off, NewConn's forced tracingEnabled=true must NOT start
-// writing envelopes — the connection is a pure passthrough.
+// with the kill switch off, NewConn must NOT start writing envelopes.
 func TestIncapableConnStaysRawPassthrough(t *testing.T) {
 	t.Setenv(envGlobalTracingEnabled, "false")
 	t.Setenv(envWSTracingEnabled, "false")
@@ -329,8 +335,9 @@ func TestIncapableConnStaysRawPassthrough(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = raw.Close() })
 
-	conn := NewConn(raw) // tracingEnabled forced true, but capable=false
+	conn := NewConn(raw) // no otel-ws subprotocol; capable=false
 	require.False(t, conn.capable)
+	require.False(t, conn.tracingEnabled)
 
 	payload := []byte(`{"x":1}`)
 	require.NoError(t, conn.WriteMessage(context.Background(), websocket.TextMessage, payload))
@@ -338,4 +345,50 @@ func TestIncapableConnStaysRawPassthrough(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, string(payload), string(got),
 		"incapable conn is raw passthrough — the echoed bytes must be the original payload, not an envelope")
+}
+
+// TestNewConn_GlobalOnModuleOff_RawPeerNoEnvelope is the PR #27 regression:
+// capability on + module/relay off + NewConn without otel-ws must not rewrite
+// the peer's payload into a JSON envelope.
+func TestNewConn_GlobalOnModuleOff_RawPeerNoEnvelope(t *testing.T) {
+	t.Setenv(envGlobalTracingEnabled, "1")
+	t.Setenv(envWSTracingEnabled, "false")
+	resetWSGateForTest()
+
+	var peerSaw []byte
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		up := websocket.Upgrader{}
+		c, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_, data, err := c.ReadMessage()
+		if err != nil {
+			return
+		}
+		peerSaw = append([]byte(nil), data...)
+		close(done)
+	}))
+	t.Cleanup(srv.Close)
+
+	raw, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+
+	conn := NewConn(raw)
+	require.True(t, conn.capable, "global on ⇒ capable")
+	require.False(t, conn.tracingEnabled, "no otel-ws subprotocol ⇒ no envelope")
+	require.False(t, conn.featureEnabled(), "module flag off")
+
+	payload := []byte("hello")
+	require.NoError(t, conn.WriteMessage(context.Background(), websocket.TextMessage, payload))
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("peer did not receive message")
+	}
+	assert.Equal(t, string(payload), string(peerSaw),
+		"raw peer must see original payload, not {\"header\":{},\"data\":...}")
 }

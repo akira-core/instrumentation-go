@@ -54,14 +54,16 @@ func (c *tracedConsumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (
 	if err != nil {
 		return nil, nil, err
 	}
+	// One resolve for this message: gate already true; tracer/attrs constant on traced path.
 	tracer, prop := c.conn.TraceContext()
+	baseAttrs := receiveBaseAttrs("receive", c.conn.ServerAttrs(), c.consumerName)
 	msgCtx := context.Background()
 	if h := msg.Headers(); h != nil {
 		msgCtx = prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: h})
 	}
 	originSpanCtx := trace.SpanContextFromContext(msgCtx)
 	spanName := "receive " + msg.Subject()
-	attrs := receiveMsgAttrs(receiveBaseAttrs("receive", c.conn.ServerAttrs(), c.consumerName), msg)
+	attrs := receiveMsgAttrs(baseAttrs, msg)
 	startOpts := []trace.SpanStartOption{
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(attrs...),
@@ -80,37 +82,30 @@ func (c *tracedConsumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (
 	return ctx, msg, nil
 }
 
+// Fetch always returns a dynamic batch wrapper so a mid-drain relay flip is
+// observed per message (design R2) — never pin direct vs traced at Fetch time.
 func (c *tracedConsumer) Fetch(batch int, opts ...jetstream.FetchOpt) (MessageBatch, error) {
-	if !c.on() {
-		return c.direct().Fetch(batch, opts...)
-	}
 	raw, err := c.c.Fetch(batch, opts...)
 	if err != nil {
 		return nil, err
 	}
-	return newTracedMessageBatch(c.conn, c.consumerName, raw), nil
+	return newDynamicMessageBatch(c.conn, c.consumerName, raw), nil
 }
 
 func (c *tracedConsumer) FetchBytes(maxBytes int, opts ...jetstream.FetchOpt) (MessageBatch, error) {
-	if !c.on() {
-		return c.direct().FetchBytes(maxBytes, opts...)
-	}
 	raw, err := c.c.FetchBytes(maxBytes, opts...)
 	if err != nil {
 		return nil, err
 	}
-	return newTracedMessageBatch(c.conn, c.consumerName, raw), nil
+	return newDynamicMessageBatch(c.conn, c.consumerName, raw), nil
 }
 
 func (c *tracedConsumer) FetchNoWait(batch int) (MessageBatch, error) {
-	if !c.on() {
-		return c.direct().FetchNoWait(batch)
-	}
 	raw, err := c.c.FetchNoWait(batch)
 	if err != nil {
 		return nil, err
 	}
-	return newTracedMessageBatch(c.conn, c.consumerName, raw), nil
+	return newDynamicMessageBatch(c.conn, c.consumerName, raw), nil
 }
 
 func (c *tracedConsumer) Info(ctx context.Context) (*ConsumerInfo, error) {
@@ -158,33 +153,18 @@ func (c *tracedPushConsumer) CachedInfo() *ConsumerInfo {
 //
 // Returns nil for a nil handler so the underlying Consume call surfaces
 // jetstream's ErrHandlerRequired instead of panicking in the delivery goroutine.
+// When on, tracer/attrs are resolved once per message (not three separate impl()
+// reads via TracingEnabled + TraceContext + ServerAttrs).
 func dynamicConsumeHandler(conn *otelnats.Conn, consumerName string, handler MsgHandler) func(jetstream.Msg) {
 	if handler == nil {
 		return nil
 	}
-	th := tracedConsumeHandler(conn, consumerName, handler)
 	dh := directHandler(handler)
 	return func(msg jetstream.Msg) {
-		if conn.TracingEnabled() {
-			th(msg)
-		} else {
+		if !conn.TracingEnabled() {
 			dh(msg)
+			return
 		}
-	}
-}
-
-// tracedConsumeHandler returns the instrumented closure that extracts the message's
-// trace context and starts a consumer span before invoking the user handler.
-//
-// conn.TraceContext() and conn.ServerAttrs() are resolved INSIDE the per-message
-// closure, not captured here: on a dynamic Conn they answer through impl(), so
-// capturing them while the flag happened to be off would freeze the noop tracer
-// into a handler that dynamicConsumeHandler will later invoke with the flag on.
-func tracedConsumeHandler(conn *otelnats.Conn, consumerName string, handler MsgHandler) func(jetstream.Msg) {
-	if handler == nil {
-		return nil
-	}
-	return func(msg jetstream.Msg) {
 		tracer, prop := conn.TraceContext()
 		baseAttrs := receiveBaseAttrs("process", conn.ServerAttrs(), consumerName)
 		msgCtx := context.Background()
@@ -213,8 +193,7 @@ func tracedConsumeHandler(conn *otelnats.Conn, consumerName string, handler MsgH
 // against or clean up.
 //
 // The tracing flag is resolved per Next — never at Messages() time — because
-// this iterator is a canonically long-lived object; tracer/propagator are
-// likewise resolved per call so a dynamic Conn's current impl answers.
+// this iterator is a canonically long-lived object.
 type tracedMessagesContext struct {
 	conn         *otelnats.Conn
 	iter         jetstream.MessagesContext
@@ -222,21 +201,23 @@ type tracedMessagesContext struct {
 }
 
 func (m *tracedMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context, jetstream.Msg, error) {
+	// Gate first (CLAUDE.md convention); off path matches directMessagesContext.
+	if !m.conn.TracingEnabled() {
+		return (&directMessagesContext{iter: m.iter}).Next(opts...)
+	}
 	msg, err := m.iter.Next(opts...)
 	if err != nil {
 		return nil, nil, err
 	}
-	if !m.conn.TracingEnabled() {
-		return context.Background(), msg, nil
-	}
 	tracer, prop := m.conn.TraceContext()
+	baseAttrs := receiveBaseAttrs("receive", m.conn.ServerAttrs(), m.consumerName)
 	msgCtx := context.Background()
 	if h := msg.Headers(); h != nil {
 		msgCtx = prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: h})
 	}
 	originSpanCtx := trace.SpanContextFromContext(msgCtx)
 	spanName := "receive " + msg.Subject()
-	attrs := receiveMsgAttrs(receiveBaseAttrs("receive", m.conn.ServerAttrs(), m.consumerName), msg)
+	attrs := receiveMsgAttrs(baseAttrs, msg)
 	startOpts := []trace.SpanStartOption{
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(attrs...),

@@ -5,7 +5,9 @@ import (
 )
 
 const (
-	envGlobalTracingEnabled = "OTEL_INSTRUMENTATION_GO_TRACING_ENABLED"
+	// envGlobalTracingEnabled aliases the shared kill-switch name so the literal
+	// has exactly one home (internal/flags) and cannot drift from it.
+	envGlobalTracingEnabled = flags.EnvGlobalTracing
 	envNATSTracingEnabled   = "OTEL_NATS_TRACING_ENABLED"
 )
 
@@ -41,16 +43,8 @@ func newNATSResolver() *flags.Resolver {
 // did a second ago: callers MUST read it per operation rather than caching it on
 // a wrapper struct.
 func natsTracingEnabled() bool {
-	if !flags.EnvEnabled(envGlobalTracingEnabled) {
+	if !flags.GlobalTracingPossible() {
 		return false
 	}
 	return natsResolver.Enabled(idxTracing)
-}
-
-// dynamicTracingPossible reports whether this process may ever trace NATS —
-// i.e. whether the instrumented implementation must be constructed at all.
-// It reads the global kill switch only, never the relay, because the choice of
-// which implementations to build is necessarily static.
-func dynamicTracingPossible() bool {
-	return flags.EnvEnabled(envGlobalTracingEnabled)
 }

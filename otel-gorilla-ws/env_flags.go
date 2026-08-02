@@ -5,7 +5,9 @@ import (
 )
 
 const (
-	envGlobalTracingEnabled = "OTEL_INSTRUMENTATION_GO_TRACING_ENABLED"
+	// envGlobalTracingEnabled aliases the shared kill-switch name so the literal
+	// has exactly one home (internal/flags) and cannot drift from it.
+	envGlobalTracingEnabled = flags.EnvGlobalTracing
 	envWSTracingEnabled     = "OTEL_GORILLA_WS_TRACING_ENABLED"
 )
 
@@ -36,23 +38,8 @@ func newWSResolver() *flags.Resolver {
 // different answer than it did a second ago, so callers MUST read it per
 // operation rather than caching it on the Conn.
 func wsTracingEnabled() bool {
-	if !flags.EnvEnabled(envGlobalTracingEnabled) {
+	if !flags.GlobalTracingPossible() {
 		return false
 	}
 	return wsResolver.Enabled(idxTracing)
-}
-
-// wsNegotiationPossible reports whether this process may ever need the otel-ws
-// wire envelope, and therefore whether Dial should offer and Upgrader.Upgrade
-// should confirm the subprotocol.
-//
-// It reads the global kill switch ONLY, deliberately ignoring the relay value.
-// Subprotocol negotiation happens during the handshake and cannot be revisited,
-// so gating it on the dynamic flag would leave every connection established
-// during an "off" window permanently unable to propagate trace context — and
-// WebSocket connections routinely live for hours. The cost of this choice is
-// that peers which both run this library with the global switch on exchange the
-// JSON envelope even while tracing is dynamically off.
-func wsNegotiationPossible() bool {
-	return flags.EnvEnabled(envGlobalTracingEnabled)
 }

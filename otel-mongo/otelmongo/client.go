@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
+	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/flags"
 	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/shared"
 )
 
@@ -25,52 +26,19 @@ type Client struct {
 	tracer     trace.Tracer                  // derived from option or otel.GetTracerProvider()
 	propagator propagation.TextMapPropagator // from option or otel.GetTextMapPropagator()
 
-	// tracingOverride / propagationOverride hold WithTracingEnabled and
-	// WithTracePropagationEnabled when the caller passed them. A non-nil
-	// tracingOverride makes this client fully STATIC: no OpenFeature evaluation
-	// runs for it and no relay change can start or stop its tracing.
-	tracingOverride     *bool
-	propagationOverride *bool
-
-	// tracedBuilt records whether the instrumented path was constructed at all.
-	// It is false when the global kill switch was off (and no override forced
-	// tracing on), in which case no OTel SDK code path is reachable from this
-	// client no matter what the relay later says.
-	tracedBuilt bool
+	// gate holds WithTracingEnabled / WithTracePropagationEnabled overrides and
+	// whether the instrumented path was built (shared with Database via gateState).
+	gate gateState
 }
 
 // effectiveTracing reports whether THIS call should be instrumented. Read per
 // operation, not cached: without an override it follows the relay within the
 // resolver's TTL.
-func (c *Client) effectiveTracing() bool {
-	if !c.tracedBuilt {
-		return false
-	}
-	if c.tracingOverride != nil {
-		return *c.tracingOverride
-	}
-	return mongoTracingEnabled()
-}
+func (c *Client) effectiveTracing() bool { return c.gate.effectiveTracing() }
 
 // effectivePropagation reports whether THIS call should inject or extract
-// _oteltrace. Propagation always requires effective tracing first, so a relay
-// flag that stops spans also stops document propagation.
-//
-// A static client (non-nil tracingOverride) never evaluates OpenFeature: its
-// propagation default is the env var alone. This is not just the documented
-// "override suppresses evaluation" contract — with the global kill switch off,
-// the override is the only reason tracing is on at all, and consulting the
-// resolver here would be the one path where a relay value reaches a process
-// whose kill switch is off.
-func (c *Client) effectivePropagation() bool {
-	if c.tracingOverride != nil {
-		if !c.effectiveTracing() {
-			return false
-		}
-		return resolveFlag(c.propagationOverride, mongoPropagationEnvOnly())
-	}
-	return resolveDocumentPropagation(c.effectiveTracing(), c.propagationOverride)
-}
+// _oteltrace. See gateState for static-client and R5 single-operation rules.
+func (c *Client) effectivePropagation() bool { return c.gate.effectivePropagation() }
 
 // ClientOption configures Connect/NewClient. Per OTel contrib: accept TracerProvider and Propagators.
 type ClientOption interface {
@@ -159,11 +127,11 @@ func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*
 	cfg := newClientConfig(traceOpts)
 	// Which implementations to build is necessarily a static decision. An
 	// explicit override decides it; otherwise the global kill switch does — NOT
-	// the relay, which may flip at any time. Note this is dynamicTracingPossible,
+	// the relay, which may flip at any time. Note this is GlobalTracingPossible,
 	// not mongoTracingEnabled: with the global switch on and the module flag off
 	// the instrumented path is still built, and effectiveTracing keeps it unused
 	// until the flag says otherwise.
-	buildTraced := resolveFlag(cfg.TracingEnabled, dynamicTracingPossible())
+	buildTraced := resolveFlag(cfg.TracingEnabled, flags.GlobalTracingPossible())
 	if !buildTraced {
 		merged := options.MergeClientOptions(opts...) //nolint:staticcheck // SA1019: v1 driver deprecates struct-merging ahead of v2; still needed here to read the effective merged Monitor/URI.
 		mc, err := mongo.Connect(ctx, merged)
@@ -173,12 +141,12 @@ func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*
 		addr, port := parseServerFromURI(merged.GetURI())
 		tracer := noop.NewTracerProvider().Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
 		return &Client{
-			Client:      mc,
-			serverAddr:  addr,
-			serverPort:  port,
-			tracer:      tracer,
-			propagator:  otel.GetTextMapPropagator(),
-			tracedBuilt: false,
+			Client:     mc,
+			serverAddr: addr,
+			serverPort: port,
+			tracer:     tracer,
+			propagator: otel.GetTextMapPropagator(),
+			gate:       gateState{tracedBuilt: false},
 		}, nil
 	}
 	tp := cfg.TracerProvider
@@ -198,14 +166,16 @@ func ConnectWithOptions(ctx context.Context, traceOpts []ClientOption, opts ...*
 	}
 	addr, port := parseServerFromURI(merged.GetURI())
 	return &Client{
-		Client:              mc,
-		serverAddr:          addr,
-		serverPort:          port,
-		tracer:              tracer,
-		propagator:          prop,
-		tracingOverride:     cfg.TracingEnabled,
-		propagationOverride: cfg.PropagationEnabled,
-		tracedBuilt:         true,
+		Client:     mc,
+		serverAddr: addr,
+		serverPort: port,
+		tracer:     tracer,
+		propagator: prop,
+		gate: gateState{
+			tracingOverride:     cfg.TracingEnabled,
+			propagationOverride: cfg.PropagationEnabled,
+			tracedBuilt:         true,
+		},
 	}, nil
 }
 
@@ -289,13 +259,11 @@ func parseServerFromURI(uri string) (addr string, port int) {
 // Database returns a wrapped Database for document-level tracing.
 func (c *Client) Database(name string, opts ...*options.DatabaseOptions) *Database {
 	return &Database{
-		Database:            c.Client.Database(name, opts...),
-		serverAddr:          c.serverAddr,
-		serverPort:          c.serverPort,
-		tracer:              c.tracer,
-		propagator:          c.propagator,
-		tracingOverride:     c.tracingOverride,
-		propagationOverride: c.propagationOverride,
-		tracedBuilt:         c.tracedBuilt,
+		Database:   c.Client.Database(name, opts...),
+		serverAddr: c.serverAddr,
+		serverPort: c.serverPort,
+		tracer:     c.tracer,
+		propagator: c.propagator,
+		gate:       c.gate,
 	}
 }

@@ -33,12 +33,8 @@ func (d *Collection) InsertMany(ctx context.Context, documents []any, opts ...*o
 }
 
 // Find executes a find command and returns the cursor + impl; passes through to *mongo.Collection (no spans, no propagation).
-func (d *Collection) Find(ctx context.Context, filter any, opts ...*options.FindOptions) (*mongo.Cursor, shared.CursorImpl, error) {
-	cursor, err := d.Coll.Find(ctx, filter, opts...)
-	if err != nil {
-		return nil, nil, err
-	}
-	return cursor, NewCursor(cursor), nil
+func (d *Collection) Find(ctx context.Context, filter any, opts ...*options.FindOptions) (*mongo.Cursor, error) {
+	return d.Coll.Find(ctx, filter, opts...)
 }
 
 // FindOne executes a find command returning at most one document; passes through to *mongo.Collection (no spans, no propagation).
@@ -83,12 +79,8 @@ func (d *Collection) Distinct(ctx context.Context, fieldName string, filter any,
 }
 
 // Aggregate runs an aggregation pipeline and returns the cursor + impl; passes through to *mongo.Collection (no spans, no propagation).
-func (d *Collection) Aggregate(ctx context.Context, pipeline any, opts ...*options.AggregateOptions) (*mongo.Cursor, shared.CursorImpl, error) {
-	cursor, err := d.Coll.Aggregate(ctx, pipeline, opts...)
-	if err != nil {
-		return nil, nil, err
-	}
-	return cursor, NewCursor(cursor), nil
+func (d *Collection) Aggregate(ctx context.Context, pipeline any, opts ...*options.AggregateOptions) (*mongo.Cursor, error) {
+	return d.Coll.Aggregate(ctx, pipeline, opts...)
 }
 
 // UpdateByID updates one document by _id; passes through to *mongo.Collection (no spans, no propagation).
@@ -102,10 +94,6 @@ func (d *Collection) BulkWrite(ctx context.Context, models []mongo.WriteModel, o
 }
 
 // Watch starts a change stream on the collection; passes through to *mongo.Collection (no spans, no propagation).
-func (d *Collection) Watch(ctx context.Context, pipeline interface{}, opts ...*options.ChangeStreamOptions) (*mongo.ChangeStream, shared.ChangeStreamImpl, error) {
-	cs, err := d.Coll.Watch(ctx, pipeline, opts...)
-	if err != nil {
-		return nil, nil, err
-	}
-	return cs, NewChangeStream(cs), nil
+func (d *Collection) Watch(ctx context.Context, pipeline interface{}, opts ...*options.ChangeStreamOptions) (*mongo.ChangeStream, error) {
+	return d.Coll.Watch(ctx, pipeline, opts...)
 }

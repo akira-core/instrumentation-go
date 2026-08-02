@@ -71,3 +71,40 @@
 - [x] 7.3 Update `CLAUDE.md`: the feature-flag sections, the precedence table, the flag key table, the `internal/flags` description (Gate removed, Resolver added), the disabled-mode invariant restated on the global switch, and the dual-implementation strategy-split layout.
 - [x] 7.4 Update `README.md` and `README.zh-TW.md` with the flag key reference and the application-side wiring snippet (`openfeature.SetProviderAndWait(gofeatureflag.NewProvider(...))` next to `otelsetup.Init()`), stating that the GO Feature Flag provider is an application dependency, not a library one.
 - [x] 7.5 Run `go build`, `go test -race`, and `golangci-lint` across all six modules one final time and confirm zero issues everywhere.
+
+## 8. Post-review remediation (PR #27 grill decisions)
+
+> Decisions locked in `design.md` § "Post-review remediation". Implement after design/spec updates; do not start code until those artifacts match.
+
+### 8.1 Correctness
+
+- [x] 8.1.1 **R1+R7 otel-gorilla-ws NewConn / envelope:** Set `NewConn` negotiation from `isOTelWireProtocol(conn.Subprotocol())`; clamp `tracingEnabled && capable` in `configureConn`; feature off + unnegotiated ⇒ raw passthrough; negotiated + feature off ⇒ empty-header envelope (D9); S1 local spans when capable+feature on without negotiation; no force-negotiated Option. Add regression test: global on + module/relay off + NewConn + raw peer payload bytes.
+- [x] 8.1.2 **R2 MessageBatch dynamic:** Always return a dispatching batch wrapper; forwarder re-checks connection gate per message; off path skips tracer/attrs/propagator. Tests: same batch true→false and false→true after TTL (mirror Consume/Messages).
+- [x] 8.1.3 **R3 Resolver `at`:** In all four `internal/flags` copies, take snapshot `at` at the start of `refresh` (before Boolean loop). Keep unsynchronized last-store-wins; no CAS/mutex.
+- [x] 8.1.4 **R5+R16 Mongo torn read / gateState:** Pass `impl()`'s resolved tracing into propagation; ban internal `effectiveTracing()` recompute on that path; same for `ContextFromDocument`/`ContextFromRawDocument`. Factor Client/Database `effective*` into shared gateState (v1+v2).
+- [x] 8.1.5 **R9 tracedMessagesContext.Next:** Gate-first delegate to `directMessagesContext` when off.
+- [x] 8.1.6 **R12 Consume single resolve:** One flag/impl resolution per message in dynamic consume path; pass tracer/attrs down (coordinate with 8.2.1).
+
+### 8.2 Performance / structure cleanup
+
+- [x] 8.2.1 **R6 JetStream hoist:** Restore construction-time tracer/prop/baseAttrs on tracedConsumeHandler path, tracedMessagesContext, tracedConsumer.Next (mirror `newTracedMessageBatch`); gate remains per-message.
+- [x] 8.2.2 **R8 collectionImpl second returns:** Change Find/Aggregate/Watch to `(raw, error)` only; stop throwaway NewCursor/NewChangeStream in direct/traced; keep FindOne dual return. v1+v2.
+- [x] 8.2.3 **R11 WriteMessage noop span:** On feature-off capable path use noop span; remove `span != nil` guards.
+- [x] 8.2.4 **R13-B1 GlobalTracingPossible:** Add `EnvGlobalTracing` + `GlobalTracingPossible` to four flags copies; delete module `dynamicTracingPossible`/`wsNegotiationPossible`; call sites use `flags.GlobalTracingPossible()`; move D9 prose to Dial/Upgrade/capability docs. Do **not** parallelize refresh Booleans.
+- [x] 8.2.5 **R14 selectImpl:** Generics helper for Collection/Cursor/ChangeStream `impl()` in v1 and v2.
+- [x] 8.2.6 **R15 relay test helpers:** Move setRelay/InMemoryFlag lifecycle into `otel-testkit/harness`; switch five `dynamic_flags_test.go` files; reset via callback.
+- [x] 8.2.7 **R18 dead nil guard:** Remove unreachable nil check in `tracedConsumeHandler`.
+
+### 8.3 Documentation and specs (may land with or just before 8.1)
+
+- [x] 8.3.1 **R4:** CHANGELOG (all affected modules), CLAUDE.md, README(s): "no provider ⇒ no change" must include otel-ws negotiation exception (global-only).
+- [x] 8.3.2 **R10:** Remove remaining Gate/propEnabledGate/permanent-cache language from CLAUDE.md, client_option_test comments (v1/v2), oteljetstream consumer/stream godoc; sync main `openspec/specs/shared-feature-flags/spec.md` to Resolver.
+- [x] 8.3.3 **R17:** Optional one-line lockstep comment on otelnats `impl`/`msgHandler`/`traceEventMsgHandler` only — no refactor.
+- [x] 8.3.4 Confirm delta specs under this change match R1–R3, R5, R8, R13 (websocket, nats-jetstream, mongodb, dynamic-feature-flags, shared-feature-flags).
+- [x] 8.3.5 Run `go build`, `go test -race`, `golangci-lint` in every touched module until clean.
+
+### Explicit non-work
+
+- **R19** same-refresh Boolean micro-torn: WONTFIX.
+- **R17** policy extract: WONTFIX (comment only).
+- Resolver CAS/singleflight, parallel Boolean fan-out: out of scope.

@@ -14,8 +14,8 @@
 // the envelope wire format a feature-off side would not unwrap.
 //
 // Connections without otel-ws negotiation operate in passthrough mode (no envelope
-// wrapping), but send/receive spans are still created. NewConn keeps tracing on for callers
-// that manage the WebSocket handshake themselves (backwards compatibility).
+// wrapping); local send/receive spans may still be created when the feature gate
+// is on. NewConn proves negotiation only via the raw connection's subprotocol.
 //
 // Tracer initialization: Set the global TracerProvider and TextMapPropagator at
 // process startup (see examples/) or pass WithTracerProvider/WithPropagators when
@@ -33,6 +33,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 // ScopeName is the instrumentation scope name for Tracer creation (OTel contrib guideline).
@@ -91,12 +92,20 @@ func (c *Conn) Subprotocol() string {
 	return appProtocolFromRaw(c.Conn.Subprotocol())
 }
 
-// NewConn wraps an existing gorilla *websocket.Conn with tracing always enabled.
-// This preserves backwards-compatible behaviour for callers that manage the
-// WebSocket handshake themselves. For spec-compliant subprotocol negotiation,
-// use Dial (client) or Upgrader.Upgrade (server).
+// NewConn wraps an existing gorilla *websocket.Conn. Envelope handling is
+// enabled only when the raw connection's negotiated subprotocol proves otel-ws
+// (isOTelWireProtocol); otherwise the wire stays raw passthrough. Callers that
+// manage the handshake themselves must leave a correct negotiated subprotocol
+// on the connection. For handshake-side negotiation, use Dial or Upgrader.Upgrade.
+//
+// When capable and the dynamic feature gate are on but otel-ws was not proven,
+// local send/receive spans may still be created without inject/extract.
 func NewConn(conn *websocket.Conn, opts ...Option) *Conn {
-	return newConn(conn, true, opts...)
+	negotiated := false
+	if conn != nil {
+		negotiated = isOTelWireProtocol(conn.Subprotocol())
+	}
+	return newConn(conn, negotiated, opts...)
 }
 
 // newConn wraps conn with the given negotiation outcome, resolving opts.
@@ -129,7 +138,9 @@ func (c *Conn) WriteMessage(ctx context.Context, messageType int, data []byte) e
 	}
 	feature := c.featureEnabled()
 
-	var span trace.Span
+	// Always hold a non-nil span: feature-off uses a non-recording noop so error
+	// paths never need nil guards (and a future branch cannot panic on flag-off).
+	span := trace.Span(noop.Span{})
 	if feature {
 		ctx, span = c.tracer.Start(ctx, "websocket.send",
 			trace.WithSpanKind(trace.SpanKindProducer),
@@ -154,19 +165,15 @@ func (c *Conn) WriteMessage(ctx context.Context, messageType int, data []byte) e
 		}
 		encoded, err := marshalWire(carrier, data)
 		if err != nil {
-			if span != nil {
-				span.RecordError(err)
-				span.SetStatus(codes.Error, err.Error())
-			}
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 			return err
 		}
 		payload = encoded
 	}
 	if err := c.Conn.WriteMessage(messageType, payload); err != nil {
-		if span != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 	return nil

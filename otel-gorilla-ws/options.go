@@ -6,6 +6,8 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
+
+	"github.com/akira-core/instrumentation-go/otel-gorilla-ws/internal/flags"
 )
 
 // Option configures a Conn.
@@ -52,11 +54,15 @@ func WithTracerProvider(tp trace.TracerProvider) Option {
 // negotiation: a connection constructed with WithTracingEnabled(false) never
 // offers (Dial) or confirms (Upgrade) otel-ws, so the peer is never committed
 // to the JSON envelope wire format that this side would not unwrap. Without the
-// option, negotiation follows the global env switch alone and NOT the relay
-// value — see wsNegotiationPossible. The reverse does not hold —
-// WithTracingEnabled(true) cannot force the envelope onto a connection whose
-// peer did not negotiate otel-ws; the negotiation outcome
-// (Conn.tracingEnabled) still requires both sides to agree.
+// option, negotiation follows the global env kill switch alone
+// (flags.GlobalTracingPossible) and NOT the relay value. Handshake cannot be
+// revisited, so gating negotiation on the dynamic flag would leave connections
+// established while off permanently unable to propagate. Cost: library peers
+// with the global switch on exchange the JSON envelope even while tracing is
+// dynamically off. The reverse does not hold — WithTracingEnabled(true) cannot
+// force the envelope onto a connection whose peer did not negotiate otel-ws;
+// the negotiation outcome (Conn.tracingEnabled) still requires both sides to
+// agree (or, for NewConn, a proven otel-ws subprotocol on the raw conn).
 func WithTracingEnabled(v bool) Option {
 	return func(o *connOptions) {
 		o.featureEnabled = &v
@@ -87,10 +93,12 @@ func effectiveCapability(cfg connOptions) bool {
 	if cfg.featureEnabled != nil {
 		return *cfg.featureEnabled
 	}
-	return wsNegotiationPossible()
+	return flags.GlobalTracingPossible()
 }
 
 // configureConn applies cfg to c: propagator, feature override and tracer.
+// It also clamps tracingEnabled so capability-off connections never retain a
+// stale negotiation flag (choke-point for the capable ⇒ no envelope invariant).
 func configureConn(c *Conn, cfg connOptions) {
 	if cfg.propagator != nil {
 		c.propagator = cfg.propagator
@@ -100,6 +108,7 @@ func configureConn(c *Conn, cfg connOptions) {
 
 	c.featureOverride = cfg.featureEnabled
 	c.capable = effectiveCapability(cfg)
+	c.tracingEnabled = c.tracingEnabled && c.capable
 
 	if !c.capable {
 		// This connection can never trace ⇒ no OTel SDK call on the caller's

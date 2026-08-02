@@ -28,6 +28,13 @@ import (
 // Not parallel-safe: the OpenFeature provider, the process environment and
 // mongoResolver are all process-global. No t.Parallel in this file.
 
+// boolFlag builds an in-memory OpenFeature boolean flag with on/off variants.
+//
+// Deliberately duplicated per module rather than extracted into a shared test
+// helper module: the four instrumentation modules are published independently,
+// so importing a helper from the untagged otel-testkit module would put an
+// unresolvable requirement in a released go.mod (`go mod tidy` in any consumer
+// pulls test dependencies of imported packages).
 func boolFlag(v bool) memprovider.InMemoryFlag {
 	variant := "off"
 	if v {
@@ -136,7 +143,7 @@ func TestWithTracingEnabledPinsAgainstTheRelay(t *testing.T) {
 	t.Run("option true stays on when the relay says off", func(t *testing.T) {
 		setRelay(t, true, true)
 		on := true
-		c := &Client{tracingOverride: &on, tracedBuilt: true}
+		c := &Client{gate: gateState{tracingOverride: &on, tracedBuilt: true}}
 		assert.True(t, c.effectiveTracing())
 
 		setRelay(t, false, false)
@@ -147,7 +154,7 @@ func TestWithTracingEnabledPinsAgainstTheRelay(t *testing.T) {
 	t.Run("option false stays off when the relay says on", func(t *testing.T) {
 		setRelay(t, false, false)
 		off := false
-		c := &Client{tracingOverride: &off, tracedBuilt: true}
+		c := &Client{gate: gateState{tracingOverride: &off, tracedBuilt: true}}
 		assert.False(t, c.effectiveTracing())
 
 		setRelay(t, true, true)
@@ -157,7 +164,7 @@ func TestWithTracingEnabledPinsAgainstTheRelay(t *testing.T) {
 
 	t.Run("no option follows the relay", func(t *testing.T) {
 		setRelay(t, false, false)
-		c := &Client{tracedBuilt: true}
+		c := &Client{gate: gateState{tracedBuilt: true}}
 		assert.False(t, c.effectiveTracing())
 
 		setRelay(t, true, false)
@@ -171,7 +178,7 @@ func TestWithTracePropagationEnabledStillCannotBypassRelayTracingOff(t *testing.
 	setRelay(t, false, false)
 
 	propOn := true
-	c := &Client{propagationOverride: &propOn, tracedBuilt: true}
+	c := &Client{gate: gateState{propagationOverride: &propOn, tracedBuilt: true}}
 	assert.False(t, c.effectivePropagation(),
 		"WithTracePropagationEnabled(true) cannot enable propagation while tracing resolves off")
 
@@ -277,7 +284,7 @@ func TestStaticClientNeverEvaluatesOpenFeature(t *testing.T) {
 	setRelay(t, true, true)
 
 	on := true
-	c := &Client{tracingOverride: &on, tracedBuilt: true}
+	c := &Client{gate: gateState{tracingOverride: &on, tracedBuilt: true}}
 
 	assert.True(t, c.effectiveTracing(), "the override alone carries tracing")
 	assert.False(t, c.effectivePropagation(),
@@ -291,6 +298,6 @@ func TestStaticClientNeverEvaluatesOpenFeature(t *testing.T) {
 
 	// And an explicit propagation override still wins over the env var.
 	off := false
-	c2 := &Client{tracingOverride: &on, propagationOverride: &off, tracedBuilt: true}
+	c2 := &Client{gate: gateState{tracingOverride: &on, propagationOverride: &off, tracedBuilt: true}}
 	assert.False(t, c2.effectivePropagation())
 }

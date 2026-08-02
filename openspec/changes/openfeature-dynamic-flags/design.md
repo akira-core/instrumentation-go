@@ -16,7 +16,7 @@ The OpenFeature Go SDK is at v1.17.2. Its relevant surface: `openfeature.SetProv
 **Goals:**
 
 - An operator can turn each module's tracing and propagation on or off through a GO Feature Flag relay proxy without restarting the application.
-- Deployments that never configure an OpenFeature provider behave exactly as they do today, driven by the same environment variables.
+- Deployments that never configure an OpenFeature provider keep environment-driven span on/off behavior, with the D9/R4 exception for otel-ws negotiation (global-only gate may change wire between library peers when global is on and the module env is off).
 - An out-of-band kill switch exists that does not depend on the relay being reachable or correctly configured.
 - Hot paths pay a bounded, predictable cost — no network call, no OpenFeature evaluation pipeline, per operation.
 - No new exported API and no new environment variables in any module.
@@ -83,17 +83,29 @@ func NewResolver(domain string, opts ...ResolverOption) *Resolver
 func (r *Resolver) Enabled(i int) bool
 ```
 
-`Enabled` loads the snapshot pointer, compares one timestamp, and returns `values[i]`. On expiry the calling goroutine evaluates every spec for that module and stores a fresh snapshot. Concurrent refreshes are permitted and unsynchronized: evaluation is idempotent, last writer wins, and a lock on this path would cost more than the duplicate work it prevents.
+`Enabled` loads the snapshot pointer, compares one timestamp, and returns `values[i]`. On expiry the calling goroutine evaluates every spec for that module and stores a fresh snapshot. Concurrent refreshes are permitted and unsynchronized: last store wins, and a lock on this path would cost more than the duplicate work it prevents.
 
-Evaluating every flag of a module together means one clock read covers all of them and the values are mutually consistent — `otel-mongo`'s tracing and propagation flags always come from the same instant, so no torn read can produce a combination that never existed on the relay.
+**Snapshot timestamp.** `at` MUST be taken at the **start** of a refresh (before evaluating specs), not after the evaluation loop completes. Stamping at store time lets a slower refresh that read a stale relay value overwrite a fresher snapshot while carrying a newer clock, so the stale values appear fresh for a full TTL (PR #27 review). Stamping at start means a late stale writer either loses on time-order reasoning or is immediately eligible for re-refresh; it does not eliminate brief last-writer races, only the "stale looks fresh for 1s" failure mode. CAS/generation and singleflight remain non-goals (see post-review R3).
 
-*Alternatives considered.* Calling `client.Boolean` on each operation is 100 ns – 1 µs (hooks chain, evaluation context assembly, provider lock, flag lookup) — acceptable next to a Mongo round trip, not acceptable on a NATS publish, and paid even when the flag is off. A per-flag TTL costs one clock read per flag rather than per module and permits torn reads. A background ticker goroutine writing the snapshot would remove the clock read entirely (~1 ns instead of ~25 ns) but adds a permanently resident goroutine per module and a shutdown story this repo has no API for.
+Evaluating every flag of a module together means one clock read covers all of them and the values are mutually consistent **within a single snapshot store** — `otel-mongo`'s tracing and propagation flags always come from the same refresh. Callers that invoke `Enabled` twice across a TTL boundary can still see two snapshots; operation-scoped consistency is enforced at call sites (R5), not by serializing every `Enabled` in the process.
 
-*Consequence.* Flag changes take effect within one second of the provider observing them; the provider's own polling interval (minutes) dominates end-to-end latency. The TTL is therefore fixed at one second and not configurable — tightening it cannot meaningfully improve responsiveness and loosening it saves nanoseconds.
+*Alternatives considered.* Calling `client.Boolean` on each operation is 100 ns – 1 µs (hooks chain, evaluation context assembly, provider lock, flag lookup) — acceptable next to a Mongo round trip, not acceptable on a NATS publish, and paid even when the flag is off. A per-flag TTL costs one clock read per flag rather than per module and permits torn reads. A background ticker goroutine writing the snapshot would remove the clock read entirely (~1 ns instead of ~25 ns) but adds a permanently resident goroutine per module and a shutdown story this repo has no API for. Parallelizing the per-spec `Boolean` loop inside one refresh was rejected: modules have at most two specs, and fan-out complexity is not worth the gain (R13).
+
+*Consequence.* Flag changes take effect within one second of the provider observing them; the provider's own polling interval (minutes) dominates end-to-end latency. The TTL is therefore fixed at one second and not configurable — tightening it cannot meaningfully improve responsiveness and loosening it saves nanoseconds. Concurrent refreshes may still briefly surface a stale last-writer value; the next expiry self-heals.
 
 ### D5. Module-specific data lives outside the byte-identical file
 
-`internal/flags` must stay byte-identical across four copies, so it cannot name any flag key or environment variable. `Resolver` takes them as `Spec` values; each module's own `env_flags.go` — which is not shared — supplies them:
+`internal/flags` must stay byte-identical across four copies, so it cannot name **module** flag keys or **module** environment variables. `Resolver` takes those as `Spec` values; each module's own `env_flags.go` — which is not shared — supplies them.
+
+**Shared global kill-switch helper (post-review R13-B1).** The process-wide name `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is the one env string every module already hard-codes. `internal/flags` SHALL export:
+
+```go
+const EnvGlobalTracing = "OTEL_INSTRUMENTATION_GO_TRACING_ENABLED"
+
+func GlobalTracingPossible() bool { return EnvEnabled(EnvGlobalTracing) }
+```
+
+Call sites replace local `dynamicTracingPossible` / `wsNegotiationPossible` wrappers with `flags.GlobalTracingPossible()`. Module-specific godoc (especially D9's otel-ws negotiation rationale) lives at the Dial/Upgrade/capability call sites, not on the shared one-liner. No other `OTEL_*` names may appear in the shared file.
 
 ```go
 // otel-mongo/otelmongo/env_flags.go
@@ -110,7 +122,7 @@ var mongoResolver = flags.NewResolver("otel-mongo",
 )
 
 func mongoTracingEnabled() bool {
-    if !flags.EnvEnabled(envGlobalTracingEnabled) {
+    if !flags.GlobalTracingPossible() {
         return false
     }
     return mongoResolver.Enabled(idxTracing)
@@ -168,15 +180,29 @@ This keeps `internal/direct` free of OTel SDK imports (the CI grep and the packa
 
 *Consequence.* `collectionImpl` returns raw driver types for `Find`/`Aggregate`/`Watch` and the facade constructs both wrappers itself; `FindOne` keeps returning a `shared.SingleResultImpl` alongside its raw result. `traced.Collection`'s exported `PropagationEnabled bool` field becomes a `func() bool`, which facade-package tests that build `traced.Collection` literals must follow.
 
+**Post-review cleanup of the dual-impl migration (R8).** After the facade builds dual Cursor/ChangeStream wrappers, the second return value from `Find`/`Aggregate`/`Watch` on `collectionImpl` is unused (`raw, _, err`). The interface SHALL return only `(*mongo.Cursor, error)` / `(*mongo.ChangeStream, error)` for those methods; `internal/{direct,traced}` SHALL NOT allocate a throwaway `NewCursor`/`NewChangeStream` on those paths. `FindOne` retains the dual return for the live span (D8 exception).
+
+**Per-operation tracing/propagation consistency (R5).** Within a single public operation, the tracing decision used to select `impl()` SHALL be the same value passed into `resolveDocumentPropagation` / `propagationOn` — callers MUST NOT re-invoke `effectiveTracing()` / `mongoTracingEnabled()` for that operation's propagation decision. `ContextFromDocument` / `ContextFromRawDocument` SHALL resolve tracing once and pass it into `resolveDocumentPropagation`. Client and Database share one small gate-state helper so the rule is not hand-copied four times (R16).
+
+**Facade `impl()` selection (R14).** The four-line `if traced != nil && tracing() { return traced }; return direct` pattern is factored once per module (v1 and v2) via a tiny generics helper; v1↔v2 parity copies remain required by CLAUDE.md.
+
 ### D9. `otel-gorilla-ws` negotiates `otel-ws` whenever the connection could ever trace
 
 Negotiation happens during the handshake and cannot be revisited, so it is gated on the same expression as implementation selection in D7 — the option if present, otherwise the global switch — and specifically *not* on the dynamic value.
 
 The read path is already safe either way: `tryUnmarshalWire` probes and falls back to the raw payload when the message is not an envelope. Only the write path must match what the peer agreed to, because sending an envelope to a peer that did not negotiate `otel-ws` hands `{"header":...,"data":...}` to that peer's application code.
 
-*Alternatives considered.* Gating negotiation on the dynamic value at handshake time avoids the envelope entirely while tracing is off, but connections established during an "off" period could never propagate trace context afterwards — and WebSocket connections routinely live for hours.
+**Envelope follows negotiation outcome, not feature-on aspiration (R1).** `Conn.tracingEnabled` means "otel-ws was negotiated (or proven via subprotocol)," not "this process might want spans."
 
-*Consequence.* Two peers that both use this library with the global switch on now exchange the JSON envelope on every message even while tracing is off, which is a wire-format change and a JSON marshal per message. Peers that do not negotiate `otel-ws` — including all non-library clients — see no change.
+- `Dial` / `Upgrader.Upgrade` set `tracingEnabled` from the handshake result (unchanged).
+- `NewConn` has no handshake: it SHALL set `tracingEnabled` from `isOTelWireProtocol(conn.Subprotocol())` (N1). Callers that manage the handshake themselves must leave a correct negotiated subprotocol on the raw conn. There is **no** `WithOTelWSNegotiated` escape hatch (O1) — that would reintroduce force-envelope wire corruption.
+- When negotiation failed / is unproven: **wire is raw passthrough**; if capability and the dynamic feature gate are on, **local send/receive spans may still be created** without inject/extract (S1).
+- `configureConn` / construction SHALL clamp `tracingEnabled = tracingEnabled && capable` so a historical `true` cannot outlive a capability-off process (R7, same root as R1).
+- `WithTracingEnabled(true)` is authoritative for the **feature / SDK** path; it MUST NOT force the JSON envelope onto a connection whose peer did not negotiate otel-ws.
+
+*Alternatives considered.* Gating negotiation on the dynamic value at handshake time avoids the envelope entirely while tracing is off, but connections established during an "off" period could never propagate trace context afterwards — and WebSocket connections routinely live for hours. Keeping `NewConn`'s forced `tracingEnabled=true` was rejected after PR #27: with capability on and the dynamic flag off it still wrote empty-header envelopes to non-negotiating peers (regression vs 0.7.x passthrough-when-feature-off and vs the CHANGELOG promise that non-negotiating peers see no wire change).
+
+*Consequence.* Two peers that both use this library with the global switch on now exchange the JSON envelope on every message even while tracing is off, which is a wire-format change and a JSON marshal per message. Peers that do not negotiate `otel-ws` — including all non-library clients and `NewConn` wrappers whose subprotocol is not otel-ws — see raw payloads.
 
 ### D10. Mongo document helpers resolve through the same snapshot
 
@@ -233,11 +259,49 @@ Because the OpenFeature provider and the environment are both process-global, te
 
 1. Land all four modules in one commit — the byte-identical `internal/flags` copies cannot be split across commits.
 2. Tag `otel-mongo/v0.9.0`, `otel-mongo/v2.9.0`, `otel-nats/v0.8.0`, `otel-gorilla-ws/v0.8.0`. Tags may be pushed sequentially; the release guard validates each against its version constant.
-3. Existing deployments that upgrade without installing an OpenFeature provider see no behavior change. No action required.
+3. Existing deployments that upgrade **without** installing an OpenFeature provider keep **span on/off** behavior driven by the same environment variables as before, with one **documented exception (R4)**: `otel-gorilla-ws` subprotocol negotiation is gated on the **global** switch alone (D9), not `GLOBAL && OTEL_GORILLA_WS_TRACING_ENABLED`. Env-only deployments with **global on + module env off** that previously never offered/confirmed otel-ws will now negotiate it between library peers (envelope on the wire, no spans while the module flag is off). Third parties that never negotiate otel-ws remain on raw payloads. CHANGELOG, CLAUDE.md, and README migration notes MUST state this exception; the unconditional sentence "no provider ⇒ identical to previous release" is false for that case and must not stand alone.
 4. Deployments adopting dynamic flags install a provider at startup, next to their existing `otelsetup.Init()` call, and create the four flags on the relay. Until a flag exists there, the corresponding environment variable continues to decide.
 
 **Rollback.** Pin the previous module version. There is no persisted state, no wire-format migration for peers that never negotiated `otel-ws`, and no relay configuration that must be torn down — flags left on the relay are simply ignored by the older build.
 
+## Post-review remediation (PR #27 grill, 2026-08)
+
+Source: `reviews/code-review-pr-27-openfeature-dynamic-flags.zh-TW.html` and a decision grill on each finding. Implementation is tracked in `tasks.md` §8; this section is the normative design record of those decisions.
+
+| ID | Topic | Severity (review) | Decision |
+|----|--------|-------------------|----------|
+| R1 | `NewConn` wire corruption when capability on + feature off | 85 | Fix behavior: envelope only if negotiated/proven (N1 Subprotocol); fail → raw wire; S1 local spans OK; O1 no force-negotiated option; clamp with capable (R7) |
+| R2 | `MessageBatch` freezes flag at Fetch | 75 | Always return a dynamic batch wrapper; per-message gate re-check; bidirectional flip tests |
+| R3 | `Resolver.refresh` last-store-wins + late `at` | 70 | Stamp `at` at evaluation **start**; no CAS/mutex this round |
+| R4 | otel-ws negotiation vs "no provider ⇒ no change" | 70 | Keep D9 behavior; document exception in CHANGELOG / design migration / CLAUDE |
+| R5 | Mongo single-call-chain torn read of tracing | 60 | Pass resolved tracing into propagation; no internal recompute; same for `ContextFromDocument` |
+| R6 | JetStream per-message rebuild of tracer/attrs | 60 | Hoist tracer/prop/baseAttrs to construction (like `newTracedMessageBatch`); gate stays per-message |
+| R7 | `capable` / `tracingEnabled` no choke-point clamp | 55 | Subsumed into R1 |
+| R8 | Dead second return of `collectionImpl` Find/Aggregate/Watch | 55 | Drop second return; stop throwaway `New*` in impls |
+| R9 | `tracedMessagesContext.Next` not gate-first | 55 | Gate-first delegate to `directMessagesContext` |
+| R10 | Gate/propEnabledGate doc drift | 50 | Full sync: CLAUDE, test comments, jetstream godoc, main `openspec/specs/shared-feature-flags` |
+| R11 | `WriteMessage` nil span + dual guards | 45 | Feature-off uses noop span; drop nil guards |
+| R12 | NATS Consume path triple `impl()` per message | 40 | Resolve once per message; pass down |
+| R13 | `dynamicTracingPossible` duplication / parallel refresh | 30 | **B1**: `flags.GlobalTracingPossible()`; call sites drop locals; **no** parallel Boolean in refresh |
+| R14 | Six copies of facade `impl()` selection | 40 | Generics `selectImpl` per mongo module |
+| R15 | Five copies of relay test helpers | 35 | Move to `otel-testkit/harness` |
+| R16 | Client/Database `effective*` duplication | 35 | Shared gateState; implement with R5 |
+| R17 | otelnats `impl`/`msgHandler`/`traceEventMsgHandler` policy | 30 | **WONTFIX** extract; optional lockstep comment only |
+| R18 | Dead nil-handler guard in `tracedConsumeHandler` | 25 | Delete dead guard |
+| R19 | Same-refresh sequential Boolean micro-torn pair | 50 filtered | **WONTFIX** — fail-safe via `resolveDocumentPropagation`; window µs; not worth serializing Boolean |
+
+### R2 detail (JetStream MessageBatch)
+
+OpenSpec already requires per-delivery follow of the relay for `MessagesContext` and `MessageBatch`. Construction-time choice of direct vs traced batch violates that. Fetch methods always return a wrapper whose forwarder re-reads the connection gate per message; when off, skip tracer/attributes/propagator entirely. Align CLAUDE.md examples so `Fetch` is not misread as "pin batch for life."
+
+### R6 + R12 detail (JetStream / Consume hot path)
+
+Dynamic means the **gate**, not re-deriving constant traced-branch metadata. Hoist `TraceContext`/`ServerAttrs`/`receiveBaseAttrs` where values are fixed for a traced connection; still re-check `TracingEnabled` (or equivalent) per message. Consume path must not call `impl()` three times for one message.
+
+### Documentation sync (R4 + R10)
+
+When remediating, rewrite every remaining reference to `Gate` / `NewGate` / `ResetForTest` / env-only permanent `propEnabledGate` in CLAUDE.md, module godoc, test helper comments, and **main** `openspec/specs/shared-feature-flags/spec.md` (not only this change's delta). Archive/sync may still apply deltas; main tree must not claim Gate exists after this change ships.
+
 ## Open Questions
 
-None outstanding. Every decision above was settled before drafting; items deliberately excluded from this change (dynamic sampling rates, per-request targeting, a harness-level flag-flip E2E assertion) are recorded as Non-Goals rather than open questions.
+None outstanding for the original design. Post-review R1–R19 are decided above; remaining work is implementation (`tasks.md` §8), not open product questions. Items deliberately excluded from this change (dynamic sampling rates, per-request targeting, a harness-level flag-flip E2E assertion, Resolver CAS/singleflight, parallel Boolean fan-out) stay Non-Goals.

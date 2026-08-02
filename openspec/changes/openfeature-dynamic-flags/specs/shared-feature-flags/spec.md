@@ -12,15 +12,15 @@ Every module (`otel-mongo`, `otel-mongo/v2`, `otel-nats`, `otel-gorilla-ws`) SHA
 - **THEN** the identical change SHALL be applied to the other three copies
 
 ### Requirement: Composed per-module gates
-Each module SHALL construct exactly one package-level `flags.Resolver` at package initialization, supplying one `flags.Spec` per dynamic flag it owns, and SHALL read it through `Resolver.Enabled(i)` at each decision point rather than caching the result on a wrapper struct. `otel-nats` and `otel-gorilla-ws` SHALL each own a single tracing `Spec`; `otel-mongo` (v1 and v2) SHALL own a tracing `Spec` and a propagation `Spec` so both resolve from one snapshot instant. The global switch `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` SHALL be read with `flags.EnvEnabled` and ANDed ahead of the resolver read, never expressed as a `Spec`.
+Each module SHALL construct exactly one package-level `flags.Resolver` at package initialization, supplying one `flags.Spec` per dynamic flag it owns, and SHALL read it through `Resolver.Enabled(i)` at each decision point rather than caching the result on a wrapper struct. `otel-nats` and `otel-gorilla-ws` SHALL each own a single tracing `Spec`; `otel-mongo` (v1 and v2) SHALL own a tracing `Spec` and a propagation `Spec` so both resolve from one snapshot store. The global switch `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` SHALL be read via `flags.GlobalTracingPossible()` (or equivalent `EnvEnabled` of that name) and ANDed ahead of the resolver read, never expressed as a `Spec`.
 
 #### Scenario: otel-nats / otel-gorilla-ws compose one tracing spec
 - **WHEN** `otelnats` or `otel-gorilla-ws` resolves its effective tracing state for a connection with no `WithTracingEnabled` option
-- **THEN** it returns `flags.EnvEnabled("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED") && resolver.Enabled(tracingIndex)`
+- **THEN** it returns `flags.GlobalTracingPossible() && resolver.Enabled(tracingIndex)` (equivalently `EnvEnabled` of the global kill-switch name)
 
 #### Scenario: otel-mongo composes tracing and propagation in one resolver
 - **WHEN** `otel-mongo` (v1 or v2) evaluates both its tracing and its propagation decision for the same operation
-- **THEN** both values come from the same `Resolver` snapshot, so they always reflect the same instant
+- **THEN** the propagation decision reuses the operation's already-resolved tracing boolean (or both values from one snapshot load), so a single operation does not combine tracing from snapshot T0 with a post-TTL refresh for the same tracing index
 
 #### Scenario: Values are read per decision, not cached per construction
 - **WHEN** a relay flag changes after a `Client` or `Conn` has been constructed without `WithTracingEnabled`

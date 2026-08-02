@@ -21,7 +21,7 @@ All notable changes to the `otel-nats` module (`otelnats` + `oteljetstream`) are
   _ = openfeature.SetProviderAndWait(provider)
   ```
 
-  With no provider installed, behavior is identical to the previous release.
+  With no provider installed, span on/off still follows the environment variables as before.
 - `github.com/open-feature/go-sdk` is a new dependency. The GO Feature Flag provider is an application-side dependency, not a library one.
 
 ### Flag keys
