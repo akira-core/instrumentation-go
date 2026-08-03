@@ -32,6 +32,28 @@ The library SHALL NOT attempt to detect or compensate for a not-ready provider: 
 - **WHEN** a process whose module is revoked at the relay restarts, and the application blocks on provider readiness during startup
 - **THEN** no operation is instrumented after the restart, matching the state the operator established before it
 
+### Requirement: A relay outage must not reach the application
+A relay that becomes unreachable after the provider has fetched successfully SHALL NOT affect the application: the in-process evaluator serves its last successfully fetched configuration, so an active revocation survives the outage and no evaluation performs network I/O.
+
+Two provider settings are required for that guarantee to hold, and SHALL be documented as requirements rather than suggestions, with their failure modes stated:
+
+- **`DataCollectorDisabled: true`.** The provider's data collector is enabled by default, appends one event per evaluation to a bounded in-memory buffer, and does not clear that buffer when a flush fails. Once the buffer is full, every subsequent append flushes synchronously on the evaluating goroutine while holding the buffer's mutex, so a relay outage stalls every instrumented operation behind a failing request.
+- **An install failure SHALL NOT abort startup.** When the relay is unreachable at boot, `SetProviderAndWait` returns an error; the documented handling SHALL be to log it and continue, so the relay is not a hard dependency of the application. The documentation SHALL state the unavoidable cost: a process that starts during a relay outage cannot learn about an active revocation and comes up at the state its environment declares.
+
+The library SHALL NOT attempt to enforce either setting, because the application owns the provider.
+
+#### Scenario: Relay goes down while a revocation is active
+- **WHEN** a module has been revoked at the relay, the provider has fetched that configuration, and the relay then becomes unreachable
+- **THEN** the module stays revoked, and no evaluation performs network I/O or blocks
+
+#### Scenario: Relay is down at startup
+- **WHEN** the relay is unreachable when the application installs the provider
+- **THEN** `SetProviderAndWait` returns an error, the documented handling logs it and continues, and the process runs at the state its environment declares with no relay control until it is restarted
+
+#### Scenario: Data collector is disabled in every documented snippet
+- **WHEN** any wiring snippet in this repository is read
+- **THEN** it sets `DataCollectorDisabled: true` and explains why
+
 ### Requirement: The relay is a revoke-only kill switch
 Each dynamic flag SHALL be resolved as `client.Boolean(ctx, key, true, openfeature.EvaluationContext{})` and SHALL be combined with the module's environment variable by conjunction, not by supplying that variable as the evaluation default:
 

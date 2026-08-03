@@ -149,9 +149,19 @@ Precedence, highest first:
 **Never call `openfeature.SetProvider`** (or `SetNamedProvider`/`SetEvaluationContext`/`AddHooks`/`Shutdown`) from library code — same rule as never initializing a `TracerProvider`. Applications install a provider at startup:
 
 ```go
-provider, _ := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{Endpoint: "http://relay:1031"})
+provider, _ := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{
+    Endpoint:              "http://relay:1031",
+    DataCollectorDisabled: true, // required — see feature-flags.md
+})
+// Blocking install; on error log and continue rather than failing startup.
 _ = openfeature.SetProviderAndWait(provider)
 ```
+
+Two provider settings are load-bearing and easy to omit. `DataCollectorDisabled: true` avoids a
+buffer that flushes synchronously from the evaluating goroutine once full, which wedges every
+instrumented operation behind a failing 10 s request while the relay is down. `SetProviderAndWait`
+rather than `SetProvider` closes the startup window in which an unfetched provider cannot revoke
+anything. Both are explained in `feature-flags.md`.
 
 With no provider installed, every module's **span on/off** behavior is driven by the same environment variables as before dynamic flags. **Exception (otel-gorilla-ws):** subprotocol negotiation is gated on the global kill switch alone, not `GLOBAL && OTEL_GORILLA_WS_TRACING_ENABLED`, so env-only deployments with global on + module env off may negotiate otel-ws between library peers (envelope on the wire, no spans while the module flag is off). Peers that do not negotiate otel-ws still see raw payloads. The library passes an empty `EvaluationContext{}`; targeting is the application's job via `SetEvaluationContext`. Because the snapshot is process-wide, only process-scoped targeting attributes are meaningful — **per-request targeting is not supported**.
 

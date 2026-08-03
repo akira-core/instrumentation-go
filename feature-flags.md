@@ -224,18 +224,60 @@ import (
 )
 
 provider, err := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{
-    Endpoint: "http://relay:1031",
+    Endpoint:              "http://relay:1031",
+    DataCollectorDisabled: true,   // required — see below
 })
 if err != nil {
     return err
 }
 // SetProviderAndWait, not SetProvider — see below.
 if err := openfeature.SetProviderAndWait(provider); err != nil {
-    return err
+    // Log and continue. Do not fail startup — see below.
+    logger.Error("feature flag provider unavailable; continuing without relay control", "error", err)
 }
 ```
 
-Install it at startup, next to your `otelsetup.Init()` call.
+Install it at startup, next to your `otelsetup.Init()` call. Three things in that snippet are
+load-bearing and are covered next: the disabled data collector, the blocking install, and the
+decision not to treat an install failure as fatal.
+
+### Disable the data collector
+
+`DataCollectorDisabled: true` is **required**, not tuning.
+
+The provider's data collector is on by default. It appends one event per evaluation to an
+in-memory buffer and flushes it to the relay on a two-minute ticker. Two details make that
+dangerous for this library's usage pattern, in which one evaluation happens per instrumented
+operation:
+
+- A **failed** flush does not clear the buffer.
+- Once the buffer reaches its cap (100,000 events by default), **every subsequent `AddEvent`
+  flushes synchronously, on the evaluating goroutine, while holding the buffer's mutex.**
+
+With the relay down, that synchronous flush fails after the HTTP client's timeout — 10 seconds by
+default — and the buffer is never drained, so it happens again on the next evaluation, with every
+other evaluating goroutine queued behind the same mutex. A relay outage would then stall the
+application's own Mongo queries and NATS publishes, which is exactly the thing the rest of this
+design is built to prevent.
+
+Nothing is lost by disabling it. The collector reports flag-evaluation analytics to the relay's
+dashboards; with process-wide flags evaluated once per operation, those analytics are a copy of
+your traffic volume.
+
+### The relay is not a startup dependency
+
+If the relay is unreachable when the process starts, the provider's first fetch fails and
+`SetProviderAndWait` returns an error. **Log it and continue.** Returning it aborts startup and
+makes the relay a hard dependency of your service, which inverts the point of a brake.
+
+Continuing costs exactly one thing, and it is unavoidable: a process that starts while the relay
+is down cannot know about an active revocation, so it comes up at the state its environment
+declares. There is no way to read a revocation you cannot reach.
+
+Once the provider is installed and has fetched successfully, a later relay outage changes nothing:
+the in-process evaluator keeps serving its last successfully fetched configuration, so an active
+revocation survives the outage. Only evaluation errors — which cannot happen for an in-process
+provider holding a configuration — fall back to "allow".
 
 ### `SetProviderAndWait` is required, not preferred
 

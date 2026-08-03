@@ -76,12 +76,22 @@ import (
 
 provider, err := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{
     Endpoint: "http://relay-proxy:1031",
+    // Required. The collector buffers one event per evaluation and, once full
+    // (100k by default), flushes synchronously from the evaluating goroutine
+    // while holding a mutex. With the relay down that flush fails after the
+    // HTTP timeout and the buffer never drains, so every instrumented
+    // operation ends up queueing behind a doomed 10 s request.
+    DataCollectorDisabled: true,
 })
 if err != nil {
     return err
 }
+// Blocking install: an unresolvable flag means "allow", so a provider that has
+// not fetched yet cannot revoke anything.
 if err := openfeature.SetProviderAndWait(provider); err != nil {
-    return err
+    // Do NOT fail startup. The relay is a brake, not a prerequisite: come up at
+    // the state the environment declares, without relay control until a restart.
+    logger.Error("feature flag provider unavailable; continuing without relay control", "error", err)
 }
 // optional, for process-level targeting on the relay:
 openfeature.SetEvaluationContext(openfeature.NewTargetlessEvaluationContext(map[string]any{

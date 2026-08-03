@@ -74,12 +74,20 @@ import (
 
 provider, err := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{
     Endpoint: "http://relay-proxy:1031",
+    // 必要。collector 每次求值累積一筆事件,滿載(預設 100k)之後會在
+    // 求值的 goroutine 上持有 mutex 同步送出。relay 掛掉時該送出會撐到
+    // HTTP timeout 才失敗且緩衝區永遠清不掉,結果是每個被 instrument 的
+    // 操作都排隊等一個注定失敗的 10 秒請求。
+    DataCollectorDisabled: true,
 })
 if err != nil {
     return err
 }
+// 阻塞式安裝:無法解析的 flag 代表「不干預」,尚未抓取設定的 provider 撤銷不了任何東西。
 if err := openfeature.SetProviderAndWait(provider); err != nil {
-    return err
+    // 不要讓啟動失敗。relay 是煞車不是前提:以環境變數宣告的狀態啟動,
+    // 在下次重啟之前沒有 relay 控制能力。
+    logger.Error("feature flag provider 無法使用,略過 relay 控制", "error", err)
 }
 // 選用:讓 relay 依行程層級屬性做分流
 openfeature.SetEvaluationContext(openfeature.NewTargetlessEvaluationContext(map[string]any{
