@@ -12,7 +12,6 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
-	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/flags"
 	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/shared"
 )
 
@@ -36,6 +35,10 @@ func (c *Client) effectiveTracing() bool { return c.gate.effectiveTracing() }
 // effectivePropagation reports whether THIS call should inject or extract
 // _oteltrace. See gateState for static-client and R5 single-operation rules.
 func (c *Client) effectivePropagation() bool { return c.gate.effectivePropagation() }
+
+// propagationWhenTracing is the propagation gate for the instrumented impls,
+// which are reached only once tracing has already resolved true (design R5).
+func (c *Client) propagationWhenTracing() bool { return c.gate.propagationWhenTracing() }
 
 // ClientOption configures Connect/NewClient. Per OTel contrib: accept TracerProvider and Propagators.
 type ClientOption interface {
@@ -123,13 +126,23 @@ func Connect(opts ...*options.ClientOptions) (*Client, error) {
 // Without options, falls back to otel.GetTracerProvider()/otel.GetTextMapPropagator() at connect time.
 func ConnectWithOptions(traceOpts []ClientOption, opts ...*options.ClientOptions) (*Client, error) {
 	cfg := newClientConfig(traceOpts)
-	// Which implementations to build is necessarily static. An explicit override
-	// decides it; otherwise the global kill switch does — NOT the relay, which may
-	// flip at any time. GlobalTracingPossible, not mongoTracingEnabled: with the
-	// global switch on and the module flag off the instrumented path is still
-	// built, and effectiveTracing keeps it unused until the flag says otherwise.
-	buildTraced := resolveFlag(cfg.TracingEnabled, flags.GlobalTracingPossible())
-	if !buildTraced {
+	// Which implementations to build is necessarily a static decision, and it
+	// keys on the WHOLE static part: gate1 (however spelled) AND the module
+	// switch. Every conflict is collected before any is returned, so a caller
+	// violating both rules learns both at once. This runs before mongo.Connect,
+	// so a rejected configuration opens no connection.
+	//
+	// Including the module switch is safe only because the relay can never
+	// enable: with it off, no relay value could raise the answer, so the
+	// instrumented path could never be reached and there is no reason to
+	// allocate it — nor to register the command monitor that runs on every
+	// MongoDB command.
+	gate, err := resolveGates(cfg.TracingEnabled, cfg.PropagationEnabled)
+	if err != nil {
+		return nil, err
+	}
+	if !gate.tracedBuilt {
+
 		merged := options.MergeClientOptions(opts...)
 		mc, err := mongo.Connect(merged)
 		if err != nil {
@@ -143,7 +156,7 @@ func ConnectWithOptions(traceOpts []ClientOption, opts ...*options.ClientOptions
 			serverPort: port,
 			tracer:     tracer,
 			propagator: otel.GetTextMapPropagator(),
-			gate:       gateState{tracedBuilt: false},
+			gate:       gate,
 		}, nil
 	}
 	tp := cfg.TracerProvider
@@ -172,11 +185,7 @@ func ConnectWithOptions(traceOpts []ClientOption, opts ...*options.ClientOptions
 		serverPort: port,
 		tracer:     tracer,
 		propagator: prop,
-		gate: gateState{
-			tracingOverride:     cfg.TracingEnabled,
-			propagationOverride: cfg.PropagationEnabled,
-			tracedBuilt:         true,
-		},
+		gate:       gate,
 	}, nil
 }
 

@@ -1,6 +1,10 @@
 package otelmongo
 
 import (
+	"errors"
+	"fmt"
+	"os"
+
 	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/flags"
 )
 
@@ -12,137 +16,125 @@ const (
 	envMongoPropagationEnabled = "OTEL_MONGO_PROPAGATION_ENABLED"
 )
 
-// OpenFeature keys an operator flips on the relay proxy to change this module's
-// behavior without restarting the application. v1 and v2 share both keys, as
-// they share both env vars.
+// OpenFeature keys an operator flips on the relay proxy to turn this module's
+// behavior off without restarting the application. v1 and v2 share both keys, as
+// they share both env vars, so revoking otel-mongo-tracing stops both.
+//
+// The relay can only REVOKE. Both keys resolve with an evaluation default of
+// true and are ANDed with their paired env var, so nothing on the relay can
+// enable what the deployment left off. That matters most for propagation:
+// _oteltrace is roughly 90 bytes written into the application's own documents,
+// never stripped on read, and removable only by a $unset migration.
 const (
 	flagKeyMongoTracing     = "otel-mongo-tracing"
 	flagKeyMongoPropagation = "otel-mongo-propagation"
 )
 
-// Indices into mongoResolver's specs. Both flags live in one resolver so a
-// single refresh evaluates them together: any one snapshot always holds a
-// combination that existed on the relay. Two Enabled calls that straddle a TTL
-// refresh still read two different snapshots — operation-scoped consistency is
-// the call site's job (design R5), not the resolver's.
+// Indices into mongoResolver's flag keys.
 const (
 	idxTracing = iota
 	idxPropagation
 )
 
-// mongoResolver resolves this module's dynamic flags through the process-global
-// OpenFeature client, with the module env vars as the evaluation defaults — so
-// an application that never installs a provider behaves exactly as it did
-// before dynamic flags existed.
+// Configuration-conflict sentinels. The env var and the option are two spellings
+// of one switch, so supplying both is an error even when they agree: the rule to
+// remember is "set one", which is checkable at a glance, rather than "make them
+// match", which depends on the truthiness allow-list.
+var (
+	ErrTracingConfigConflict = errors.New(
+		"otelmongo: WithTracingEnabled and " + envGlobalTracingEnabled +
+			" are mutually exclusive; set exactly one")
+
+	ErrTracePropagationConfigConflict = errors.New(
+		"otelmongo: WithTracePropagationEnabled and " + envMongoPropagationEnabled +
+			" are mutually exclusive; set exactly one")
+)
+
+// mongoResolver resolves this module's relay verdicts through the process-global
+// OpenFeature client. It caches nothing, so a revocation reaches a live client on
+// its very next operation.
 //
-// The global switch is deliberately NOT a Spec: it is an out-of-band kill switch
-// with no relay counterpart, ANDed ahead of the resolver so that no OpenFeature
-// code path runs at all while it is off.
-var mongoResolver = newMongoResolver()
+// The global switch is deliberately NOT a flag key: it is an out-of-band kill
+// switch with no relay counterpart, ANDed ahead of the resolver so that no
+// OpenFeature code path runs at all while it is off.
+var mongoResolver = flags.NewResolver(
+	flags.WithFlagKeys(
+		flagKeyMongoTracing,     // paired with envMongoTracingEnabled, ANDed by this package
+		flagKeyMongoPropagation, // paired with envMongoPropagationEnabled, ANDed by this package
+	),
+)
 
-func newMongoResolver() *flags.Resolver {
-	return flags.NewResolver("otel-mongo",
-		flags.WithSpecs(
-			flags.Spec{Key: flagKeyMongoTracing, EnvVar: envMongoTracingEnabled},
-			flags.Spec{Key: flagKeyMongoPropagation, EnvVar: envMongoPropagationEnabled},
-		),
-	)
-}
-
-// mongoTracingEnabled reports the module's effective tracing state for a Client
-// that carries no WithTracingEnabled override.
+// mongoRelayAllowsTracing and mongoRelayAllowsPropagation report the relay
+// verdicts alone.
 //
-// Unlike the plain env read it replaces, this may return a different answer than
-// it did a second ago: callers MUST read it per operation rather than caching it
-// on a wrapper struct.
-func mongoTracingEnabled() bool {
-	if !flags.GlobalTracingPossible() {
-		return false
-	}
-	return mongoResolver.Enabled(idxTracing)
-}
+// Each is only part of the answer: callers MUST AND them with the client's
+// static tiers, which is what gateState does. Reading either on its own would
+// let the relay enable what the deployment left off.
+func mongoRelayAllowsTracing() bool     { return mongoResolver.Allowed(idxTracing) }
+func mongoRelayAllowsPropagation() bool { return mongoResolver.Allowed(idxPropagation) }
 
-// mongoPropagationEnvOnly reports OTEL_MONGO_PROPAGATION_ENABLED alone, without
-// consulting the relay. It is the propagation default for clients pinned static
-// by WithTracingEnabled: no OpenFeature evaluation may run for them — and when
-// the pin is what enabled tracing past a disabled global kill switch, none may
-// run at all, or the relay could reach a process whose kill switch is off.
-func mongoPropagationEnvOnly() bool {
-	return flags.EnvEnabled(envMongoPropagationEnabled)
-}
-
-// mongoPropagationResolved reports the module's propagation flag on its own,
-// without the tracing gate. Formerly a plain OTEL_MONGO_PROPAGATION_ENABLED read;
-// now the relay decides when it has an opinion and that env var is the fallback.
-// Used by resolveDocumentPropagation as the default.
-func mongoPropagationResolved() bool {
-	return mongoResolver.Enabled(idxPropagation)
-}
-
-func mongoPropagationEnabled() bool {
-	// Resolve tracing once, then propagation — never re-enter mongoTracingEnabled
-	// inside resolveDocumentPropagation (design R5).
-	return resolveDocumentPropagation(mongoTracingEnabled(), nil)
-}
-
-// mongoFlagsPair returns tracing and then propagation for the package-level
-// document helpers.
+// resolveGate1 resolves the process-wide first tier for one client.
 //
-// The two Enabled reads are consecutive, NOT atomic: if the snapshot TTL expires
-// between them the propagation value can come from a newer refresh than the
-// tracing value. A truly single-snapshot read would need a multi-value accessor
-// on flags.Resolver, which does not exist yet.
-func mongoFlagsPair() (tracing, propagation bool) {
-	if !flags.GlobalTracingPossible() {
-		return false, false
+// Rejection is on PRESENCE, not on value: EnvSet is required because EnvEnabled
+// cannot tell "unset" (the deployment expressed no opinion, and the option may
+// supply one) from "set to something falsy".
+func resolveGate1(override *bool) (bool, error) {
+	if flags.GlobalTracingSet() && override != nil {
+		return false, fmt.Errorf("%w: option=%v, %s=%q",
+			ErrTracingConfigConflict, *override,
+			envGlobalTracingEnabled, os.Getenv(envGlobalTracingEnabled))
 	}
-	tracing = mongoResolver.Enabled(idxTracing)
-	if !tracing {
-		return false, false
-	}
-	return true, mongoResolver.Enabled(idxPropagation)
-}
-
-// resolveDocumentPropagation returns the effective _oteltrace propagation flag
-// for a Client, given that Client's already-resolved effective tracing state
-// (tracingEnabled — the resolved flags, or a WithTracingEnabled override if one
-// was supplied). tracingEnabled must be false before propagation is
-// force-disabled, so no _oteltrace inject/extract occurs while wrapper spans are
-// off. When tracingEnabled is true, an explicit option override (e.g.
-// WithTracePropagationEnabled) wins, otherwise the resolved propagation flag is
-// the default. WithTracePropagationEnabled cannot bypass tracingEnabled being
-// false, however that false came about.
-//
-// tracingEnabled is a parameter rather than an internal mongoTracingEnabled()
-// call so a WithTracingEnabled(true) override (global switch off) still lets
-// WithTracePropagationEnabled take effect. Reintroducing an internal recompute
-// here would silently break that combination.
-func resolveDocumentPropagation(tracingEnabled bool, override *bool) bool {
-	if !tracingEnabled {
-		return false
-	}
-	return resolveFlag(override, mongoPropagationResolved())
-}
-
-func resolveFlag(override *bool, envDefault bool) bool {
 	if override != nil {
-		return *override
+		return *override, nil
 	}
-	return envDefault
+	return flags.GlobalTracingPossible(), nil
 }
 
-// cachedPropagationEnabled reports the full three-tier propagation decision for
-// the package-level ContextFromDocument / ContextFromRawDocument helpers.
+// resolvePropagationTier resolves the _oteltrace propagation tier for one client.
+// Same presence rule as resolveGate1, with its own sentinel.
+func resolvePropagationTier(override *bool) (bool, error) {
+	if flags.EnvSet(envMongoPropagationEnabled) && override != nil {
+		return false, fmt.Errorf("%w: option=%v, %s=%q",
+			ErrTracePropagationConfigConflict, *override,
+			envMongoPropagationEnabled, os.Getenv(envMongoPropagationEnabled))
+	}
+	if override != nil {
+		return *override, nil
+	}
+	return flags.EnvEnabled(envMongoPropagationEnabled), nil
+}
+
+// resolveGates resolves every static tier for one client, collecting ALL
+// configuration conflicts before returning any of them.
 //
-// Those are package-level functions with no Client to consult, so they see
-// neither WithTracingEnabled nor WithTracePropagationEnabled — a Client whose
-// Collection writes _oteltrace because of an override may still see ok == false
-// here. They DO follow the relay, within the resolver's TTL, so a flag that
-// stops the Collection path also stops a change-stream reader in the same loop.
-//
-// Caching lives in the resolver, so repeated calls in a hot decode loop do not
-// re-enter the OpenFeature evaluation pipeline.
-func cachedPropagationEnabled() bool {
-	_, prop := mongoFlagsPair()
-	return prop
+// A caller can violate both rules at once — one configuration file setting every
+// environment variable, one code path passing every option — so both checks run
+// and the failures are joined in a fixed order (tracing first, propagation
+// second). Returning only the first would make the caller fix one conflict and
+// rediscover the other on the next run, which is the failure mode configuration
+// errors are worst at.
+func resolveGates(tracingOverride, propagationOverride *bool) (gateState, error) {
+	gate1, tracingErr := resolveGate1(tracingOverride)
+	gateProp, propErr := resolvePropagationTier(propagationOverride)
+
+	if err := errors.Join(tracingErr, propErr); err != nil {
+		return gateState{}, err
+	}
+
+	return gateState{
+		// Both terms are environment-derived and fixed here, so they also decide
+		// which implementations are allocated at all. Including the module env
+		// var is safe because the relay can only revoke: with it off, no relay
+		// value could raise the answer.
+		tracedBuilt: gate1 && flags.EnvEnabled(envMongoTracingEnabled),
+		propagation: gateProp,
+	}, nil
+}
+
+// envGates resolves the static tiers from the environment alone, for the
+// constructors that accept no options. It cannot fail: a configuration conflict
+// requires an option to conflict with, and there is none here.
+func envGates() gateState {
+	g, _ := resolveGates(nil, nil)
+	return g
 }

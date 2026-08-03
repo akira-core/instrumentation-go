@@ -10,7 +10,14 @@ Every tracing and propagation switch in this repo is an environment variable rea
 
 All three patterns and the `Gate` contract assume the answer never changes after startup. Making the switches dynamic means revisiting all of them: the split must re-select per operation, the gate must re-read per call, and the carrier must stop caching what it hands down. It also ends `internal/flags`'s zero-dependency property — a property worth naming, because a vendored four-copy file with no imports is trivially safe to duplicate. That trade is accepted in D5.
 
-The OpenFeature Go SDK is at v1.17.2. Its relevant surface: `openfeature.SetProviderAndWait(p)` installs a process-global provider, `openfeature.NewClient(domain)` returns a client bound to that global, and `client.Boolean(ctx, key, defaultValue, evalCtx)` returns `defaultValue` on any error — including when no provider was ever installed, since the SDK's default is a no-op provider. `openfeature/memprovider` provides an in-memory provider suitable for tests.
+The OpenFeature Go SDK is at v1.17.2. Its relevant surface:
+
+- `openfeature.SetProviderAndWait(p)` installs a process-global **default** provider; `SetNamedProvider(domain, p)` installs one scoped to a domain, which takes precedence over the default for clients bound to that domain.
+- `openfeature.NewClient(domain)` returns a client that resolves through the named provider for `domain` when one exists and falls back to the default otherwise.
+- `client.Boolean(ctx, key, defaultValue, evalCtx)` returns `defaultValue` on any error — including when no provider was ever installed, since the SDK's default is a no-op provider.
+- `openfeature.ProviderMetadata().Name` reports the installed default provider's identity, and is `"NoopProvider"` exactly when nothing has been installed. This is a reliable "has the application configured a provider?" test, and D17 uses it.
+- `Client.evaluate` merges evaluation contexts in the order *API (global) → transaction → client → invocation* (`client.go:695`), so an attribute passed at the invocation site composes with — and wins over — the application's global context without the library ever calling `SetEvaluationContext`.
+- `openfeature/memprovider` provides an in-memory provider suitable for tests.
 
 This document has been revised once. An earlier model — in which the relay decided in both directions and `WithTracingEnabled` pinned a connection static — was implemented and merged before design review replaced it, so the code in the tree does not yet match what follows. See § "Superseded decisions" for the point-by-point mapping and `tasks.md` § 9 for the remaining work.
 
@@ -24,16 +31,17 @@ This document has been revised once. An earlier model — in which the relay dec
 - Hot paths pay a bounded, predictable cost with no network call, and the per-operation cost of resolving a flag is measured and recorded rather than assumed (D4).
 - The compiler-enforced disabled path survives. `internal/direct` still imports no `go.opentelemetry.io/otel` package, CI still greps for it, and a process whose switches are off still cannot reach OTel code.
 - A configuration that expresses two different intents for the same switch fails loudly at construction rather than silently picking one.
-- No new environment variables. New exported API is limited to what the mutual-exclusion rule forces: one error sentinel per module (two in `otel-mongo`) and one changed constructor signature.
+- An application can obtain relay control **without writing any Go code**, by setting environment variables alone. Three new process-scoped variables serve that (`OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` / `_API_KEY` / `_POLL_INTERVAL`); no new module-scoped variable is added.
+- New exported API is limited to what the mutual-exclusion rule forces — one error sentinel per module (two in `otel-mongo`) and one changed constructor signature — plus two additive `otel-gorilla-ws` symbols that make D9's "run your own handshake" instruction followable.
 
 **Non-Goals:**
 
 - Remotely enabling tracing. This is the deliberate inverse of the usual feature-flag posture; see D2.
 - Supporting the GO Feature Flag provider's remote evaluation mode, which would put an HTTP request on the operation path; see D4.
-- Per-request flag targeting (per tenant, per user). The design caches a single process-wide value per flag; request-scoped attributes cannot influence it.
+- Per-request flag targeting (per tenant, per user). The resolver holds no per-request state and passes a process-scoped evaluation context; request-scoped attributes cannot influence it.
 - Dynamic sampling rates. `otel-sampler` is untouched.
 - Changing span shapes, attributes, semantic conventions, or business logic anywhere.
-- Owning the OpenFeature provider lifecycle, evaluation context, or relay polling interval. Those belong to the application.
+- Owning the OpenFeature **default** provider, the **global** evaluation context, or provider shutdown. The library installs a **named** provider on its own domain when the environment asks for one and none exists (D17); everything outside that domain stays the application's.
 
 ## The resolution model in one place
 
@@ -86,15 +94,19 @@ The first two tiers are conjunctive and interchangeable in effect; they differ i
 
 ## Decisions
 
-### D1. Application owns the provider; the library only reads
+### D1. The application owns the default provider; the library reads through its own domain
 
-`internal/flags` calls `openfeature.NewClient(domain)` and never `SetProvider`, `SetNamedProvider`, `SetEvaluationContext`, `AddHooks`, or `Shutdown`. The client itself is created lazily on the first refresh rather than in `NewResolver`, so a process whose switches are off never initializes any part of the OpenFeature SDK.
+`internal/flags` calls `openfeature.NewClient(FlagDomain)` and never `SetProvider`, `SetEvaluationContext`, `AddHooks`, or `Shutdown`. The one thing it may install is a **named** provider bound to `FlagDomain`, and only under D17's conditions. The client itself is created lazily on the first evaluation rather than in `NewResolver`, so a process whose switches are off never initializes any part of the OpenFeature SDK.
 
-This mirrors the rule this repo already applies to tracing: packages never initialize a `TracerProvider`, they fall back to `otel.GetTracerProvider()`. The reasons transfer verbatim — provider lifecycle is an application concern, a library must not mutate process-global state, and several instrumentation modules in one binary must not fight over it.
+The boundary this draws is narrower than "never touch the SDK's global state", and it is the load-bearing one: nothing the library does can change how the **application's own** feature flags resolve. A named provider on `otel-instrumentation-go` is invisible to `NewClient("")` and to every other domain.
 
-*Alternatives considered.* Having each `internal/flags` copy lazily construct its own provider from an environment variable would be zero-configuration, but an application using Mongo, NATS, and WebSocket would run three independent providers polling the relay, and would collide with an application that installs its own. Racing to install the global provider "first one wins" avoids the triple poll but still has a library silently mutating global state, and the SDK offers no reliable way to ask whether the installed provider is still the no-op default.
+This still mirrors the rule this repo applies to tracing — packages never initialize a `TracerProvider` — in the part that matters. A `TracerProvider` decides where the application's telemetry goes; the analogous blast radius here is the default provider, and that stays untouched.
 
-*Consequence — the domain is a hook, not an isolation boundary.* `NewClient("otel-mongo")` resolves through the process-global default provider unless the application installs a named one. An application that wants a different provider for one module can do so with `SetNamedProvider("otel-mongo", p)`, and that falls out for free — but until it does, any other library in the same binary that installs a global provider (breaking the rule we follow) also decides our flags. Under D2 the worst such a provider can do is revoke, so the failure is in the safe direction; the domain name alone should nonetheless not be read as protection.
+*Alternatives considered.* Leaving provider construction entirely to the application, the shape this design carried until D17, keeps the library free of any global mutation at all. It was replaced because it makes relay control cost a code change in every consuming application, and the three objections that originally justified it have since been answered: the triple-poll problem is removed by a shared domain and a `NoopProvider` check (D17), the collision problem by using a named rather than default provider, and "the SDK offers no reliable way to ask whether the installed provider is still the no-op default" was simply **false** — `openfeature.ProviderMetadata().Name` answers it exactly.
+
+*Consequence — the domain is now an isolation boundary in one direction.* Once D17 has installed a named provider on `FlagDomain`, another library in the same binary that installs a global provider (breaking the rule we follow) can no longer decide our flags. Until then — and in every process that does not set the endpoint variable — `NewClient(FlagDomain)` falls back to the default provider, so the old exposure remains. Under D2 the worst such a provider can do is revoke, so the failure is in the safe direction either way.
+
+*Consequence — per-module providers are no longer available.* All four modules share one domain (D17), so an application cannot point `otel-mongo` at a different relay from `otel-nats`. The previous design's per-module `SetNamedProvider("otel-mongo", p)` hook is given up; nothing asked for it, and a single domain is what makes one provider instance serve all four without leaking a poller goroutine per module.
 
 *Consequence — two provider settings are load-bearing.* The design's guarantee that a relay outage cannot affect the application holds only if the application configures the provider correctly, and two defaults work against it.
 
@@ -102,11 +114,15 @@ This mirrors the rule this repo already applies to tracing: packages never initi
 
 An install failure must not abort startup. If the relay is unreachable at boot, the provider's first fetch fails and `SetProviderAndWait` returns an error; the documented handling is to log and continue, because the relay is a brake and not a prerequisite. The cost is unavoidable and stated rather than hidden: a process that starts while the relay is down cannot learn about an active revocation, so it comes up at the state its environment declares.
 
-Neither of these is something the library can enforce — the application owns the provider (D1) — so both are stated as requirements in `feature-flags.md` rather than as suggestions, with the failure mode spelled out.
+For the provider D17 installs, the first is **enforced in code**: `DataCollectorDisabled: true` and `EvaluationType: INPROCESS` are hardcoded and deliberately not exposed as environment variables, so the zero-code path cannot be misconfigured into either failure. For an application that installs its own provider the library can enforce nothing, so both remain stated as requirements in `feature-flags.md` rather than as suggestions, with the failure mode spelled out.
 
 *Consequence — the provider must be ready before the first operation.* D2 makes an unresolvable flag mean "do not interfere", which is fail-open with respect to the relay. That is correct in steady state and wrong for exactly one window: process startup. An application that installs its provider with `openfeature.SetProvider` gets a non-blocking install, so between that call and the provider's first successful fetch every flag resolves to `true`. A module whose environment variable is truthy — which it must be for the relay to control it at all — is therefore **on** during that window, even while the relay is revoking it.
 
-The scenario that makes this matter is the ordinary one: an operator revokes a module to stop an incident, and the process restarts for an unrelated reason. Under the superseded design a not-ready provider fell back to the environment, which for a deployment expecting relay control was usually off, so it failed closed. Under this one it falls back to allow. Applications SHALL therefore install the provider with `openfeature.SetProviderAndWait` — or otherwise block until it reports ready — before serving traffic. This is a requirement of the design rather than a stylistic preference, and the README states it as one, because an application has no way to derive the reason on its own.
+The scenario that makes this matter is the ordinary one: an operator revokes a module to stop an incident, and the process restarts for an unrelated reason. Under the superseded design a not-ready provider fell back to the environment, which for a deployment expecting relay control was usually off, so it failed closed. Under this one it falls back to allow.
+
+**Blocking on readiness is the application's call, not a requirement of this design.** D17 installs non-blocking, deliberately: the alternative is to make the first instrumented operation of the process wait on a relay round trip, and a brake must not become a latency source. The window that leaves open is bounded by one relay fetch, and an application that cannot accept it closes it itself — install a provider with `openfeature.SetProviderAndWait` before constructing any wrapper, and D17 stands down (its trigger requires `ProviderMetadata().Name == "NoopProvider"`). The capability is not lost; it moves to the party that can decide whether the window matters.
+
+What the window costs is stated rather than hidden, because for `otel-mongo` it is not only spans: `_oteltrace` written during it is permanent (D10), and cleanup is a `$unset` migration. `feature-flags.md` states both the window and the way to close it.
 
 ### D2. The relay is a kill switch: the evaluation default is always `true`
 
@@ -159,25 +175,27 @@ When `gate1` resolves off, the module constructs only its passthrough implementa
 
 ```go
 type Resolver struct {
-    domain string
-    keys   []string   // OpenFeature flag keys, in Allowed-index order
+    keys []string   // OpenFeature flag keys, in Allowed-index order
 
     clientOnce sync.Once
     client     openfeature.IClient
+    evalCtx    openfeature.EvaluationContext   // populated only when D17 installed (service.name)
 }
 
-func NewResolver(domain string, opts ...ResolverOption) *Resolver
+func NewResolver(opts ...ResolverOption) *Resolver
 func WithFlagKeys(keys ...string) ResolverOption
 
 func (r *Resolver) Allowed(i int) bool {
     if i < 0 || i >= len(r.keys) {
         return false      // a mis-wired module degrades to disabled, not to a panic
     }
-    return r.evaluator().Boolean(context.Background(), r.keys[i], true, openfeature.EvaluationContext{})
+    return r.evaluator().Boolean(context.Background(), r.keys[i], true, r.evalCtx)
 }
 ```
 
-That is the whole resolver. There is no snapshot, no TTL, no clock, no refresh, and no timeout.
+That is the whole resolver. There is no snapshot, no TTL, no clock, no refresh, and no timeout. `NewResolver` takes no domain: the domain is process-scoped rather than module-scoped, so D5 makes it a constant in the byte-identical file and removes a string that would otherwise have to agree across five places with nothing checking it.
+
+`evaluator()` is where the lazy `NewClient` lives, and D17 hangs the environment-driven provider install on the same `sync.Once`.
 
 **What this costs, measured.** On an in-memory provider — the same shape as the GO Feature Flag in-process provider this design supports — one `client.Boolean` call is **2.0 µs, 336 B and 7 allocations**, against **82 ns and 0 allocations** for an atomic-pointer snapshot read. The 2 µs is not the flag lookup; it is the SDK's evaluation pipeline around it: before/after/finally hook chains, evaluation-context merging, the provider registry's RWMutex, interface dispatch. The provider being in memory does not help with any of it.
 
@@ -192,7 +210,9 @@ What deferring buys is the removal of an entire class of concurrency subtleties 
 - no cross-flag consistency question: with no TTL there is no TTL boundary for a two-flag read to straddle, leaving only the microsecond window between two consecutive `Boolean` calls, which R19 already accepted as WONTFIX
 - no shared mutable snapshot slice to protect from callers
 - no refresh timeout, and therefore no magic number defending a configuration the design already declares unsupported
-- revocation takes effect immediately rather than immediately-plus-up-to-one-second
+- one less term in the revocation-latency budget
+
+**What the latency budget actually is.** The removed TTL was never the dominant term. A revocation becomes visible when the provider's background poll picks it up, and that interval is **60 seconds** by default under D17 (the GO Feature Flag provider's own default is 120 s, and `interval <= 0` falls back to it — `evaluator/inprocess.go:186`). Against that, the deleted one-second TTL was under 2% of the end-to-end delay. It is listed above as a simplification, not as a latency win, and this correction matters twice over: `feature-flags.md` must not describe revocation as immediate, and the bar for adding a cache back is lower than this section originally implied — a one-second TTL on top of a 60-second poll moves the worst case from 60 s to 61 s.
 
 **The evaluation runs on the caller's goroutine.** With the supported in-process provider that is a local, allocation-heavy but bounded computation. With the unsupported remote evaluation mode it would be a synchronous HTTP request on the path of every Mongo query and every NATS publish — which is the reason that mode is unsupported rather than merely discouraged.
 
@@ -207,13 +227,29 @@ What deferring buys is the removal of an entire class of concurrency subtleties 
 **Shared global kill-switch helper.** The process-wide name `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is the one env string every module already hard-codes. `internal/flags` SHALL export:
 
 ```go
-const EnvGlobalTracing = "OTEL_INSTRUMENTATION_GO_TRACING_ENABLED"
+const (
+    EnvGlobalTracing = "OTEL_INSTRUMENTATION_GO_TRACING_ENABLED"
+
+    // D17: provider auto-install. Process-scoped, like the kill switch above.
+    EnvFlagsEndpoint     = "OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT"
+    EnvFlagsAPIKey       = "OTEL_INSTRUMENTATION_GO_FLAGS_API_KEY"
+    EnvFlagsPollInterval = "OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL"
+
+    // D12: the targeting attribute source, defined by the OTel specification.
+    EnvServiceName = "OTEL_SERVICE_NAME"
+
+    // The one OpenFeature domain all four modules resolve through. Exported
+    // because module-package tests install their in-memory provider on it.
+    FlagDomain = "otel-instrumentation-go"
+)
 
 func GlobalTracingPossible() bool { return EnvEnabled(EnvGlobalTracing) }
 func GlobalTracingSet() bool      { return EnvSet(EnvGlobalTracing) }
 ```
 
-Module-specific godoc (especially D9's otel-ws negotiation rationale) lives at the Dial/Upgrade/capability call sites, not on the shared one-liners. No other `OTEL_*` names may appear in the shared file.
+The rule is that the shared file may not name anything **module**-scoped. Every name above is process-scoped — one kill switch, one provider, one domain for the whole binary — so it belongs here for the same reason `EnvGlobalTracing` does, and putting it here is what keeps five copies of the domain string from having to agree with nothing checking them.
+
+Module-specific godoc (especially D9's otel-ws negotiation rationale) lives at the Dial/Upgrade/capability call sites, not on the shared one-liners.
 
 ```go
 // otel-mongo/otelmongo/env_flags.go
@@ -222,7 +258,7 @@ const (
     idxPropagation
 )
 
-var mongoResolver = flags.NewResolver("otel-mongo",
+var mongoResolver = flags.NewResolver(
     flags.WithFlagKeys(
         "otel-mongo-tracing",      // paired with envMongoTracingEnabled, ANDed by this package
         "otel-mongo-propagation",  // paired with envMongoPropagationEnabled, ANDed by this package
@@ -230,7 +266,7 @@ var mongoResolver = flags.NewResolver("otel-mongo",
 )
 ```
 
-The evaluation call and the truthiness rules — the parts most likely to drift if hand-copied — stay inside the byte-identical file. The zero-dependency property that file used to have is given up here; the OpenFeature SDK is the only import added, and it is the reason the file is worth sharing at all.
+The evaluation call, the truthiness rules and the provider install — the parts most likely to drift if hand-copied — stay inside the byte-identical file. The zero-dependency property that file used to have is given up here, and D17 gives up more of it than the OpenFeature SDK alone: the file also imports the GO Feature Flag provider and `log/slog`. That concentration is the argument for sharing the file, not against it — the alternative is four hand-maintained copies of a provider construction that must agree on two hardcoded options.
 
 **The byte-identical rule is maintained by code review, not by a check.** There is no CI step comparing the four copies; the package doc comment currently claims otherwise and is corrected as part of this change. All four are identical today, so the discipline has held, but it is worth naming what a single drifted copy would do, because this change concentrates more load-bearing logic in that file than it previously held:
 
@@ -240,6 +276,8 @@ The evaluation call and the truthiness rules — the parts most likely to drift 
 | the truthiness allow-list | that module accepts `enabled` or an empty string where the others do not |
 | `EnvSet` | the mutual-exclusion check misfires or fails to fire for that module |
 | lazy client construction | "switches off ⇒ the OpenFeature SDK is never touched" stops holding for that module |
+| `FlagDomain` | that module resolves through a domain nobody installed a provider on, so it falls back to the default provider and the relay's revocations never reach it — the kill switch is dead for one module and no test goes red |
+| `EnvFlagsEndpoint` | that module never auto-installs, so in a zero-code deployment it is the only one the relay cannot revoke |
 
 A CI step comparing the copies' hashes, alongside the existing "Verify direct/ has no OTel SDK imports" grep that protects an invariant of exactly this shape, would turn the rule into a check. It is deliberately out of scope here — this change's mandate is the kill switch, not CI infrastructure — and is recorded so the option is not lost.
 
@@ -322,15 +360,32 @@ negotiationCapability = gate1 && EnvEnabled(OTEL_GORILLA_WS_TRACING_ENABLED)
 
 The relay verdict is excluded because it can flip a second later — but, under D2, excluding it costs nothing, because a relay can only revoke. A connection whose module environment variable is off at handshake time can never be switched on by any later relay value, so there is no future state in which it would need the envelope. This is the direct benefit of the kill-switch model: capability is now a fully static expression, and the previous design's R4 exception — "upgrading without a provider changes the wire between library peers when the global switch is on and the module switch is off" — **no longer exists**. With no provider installed, `otel-gorilla-ws` reproduces the previous release's wire behavior exactly.
 
-The read path is safe either way: `tryUnmarshalWire` probes and falls back to the raw payload when the message is not an envelope. Only the write path must match what the peer agreed to, because sending an envelope to a peer that did not negotiate `otel-ws` hands `{"header":...,"data":...}` to that peer's application code.
+Only the write path must match what the peer agreed to, because sending an envelope to a peer that did not negotiate `otel-ws` hands `{"header":...,"data":...}` to that peer's application code. The read path probes with `tryUnmarshalWire`, which recognises the envelope and otherwise treats the frame as a legacy flat message or as an opaque payload.
+
+**The probe is not byte-transparent, and must be made so.** `tryUnmarshalWire`'s legacy branch unmarshals any non-empty JSON object into a `map[string]json.RawMessage`, deletes `traceparent`/`tracestate`, and re-marshals (`message.go:76-101`). Go serialises maps with keys sorted, so an ordinary JSON payload carrying neither trace key still comes back with its fields reordered and its whitespace normalised — semantically identical, byte-wise different, and wrong for any caller that hashes or signature-verifies the frame. A message with neither key is by definition not a legacy envelope, so the branch SHALL return `ok=false` when both are absent, leaving the original bytes untouched. This is newly reachable because the R7 clamp (below) makes a capability-off peer write raw frames onto a negotiated connection, which is exactly the input that falls through to this branch.
+
+*The envelope shape is reserved.* The envelope branch matches any object with a `header` of all-string values and a `data` member, so an application payload of that shape on an `otel-ws` connection is unwrapped and its outer structure discarded. Tightening the match (requiring `header` to contain only the two trace keys) is rejected: it would make any future header member added by the JS packages fail the match and fall into the legacy branch, which is worse. `otel-ws` is a negotiated protocol and `otel-ws.md` publishes the envelope, so `{"header":…,"data":…}` is a reserved wire structure — stated there, since that document currently does not say so.
 
 **Envelope follows negotiation outcome, not feature-on aspiration (R1).** `Conn.tracingEnabled` means "otel-ws was negotiated (or proven via subprotocol)", not "this process might want spans".
 
 - `Dial` / `Upgrader.Upgrade` set `tracingEnabled` from the handshake result.
 - `NewConn` has no handshake: it sets `tracingEnabled` from `isOTelWireProtocol(conn.Subprotocol())`. Callers that manage the handshake themselves must leave a correct negotiated subprotocol on the raw conn. There is **no** `WithOTelWSNegotiated` escape hatch — that would reintroduce force-envelope wire corruption.
+- That instruction has to be followable, and today it is not: the token (`otelWSProtocol`), the `otel-ws+<app>` composite form and the predicate (`isOTelWireProtocol`) are all unexported, so a caller running their own handshake can only hardcode strings that are internal details — while `otel-ws.md` already publishes them as a wire contract. Two additive symbols close that gap without reopening the escape hatch, because neither can force an envelope onto a peer that did not negotiate one:
+
+  ```go
+  // SubprotocolOTelWS is the subprotocol token this package negotiates.
+  const SubprotocolOTelWS = "otel-ws"
+
+  // IsOTelNegotiated reports whether NewConn will enable the envelope on conn.
+  func IsOTelNegotiated(conn *websocket.Conn) bool
+  ```
+
+  The token lets a hand-rolled handshake be written correctly; the predicate lets it be verified rather than assumed. A stock `websocket.Dialer`/`Upgrader` can only reach the bare `otel-ws` form — gorilla echoes exact matches — so the `otel-ws+<app>` composite remains exclusive to `Upgrader.Upgrade`; documented alongside the constant.
 - When negotiation failed or is unproven the wire is raw passthrough; if capability and the per-call gate are on, local send/receive spans may still be created without inject/extract.
-- `configureConn` clamps `tracingEnabled = tracingEnabled && capable` so a historical `true` cannot outlive a capability-off process (R7).
+- **The R7 clamp applies to the write path only.** `configureConn` clamps the *write* decision with `capable`, so a capability-off process never emits an envelope and a historical `true` cannot outlive it. It must **not** clamp the read path. Whether the peer envelopes is a fact established by the handshake; our gate is a local policy, and applying policy to the fact is what produced the defect: on a connection that proved `otel-ws` with `capable` false, `ReadMessage`'s `!c.capable` fast path (`conn.go:190-193`) hands the peer's `{"header":…,"data":…}` bytes to the application unparsed. `Conn` therefore records the wire fact in its own field, unclamped, and the read path unwraps whenever that field is set. The write side stays clamped and the asymmetry is safe in that direction, because a peer receiving a raw frame falls back to the payload. Unwrapping is `json.Unmarshal` with the headers discarded — no span, no attribute build, no propagator call — so the disabled-mode invariant is untouched.
 - A relay revocation on a negotiated connection stops spans and stops injection; the envelope keeps being written with an empty header, because the peer parses every frame as one.
+
+*Consequence — the WebSocket kill switch is a telemetry switch, not an overhead switch.* Because the envelope survives a revocation, a revoked `otel-gorilla-ws` still runs `marshalWire` on every write and the `tryUnmarshalWire` probe on every read; only the spans and the inject/extract disappear. It is the one module of the four that does not return to the zero-cost path when the relay revokes, and removing that wire overhead requires a redeploy. The alternative — dropping the envelope on revocation — desynchronises the wire from a peer that is still enveloping and silently dismembers any payload shaped like one, so correctness wins. `feature-flags.md`'s operational summary states the limit next to "set its relay flag to `false`", because an operator pulling the brake during a latency incident would otherwise expect relief that does not come.
 
 *Consequence.* Two peers that both run this library with `gate1` on **and** `OTEL_GORILLA_WS_TRACING_ENABLED` truthy exchange the JSON envelope on every message, including while the relay has revoked tracing. That is a deliberate deployment choice by that site, not something a reader of the previous CHANGELOG would be surprised by.
 
@@ -342,18 +397,22 @@ The flags exist to stop the library doing work **on the caller's behalf**. `Coll
 
 The comparison that settles it is with `Cursor.DecodeAndTrace` / `ChangeStream.DecodeAndTrace`, which look superficially similar and **are** gated:
 
-| | emits telemetry | writes to the document | gated |
-|---|---|---|---|
-| `Collection.InsertOne` and siblings | CLIENT span | `_oteltrace` | yes |
-| `Cursor.DecodeAndTrace` | `mongo.cursor.decode` span | no | yes |
-| `ContextFromDocument` | no | no | **no** |
-| `ContextFromRawDocument` | no | no | **no** |
+| | emits telemetry | writes to the document | gated | still extracts when the flag is off |
+|---|---|---|---|---|
+| `Collection.InsertOne` and siblings | CLIENT span | `_oteltrace` | yes | — |
+| `Cursor.DecodeAndTrace` | `mongo.cursor.decode` span | no | yes | **no** (`direct.Cursor.DecodeAndTrace` returns `ctx` unchanged) |
+| `ContextFromDocument` | no | no | **no** | **yes** |
+| `ContextFromRawDocument` | no | no | **no** | **yes** |
 
 `DecodeAndTrace` starts and ends a real span on every call, so it belongs under the switch. The package-level pair does not, so it does not. An earlier revision of this design had them following the relay on the grounds that two code paths in one change-stream loop should not obey different rules; that argument assumed the two paths were the same kind of thing, and they are not.
+
+The last column is the one an operator has to read, and it is why the table gains it: without it, both ungated rows look inert. **Revocation does not stop trace-context extraction.** A caller who wants linking to survive the library being silenced writes `Decode` + `ContextFromDocument` instead of `DecodeAndTrace`, and gets it — the gate on `DecodeAndTrace` governs the span it emits, not the linking, and is bypassable by design through the documented alternative. `feature-flags.md` § *What is not gated* says this in those words, because § *Operational summary*'s "to stop a module now" otherwise reads as though everything stops.
 
 *Consequence — the invariant is about gated paths.* The disabled-mode invariant's "no propagator inject/extract" clause is scoped to code the flags govern. `propagation` is OTel **API**, not SDK, so nothing in the compiler-enforced `internal/direct` boundary or the CI grep is weakened; the clause is restated in `CLAUDE.md` to say what it protects (no span, no SDK, no exporter, no attribute build, no injection) rather than to list mechanisms.
 
 *Consequence — BREAKING.* A process with every switch off previously got a zero `SpanContext` and `false` from `ContextFromDocument`, and an unmodified `ctx` from `ContextFromRawDocument`. It now gets the document's real span context. The direction is more capability, not less, and only code that calls these functions is affected — but a deployment that switched an environment variable off specifically to stop trace linking must now stop calling them instead.
+
+*Consequence — one relay evaluation per document disappears.* These two are the per-document call in a change-stream or cursor loop, so under the previous gate they paid D4's 2 µs and 7 allocations once per document, on top of whatever the operation itself resolved. Ungated, they resolve nothing. The cost D4 accepts is now confined to wrappers doing work on the caller's behalf, which is where the argument for paying it lives.
 
 *Consequence — the option blind spot stops mattering.* Because there is no gate, there is nothing for the package-level pair to misread when a deployment supplies `gate1` through `WithTracingEnabled` rather than the environment variable. The mutual-exclusion rule in D3 no longer has a corner where choosing the option spelling silently disables a read path.
 
@@ -372,15 +431,47 @@ The environment variable is **not** the flag's evaluation default (D2); it is a 
 
 *Alternatives considered.* Reusing the environment variable strings as flag keys would give operators one identifier instead of two, but `UPPER_SNAKE` is foreign to GO Feature Flag configuration and welds the two namespaces together. Making keys overridable through additional environment variables would let a site match an in-house naming convention, but the relay configuration is written by that same site — naming a flag `otel-mongo-tracing` there costs nothing.
 
-### D12. Evaluation context is the application's
+### D12. Evaluation context is the application's, except for one attribute on the zero-code path
 
-The library passes an empty `openfeature.EvaluationContext{}`. Applications that want targeting install a global one with `openfeature.SetEvaluationContext`, which the SDK merges into every evaluation.
+An application that installs its own provider owns its evaluation context outright: it calls `openfeature.SetEvaluationContext`, the SDK merges that into every evaluation, and the library adds nothing. That is unchanged.
 
-The library has no non-arbitrary source for `service.name` or `deployment.environment` — it would have to guess between `OTEL_SERVICE_NAME`, the OTel resource, and hostname — and anything it invented would collide with what the application set. The resolver passes no attributes and holds no per-request state, so only process-scoped attributes are meaningful anyway.
+The zero-code path (D17) cannot do that — `SetEvaluationContext` is Go code, and the whole point of the path is that there is none. Left empty, its evaluation context makes every relay rule untestable, so `otel-mongo-tracing: false` is the only expressible revocation and it lands on **every process in the fleet**. An incident in one service forces a fleet-wide revocation or nothing.
 
-### D13. Testing uses an in-memory provider and an injected clock
+So when — and only when — D17 installed the provider, the resolver supplies one attribute:
 
-Tests install `memprovider.NewInMemoryProvider(...)` through `SetProviderAndWait`, mutate a flag value, and assert the next operation observes it. Because D4 resolves per call, no clock injection, no reset hook and no waiting are involved: the change is visible on the very next operation. This is what replaces the deleted `Gate.ResetForTest` — the provider is the control surface, so tests drive the real code path instead of bypassing it.
+```go
+if svc := os.Getenv("OTEL_SERVICE_NAME"); svc != "" {
+    r.evalCtx = openfeature.NewTargetlessEvaluationContext(
+        map[string]any{"service.name": svc})
+}
+```
+
+Three things make this narrow enough to be safe:
+
+- **`OTEL_SERVICE_NAME` is not a guess.** It is the OpenTelemetry specification's own variable, already set by any deployment running an exporter. Reading it is the least arbitrary source available to an OTel instrumentation library; `OTEL_RESOURCE_ATTRIBUTES` (a spec format to parse) and hostname (genuinely arbitrary) stay out.
+- **It is passed at the invocation site, never through `SetEvaluationContext`.** The SDK merges *API → transaction → client → invocation*, so this composes with an application's global context instead of replacing it, and D1's rule against mutating global state holds.
+- **It is confined to the D17 path**, which removes the one collision the merge order would otherwise create: invocation wins over global, so supplying it on the application-installed path could override a `service.name` the application set itself. A process on the D17 path has no global context to override.
+
+Unset `OTEL_SERVICE_NAME` yields an empty context and today's behaviour exactly. What it buys is a relay rule that can name one service:
+
+```yaml
+otel-mongo-tracing:
+  variations: { enabled: true, disabled: false }
+  targeting:
+    - query: service.name eq "checkout-api"
+      variation: disabled
+  defaultRule: { variation: enabled }
+```
+
+Per-request targeting remains a Non-Goal regardless: the attribute is process-scoped and the resolver holds no request state.
+
+### D13. Testing uses an in-memory provider
+
+Tests install `memprovider.NewInMemoryProvider(...)` through **`SetNamedProviderAndWait(flags.FlagDomain, …)`**, mutate a flag value, and assert the next operation observes it.
+
+**Named, not default, and the endpoint variable must be unset.** Both halves are forced by D17. A named provider on `FlagDomain` outranks the default for our clients, so a test that installs a default provider is silently shadowed the moment any earlier test in the same binary triggered an auto-install — the assertion then reads whatever that provider serves. And `clientOnce` makes the install a once-per-process event that no test can undo, since D6 deleted `ResetForTest`. Installing on the same domain the production path resolves through removes the shadowing; keeping `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` unset in the test environment removes the trigger. Tests that exercise D17 itself set the variable deliberately and assert on the registration, in isolation from the rest.
+
+Rejected: reintroducing a `ResetForTest` hook, which D6 has just deleted and which the above does not need; and making the domain configurable, which restores the five-way string agreement D5 removed, for tests alone. Because D4 resolves per call, no clock injection, no reset hook and no waiting are involved: the change is visible on the very next operation. This is what replaces the deleted `Gate.ResetForTest` — the provider is the control surface, so tests drive the real code path instead of bypassing it.
 
 Tests must exercise the kill-switch asymmetry explicitly: a relay `true` against a falsy module environment variable must produce **no** spans and **no** evaluation, and a relay `false` against a truthy one must stop a running connection.
 
@@ -391,6 +482,16 @@ One integration test stands up a real GO Feature Flag relay proxy container and 
 A full harness-level assertion that spans stop reaching the OTLP sink after a revocation is deliberately excluded. It would have to outwait the provider's poll interval and the exporter's batch timeout, making it a timing race; its two halves are already covered separately by the integration test (the value propagates) and the unit tests (a false value emits no span).
 
 Because the OpenFeature provider and the environment are both process-global, tests that touch them must not call `t.Parallel` — the same constraint that already applies to the environment-toggling tests.
+
+This revision's decisions each need coverage:
+
+- **D17 auto-install** — fires with the endpoint set and no provider installed; stands down when a provider already exists; a malformed `_POLL_INTERVAL` warns, falls back to 60 s and still installs; an unset endpoint installs nothing and touches no SDK state.
+- **D12 `service.name`** — attached on the auto-install path when `OTEL_SERVICE_NAME` is set, absent otherwise, and never attached on the application-installed path.
+- **D14 warning** — a set-but-unrecognised value warns; unset, truthy and explicitly falsy values do not.
+- **D9 Q2** — `SubprotocolOTelWS` and `IsOTelNegotiated` agree with what `NewConn` actually does.
+- **D9 Q3** — a conn that proved `otel-ws` with `capable` false returns the *unwrapped* payload from `ReadMessage`, not the envelope bytes, and still writes raw.
+- **D9 Q4** — a JSON-object payload carrying neither trace key comes back byte-identical, key order included.
+- **Open question 1** — a document already carrying `_oteltrace`, re-injected, yields exactly one occurrence and extraction returns the new value.
 
 ### D14. `EnvEnabled` recognises an explicit truthy allow-list
 
@@ -407,7 +508,19 @@ An unset variable is false, as before. What changes is the default branch: previ
 
 The allow-list mirrors the existing falsy list one-for-one (`0`/`false`/`no`/`off`), so the documented rule is symmetric and short.
 
-*Consequence — BREAKING.* Deployments that enable a switch with any value outside the allow-list silently flip to disabled on upgrade. The direction is fail-safe (less instrumentation, never more), but it presents as "spans disappeared after upgrading" and must be called out in every CHANGELOG.
+**A set-but-unrecognised value warns.** `EnvEnabled` emits one `slog.Warn` when the variable is present and its value is in neither list:
+
+```
+level=WARN msg="unrecognised boolean value; treated as disabled"
+  var=OTEL_INSTRUMENTATION_GO_TRACING_ENABLED value=enabled
+  accepted="1,true,yes,on / 0,false,no,off"
+```
+
+Three cases stay silent, so a correct deployment logs nothing: unset (the legitimate default-off), a value in the falsy list (an explicit off), and a value in the truthy list. Only a misconfiguration speaks. This became possible with D17, which brings `log/slog` into the shared file for the provider install; before it the library had no output channel and the failure had to stay silent. The cost is bounded by D8's invariant that `EnvEnabled` is called at construction only and never on a hot path.
+
+**No deduplication.** A process constructing N wrappers emits the warning N times. A `sync.Map` of already-warned names would fix that, and is rejected: it puts mutable state into the file D5 identifies as the highest drift risk in the repository, to suppress repetition of a message that only appears when something is already wrong.
+
+*Consequence — BREAKING.* Deployments that enable a switch with any value outside the allow-list flip to disabled on upgrade. The direction is fail-safe (less instrumentation, never more), and the warning above names the cause at the moment it happens rather than leaving it to present as "spans disappeared after upgrading" — but it must still be called out in every CHANGELOG, because a deployment that does not read warnings sees only the symptom.
 
 ### D15. Conflicting configuration fails at construction, with named errors
 
@@ -431,6 +544,48 @@ Returned errors wrap the sentinel and name both observed values (`option=false, 
 
 *Consequence — BREAKING.* Every `NewConn` call site must change. In this repository that is four test call sites; the one known downstream consumer (`instrumentation-demo`) does not use `otel-gorilla-ws` at all.
 
+### D17. The library installs a named provider from the environment when none exists
+
+An application obtains relay control by setting environment variables. It writes no Go code, adds no import, and changes nothing but its deployment configuration.
+
+```go
+// inside Resolver.evaluator(), under the existing clientOnce
+if endpoint := os.Getenv(EnvFlagsEndpoint); endpoint != "" &&
+    openfeature.ProviderMetadata().Name == "NoopProvider" {
+    // ... construct, register (non-blocking), populate evalCtx per D12
+}
+r.client = openfeature.NewClient(FlagDomain)
+```
+
+Two conditions, both necessary. The endpoint variable is the operator's expression of intent; the `NoopProvider` check is what makes the install an *allowance* rather than a takeover — an application that installs its own provider before constructing any wrapper keeps it, and this path stands down.
+
+| Setting | Source | Note |
+|---|---|---|
+| `Endpoint` | `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` | Unset or empty ⇒ nothing is installed and no SDK state is touched |
+| `APIKey` | `OTEL_INSTRUMENTATION_GO_FLAGS_API_KEY` | Never included in a warning or error message |
+| `FlagChangePollingInterval` | `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` | `time.ParseDuration` only, default `60s` |
+| `DataCollectorDisabled` | **hardcoded `true`** | D1's stall mechanism, now unmissable |
+| `EvaluationType` | **hardcoded `INPROCESS`** | The unsupported remote mode is unreachable from this path |
+| everything else | not exposed | `Headers`, `ExporterMetadata`, `HTTPClient`, `Logger`, and the six `DataCollector*`/`FlagCache*` fields, which the two hardcoded settings make inert anyway |
+
+**Duration strings only, and a malformed one does not disable the brake.** `60` is rejected rather than read as 60 ms — the OTel convention of bare-integer milliseconds would turn a plausible value into a catastrophic misreading of a polling interval. A parse failure warns through `slog.Default()`, falls back to `60s`, and **still installs**. The opposite rule (refuse to install) was decided first, when the install had a caller that could return the error; once it moved inside the library the error's only outlet became a log line, and refusing would let a typo in an optional tuning knob silently delete the entire kill switch — the highest-severity outcome reachable from the lowest-severity mistake. An empty endpoint is different in kind: there is no default to fall back to, so nothing installs.
+
+**Why 60 s.** The provider's own default is 120 s (`evaluator/inprocess.go:21`, applied when the interval is `<= 0`). Two minutes is the wrong default for an emergency brake. At 60 s the poll is a conditional `GET` with an ETag returning 304 in the steady state, so the cost of halving it is negligible; D4's latency-budget note records that this interval, not the resolver, is what revocation latency is made of.
+
+*Alternatives considered — all three failed on the same constraint.* The application may change `go.mod` only, not any `.go` file. Go initialises packages purely from the import graph, and `go mod tidy` deletes a `require` that nothing imports, so **no code can be made to run from `go.mod` alone** — not via `godebug` (stdlib toggles), `tool` (build-time), or build tags (a build-command and `.go` change). The trigger therefore has to live in a package the application already imports, which means the instrumentation modules themselves.
+
+- *A separate `otel-flagsetup` module with a blank import* (`import _ ".../autoinstall"`) is the idiomatic Go answer and was the decision until that constraint was stated. It keeps the provider's dependency tree out of every consumer's build, because a Go dependency follows the import. One `.go` line, which is one too many.
+- *A minimal in-house provider* built on `net/http` and `encoding/json` keeps `go.mod` clean and needs no app code. Rejected on correctness: the relay's configuration format supports targeting rules, percentage rollouts and JSONLogic queries, and a minimal evaluator would silently ignore a revocation expressed as any of them — an operator would believe the brake was applied when it was not.
+- *The OFREP provider* has an effectively empty dependency tree and would evaluate correctly, since the relay does the evaluating. Rejected because it has no cache and no poller — `internal/evaluate/resolver.go` issues one HTTP request per `Boolean` call, putting a network round trip on the path of every Mongo query and NATS publish, which D4 and `feature-flags.md` § *In-process evaluation only* exclude by design.
+
+*Consequence — four `go.mod` files gain the GO Feature Flag provider.* That brings roughly ten modules including `go-feature-flag/modules/core`, the ofrep provider, `bluele/gcache`, `diegoholiveira/jsonlogic`, `nikunjy/rules` and a full `antlr4-go/antlr` runtime, into every consumer's build — including consumers that never set the endpoint variable. The cost is to `go.sum` length, vulnerability-scanning surface and licence review rather than to runtime, since the linker drops unreached code. It is the price of the zero-`.go`-change requirement, and no design satisfies both.
+
+*Consequence — a bounded startup window in which nothing can be revoked.* The install is non-blocking, so between it and the provider's first successful fetch every flag resolves to `true`. An application that cannot accept that closes it by installing its own provider with `SetProviderAndWait`; see D1.
+
+*Consequence — the four modules can race to install.* Each module's `internal/flags` copy holds its own `clientOnce`, and no state is shared between them, so two modules evaluating for the first time concurrently can both observe `NoopProvider` and both register. The second registration replaces the first and the SDK shuts the first down (`shutdownOld`, whose multiple-bindings guard does not apply since each instance is bound to one domain), leaving one live provider and one poller. The cost is a duplicated first fetch. No lock can span four `internal/` packages that do not import each other; accepted and stated.
+
+*Consequence — the poller outlives everything.* Nothing shuts the provider down: there is no handle to hand back on a path whose entire premise is that the application writes no code. D4 rejected a background ticker partly for lacking "a shutdown story this repo has no API for", and this accepts that same gap knowingly, for one goroutine per process that ends with the process. An application that needs lifecycle control installs its own provider and owns it.
+
 ## Risks / Trade-offs
 
 **Tracing cannot be enabled remotely.** The relay is the wrong tool for "turn this on so I can see what is happening". → Stated in the README next to the wiring snippet, and in every CHANGELOG. Sites that want relay control deploy with the module switch on and use the relay as a brake.
@@ -443,15 +598,25 @@ Returned errors wrap the sentinel and name both observed values (`option=false, 
 
 **`NewConn` signature change.** → BREAKING; see D16.
 
-**A misconfigured provider can turn a relay outage into an application stall.** The provider's data collector, on by default, flushes synchronously from the evaluating goroutine once its buffer fills, and a failed flush never drains it. → `DataCollectorDisabled: true` is documented as required, with the mechanism spelled out, in `feature-flags.md` and in every wiring snippet. The library cannot enforce it, because the application owns the provider.
+**A misconfigured provider can turn a relay outage into an application stall.** The provider's data collector, on by default, flushes synchronously from the evaluating goroutine once its buffer fills, and a failed flush never drains it. → On the D17 path this is **enforced in code**: `DataCollectorDisabled: true` is hardcoded and not exposed as a variable. For an application installing its own provider it remains documented-only, with the mechanism spelled out, in `feature-flags.md` and in every wiring snippet.
 
-**Every evaluation runs on the caller's goroutine.** With the supported in-process provider that is 2 µs and 7 allocations per operation (D4). With an unsupported remote-evaluation provider it would be a synchronous HTTP request on the path of every Mongo query and NATS publish. → The per-operation cost is measured, recorded and accepted as a deferral; the unsupported mode is stated in `feature-flags.md` and in the README.
+**Every evaluation runs on the caller's goroutine.** With the supported in-process provider that is 2 µs and 7 allocations per operation (D4). With an unsupported remote-evaluation provider it would be a synchronous HTTP request on the path of every Mongo query and NATS publish. → The per-operation cost is measured, recorded and accepted as a deferral. The unsupported mode is now unreachable from the D17 path, which hardcodes `INPROCESS`; it remains stated in `feature-flags.md` and in the README for applications installing their own provider.
 
 **Revocations are not atomic across flags.** A relay change touching several flags is observed by consecutive `Boolean` calls microseconds apart, so an operation reading two of them can in principle see one old and one new value. → This is R19, already accepted: the window is microseconds, and for the pair that actually interacts — Mongo tracing and propagation — a false tracing verdict short-circuits propagation, so the combination fails safe.
 
 **`_oteltrace` is written into application documents and never removed.** Roughly 90 bytes per document across six write methods, with no strip on read, no undo, and a hard write failure against strict `$jsonSchema` validation. → D2 and D10 mean only the deployment can start this; the relay can only stop it. Documented in the module README with the field shape, the write methods, the size, and the fact that cleanup is a `$unset` migration.
 
-**Four `go.mod` files gain the OpenFeature SDK.** Consumers that never use the relay still resolve the dependency. → The SDK is small and dependency-light; the alternative designs that avoid it all require application-side wiring that this change explicitly set out to avoid.
+**Four `go.mod` files gain the OpenFeature SDK *and* the GO Feature Flag provider.** Consumers that never set the endpoint variable still resolve roughly ten additional modules, including a full ANTLR runtime, a JSONLogic evaluator and a rules engine. → Accepted in D17 as the price of relay control without a `.go` change, since Go cannot run code from `go.mod` alone. The cost lands on `go.sum`, vulnerability-scanning surface and licence review, not on runtime. The one design that avoids it — a separate module plus a blank import — costs the application one line of Go, which the requirement excludes.
+
+**The kill switch cannot be revoked during a bounded startup window.** D17 installs non-blocking, so from the install until the provider's first fetch every flag reads `true`; for `otel-mongo` that window can write permanent `_oteltrace` fields. → Stated in D1 and `feature-flags.md`, with the way to close it: install a provider with `SetProviderAndWait` before constructing any wrapper and D17 stands down. Blocking by default was rejected because it would put a relay round trip in front of the first instrumented operation.
+
+**Nothing shuts the auto-installed provider down.** One poller goroutine and one HTTP client live for the process lifetime. → Accepted in D17; a path whose premise is "the application writes no code" has nowhere to hand a shutdown function back to. Applications needing lifecycle control install their own provider.
+
+**Two modules can install a provider concurrently.** The four `internal/flags` copies share no state, so both may observe `NoopProvider` and register. → The SDK's replace-and-shutdown leaves one live provider; the cost is one duplicated fetch. No lock can span four non-importing `internal/` packages.
+
+**A revoked `otel-gorilla-ws` still pays the envelope on every frame.** Revocation stops spans and injection but not `marshalWire`/`tryUnmarshalWire`, so it is the one module that does not return to the zero-cost path. → Accepted in D9: dropping the envelope would desynchronise the wire from a peer still enveloping. Stated in `feature-flags.md` § *Operational summary* so an operator does not expect overhead relief from the brake.
+
+**Revocation is not immediate.** End-to-end latency is the provider's poll interval — 60 s by default under D17, not the microseconds the uncached resolver suggests. → D4's latency note is corrected and `feature-flags.md` gains a section stating the number, replacing wording that read as "immediate".
 
 ## Migration Plan
 
@@ -462,8 +627,9 @@ Returned errors wrap the sentinel and name both observed values (`option=false, 
    - any code that sets `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` *and* passes `WithTracingEnabled` now fails at construction (D3/D15).
 
    Unlike the design that preceded this revision, there is **no** wire-format exception for `otel-gorilla-ws`: negotiation is gated on the static capability (D9), so peers see exactly the previous release's wire.
-4. `otelgorillaws.NewConn` call sites must take the new error return (D16).
-5. Deployments adopting the relay install a provider at startup, next to their existing `otelsetup.Init()` call, create the flags on the relay, and **deploy with the module switches on** — the relay can only revoke. Until a flag exists on the relay, the module runs at its deployed state.
+4. `otelgorillaws.NewConn` call sites must take the new error return (D16). Two `otel-gorilla-ws` behaviours also change without a signature change, both fixes, both altering returned bytes in the affected case: `ReadMessage` on a connection that proved `otel-ws` with capability off now returns the unwrapped payload instead of the peer's envelope bytes (D9), and a JSON-object payload carrying neither trace key is returned byte-identical instead of re-marshalled with sorted keys (D9). `SubprotocolOTelWS` and `IsOTelNegotiated` are additive.
+5. Deployments adopting the relay set `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` (plus `_API_KEY` and `_POLL_INTERVAL` if needed), create the flags on the relay, and **deploy with the module switches on** — the relay can only revoke. No application code changes. Until a flag exists on the relay, the module runs at its deployed state. Applications that already install their own OpenFeature provider keep it and need not set the endpoint variable; D17 stands down when a provider is present.
+6. Deployments wanting per-service targeting set `OTEL_SERVICE_NAME` (D12) and write the relay rule against `service.name`. Without it, a relay flag applies to every process in the fleet.
 
 **Rollback.** Pin the previous module version. There is no persisted state and no relay configuration that must be torn down — flags left on the relay are simply ignored by the older build. `_oteltrace` fields already written to documents are not removed by a rollback; that is a `$unset` migration either way.
 
@@ -482,6 +648,11 @@ This design was revised after PR #27 shipped an implementation of an earlier mod
 | R4: "no provider ⇒ identical behavior" is false for otel-ws negotiation | Withdrawn — D9's capability is fully static, so the exception no longer arises |
 | Detecting whether the relay "has an opinion" (double `Boolean` evaluation) | Unnecessary — under D2 "relay silent" and "relay allows" are the same outcome |
 | A per-module snapshot behind an `atomic.Pointer` with a one-second TTL | D4 — deferred, not rejected. Caching is invisible behind `Allowed(i) bool`, so it can be added later at no call-site cost; the measured 2 µs it would save is recorded there |
+| The application owns the provider outright; the library never installs one | D17 — the library installs a **named** provider on its own domain when the environment asks for one and none exists. The default provider, the global evaluation context and shutdown remain the application's |
+| Applications SHALL install with `openfeature.SetProviderAndWait`, because a not-ready provider cannot revoke | D1 — downgraded to the application's call. D17 installs non-blocking so a brake never becomes a latency source; an application that needs the startup window closed installs its own provider and D17 stands down |
+| "The SDK offers no reliable way to ask whether the installed provider is still the no-op default" | Factually wrong. `openfeature.ProviderMetadata().Name == "NoopProvider"` answers it, and D17 makes it the auto-install trigger |
+| Each module resolves through its own domain (`otel-mongo`, `otel-nats`, …) | D5/D17 — one process-scoped `FlagDomain`. Per-module domains would need one provider instance each, because `InProcess.Init` is not idempotent and registering one instance under N domains leaks N−1 unstoppable pollers |
+| Revocation takes effect immediately | D4 — end-to-end latency is the provider's poll interval, 60 s by default. The resolver adds nothing; it never did |
 
 ## Post-review remediation (PR #27 grill, 2026-08)
 
@@ -489,13 +660,13 @@ Source: `reviews/code-review-pr-27-openfeature-dynamic-flags.zh-TW.html` and a d
 
 | ID | Topic | Decision | Status after revision |
 |----|--------|----------|----------------------|
-| R1 | `NewConn` wire corruption when capability on + feature off | Envelope only if negotiated/proven; fail → raw wire; local spans OK; no force-negotiated option; clamp with capable (R7) | Stands (D9) |
+| R1 | `NewConn` wire corruption when capability on + feature off | Envelope only if negotiated/proven; fail → raw wire; local spans OK; no force-negotiated option; clamp with capable (R7) | **Amended (D9)** — the clamp is correct for the write path and wrong for the read path; the wire fact is now recorded unclamped and `ReadMessage` unwraps on it. "No force-negotiated option" stands, and `SubprotocolOTelWS`/`IsOTelNegotiated` are added so the instruction it implies can be followed |
 | R2 | `MessageBatch` freezes flag at Fetch | Always return a dynamic batch wrapper; per-message gate re-check | Stands (D8) |
 | R3 | `Resolver.refresh` last-store-wins + late `at` | Stamp `at` at evaluation start; no CAS/mutex | **Moot** — D4 removes the snapshot, so there is no `at` and no refresh |
 | R4 | otel-ws negotiation vs "no provider ⇒ no change" | Was: keep behavior, document exception | **Withdrawn** — D9 removes the exception |
 | R5 | Mongo single-call-chain torn read of tracing | Pass resolved tracing into propagation; no internal recompute | Stands |
 | R6 | JetStream per-message rebuild of tracer/attrs | Hoist tracer/prop/baseAttrs to construction; gate stays per-message | Stands |
-| R7 | `capable` / `tracingEnabled` no choke-point clamp | Subsumed into R1 | Stands |
+| R7 | `capable` / `tracingEnabled` no choke-point clamp | Subsumed into R1 | **Amended (D9)** — clamp applies to the write decision only |
 | R8 | Dead second return of `collectionImpl` Find/Aggregate/Watch | Drop second return; stop throwaway `New*` in impls | Stands |
 | R9 | `tracedMessagesContext.Next` not gate-first | Gate-first delegate to `directMessagesContext` | Stands |
 | R10 | Gate/propEnabledGate doc drift | Full sync: CLAUDE, test comments, jetstream godoc, main spec | Stands, widened by the revision |
@@ -511,9 +682,9 @@ Source: `reviews/code-review-pr-27-openfeature-dynamic-flags.zh-TW.html` and a d
 
 ## Open Questions
 
-Two items are known-open and tracked in `tasks.md`, not blockers for the design:
+Both items previously listed here are now **in scope** and carried in `tasks.md` as work, not as questions:
 
-1. **Read-modify-write may produce a duplicate `_oteltrace` field.** `InjectTraceIntoDocument` appends unconditionally, so a document read into a `bson.M`, modified and written back with `ReplaceOne` carries the field twice in the resulting `bson.D`. Needs a test to confirm the server's behavior; if confirmed, inject must remove any existing key before appending. Independent of the relay.
-2. **`CLAUDE.md` claims `_oteltrace` is "stripped on read".** No such code exists in either module. The claim must be corrected wherever it appears.
+1. **Read-modify-write produces a duplicate `_oteltrace` field.** `InjectTraceIntoDocument` appends unconditionally (`internal/shared/tracing.go:55`), so a document read into a `bson.M`, modified and written back with `ReplaceOne` carries the field twice. This was recorded as needing a test to establish the server's behaviour first; that framing understated it, because the **read** side is deterministically wrong regardless of what the server does: `ExtractMetadataFromRaw` uses `bson.Raw.LookupErr`, which returns the **first** match, so extraction yields the stale trace context from the original write and a read-modify-write loop pins the linkage there permanently. Inject removes any existing key before appending, in both modules. A change whose central argument is the correctness of what gets written into application documents (D2, D10) should not ship carrying a known defect in exactly that.
+2. **`CLAUDE.md` claims `_oteltrace` is "stripped on read".** No such code exists in either module, and D10 depends on the opposite being true. Corrected wherever it appears.
 
 Items deliberately excluded from this change stay Non-Goals: dynamic sampling rates, per-request targeting, a harness-level flag-flip E2E assertion, `Resolver` CAS/singleflight, parallel `Boolean` fan-out, and remote enablement of any switch.

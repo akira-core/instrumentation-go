@@ -13,8 +13,6 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
-
-	"github.com/akira-core/instrumentation-go/otel-nats/otelnats/internal/flags"
 )
 
 const (
@@ -44,48 +42,46 @@ type MsgHandler func(m Msg)
 // when tracing is on, directConn (passthrough) when off.
 //
 // Selection happens per operation, not once at construction, so a relay flag
-// change reaches a long-lived connection without it being re-established. Two
-// cases short-circuit that: a WithTracingEnabled override pins the choice for the
-// connection's lifetime, and a process whose global kill switch is off never
-// builds the instrumented implementation at all. Both are represented by static
-// being non-nil, which makes impl() a single nil check on those paths.
+// change reaches a long-lived connection without it being re-established. NO
+// connection is ever static — not even one carrying WithTracingEnabled, which
+// supplies the first tier and says nothing about the relay.
+//
+// What construction does fix is the ceiling: traced is nil when the two
+// environment-derived tiers say this connection could never trace, and then no
+// OTel SDK code path is reachable for its lifetime and the resolver is never
+// consulted.
 type Conn struct {
 	nc *nats.Conn
 
-	// static is non-nil when the choice is fixed for this connection's lifetime.
-	static connImpl
-	// direct and traced are both non-nil only when the choice is dynamic.
+	// direct is always non-nil. traced is non-nil only when the static tiers
+	// allow tracing, and is then selected per operation by the relay verdict.
 	direct connImpl
 	traced connImpl
 }
 
 // impl returns the implementation this operation runs through.
-// Dynamic-path flag condition must stay lockstep with msgHandler and
-// traceEventMsgHandler (static? / natsTracingEnabled?) — do not change one alone.
+// The condition must stay lockstep with msgHandler and traceEventMsgHandler
+// (traced == nil? / natsRelayAllows?) — do not change one alone.
 func (c *Conn) impl() connImpl {
-	if c.static != nil {
-		return c.static
-	}
-	if natsTracingEnabled() {
+	if c.traced != nil && natsRelayAllows() {
 		return c.traced
 	}
 	return c.direct
 }
 
 // msgHandler returns the nats.MsgHandler bound into a subscription. A
-// subscription is created once and often lives for the whole process, so a
-// dynamic Conn must NOT pin impl()'s answer at subscribe time — both handlers
-// are built once here and the flag is re-resolved per message, so a
-// subscription created before a relay change follows it. A static Conn binds
-// its pinned impl's handler directly.
+// subscription is created once and often lives for the whole process, so it
+// must NOT pin impl()'s answer at subscribe time — both handlers are built once
+// here and the relay verdict is re-resolved per message, so a subscription
+// created before a revocation follows it.
 func (c *Conn) msgHandler(subject, queue string, handler MsgHandler) nats.MsgHandler {
-	if c.static != nil {
-		return c.static.wrapMsgHandler(subject, queue, handler)
+	if c.traced == nil {
+		return c.direct.wrapMsgHandler(subject, queue, handler)
 	}
 	th := c.traced.wrapMsgHandler(subject, queue, handler)
 	dh := c.direct.wrapMsgHandler(subject, queue, handler)
 	return func(m *nats.Msg) {
-		if natsTracingEnabled() {
+		if natsRelayAllows() {
 			th(m)
 		} else {
 			dh(m)
@@ -94,15 +90,16 @@ func (c *Conn) msgHandler(subject, queue string, handler MsgHandler) nats.MsgHan
 }
 
 // traceEventMsgHandler is msgHandler's sibling for SubscribeTraceEvents: hop
-// spans follow the flag per event rather than being pinned at subscribe time.
+// spans follow the relay verdict per event rather than being pinned at
+// subscribe time.
 func (c *Conn) traceEventMsgHandler() nats.MsgHandler {
-	if c.static != nil {
-		return c.static.traceEventHandler()
+	if c.traced == nil {
+		return c.direct.traceEventHandler()
 	}
 	th := c.traced.traceEventHandler()
 	dh := c.direct.traceEventHandler()
 	return func(m *nats.Msg) {
-		if natsTracingEnabled() {
+		if natsRelayAllows() {
 			th(m)
 		} else {
 			dh(m)
@@ -181,25 +178,21 @@ func WithTraceDestination(subject string) Option {
 	})
 }
 
-// WithTracingEnabled overrides flag resolution for this Conn only, in either
-// direction. When set, this value is authoritative for the resulting Conn —
-// including everything derived from it, such as oteljetstream wrappers — and
-// takes precedence over the global env kill switch, the module env var and any
-// value the relay proxy serves.
+// WithTracingEnabled supplies the process-wide first-tier switch for this Conn
+// only. It is an alternative SPELLING of OTEL_INSTRUMENTATION_GO_TRACING_ENABLED,
+// not an override of it: supplying both is a configuration error reported by the
+// constructor (ErrTracingConfigConflict), even when the two agree.
 //
-// An overridden Conn is fully STATIC: its implementation is fixed at construction
-// and no OpenFeature evaluation ever runs for it, so a later relay change cannot
-// start or stop its tracing. Connections constructed WITHOUT this option resolve
-// per operation and do follow the relay.
+// It is one tier of three and says nothing about the other two. A Conn carrying
+// it — and everything derived from it, such as oteljetstream wrappers — still
+// reads OTEL_NATS_TRACING_ENABLED at construction and still resolves the relay
+// verdict on EVERY operation, so it still stops when the relay revokes. There
+// is no way to opt a connection out of a revocation.
 //
-// This lets an application derive NATS tracing from its own toggle instead of
-// requiring every deployment to export the two env vars, and lets tests
-// construct both traced and untraced connections in the same process without
-// process-wide env manipulation or an OpenFeature provider.
-//
-// A Conn constructed with WithTracingEnabled(false) delegates natively with
-// no spans; a Conn constructed with WithTracingEnabled(true) traces even if the
-// env gates are off or unset.
+// It exists for callers who cannot set a process environment variable: tests,
+// or several independently configured connections in one binary. With the
+// environment variable unset, the option is the only source of the first tier,
+// so both a tracing and a non-tracing Conn can be built in one process.
 func WithTracingEnabled(v bool) Option {
 	return optionFunc(func(c *connConfig) {
 		c.TracingEnabled = &v
@@ -211,20 +204,21 @@ func Version() string {
 	return instrumentationVersion
 }
 
-func newConn(nc *nats.Conn, opts ...Option) *Conn {
+func newConn(nc *nats.Conn, opts ...Option) (*Conn, error) {
 	cfg := newConnConfig(opts...)
 	direct := &directConn{nc: nc}
 
-	// A WithTracingEnabled override is authoritative and static: the choice is
-	// fixed here and no OpenFeature evaluation ever happens for this connection.
-	// Without an override, the global kill switch decides whether the
-	// instrumented implementation is built at all — when it is off, nothing but
-	// the passthrough exists and no OTel code path is reachable.
-	if cfg.TracingEnabled != nil && !*cfg.TracingEnabled {
-		return &Conn{nc: nc, static: direct}
+	// Both environment-derived tiers, ANDed and fixed here. When they say no,
+	// only the passthrough is built: no OTel code path is reachable and the
+	// resolver is never consulted. Including the module env var is safe because
+	// the relay can only revoke — with it off, no relay value could raise the
+	// answer, so the instrumented implementation could never be reached.
+	possible, err := tracedPossible(cfg.TracingEnabled)
+	if err != nil {
+		return nil, err
 	}
-	if cfg.TracingEnabled == nil && !flags.GlobalTracingPossible() {
-		return &Conn{nc: nc, static: direct}
+	if !possible {
+		return &Conn{nc: nc, direct: direct}, nil
 	}
 
 	if cfg.Propagators == nil {
@@ -243,11 +237,9 @@ func newConn(nc *nats.Conn, opts ...Option) *Conn {
 		traceDest:   cfg.TraceDest,
 	}
 
-	if cfg.TracingEnabled != nil {
-		// Override is true: pinned on, immune to later relay changes.
-		return &Conn{nc: nc, static: traced}
-	}
-	return &Conn{nc: nc, direct: direct, traced: traced}
+	// Both implementations exist; the relay verdict selects between them per
+	// operation. The option supplied gate1 and does not pin anything.
+	return &Conn{nc: nc, direct: direct, traced: traced}, nil
 }
 
 // serverAttrsFromConn parses the connected NATS server address into server.address / server.port attributes.

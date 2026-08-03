@@ -94,17 +94,19 @@ and `gate1` SHALL be resolved as:
 
 `flags.EnvSet(name)` SHALL report only whether the variable is present, via `os.LookupEnv`. It SHALL be used solely for the mutual-exclusion check and SHALL NOT be used to decide whether a switch is enabled.
 
+A set value belonging to neither the truthy nor the falsy list SHALL additionally emit one `slog.Warn` before returning disabled, so the reversal below announces itself rather than presenting later as "spans disappeared after upgrading". Unset, truthy and explicitly falsy values SHALL stay silent. The full contract, including the decision not to deduplicate the warning, is in the `dynamic-feature-flags` capability.
+
 #### Scenario: Allow-list membership decides
 - **WHEN** a switch is set to `ON`, ` true `, `yes`, or `1`
-- **THEN** `EnvEnabled` reports enabled
+- **THEN** `EnvEnabled` reports enabled and emits no warning
 
 #### Scenario: Empty string no longer enables
 - **WHEN** a switch is exported with an empty value
 - **THEN** `EnvEnabled` reports disabled, reversing the behavior of the preceding release
 
-#### Scenario: Unrecognised values no longer enable
+#### Scenario: Unrecognised values no longer enable, and warn
 - **WHEN** a switch is set to `enabled`, `2`, `y`, or `t`
-- **THEN** `EnvEnabled` reports disabled, reversing the behavior of the preceding release
+- **THEN** `EnvEnabled` reports disabled, reversing the behavior of the preceding release, and emits a warning naming the variable, the value and the accepted values
 
 ### Requirement: Named configuration-conflict errors
 Each wrapper module SHALL export a sentinel error value for the mutual-exclusion violation, wrapped by the error its constructors return, so callers can match it with `errors.Is`. `otel-mongo` (v1 and v2) SHALL export a second sentinel for the `WithTracePropagationEnabled` / `OTEL_MONGO_PROPAGATION_ENABLED` pair. Because `internal/flags` is not importable by consumers, the sentinels SHALL live in each module's own package; only the `EnvSet` predicate is shared.
@@ -130,7 +132,7 @@ A constructor with more than one such check — only `otel-mongo` has one — SH
 ### Requirement: Cached gate resolution
 **Reason**: `flags.Gate` cached a resolver's result for the entire process lifetime, which is incompatible with revoking a flag at runtime. Its three call sites (`natsGate`, `wsGate`, `propEnabledGate`) are replaced by `flags.Resolver`, which resolves on every call. `Gate` and `NewGate` are deleted rather than left as dead code.
 
-**Migration**: None required for consumers — `internal/flags` is not importable outside this repository. Within the repository, replace `flags.NewGate(fn)` with `flags.NewResolver(domain, flags.WithFlagKeys(...))` and `gate.Enabled()` with the three-tier conjunction defined in *Composed per-module gates*. See the `dynamic-feature-flags` capability for the replacement contract.
+**Migration**: None required for consumers — `internal/flags` is not importable outside this repository. Within the repository, replace `flags.NewGate(fn)` with `flags.NewResolver(flags.WithFlagKeys(...))` — no domain argument; the OpenFeature domain is a process-scoped constant in the shared file — and `gate.Enabled()` with the three-tier conjunction defined in *Composed per-module gates*. See the `dynamic-feature-flags` capability for the replacement contract.
 
 ### Requirement: Test-only cache reset
 **Reason**: `Gate.ResetForTest` is removed with `Gate`. Nothing replaces it: because `Resolver` caches nothing, tests change a value on the installed in-memory provider and the next operation observes it. The provider is the control surface, so tests drive the real code path instead of bypassing it.

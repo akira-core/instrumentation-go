@@ -29,6 +29,10 @@ func (d *Database) effectiveTracing() bool { return d.gate.effectiveTracing() }
 // _oteltrace. See gateState for static-client and R5 rules.
 func (d *Database) effectivePropagation() bool { return d.gate.effectivePropagation() }
 
+// propagationWhenTracing is the propagation gate for the instrumented impls,
+// which are reached only once tracing has already resolved true (design R5).
+func (d *Database) propagationWhenTracing() bool { return d.gate.propagationWhenTracing() }
+
 // Collection returns a Collection with document-level trace propagation.
 func (d *Database) Collection(name string, opts ...*options.CollectionOptions) *Collection {
 	return newCollectionForDatabase(d, d.Database.Collection(name, opts...))

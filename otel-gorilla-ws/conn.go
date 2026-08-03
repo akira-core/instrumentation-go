@@ -39,9 +39,35 @@ import (
 // ScopeName is the instrumentation scope name for Tracer creation (OTel contrib guideline).
 const ScopeName = "instrumentation-go/otel-gorilla-ws"
 
-// otelWSProtocol is the subprotocol token injected during the WebSocket handshake
-// to negotiate otel-ws trace propagation support.
-const otelWSProtocol = "otel-ws"
+// SubprotocolOTelWS is the WebSocket subprotocol token this package negotiates
+// to enable trace-context propagation.
+//
+// It is exported for callers who run their own handshake and then wrap the
+// result with NewConn, which enables the envelope only when the raw connection
+// carries a negotiated otel-ws subprotocol. Offer this token (client) or echo
+// it (server) to satisfy that. A stock websocket.Dialer or Upgrader can reach
+// only the bare form, because gorilla echoes exact matches; the composite
+// "otel-ws+<app>" form is produced only by this package's Upgrader.Upgrade.
+//
+// Exporting the token is not an escape hatch: it cannot force an envelope onto
+// a peer that did not negotiate one.
+const SubprotocolOTelWS = "otel-ws"
+
+// otelWSProtocol is the internal spelling of SubprotocolOTelWS.
+const otelWSProtocol = SubprotocolOTelWS
+
+// IsOTelNegotiated reports whether conn's negotiated subprotocol proves otel-ws,
+// i.e. whether NewConn will enable envelope handling on it.
+//
+// Callers running their own handshake use this to verify the outcome instead of
+// assuming it: a connection that silently failed to negotiate otel-ws still
+// works, but carries no trace context.
+func IsOTelNegotiated(conn *websocket.Conn) bool {
+	if conn == nil {
+		return false
+	}
+	return isOTelWireProtocol(conn.Subprotocol())
+}
 
 // Conn is a WebSocket connection with built-in OpenTelemetry trace-context
 // propagation.  It embeds *websocket.Conn so that callers can still use all
@@ -49,40 +75,48 @@ const otelWSProtocol = "otel-ws"
 type Conn struct {
 	*websocket.Conn
 
-	propagator     propagation.TextMapPropagator
-	tracer         trace.Tracer
-	tracingEnabled bool // true only after successful otel-ws subprotocol negotiation
+	propagator propagation.TextMapPropagator
+	tracer     trace.Tracer
 
-	// featureOverride is the WithTracingEnabled value when the option was passed.
-	// When non-nil the connection is static: featureEnabled returns it verbatim
-	// and no OpenFeature evaluation runs. When nil, featureEnabled resolves the
-	// dynamic flag per call so a relay change reaches this live connection.
-	featureOverride *bool
+	// enveloped records the WIRE FACT: the peer envelopes every frame, because
+	// otel-ws was negotiated (Dial / Upgrade) or proven from the raw
+	// connection's subprotocol (NewConn). It is NOT clamped by capability —
+	// whether the peer wraps its frames is settled by the handshake and this
+	// side's local gate has no power over it. The read path keys on this, which
+	// is what stops a capability-off wrapper from handing raw
+	// {"header":...,"data":...} bytes to the application.
+	enveloped bool
 
-	// capable records whether this connection could EVER trace — the override
-	// when present, otherwise the global kill switch at construction. False ⇒
-	// pure passthrough: no envelope handling, no spans, no OpenFeature
-	// evaluation, exactly the pre-dynamic disabled behavior. Distinct from both
-	// tracingEnabled (the negotiation outcome) and featureEnabled() (the
-	// per-call span gate): a capable, negotiated connection whose dynamic flag
-	// is off still speaks the envelope wire format, because the peer committed
-	// to it at the handshake.
+	// tracingEnabled is the WRITE-side envelope decision: enveloped AND
+	// capable. A capability-off process writes raw frames even to a peer that
+	// envelopes — safe, because that peer's probe falls back to the payload —
+	// while a capable, negotiated connection whose relay verdict is off still
+	// writes the envelope, because the peer committed to it at the handshake.
+	tracingEnabled bool
+
+	// capable records whether this connection could EVER trace: both
+	// environment-derived tiers ANDed at construction (gate1, spelled either as
+	// OTEL_INSTRUMENTATION_GO_TRACING_ENABLED or WithTracingEnabled, AND
+	// OTEL_GORILLA_WS_TRACING_ENABLED). False ⇒ no spans and no OpenFeature
+	// evaluation, exactly the pre-dynamic disabled behavior. Distinct from
+	// enveloped (the wire fact) and from featureEnabled() (the per-call gate).
 	capable bool
 }
 
 // featureEnabled reports whether this call should create spans and inject or
 // extract trace context.
 //
-// Distinct from tracingEnabled, which is the otel-ws subprotocol NEGOTIATION
-// outcome and is fixed for the connection's lifetime. A connection can have
-// tracingEnabled true (peer agreed to envelopes) while featureEnabled is false
-// (relay turned tracing off): it keeps writing envelopes, because the peer
-// expects them, but injects nothing and creates no span.
+// It is the per-call gate: the static capability AND the relay verdict, which
+// is resolved fresh every time so a revocation reaches this live connection on
+// its next operation. There is no option branch — WithTracingEnabled supplies
+// gate1, which capability already folded in at construction.
+//
+// Distinct from enveloped and tracingEnabled, which describe the wire. A
+// connection can be enveloped with featureEnabled false: it keeps writing
+// envelopes because the peer expects them, but injects nothing and creates no
+// span.
 func (c *Conn) featureEnabled() bool {
-	if c.featureOverride != nil {
-		return *c.featureOverride
-	}
-	return wsTracingEnabled()
+	return c.capable && wsRelayAllows()
 }
 
 // Subprotocol returns the application protocol negotiated for this connection.
@@ -94,34 +128,41 @@ func (c *Conn) Subprotocol() string {
 
 // NewConn wraps an existing gorilla *websocket.Conn. Envelope handling is
 // enabled only when the raw connection's negotiated subprotocol proves otel-ws
-// (isOTelWireProtocol); otherwise the wire stays raw passthrough. Callers that
-// manage the handshake themselves must leave a correct negotiated subprotocol
-// on the connection. For handshake-side negotiation, use Dial or Upgrader.Upgrade.
+// (see IsOTelNegotiated); otherwise the wire stays raw passthrough. Callers that
+// manage the handshake themselves must leave a correct negotiated subprotocol on
+// the connection — offer or echo SubprotocolOTelWS. For handshake-side
+// negotiation, use Dial or Upgrader.Upgrade.
 //
-// When capable and the dynamic feature gate are on but otel-ws was not proven,
-// local send/receive spans may still be created without inject/extract.
-func NewConn(conn *websocket.Conn, opts ...Option) *Conn {
-	negotiated := false
-	if conn != nil {
-		negotiated = isOTelWireProtocol(conn.Subprotocol())
-	}
-	return newConn(conn, negotiated, opts...)
+// It returns an error when the configuration is contradictory: supplying both
+// WithTracingEnabled and OTEL_INSTRUMENTATION_GO_TRACING_ENABLED yields
+// ErrTracingConfigConflict. NewConn is the entry point most likely to be
+// misconfigured, since it is the path for callers running their own handshake.
+//
+// When capable and the relay verdict are on but otel-ws was not proven, local
+// send/receive spans may still be created without inject/extract.
+func NewConn(conn *websocket.Conn, opts ...Option) (*Conn, error) {
+	return newConn(conn, IsOTelNegotiated(conn), opts...)
 }
 
 // newConn wraps conn with the given negotiation outcome, resolving opts.
-func newConn(conn *websocket.Conn, tracingEnabled bool, opts ...Option) *Conn {
-	return newConnFromConfig(conn, tracingEnabled, resolveConnOptions(opts))
+func newConn(conn *websocket.Conn, enveloped bool, opts ...Option) (*Conn, error) {
+	cfg := resolveConnOptions(opts)
+	capable, err := effectiveCapability(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return newConnFromConfig(conn, enveloped, cfg, capable), nil
 }
 
 // newConnFromConfig is the constructor core shared by NewConn, Dial and
-// Upgrader.Upgrade — the latter two resolve their options before the
-// handshake (to gate otel-ws negotiation) and pass the parsed config here.
-func newConnFromConfig(conn *websocket.Conn, tracingEnabled bool, cfg connOptions) *Conn {
+// Upgrader.Upgrade — the latter two resolve their options and capability before
+// the handshake (to gate otel-ws negotiation) and pass both here.
+func newConnFromConfig(conn *websocket.Conn, enveloped bool, cfg connOptions, capable bool) *Conn {
 	c := &Conn{
-		Conn:           conn,
-		tracingEnabled: tracingEnabled,
+		Conn:      conn,
+		enveloped: enveloped,
 	}
-	configureConn(c, cfg)
+	configureConn(c, cfg, capable)
 	return c
 }
 
@@ -180,14 +221,16 @@ func (c *Conn) WriteMessage(ctx context.Context, messageType int, data []byte) e
 }
 
 // ReadMessage reads the next message from the WebSocket connection. A
-// "websocket.receive" consumer span is created while the dynamic span gate is
-// on. On a connection that negotiated otel-ws the envelope is ALWAYS unwrapped —
-// the peer envelopes every frame regardless of this side's gate, so skipping
-// the unwrap would hand raw {"header":...,"data":...} bytes to the application
-// whenever the gate is off while the peer still envelopes (a pinned-on peer,
-// TTL skew, or in-flight messages written before a flip).
+// "websocket.receive" consumer span is created while the per-call gate is on.
+//
+// On a connection whose peer envelopes, the envelope is ALWAYS unwrapped —
+// including when this side is not capable of tracing at all. The peer's framing
+// is a fact of the handshake, not of this side's gate, so keying the unwrap on
+// capability would hand raw {"header":...,"data":...} bytes to the application
+// whenever a capability-off process wraps a negotiated connection, or whenever
+// the peer is pinned on while this side is off.
 func (c *Conn) ReadMessage(ctx context.Context) (context.Context, int, []byte, error) {
-	if !c.capable {
+	if !c.capable && !c.enveloped {
 		msgType, raw, err := c.Conn.ReadMessage()
 		return ctx, msgType, raw, err
 	}
@@ -212,7 +255,7 @@ func (c *Conn) ReadMessage(ctx context.Context) (context.Context, int, []byte, e
 		trace.WithSpanKind(trace.SpanKindConsumer),
 	}
 
-	if c.tracingEnabled {
+	if c.enveloped {
 		decoded, hdrs, ok := tryUnmarshalWire(raw)
 		if ok {
 			payload = decoded
@@ -266,7 +309,10 @@ func (c *Conn) ReadMessage(ctx context.Context) (context.Context, int, []byte, e
 // gorilla sees it — see stripOTelSubprotocol.
 func Dial(ctx context.Context, urlStr string, requestHeader http.Header, subprotocols []string, opts ...Option) (*Conn, *http.Response, error) {
 	cfg := resolveConnOptions(opts)
-	featureOn := effectiveCapability(cfg)
+	featureOn, err := effectiveCapability(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	var otelInjected bool
 	dialProtos := subprotocols
@@ -296,17 +342,17 @@ func Dial(ctx context.Context, urlStr string, requestHeader http.Header, subprot
 		return nil, resp, err
 	}
 
-	var tracingEnabled bool
+	var enveloped bool
 	if otelInjected {
 		negotiated := raw.Subprotocol()
 		// Scenario C: server returned a non-otel app protocol → passthrough.
 		// Scenario D: server returned no protocol → passthrough (connection kept alive).
-		// Scenario G: server returned "otel-ws+<proto>" → tracing enabled.
-		tracingEnabled = isOTelWireProtocol(negotiated)
+		// Scenario G: server returned "otel-ws+<proto>" → envelope on the wire.
+		enveloped = isOTelWireProtocol(negotiated)
 	}
-	// Scenario E: otelInjected=false → tracingEnabled=false (passthrough).
+	// Scenario E: otelInjected=false → enveloped=false (passthrough).
 
-	return newConnFromConfig(raw, tracingEnabled, cfg), resp, nil
+	return newConnFromConfig(raw, enveloped, cfg, featureOn), resp, nil
 }
 
 func appProtocolFromRaw(rawProto string) string {

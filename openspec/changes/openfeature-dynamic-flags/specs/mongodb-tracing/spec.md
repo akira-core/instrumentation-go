@@ -67,6 +67,18 @@ The field SHALL NOT be removed by any read path: the module reads `_oteltrace` t
 
 Because enabling this behavior changes what is persisted — approximately 90 bytes of BSON per document, more when a `tracestate` is present — it SHALL be enablable only by the deployment (`OTEL_MONGO_PROPAGATION_ENABLED` or `WithTracePropagationEnabled`), never by a relay value.
 
+**Injection SHALL produce exactly one `_oteltrace` field.** `InjectTraceIntoDocument` currently appends unconditionally, so a document read, modified and written back — the ordinary read-modify-write cycle, since the field is never stripped on read — carries the field twice in the resulting `bson.D`. It SHALL remove any existing `_oteltrace` key before appending.
+
+The read side makes this a correctness defect independent of how the server treats a duplicate key: `ExtractMetadataFromRaw` resolves the field with `bson.Raw.LookupErr`, which returns the **first** match, so a duplicated field yields the trace context from the original write rather than the current one, and a read-modify-write loop pins the linkage there permanently. Both modules SHALL apply the same fix.
+
+#### Scenario: Re-injection replaces rather than duplicates
+- **WHEN** a document already containing `_oteltrace` is written back through a propagating write method with an active span
+- **THEN** the resulting document contains exactly one `_oteltrace` field, carrying the current span's context
+
+#### Scenario: Extraction returns the current context after a read-modify-write
+- **WHEN** a document is read, modified, written back, and then read again
+- **THEN** `ContextFromDocument` returns the span context written by the most recent write
+
 #### Scenario: Insert with active span
 - **WHEN** `InsertOne` is called with a context carrying an active OTel span and propagation is enabled
 - **THEN** the inserted document contains an `_oteltrace` field with the span's `traceparent` and `tracestate`
@@ -91,6 +103,8 @@ The justification is that they emit nothing: they start no span, build no attrib
 `Cursor.DecodeAndTrace` and `ChangeStream.DecodeAndTrace` SHALL remain gated, because they start and end a real `mongo.cursor.decode` span on every call. The two surfaces are not equivalent and SHALL NOT be given the same rule on the grounds that both read `_oteltrace`.
 
 Because they observe no configuration at all, these functions SHALL continue to ignore per-connection options, and SHALL behave identically however `gate1` was supplied.
+
+**A revocation therefore does not stop trace-context extraction, and the documentation SHALL say so in those words.** The gate on `DecodeAndTrace` governs the span it emits, not the linking, and is bypassable by design through `Decode` followed by `ContextFromDocument` — the documented alternative for a caller who wants linking to survive the library being silenced. Left unstated, the operational instruction "to stop a module now, set its relay flag to `false`" reads as though everything stops.
 
 #### Scenario: Extraction works with every switch off
 - **WHEN** `ContextFromDocument` is called on a document containing a valid `_oteltrace` field while `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` and both module environment variables are unset

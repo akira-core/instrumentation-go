@@ -79,10 +79,18 @@ Letting a capability-off side negotiate `otel-ws` would commit the peer to a wir
 - **WHEN** two capable peers establish a connection and the relay then revokes `otel-gorilla-ws-tracing`
 - **THEN** every message still carries the JSON envelope with no trace context, no spans are created, and the receiving application observes the original payload
 
+#### Scenario: Revocation does not remove the envelope's cost
+- **WHEN** `otel-gorilla-ws-tracing` is revoked on a negotiated connection
+- **THEN** each write still marshals the envelope and each read still runs the probe, so this module alone does not return to the zero-cost path on revocation, and removing that wire overhead requires a redeploy — which the operational documentation SHALL state next to the instruction for revoking a module
+
 ### Requirement: NewConn always wraps envelopes
 `NewConn(rawConn, opts...)` SHALL enable envelope wrapping **only** when the raw connection's negotiated subprotocol proves `otel-ws` (`isOTelWireProtocol`). It SHALL NOT force envelope wrapping on a connection whose subprotocol does not prove negotiation, because the peer would then receive `{"header":...,"data":...}` frames it never agreed to and hand them to its application unparsed.
 
-Callers that manage the handshake themselves SHALL leave a correct negotiated subprotocol on the raw connection. There SHALL be no option that asserts negotiation without subprotocol evidence. Construction SHALL clamp the outcome with capability, so a raw connection carrying an `otel-ws` subprotocol wrapped by a non-capable process still uses raw passthrough.
+Callers that manage the handshake themselves SHALL leave a correct negotiated subprotocol on the raw connection. There SHALL be no option that asserts negotiation without subprotocol evidence.
+
+**Capability SHALL clamp the write decision only.** Whether the peer envelopes is a fact established by the handshake; this side's feature gate is a local policy, and applying the policy to the fact corrupts the read path. A non-capable process wrapping an `otel-ws` connection SHALL therefore write raw frames — safe, because a peer receiving a raw frame falls back to treating it as the payload — while `ReadMessage` SHALL still unwrap, because the peer envelopes every frame regardless of this side's gate. `Conn` SHALL record the negotiated wire fact in a field that capability does not clamp, and the read path SHALL key on that field rather than on capability.
+
+Unwrapping under a disabled gate is `json.Unmarshal` with the extracted headers discarded — no span, no attribute construction, no propagator call — so the disabled-mode invariant is unaffected.
 
 #### Scenario: NewConn without otel-ws subprotocol stays raw on the wire
 - **WHEN** `NewConn` wraps a connection whose negotiated subprotocol is not an otel-ws protocol and the connection is capable
@@ -92,11 +100,46 @@ Callers that manage the handshake themselves SHALL leave a correct negotiated su
 - **WHEN** `NewConn` wraps a connection whose negotiated subprotocol is `otel-ws` or `otel-ws+…` and the connection is capable
 - **THEN** `WriteMessage`/`ReadMessage` use the JSON envelope for the connection lifetime, independent of later relay revocations for the envelope decision
 
-#### Scenario: Incapable wrapper of a negotiated connection stays raw
-- **WHEN** `NewConn` wraps a connection whose subprotocol is `otel-ws+json` while capability is off
-- **THEN** the wrapper delegates directly to the native connection and performs no envelope handling
+#### Scenario: Incapable wrapper of a negotiated connection writes raw
+- **WHEN** `NewConn` wraps a connection whose subprotocol is `otel-ws+json` while capability is off, and `WriteMessage` is called
+- **THEN** the application payload is sent unchanged, and the peer's probe falls back to it
+
+#### Scenario: Incapable wrapper of a negotiated connection still unwraps on read
+- **WHEN** the same wrapper receives a frame the peer enveloped
+- **THEN** `ReadMessage` returns the unwrapped payload, not the `{"header":…,"data":…}` bytes, and creates no span and performs no extraction
 
 ## ADDED Requirements
+
+### Requirement: The otel-ws subprotocol token and negotiation test are exported
+Because `NewConn` requires callers running their own handshake to leave a correct negotiated subprotocol and offers no escape hatch, the package SHALL export what is needed to satisfy that requirement:
+
+- `const SubprotocolOTelWS = "otel-ws"` — the token to offer (client) or echo (server).
+- `func IsOTelNegotiated(conn *websocket.Conn) bool` — reports whether `NewConn` will enable envelope handling on that connection.
+
+Neither SHALL be able to force an envelope onto a peer that did not negotiate one, so the prohibition on a negotiation-asserting option is preserved. The documentation SHALL state that a stock `websocket.Dialer` or `Upgrader` can reach only the bare `otel-ws` form, since gorilla echoes exact matches, and that the `otel-ws+<app>` composite remains exclusive to this package's `Upgrader.Upgrade`.
+
+#### Scenario: Hand-rolled client handshake opts in
+- **WHEN** an application sets `Subprotocols: []string{otelgorillaws.SubprotocolOTelWS, "json"}` on its own `websocket.Dialer`, dials, and wraps the result with `NewConn`
+- **THEN** envelope handling is enabled if the server echoed the token
+
+#### Scenario: Caller can verify rather than assume
+- **WHEN** an application calls `IsOTelNegotiated(raw)` before `NewConn`
+- **THEN** the result equals whether `NewConn` will enable envelope handling on that connection
+
+### Requirement: The envelope probe is byte-transparent for non-envelope payloads
+`tryUnmarshalWire` SHALL return the caller's original bytes unchanged whenever the frame is not one of the two recognised trace-carrying formats.
+
+Its legacy flat-format branch SHALL return `ok=false` when **neither** `traceparent` nor `tracestate` is present at the top level. A message carrying neither is by definition not a legacy envelope, and the branch's re-marshal of a `map[string]json.RawMessage` sorts keys and normalises whitespace, so returning it would hand the application a byte-different frame — breaking any caller that hashes or signature-verifies the payload. This path is reachable whenever a capability-off peer writes raw frames onto a negotiated connection.
+
+The envelope structure `{"header":…,"data":…}` SHALL be documented in `otel-ws.md` as **reserved** on an `otel-ws` connection: an application payload of that shape is unwrapped and its outer structure discarded. Tightening the match to require `header` to contain only the two trace keys SHALL NOT be done, because a future header member added by the JS packages would then fall into the legacy branch instead.
+
+#### Scenario: JSON object without trace keys survives byte-identically
+- **WHEN** a frame containing a JSON object with neither `traceparent` nor `tracestate` is read on a negotiated connection
+- **THEN** the application receives the original bytes, key order and whitespace included
+
+#### Scenario: Legacy flat format is still recognised
+- **WHEN** a frame contains a top-level `traceparent`
+- **THEN** the trace context is extracted and the remaining fields are returned as the payload
 
 ### Requirement: NewConn reports configuration errors
 `NewConn` SHALL have the signature `NewConn(conn *websocket.Conn, opts ...Option) (*Conn, error)` so that a configuration conflict detected at construction can be reported, in line with every other option-accepting constructor in the repository (`Dial`, `Upgrader.Upgrade`, and the Mongo and NATS connect variants, all of which already return an error).

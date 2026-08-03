@@ -1,6 +1,9 @@
 package otelgorillaws
 
 import (
+	"fmt"
+	"os"
+
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
@@ -39,30 +42,23 @@ func WithTracerProvider(tp trace.TracerProvider) Option {
 	}
 }
 
-// WithTracingEnabled overrides flag resolution for this Conn only, in either
-// direction. When set, this value is authoritative — it takes precedence over
-// the global env kill switch, the module env var and any value the relay proxy
-// serves, and it controls whether any OTel SDK code path runs at all (span
-// creation, propagator inject/extract via the wire envelope).
+// WithTracingEnabled supplies the process-wide first-tier switch for this Conn
+// only. It is an alternative SPELLING of OTEL_INSTRUMENTATION_GO_TRACING_ENABLED,
+// not an override of it: supplying both is a configuration error reported by the
+// constructor (ErrTracingConfigConflict), even when the two agree.
 //
-// An overridden Conn is fully STATIC: no OpenFeature evaluation ever runs for
-// it, so a later relay change cannot start or stop its tracing. Connections
-// constructed WITHOUT this option resolve span creation per operation and do
-// follow the relay.
+// It is one tier of three and says nothing about the other two. A connection
+// carrying it still reads OTEL_GORILLA_WS_TRACING_ENABLED at construction and
+// still resolves the relay verdict on EVERY operation, so it still stops when
+// the relay revokes. There is no way to opt a connection out of a revocation.
 //
-// In Dial and Upgrader.Upgrade this option also gates otel-ws subprotocol
-// negotiation: a connection constructed with WithTracingEnabled(false) never
-// offers (Dial) or confirms (Upgrade) otel-ws, so the peer is never committed
-// to the JSON envelope wire format that this side would not unwrap. Without the
-// option, negotiation follows the global env kill switch alone
-// (flags.GlobalTracingPossible) and NOT the relay value. Handshake cannot be
-// revisited, so gating negotiation on the dynamic flag would leave connections
-// established while off permanently unable to propagate. Cost: library peers
-// with the global switch on exchange the JSON envelope even while tracing is
-// dynamically off. The reverse does not hold — WithTracingEnabled(true) cannot
-// force the envelope onto a connection whose peer did not negotiate otel-ws;
-// the negotiation outcome (Conn.tracingEnabled) still requires both sides to
-// agree (or, for NewConn, a proven otel-ws subprotocol on the raw conn).
+// In Dial and Upgrader.Upgrade it also participates in gating otel-ws
+// subprotocol negotiation, which is resolved from the static tiers alone
+// (this switch AND the module env var) because a handshake cannot be revisited.
+// Excluding the relay costs nothing: the relay can only revoke, so a connection
+// whose module env var is off at handshake time could never later need the
+// envelope. The reverse does not hold — WithTracingEnabled(true) cannot force
+// the envelope onto a peer that did not negotiate otel-ws.
 func WithTracingEnabled(v bool) Option {
 	return func(o *connOptions) {
 		o.featureEnabled = &v
@@ -81,34 +77,58 @@ func resolveConnOptions(opts []Option) connOptions {
 	return cfg
 }
 
-// effectiveCapability resolves whether a connection may EVER trace: the
-// WithTracingEnabled override when present, otherwise the global env kill
-// switch. It deliberately does not consult the relay.
+// resolveGate1 resolves the process-wide first tier for one connection.
 //
-// This is the static half of the decision. It answers two questions that cannot
-// be revisited after construction — whether to negotiate the otel-ws subprotocol
-// during the handshake, and whether to build a real tracer at all — so it must
-// not depend on a value that can change a second later.
-func effectiveCapability(cfg connOptions) bool {
-	if cfg.featureEnabled != nil {
-		return *cfg.featureEnabled
+// The environment variable and the option are two spellings of one switch, so
+// supplying both is rejected on PRESENCE, not on value: EnvSet is required
+// because EnvEnabled cannot tell "unset" (the deployment expressed no opinion,
+// and the option may supply one) from "set to something falsy".
+func resolveGate1(cfg connOptions) (bool, error) {
+	if flags.GlobalTracingSet() && cfg.featureEnabled != nil {
+		return false, fmt.Errorf("%w: option=%v, %s=%q",
+			ErrTracingConfigConflict, *cfg.featureEnabled,
+			envGlobalTracingEnabled, os.Getenv(envGlobalTracingEnabled))
 	}
-	return flags.GlobalTracingPossible()
+	if cfg.featureEnabled != nil {
+		return *cfg.featureEnabled, nil
+	}
+	return flags.GlobalTracingPossible(), nil
+}
+
+// effectiveCapability resolves whether a connection may EVER trace: both
+// environment-derived tiers, ANDed. It deliberately does not consult the relay.
+//
+// This is the whole static part of the decision. It answers two questions that
+// cannot be revisited after construction — whether to negotiate the otel-ws
+// subprotocol during the handshake, and whether to build a real tracer at all —
+// so it must not depend on a value that can change a second later. Including
+// the module env var is safe precisely because the relay can only revoke: with
+// it off, no relay value could ever raise the answer.
+func effectiveCapability(cfg connOptions) (bool, error) {
+	gate1, err := resolveGate1(cfg)
+	if err != nil {
+		return false, err
+	}
+	return gate1 && flags.EnvEnabled(envWSTracingEnabled), nil
 }
 
 // configureConn applies cfg to c: propagator, feature override and tracer.
-// It also clamps tracingEnabled so capability-off connections never retain a
-// stale negotiation flag (choke-point for the capable ⇒ no envelope invariant).
-func configureConn(c *Conn, cfg connOptions) {
+//
+// It clamps the WRITE-side envelope decision with capability, so a
+// capability-off process never emits an envelope. It deliberately does NOT
+// clamp c.enveloped, which records whether the PEER envelopes — a fact settled
+// by the handshake that this side's local gate has no power over. Clamping that
+// too is what made ReadMessage hand raw {"header":...,"data":...} bytes to the
+// application.
+func configureConn(c *Conn, cfg connOptions, capable bool) {
 	if cfg.propagator != nil {
 		c.propagator = cfg.propagator
 	} else {
 		c.propagator = otel.GetTextMapPropagator()
 	}
 
-	c.featureOverride = cfg.featureEnabled
-	c.capable = effectiveCapability(cfg)
-	c.tracingEnabled = c.tracingEnabled && c.capable
+	c.capable = capable
+	c.tracingEnabled = c.enveloped && c.capable
 
 	if !c.capable {
 		// This connection can never trace ⇒ no OTel SDK call on the caller's

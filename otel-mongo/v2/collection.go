@@ -9,7 +9,6 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/direct"
-	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/flags"
 	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/shared"
 	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/traced"
 )
@@ -98,29 +97,20 @@ var (
 // gate is off the returned wrapper is a passthrough — no spans, no
 // _oteltrace, no propagator extract.
 func NewCollection(coll *mongo.Collection, tracer trace.Tracer, propagator propagation.TextMapPropagator) *Collection {
+	gate := envGates()
 	c := &Collection{
 		Collection: coll,
 		direct:     direct.NewCollection(coll),
-		tracing:    mongoTracingEnabled,
+		tracing:    gate.effectiveTracing,
 	}
-	if !flags.GlobalTracingPossible() {
+	if !gate.tracedBuilt {
 		return c
 	}
 	c.traced = &traced.Collection{
-		Coll:       coll,
-		Tracer:     tracer,
-		Propagator: propagator,
-		// Full three-tier resolve (includes tracing) so PropagationEnabled
-		// remains correct when inspected with tracing off (pinned by
-		// collection_test.go / dynamic_flags_test.go).
-		//
-		// KNOWN GAP (design R5): this re-resolves tracing, which impl() has
-		// already resolved for the same operation, so one operation can straddle
-		// a TTL refresh and emit a CLIENT span while skipping _oteltrace
-		// injection. Closing it needs the operation's resolved tracing value
-		// threaded into propagationOn (see gateState.propagationGiven, currently
-		// unused for that purpose).
-		PropagationEnabled: mongoPropagationEnabled,
+		Coll:               coll,
+		Tracer:             tracer,
+		Propagator:         propagator,
+		PropagationEnabled: gate.propagationWhenTracing,
 	}
 	return c
 }
@@ -141,9 +131,10 @@ func newCollectionForDatabase(d *Database, raw *mongo.Collection) *Collection {
 		Coll:       raw,
 		Tracer:     d.tracer,
 		Propagator: d.propagator,
-		// effectivePropagation re-resolves tracing internally — see the R5 known
-		// gap noted in NewCollection above.
-		PropagationEnabled: d.effectivePropagation,
+		// propagationWhenTracing, not effectivePropagation: this impl is reached
+		// only after the facade resolved tracing true for the operation, so
+		// re-resolving it here would straddle two verdicts (design R5).
+		PropagationEnabled: d.propagationWhenTracing,
 		ServerAddr:         d.serverAddr,
 		ServerPort:         d.serverPort,
 	}

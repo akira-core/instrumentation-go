@@ -4,6 +4,15 @@ import (
 	nats "github.com/nats-io/nats.go"
 )
 
+// checkConnOptions rejects a contradictory configuration BEFORE any connection
+// is opened, so a caller that supplied both WithTracingEnabled and
+// OTEL_INSTRUMENTATION_GO_TRACING_ENABLED does not leave a live NATS connection
+// behind an error return.
+func checkConnOptions(traceOpts []Option) error {
+	_, err := tracedPossible(newConnConfig(traceOpts...).TracingEnabled)
+	return err
+}
+
 // Connect establishes a NATS connection with tracing. Signature aligns with nats.Connect.
 // Tracer and propagator are read from otel globals. Call otel.SetTracerProvider and
 // otel.SetTextMapPropagator at process startup, or pass WithTracerProvider/WithPropagators
@@ -15,11 +24,14 @@ func Connect(url string, natsOpts ...nats.Option) (*Conn, error) {
 // ConnectWithOptions establishes a NATS connection with tracing.
 // WithTracerProvider/WithPropagators override the global for this Conn only (globals are not modified).
 func ConnectWithOptions(url string, natsOpts []nats.Option, traceOpts ...Option) (*Conn, error) {
+	if err := checkConnOptions(traceOpts); err != nil {
+		return nil, err
+	}
 	nc, err := nats.Connect(url, natsOpts...)
 	if err != nil {
 		return nil, err
 	}
-	return newConn(nc, traceOpts...), nil
+	return newConn(nc, traceOpts...)
 }
 
 func filterNilOptions(natsOpts []nats.Option) []nats.Option {
@@ -42,6 +54,9 @@ func ConnectTLS(url, certFile, keyFile, caFile string, natsOpts ...nats.Option) 
 // ConnectTLSWithOptions is ConnectTLS with additional trace options (WithTracerProvider, WithPropagators).
 // natsOpts are passed to the underlying nats.Connect; traceOpts configure the OTel instrumentation.
 func ConnectTLSWithOptions(url, certFile, keyFile, caFile string, natsOpts []nats.Option, traceOpts ...Option) (*Conn, error) {
+	if err := checkConnOptions(traceOpts); err != nil {
+		return nil, err
+	}
 	opts := make([]nats.Option, 0, len(natsOpts)+2)
 	opts = append(opts, natsOpts...)
 	opts = append(opts, nats.ClientCert(certFile, keyFile))
@@ -52,7 +67,7 @@ func ConnectTLSWithOptions(url, certFile, keyFile, caFile string, natsOpts []nat
 	if err != nil {
 		return nil, err
 	}
-	return newConn(nc, traceOpts...), nil
+	return newConn(nc, traceOpts...)
 }
 
 // ConnectWithCredentials connects to NATS using a credentials file (JWT + NKey), with tracing.
@@ -65,6 +80,9 @@ func ConnectWithCredentials(url, credFile string, natsOpts ...nats.Option) (*Con
 // (WithTracerProvider, WithPropagators). natsOpts are passed to the underlying nats.Connect;
 // traceOpts configure the OTel instrumentation.
 func ConnectWithCredentialsWithOptions(url, credFile string, natsOpts []nats.Option, traceOpts ...Option) (*Conn, error) {
+	if err := checkConnOptions(traceOpts); err != nil {
+		return nil, err
+	}
 	opts := make([]nats.Option, 0, len(natsOpts)+1)
 	opts = append(opts, natsOpts...)
 	opts = append(opts, nats.UserCredentials(credFile))
@@ -72,5 +90,5 @@ func ConnectWithCredentialsWithOptions(url, credFile string, natsOpts []nats.Opt
 	if err != nil {
 		return nil, err
 	}
-	return newConn(nc, traceOpts...), nil
+	return newConn(nc, traceOpts...)
 }

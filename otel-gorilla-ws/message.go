@@ -57,7 +57,16 @@ func marshalWire(carrier map[string]string, payload []byte) ([]byte, error) {
 //  2. Legacy flat format (backward compat with old Go-only deployments):
 //     {"traceparent":"...","tracestate":"...","field1":"value1"}
 //
-// Returns ok=false for non-JSON or non-object input.
+// Returns ok=false — leaving the caller's bytes untouched — for non-JSON input,
+// non-object input, and any JSON object carrying NEITHER trace key.
+//
+// That last case is load-bearing. The legacy branch rebuilds its result by
+// re-marshalling a map, and Go serialises maps with keys sorted, so returning
+// an ordinary payload through it would hand the application a byte-different
+// frame: reordered keys, normalised whitespace, collapsed duplicates. Any
+// caller that hashes or signature-verifies the frame would break. A message
+// with neither trace key is by definition not a legacy envelope, so there is
+// nothing to strip and no reason to rebuild it.
 func tryUnmarshalWire(data []byte) (payload []byte, headers map[string]string, ok bool) {
 	// 1. Try envelope format first (JS packages + new Go code).
 	var env wireEnvelope
@@ -75,6 +84,14 @@ func tryUnmarshalWire(data []byte) (payload []byte, headers map[string]string, o
 	// 2. Fallback: legacy flat format (old Go clients).
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(data, &m); err != nil || len(m) == 0 {
+		return nil, nil, false
+	}
+
+	// Neither trace key ⇒ not a legacy envelope. Return the original bytes
+	// rather than a re-marshalled, key-sorted copy of them.
+	_, hasTraceparent := m[TraceparentHeader]
+	_, hasTracestate := m[TracestateHeader]
+	if !hasTraceparent && !hasTracestate {
 		return nil, nil, false
 	}
 
