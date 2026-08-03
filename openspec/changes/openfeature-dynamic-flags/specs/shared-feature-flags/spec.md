@@ -1,18 +1,18 @@
 ## MODIFIED Requirements
 
 ### Requirement: Byte-identical vendoring across modules
-Every module (`otel-mongo`, `otel-mongo/v2`, `otel-nats`, `otel-gorilla-ws`) SHALL vendor its own copy of the `internal/flags` package (`flags.go` + `flags_test.go`), and the file contents excluding the `package` declaration line SHALL remain byte-identical across all four copies. This rule SHALL cover the `Resolver` snapshot, refresh and timeout logic added for dynamic flag resolution, which is the shared logic most at risk of silent divergence.
+Every module (`otel-mongo`, `otel-mongo/v2`, `otel-nats`, `otel-gorilla-ws`) SHALL vendor its own copy of the `internal/flags` package (`flags.go` + `flags_test.go`), and the file contents excluding the `package` declaration line SHALL remain byte-identical across all four copies. This rule SHALL cover the `Resolver` evaluation call and the truthiness rules added for dynamic flag resolution, which is the shared logic most at risk of silent divergence — and would cover any caching added to it later.
 
 #### Scenario: A module's flags.go is modified
 - **WHEN** a change modifies the body of `flags.go` in one module's `internal/flags/` copy
 - **THEN** the same change SHALL be applied to the other three modules' `internal/flags/` copies to preserve byte-identical content
 
 #### Scenario: Resolver logic is modified
-- **WHEN** the TTL comparison, snapshot construction, refresh timeout, or truthiness allow-list in one copy is changed
+- **WHEN** the evaluation call, the out-of-range behaviour, or the truthiness allow-list in one copy is changed
 - **THEN** the identical change SHALL be applied to the other three copies
 
 ### Requirement: Composed per-module gates
-Each module SHALL construct exactly one package-level `flags.Resolver` at package initialization, supplying one OpenFeature flag key per dynamic flag it owns via `flags.WithFlagKeys`, and SHALL read it at each decision point rather than caching the result on a wrapper struct. `otel-nats` and `otel-gorilla-ws` SHALL each own a single tracing key; `otel-mongo` (v1 and v2) SHALL own a tracing key and a propagation key so both verdicts can be read from one snapshot.
+Each module SHALL construct exactly one package-level `flags.Resolver` at package initialization, supplying one OpenFeature flag key per dynamic flag it owns via `flags.WithFlagKeys`, and SHALL read it at each decision point rather than caching the result on a wrapper struct. `otel-nats` and `otel-gorilla-ws` SHALL each own a single tracing key; `otel-mongo` (v1 and v2) SHALL own a tracing key and a propagation key.
 
 Composition SHALL be a conjunction of three tiers, in this order, with short-circuit evaluation:
 
@@ -32,13 +32,13 @@ where `gate1` is the first-tier switch defined below. The relay verdict SHALL be
 - **WHEN** `gate1` is enabled but the module's environment variable is unset or falsy
 - **THEN** the effective state is disabled and no `Client.Boolean` call is made for that module
 
-#### Scenario: otel-mongo reads both verdicts from one snapshot
+#### Scenario: otel-mongo resolves propagation from the operation's tracing decision
 - **WHEN** `otel-mongo` (v1 or v2) evaluates both its tracing and its propagation decision for the same operation
-- **THEN** both relay verdicts come from a single snapshot load, and the propagation decision reuses the operation's already-resolved tracing boolean rather than re-resolving it
+- **THEN** the propagation decision reuses the operation's already-resolved tracing boolean rather than re-resolving it, and short-circuits to disabled when that boolean is false
 
 #### Scenario: Values are read per decision, not cached per construction
 - **WHEN** a relay flag is revoked after a `Client` or `Conn` has been constructed
-- **THEN** the next operation on that wrapper observes the revocation within the resolver's TTL, without reconstruction, and this holds whether or not the wrapper was constructed with `WithTracingEnabled`
+- **THEN** the next operation on that wrapper observes the revocation, without reconstruction, and this holds whether or not the wrapper was constructed with `WithTracingEnabled`
 
 ### Requirement: Per-connection option and environment switch are mutually exclusive
 Each wrapper module SHALL offer a construction-time functional option, `WithTracingEnabled(v bool)`, that supplies the first-tier switch (`gate1`) for that connection or client. The option and the environment variable `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` SHALL be two spellings of the same tier and SHALL NOT both be supplied: when the environment variable is **present** — tested by `os.LookupEnv`, irrespective of its value — and the option is also passed, construction SHALL return an error and SHALL NOT produce a connection or client. Presence, not disagreement, is the trigger.
@@ -77,7 +77,7 @@ and `gate1` SHALL be resolved as:
 
 #### Scenario: Option-carrying connection still obeys a revocation
 - **WHEN** a connection constructed with `WithTracingEnabled(true)` is tracing under a truthy module environment variable and the relay resolves the module flag to `false`
-- **THEN** operations issued after the resolver's TTL expires emit no spans, exactly as they would on a connection constructed from the environment variable
+- **THEN** the next operation emits no spans, exactly as it would on a connection constructed from the environment variable
 
 #### Scenario: Option-carrying connection cannot be enabled by the relay
 - **WHEN** a connection is constructed with `WithTracingEnabled(true)` while the module environment variable is unset, and the relay resolves the module flag to `true`
@@ -128,11 +128,11 @@ A constructor with more than one such check — only `otel-mongo` has one — SH
 ## REMOVED Requirements
 
 ### Requirement: Cached gate resolution
-**Reason**: `flags.Gate` cached a resolver's result for the entire process lifetime, which is incompatible with revoking a flag at runtime. Its three call sites (`natsGate`, `wsGate`, `propEnabledGate`) are replaced by `flags.Resolver`, whose snapshot expires after a one-second TTL. `Gate` and `NewGate` are deleted rather than left as dead code.
+**Reason**: `flags.Gate` cached a resolver's result for the entire process lifetime, which is incompatible with revoking a flag at runtime. Its three call sites (`natsGate`, `wsGate`, `propEnabledGate`) are replaced by `flags.Resolver`, which resolves on every call. `Gate` and `NewGate` are deleted rather than left as dead code.
 
 **Migration**: None required for consumers — `internal/flags` is not importable outside this repository. Within the repository, replace `flags.NewGate(fn)` with `flags.NewResolver(domain, flags.WithFlagKeys(...))` and `gate.Enabled()` with the three-tier conjunction defined in *Composed per-module gates*. See the `dynamic-feature-flags` capability for the replacement contract.
 
 ### Requirement: Test-only cache reset
-**Reason**: `Gate.ResetForTest` is removed with `Gate`. `Resolver` exposes `WithClock` instead, which lets tests advance past the TTL deterministically and makes the TTL behavior itself testable rather than merely bypassable.
+**Reason**: `Gate.ResetForTest` is removed with `Gate`. Nothing replaces it: because `Resolver` caches nothing, tests change a value on the installed in-memory provider and the next operation observes it. The provider is the control surface, so tests drive the real code path instead of bypassing it.
 
-**Migration**: None required for consumers. Within the repository, replace `gate.ResetForTest()` in tests with an injected clock advanced past the one-second TTL, and drive relay verdicts through `memprovider.NewInMemoryProvider`. The prohibition on `t.Parallel` for tests that touch process-global state still applies.
+**Migration**: None required for consumers. Within the repository, replace `gate.ResetForTest()` in tests with a mutation of the installed `memprovider.NewInMemoryProvider`. The prohibition on `t.Parallel` for tests that touch process-global state still applies.

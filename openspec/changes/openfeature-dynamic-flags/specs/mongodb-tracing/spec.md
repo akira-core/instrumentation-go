@@ -26,7 +26,7 @@ Environment truthiness SHALL follow the allow-list in `shared-feature-flags`: on
 
 #### Scenario: Relay revokes tracing on a running client
 - **WHEN** a `Client` is tracing under a truthy `OTEL_MONGO_TRACING_ENABLED` and the relay resolves `otel-mongo-tracing` to `false`
-- **THEN** operations issued after the resolver's TTL expires emit no spans and inject no `_oteltrace`
+- **THEN** the next operation emits no span and injects no `_oteltrace`
 
 #### Scenario: Relay cannot enable tracing the deployment left off
 - **WHEN** `gate1` is enabled, `OTEL_MONGO_TRACING_ENABLED` is unset, and the relay resolves `otel-mongo-tracing` to `true`
@@ -117,7 +117,7 @@ Because they observe no configuration at all, these functions SHALL continue to 
 
 Implementation selection at construction SHALL key on the whole static part of the decision, `gate1 && EnvEnabled(OTEL_MONGO_TRACING_ENABLED)` — the same expression `otel-gorilla-ws` uses for its negotiation capability. When it is false, only the `internal/direct` implementation SHALL be constructed and no OTel SDK code path SHALL be reachable, because the relay can only revoke and therefore can never make the instrumented path reachable. When it is true, both implementations SHALL be constructed and the per-operation relay verdict SHALL select between them. No wrapper SHALL be pinned to one implementation because a `WithTracingEnabled` option was supplied.
 
-For a single public operation, the tracing boolean used to select the implementation SHALL also be the tracing input to document-propagation resolution for that operation — the propagation path SHALL NOT independently re-resolve module tracing via a second resolver read that could cross a TTL boundary mid-operation. Fail-safe composition remains: when that tracing value is false, propagation SHALL be false.
+For a single public operation, the tracing boolean used to select the implementation SHALL also be the tracing input to document-propagation resolution for that operation — the propagation path SHALL NOT independently re-resolve module tracing via a second resolver read. Fail-safe composition remains: when that tracing value is false, propagation SHALL be false.
 
 The unexported `collectionImpl` methods `Find`, `Aggregate`, and `Watch` SHALL return only the raw driver cursor/change-stream plus error; the facade SHALL construct dual direct/traced wrappers. Those methods SHALL NOT return a throwaway `shared.CursorImpl` / `shared.ChangeStreamImpl` that the facade discards. `FindOne` continues to return `shared.SingleResultImpl` for the live-span exception below.
 
@@ -137,7 +137,7 @@ The unexported `collectionImpl` methods `Find`, `Aggregate`, and `Watch` SHALL r
 
 #### Scenario: Long-lived change stream follows the revocation
 - **WHEN** a `ChangeStream` opened while tracing was enabled outlives a relay revocation of `otel-mongo-tracing`
-- **THEN** iterations after the resolver's TTL expires run through the `internal/direct` implementation and emit no spans
+- **THEN** subsequent iterations run through the `internal/direct` implementation and emit no spans
 
 #### Scenario: Option does not pin the implementation
 - **WHEN** a `Client` is constructed with `WithTracingEnabled(true)` while `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is unset, and the relay later revokes `otel-mongo-tracing`

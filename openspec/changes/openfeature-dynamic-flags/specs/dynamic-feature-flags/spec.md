@@ -111,47 +111,30 @@ When neither is supplied the tier resolves to disabled. When exactly one is supp
 - **WHEN** a switch is set to `false`
 - **THEN** `EnvSet` reports present and `EnvEnabled` reports disabled, so the mutual-exclusion check fires while the switch itself stays off
 
-### Requirement: Per-module snapshot with a one-second TTL
-`internal/flags` SHALL expose a `Resolver` that holds an immutable snapshot of every flag's relay verdict for one module in an `atomic.Pointer`, together with the instant the snapshot was taken. `Resolver.Allowed(i int)` SHALL load the pointer, compare that instant against the resolver's clock, and return the cached verdict when the snapshot is younger than the TTL. When the snapshot is absent or expired, the calling goroutine SHALL evaluate every flag key of that module and store a new snapshot. Refreshes SHALL NOT be serialized — concurrent refreshes are permitted and the last store wins.
+### Requirement: The relay verdict is resolved per operation
+`internal/flags` SHALL expose a `Resolver` holding the module's OpenFeature client and its flag keys, whose `Allowed(i int)` evaluates the key at index `i` on **every** call. It SHALL NOT cache verdicts, and SHALL therefore contain no snapshot, no TTL, no clock and no refresh. An out-of-range index SHALL return `false` rather than panic, so a mis-wired module degrades to the disabled path instead of taking the process down.
 
-The snapshot's `at` timestamp SHALL be recorded at the **start** of the refresh (before any `client.Boolean` call), not after evaluation completes, so a slower refresh that observed older relay values cannot stamp a newer completion time over a fresher snapshot and keep stale values marked fresh for a full TTL.
+The OpenFeature client SHALL be created lazily on first use rather than in `NewResolver`, so a process whose switches are off never initializes any part of the OpenFeature SDK.
 
-The refresh SHALL run under a bounded context derived from `context.Background()`, never from a caller's context, so that one request's cancellation cannot decide the fate of process-scoped state and so that a provider performing network I/O cannot block an operation indefinitely. A refresh that times out SHALL yield the evaluation default `true` for every spec, which is the same outcome as "the relay does not interfere".
+A revocation SHALL therefore take effect on the next operation, bounded only by the provider's own polling interval. A module needing more than one verdict for one operation SHALL make consecutive `Allowed` calls; the microsecond window between them is accepted and is not grounds for adding a cache.
 
-The TTL SHALL be fixed at one second and SHALL NOT be configurable through any exported API or environment variable. Keys within one refresh MAY be evaluated sequentially; parallel fan-out is not required.
+Caching remains a permitted future optimisation: it SHALL be addable inside `Resolver` without changing `Allowed`'s signature or any call site. An implementation that adds it SHALL restate the TTL, timestamp-placement, multi-flag-consistency and snapshot-immutability decisions that the uncached form makes unnecessary.
 
-#### Scenario: Repeated reads within the TTL do not re-evaluate
-- **WHEN** `Allowed` is called many times within one second of a snapshot being taken
-- **THEN** the provider is evaluated no more than once for that window and every call returns the cached verdict
+#### Scenario: Every operation observes the current relay value
+- **WHEN** a relay flag is revoked while a wrapper is in use
+- **THEN** the very next operation observes the revocation, with no waiting period beyond the provider's own polling
 
-#### Scenario: Read after the TTL re-evaluates
-- **WHEN** `Allowed` is called more than one second after the snapshot was taken and the relay's value has changed
-- **THEN** the new verdict is returned and a fresh snapshot is stored
+#### Scenario: No client is created while the switches are off
+- **WHEN** a process runs with `gate1` or the module environment variable disabled
+- **THEN** `openfeature.NewClient` is never called for that module and no evaluation is performed
 
-#### Scenario: First read populates the snapshot
-- **WHEN** `Allowed` is called for the first time on a freshly constructed `Resolver`
-- **THEN** every flag key is evaluated once and the resulting snapshot is stored before the verdict is returned
+#### Scenario: Out-of-range index degrades to disabled
+- **WHEN** `Allowed` is called with an index outside the resolver's key list
+- **THEN** it returns `false` and does not panic
 
-#### Scenario: Snapshot timestamp is taken before evaluation
-- **WHEN** two concurrent refreshes run and the later-finishing refresh began earlier and read older relay values
-- **THEN** its stored snapshot's `at` reflects its start time, so it cannot appear strictly fresher than a refresh that started later solely by finishing later
-
-#### Scenario: A hung provider does not hang the operation
-- **WHEN** the installed provider blocks longer than the refresh timeout
-- **THEN** the refresh returns `true` for every spec, the operation proceeds at its environment-declared state, and the next expiry retries
-
-### Requirement: All of a module's flags can be read from one snapshot
-`Resolver` SHALL expose an accessor that returns every key's verdict from a **single** snapshot load, so a caller needing more than one of a module's flags observes one consistent instant. `Allowed(i)` called twice MAY straddle a TTL boundary and observe two snapshots; callers that require mutual consistency SHALL use the multi-value accessor rather than repeated single reads.
-
-`otel-mongo` (v1 and v2) SHALL use the multi-value accessor wherever one operation needs both its tracing and its propagation verdict. Modules owning a single key MAY use `Allowed`.
-
-#### Scenario: All flags of a module share one snapshot instant
-- **WHEN** a caller reads `otel-mongo`'s tracing and propagation verdicts through the multi-value accessor while both are being changed on the relay
-- **THEN** it observes either both old verdicts or both new verdicts, never one of each
-
-#### Scenario: Repeated single reads carry no such guarantee
-- **WHEN** a caller invokes `Allowed(idxTracing)` and `Allowed(idxPropagation)` as two separate calls that straddle a TTL expiry
-- **THEN** the two verdicts MAY come from different snapshots, which is why the multi-value accessor exists
+#### Scenario: Two consecutive verdicts may tear
+- **WHEN** an operation reads a module's tracing and propagation verdicts as two consecutive `Allowed` calls and the relay changes both between them
+- **THEN** the operation MAY observe one old and one new verdict; the window is microseconds wide and is accepted, and for the tracing/propagation pair a disabled tracing verdict short-circuits propagation so the combination fails safe
 
 ### Requirement: Module-specific flag identity lives outside the shared file
 `internal/flags` SHALL NOT contain module-scoped OpenFeature flag keys or module-scoped environment variable names. `Resolver` SHALL accept the OpenFeature flag keys through `WithFlagKeys(keys ...string)`, supplied by each module's own non-shared `env_flags.go`, which also owns the paired environment variable and performs the conjunction itself. The resolver SHALL NOT hold or read any environment variable name other than the process-wide one below — a field pairing a key with its environment variable would have no reader, since the environment variable is no longer the evaluation default. The shared file MAY define the single process-wide first-tier name `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` as `EnvGlobalTracing` and MAY export `GlobalTracingPossible() bool` and `GlobalTracingSet() bool`. The byte-identical vendoring rule SHALL continue to apply to the whole of `internal/flags`, including the `Resolver` code.
@@ -165,7 +148,7 @@ The TTL SHALL be fixed at one second and SHALL NOT be configurable through any e
 - **THEN** the only `OTEL_*` environment variable name it may contain is `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`, exposed as `EnvGlobalTracing` / `GlobalTracingPossible` / `GlobalTracingSet`
 
 #### Scenario: Resolver code stays byte-identical
-- **WHEN** the refresh, timeout, or TTL logic in one module's `internal/flags/flags.go` is modified
+- **WHEN** the evaluation call or the truthiness rules in one module's `internal/flags/flags.go` are modified
 - **THEN** the same modification is applied to the other three copies so the file contents excluding the `package` declaration remain byte-identical
 
 ### Requirement: Fixed flag key vocabulary
@@ -195,27 +178,27 @@ Modules SHALL pass an empty `openfeature.EvaluationContext{}` to every evaluatio
 
 #### Scenario: Request-scoped targeting is not supported
 - **WHEN** the relay defines targeting rules keyed on an attribute that varies per request
-- **THEN** the resolved verdict reflects only the process-wide evaluation context, because a single snapshot serves every caller for the TTL window
+- **THEN** the resolved verdict reflects only the process-wide evaluation context, because the resolver contributes no attributes and holds no per-request state
 
 ### Requirement: Supported provider evaluation mode
-The documented wiring SHALL use the GO Feature Flag provider's default in-process evaluation mode, in which the provider polls the relay in the background and each `Boolean` call is a local lookup. Remote evaluation mode SHALL be documented as unsupported, because it makes every evaluation an HTTP request and therefore places network I/O on the operation path once per TTL window. The refresh timeout SHALL bound the damage when a site configures it anyway.
+The documented wiring SHALL use the GO Feature Flag provider's default in-process evaluation mode, in which the provider polls the relay in the background and each `Boolean` call is a local lookup. Remote evaluation mode SHALL be documented as unsupported, because it makes every evaluation an HTTP request and therefore places a synchronous network round trip on the path of every instrumented operation.
 
 #### Scenario: In-process provider keeps evaluation local
 - **WHEN** an application constructs the provider with only an `Endpoint` and installs it
-- **THEN** each refresh performs local lookups against the provider's polled configuration and issues no request on the operation path
+- **THEN** every evaluation is a local lookup against the provider's polled configuration and issues no request on the operation path
 
 #### Scenario: Documentation states the constraint
 - **WHEN** the README and CLAUDE.md wiring snippets are read
-- **THEN** they state that in-process evaluation is the supported mode and that remote evaluation is not supported
+- **THEN** `feature-flags.md` states that in-process evaluation is the supported mode and that remote evaluation is not supported
 
-### Requirement: Test hooks for clock injection and in-memory providers
-`NewResolver` SHALL accept a `WithClock(func() time.Time)` option so tests can advance time deterministically across the TTL boundary. Tests SHALL drive relay verdicts through `memprovider.NewInMemoryProvider` installed with `openfeature.SetProviderAndWait`. Because both the OpenFeature provider and the process environment are global, tests that install a provider or call `t.Setenv` SHALL NOT call `t.Parallel`.
+### Requirement: Tests drive verdicts through an in-memory provider
+Tests SHALL drive relay verdicts through `memprovider.NewInMemoryProvider` installed with `openfeature.SetProviderAndWait`, and SHALL observe a change on the next operation without sleeping, injecting a clock, or calling a reset hook. Because both the OpenFeature provider and the process environment are global, tests that install a provider or call `t.Setenv` SHALL NOT call `t.Parallel`.
 
 Tests SHALL cover the kill-switch asymmetry explicitly in both directions.
 
-#### Scenario: Fake clock exercises the TTL boundary
-- **WHEN** a test advances the injected clock by 900 ms after a snapshot and reads a changed relay verdict
-- **THEN** the stale cached verdict is returned; advancing to 1100 ms and reading again returns the new verdict
+#### Scenario: A revocation is visible on the next call
+- **WHEN** a test mutates the installed in-memory provider's flag from `true` to `false`
+- **THEN** the next operation observes the revocation, with no sleep and no clock manipulation
 
 #### Scenario: In-memory provider drives revocation
 - **WHEN** a test installs an `InMemoryProvider` with a flag set to `false` while the paired environment variable is truthy

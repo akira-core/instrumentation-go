@@ -15,7 +15,7 @@ Environment truthiness SHALL follow the allow-list in `shared-feature-flags`: on
 
 Which implementations exist SHALL be decided at construction by the static part of the conjunction, `gate1 && EnvEnabled(OTEL_NATS_TRACING_ENABLED)`, matching the other three modules. When it is false only `directConn` / `directJSImpl` SHALL be constructed, because the relay can only revoke and therefore can never make the traced implementation reachable.
 
-The relay verdict SHALL be read per operation rather than cached on the wrapper struct, so a `Conn` and everything derived from it — `oteljetstream` wrappers, consumers, long-lived message iterators and batch forwarders — observes a revocation within the resolver's TTL without reconstruction. `WithTracingEnabled` SHALL NOT make a connection static: a connection carrying it still reads the relay verdict per operation and still stops when the relay revokes.
+The relay verdict SHALL be read per operation rather than cached on the wrapper struct, so a `Conn` and everything derived from it — `oteljetstream` wrappers, consumers, long-lived message iterators and batch forwarders — observes a revocation on its next operation without reconstruction. `WithTracingEnabled` SHALL NOT make a connection static: a connection carrying it still reads the relay verdict per operation and still stops when the relay revokes.
 
 #### Scenario: First tier off
 - **WHEN** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is unset or falsy and no `WithTracingEnabled` option is passed
@@ -39,14 +39,14 @@ The relay verdict SHALL be read per operation rather than cached on the wrapper 
 
 #### Scenario: Relay revokes tracing on a running connection
 - **WHEN** a `Conn` is publishing with tracing enabled and the relay subsequently resolves `otel-nats-tracing` to `false`
-- **THEN** publishes issued after the resolver's TTL expires delegate natively, emit no spans, and inject no trace headers
+- **THEN** the next publish delegates natively, emits no span, and injects no trace headers
 
 #### Scenario: Relay cannot enable tracing the deployment left off
 - **WHEN** `gate1` is enabled, `OTEL_NATS_TRACING_ENABLED` is unset, and the relay resolves `otel-nats-tracing` to `true`
 - **THEN** no spans are created and no evaluation is performed
 
 #### Scenario: Relay revocation reaches a long-lived JetStream consumer
-- **WHEN** a `MessagesContext` iterator or a `MessageBatch` forwarder created before a revocation is still delivering messages after the resolver's TTL expires
+- **WHEN** a `MessagesContext` iterator or a `MessageBatch` forwarder created before a revocation is still delivering messages after the revocation
 - **THEN** messages delivered after the revocation are handled natively, with no spans and no header extraction, without the consumer being recreated
 
 #### Scenario: MessageBatch does not freeze the flag at Fetch time
@@ -67,4 +67,4 @@ The relay verdict SHALL be read per operation rather than cached on the wrapper 
 
 #### Scenario: Option-carrying connection still obeys a revocation
 - **WHEN** a connection constructed with `WithTracingEnabled(true)` is tracing and the relay subsequently resolves `otel-nats-tracing` to `false`
-- **THEN** operations issued after the resolver's TTL expires emit no spans, exactly as on a connection constructed from the environment variable
+- **THEN** the next operation emits no span, exactly as on a connection constructed from the environment variable

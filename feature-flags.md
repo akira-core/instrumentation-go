@@ -16,7 +16,8 @@ a process is running.
 
 Instrumentation is enabled by a deployment and can be revoked by an operator. A [GO Feature Flag]
 relay proxy, reached through [OpenFeature], acts as a **kill switch only**: a flag set to `false`
-turns a running module off within a second, and nothing on the relay can turn anything on.
+turns a running module off as soon as the provider observes it, and nothing on the relay can turn
+anything on.
 Everything that is on was turned on by a deployment that someone reviewed. When the relay is
 unreachable, misconfigured, or absent, every flag reads as "do not interfere" and the
 environment alone decides — so an application that never installs a provider behaves exactly as
@@ -35,7 +36,7 @@ tracing = gate1 && OTEL_<MODULE>_TRACING_ENABLED && relay verdict
 |---|---|---|---|
 | **`gate1`** — `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` **or** `WithTracingEnabled`, never both | whoever deploys, or whoever constructs the wrapper | every module in the process is off, only passthrough implementations are allocated, and no OpenFeature code path is reachable | No |
 | **`OTEL_<MODULE>_TRACING_ENABLED`** | whoever deploys | that module is off, only its passthrough implementation is allocated, and its relay flag is never evaluated | No |
-| **relay flag `otel-<module>-tracing`** | whoever operates | that module stops emitting on a running process, within one second | **Yes — this is the only tier that can** |
+| **relay flag `otel-<module>-tracing`** | whoever operates | that module stops emitting on a running process, from its next operation | **Yes — this is the only tier that can** |
 
 The first two tiers are both environment-derived and both fixed at construction. They differ only
 in scope — whole process versus one module — and in who owns them. The third is the only dynamic
@@ -265,9 +266,29 @@ openfeature.SetEvaluationContext(openfeature.NewTargetlessEvaluationContext(map[
 }))
 ```
 
-Resolved verdicts are cached per module for one second, and that cache is process-wide. Targeting
-can therefore key on process-level attributes — service, environment, host — but **not** on
-per-request attributes.
+The modules resolve a verdict on every instrumented operation and cache nothing, so a revocation
+takes effect on the next operation with no additional delay. The evaluation context is
+process-wide, so targeting can key on process-level attributes — service, environment, host — but
+**not** on per-request attributes.
+
+## What resolution costs
+
+The relay verdict is resolved on **every instrumented operation**; nothing is cached. Measured
+against an in-memory provider, one evaluation is roughly **2 µs and 7 allocations**. That is not
+the flag lookup — it is the OpenFeature SDK's evaluation pipeline around it (hook chains,
+evaluation-context merging, the provider registry lock), and it does not get cheaper because the
+provider keeps its configuration in memory.
+
+Two things bound where that cost lands:
+
+- It is paid only by wrappers that are **actively instrumenting**. A module switched off in the
+  environment allocates only its passthrough implementation and never evaluates anything.
+- Against a Mongo round trip it is noise. Against a NATS publish, which already pays 1–3 µs to
+  create a span, it roughly doubles the instrumentation overhead.
+
+Caching sits behind an unchanged internal signature, so it can be added without affecting any
+API if a benchmark on a real workload shows it matters. It is deliberately deferred rather than
+ruled out; the reasoning is recorded in the design document.
 
 ## Per-connection options
 
@@ -285,8 +306,8 @@ revokes. There is no way to opt a connection out of a revocation.
 
 - To make a module revocable: deploy with `gate1` and the module switch on, and create its flag
   on the relay.
-- To stop a module now: set its relay flag to `false`. It takes effect within one second plus
-  your provider's polling interval.
+- To stop a module now: set its relay flag to `false`. It takes effect as soon as your provider
+  picks the change up — the library adds no delay of its own.
 - To stop everything now: revoke all four relay flags. There is no single key.
 - To stop a module permanently: change its environment variable and redeploy.
 - To investigate an incident by turning tracing **on**: not possible from the relay. Change the

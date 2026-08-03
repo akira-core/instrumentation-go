@@ -10,7 +10,7 @@ OpenFeature (with the GO Feature Flag provider and its relay proxy) gives us a s
 
 - `internal/flags` gains a `Resolver` that resolves each module's flags through the process-global OpenFeature client with an evaluation default of `true`, and the module's environment variable is ANDed separately rather than passed as that default. A relay `false` disables a module the deployment enabled; no relay value enables a module the deployment left off.
 - Every failure path — no provider, provider not ready, flag absent, evaluation error, relay unreachable — resolves to `true`, meaning *do not interfere*, so an application that never configures a provider behaves exactly as its environment says.
-- Resolved verdicts are cached in a per-module immutable snapshot held in an `atomic.Pointer`, refreshed lazily on read at most once per second, under a bounded context. Hot paths pay one atomic load, one monotonic clock read and one env read; they never enter the OpenFeature evaluation pipeline per operation.
+- Verdicts are **not** cached: `Resolver.Allowed(i)` evaluates on every call, so a revocation takes effect on the next operation. This costs a measured 2.0 µs and 7 allocations per instrumented operation against 82 ns for a cached read, and is accepted as a deferral — caching sits behind an unchanged `Allowed(i) bool`, so it can be added later without touching a call site. Deferring it removes the TTL, the snapshot timestamp question, the multi-flag consistency question and the injectable clock from the file that must stay byte-identical across four copies.
 - The application owns the provider: this repo never calls `openfeature.SetProvider` and never sets an evaluation context, exactly as it never initializes a `TracerProvider`.
 
 ### The first-tier switch may be set in exactly one place
@@ -54,12 +54,12 @@ OpenFeature (with the GO Feature Flag provider and its relay proxy) gives us a s
 
 ### New Capabilities
 
-- `dynamic-feature-flags`: OpenFeature-backed runtime **revocation** of the instrumentation feature flags — the `Resolver`/`Snapshot` primitives, the always-`true` evaluation default and its kill-switch semantics, the TTL and refresh-timeout behavior, the truthiness allow-list, the mutual-exclusion rule, the flag key naming scheme, provider ownership and supported evaluation mode, and the failure/fallback behavior when no provider is configured or evaluation errors.
+- `dynamic-feature-flags`: OpenFeature-backed runtime **revocation** of the instrumentation feature flags — the `Resolver` primitive and its per-call, uncached resolution, the always-`true` evaluation default and its kill-switch semantics, the truthiness allow-list, the mutual-exclusion rule, the flag key naming scheme, provider ownership, the provider-readiness requirement, the supported evaluation mode, and the failure/fallback behavior when no provider is configured or evaluation errors.
 
 ### Modified Capabilities
 
 - `shared-feature-flags`: `Gate`/`NewGate`/`ResetForTest` removed; the three-tier conjunction replaces the composed-gate requirements; `EnvEnabled` gains an allow-list and `EnvSet` is added; the per-connection option becomes a mutually exclusive spelling of the first tier rather than an override; the byte-identical vendoring rule now covers the `Resolver` code.
-- `mongodb-tracing`: three-tier gating restated with the relay as a revoke-only tier; document propagation records that `_oteltrace` is never stripped on read and that only a deployment can enable it; trace-context restoration follows the snapshot; the strategy split keys on the first tier alone and no wrapper is pinned by an option.
+- `mongodb-tracing`: three-tier gating restated with the relay as a revoke-only tier; document propagation records that `_oteltrace` is never stripped on read and that only a deployment can enable it; trace-context restoration loses its gate entirely; the strategy split keys on the static tiers and no wrapper is pinned by an option.
 - `nats-jetstream-tracing`: two-tier gating restated with the revoke-only relay tier; strategy selection keys on the first tier alone; option-carrying connections still obey revocations.
 - `websocket-tracing`: two-tier gating restated with the revoke-only relay tier; negotiation gated on the static capability with no wire-format exception; `NewConn` no longer forces the envelope and now returns an error.
 
@@ -77,13 +77,13 @@ OpenFeature (with the GO Feature Flag provider and its relay proxy) gives us a s
 **Dependencies**: `github.com/open-feature/go-sdk` enters all four modules' `go.mod`, ending `internal/flags`'s zero-dependency property. The GO Feature Flag provider is an application-side dependency, not a library one.
 
 **Code**:
-- `*/internal/flags/flags.go` — four byte-identical copies: `Gate` removed; `Resolver`/`Snapshot`, `EnvSet`, the truthiness allow-list, the multi-value accessor and the bounded refresh added.
+- `*/internal/flags/flags.go` — four byte-identical copies: `Gate` removed; `Resolver` with a lazy client and per-call evaluation, `EnvSet`, and the truthiness allow-list added.
 - `otel-mongo/otelmongo/env_flags.go`, `otel-mongo/v2/env_flags.go`, `otel-nats/otelnats/env_flags.go`, `otel-gorilla-ws/env_flags.go` — construct the module's `Resolver`, own the conflict sentinels.
 - `otel-mongo/{otelmongo,v2}/{client,collection,tracing,gate_state}.go` and `internal/traced/*` — three-tier conjunction per call; static-client paths deleted.
 - `otel-nats/otelnats/*.go`, `otel-nats/oteljetstream/*.go` — same; `Conn.static` deleted.
 - `otel-gorilla-ws/{conn,options,upgrader}.go` — static capability, per-call span gate, `NewConn` signature.
 
-**Testing**: unit tests in all four modules using an in-memory OpenFeature provider and a fake clock, covering both directions of the kill-switch asymmetry; one integration test standing up a real relay proxy container to verify the documented wiring recipe in the revoke direction. Roughly 89 existing call sites that combine an environment variable with a constructor option must be rewritten to use exactly one of them.
+**Testing**: unit tests in all four modules using an in-memory OpenFeature provider — no fake clock and no reset hook, since a mutation is visible on the next operation — covering both directions of the kill-switch asymmetry; one integration test standing up a real relay proxy container to verify the documented wiring recipe in the revoke direction. Roughly 89 existing call sites that combine an environment variable with a constructor option must be rewritten to use exactly one of them.
 
 **Documentation**: `CLAUDE.md`, `README.md`, `README.zh-TW.md`, and each module's `CHANGELOG.md` — the resolution table, the flag key reference, the kill-switch semantics and the capability that is deliberately absent (remote enablement), the supported provider evaluation mode, and the correction of the false "`_oteltrace` is stripped on read" claim.
 

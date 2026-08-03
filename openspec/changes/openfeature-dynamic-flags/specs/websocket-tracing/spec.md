@@ -16,7 +16,7 @@ The relay flag `otel-gorilla-ws-tracing` SHALL be resolved with an evaluation de
 
 Environment truthiness SHALL follow the allow-list in `shared-feature-flags`: only `1`, `true`, `yes`, `on` (trimmed, case-insensitive) enable; every other value, including the empty string, disables.
 
-`feature` SHALL be re-read per `WriteMessage`/`ReadMessage` call rather than cached on the `Conn`, so a live connection observes a revocation within the resolver's TTL. `WithTracingEnabled` SHALL NOT make a connection static: it supplies `gate1` only, and a connection carrying it still stops creating spans when the relay revokes.
+`feature` SHALL be re-read per `WriteMessage`/`ReadMessage` call rather than cached on the `Conn`, so a live connection observes a revocation on its next operation. `WithTracingEnabled` SHALL NOT make a connection static: it supplies `gate1` only, and a connection carrying it still stops creating spans when the relay revokes.
 
 Whether the connection writes the JSON envelope SHALL remain fixed for its lifetime and SHALL be determined solely by whether `otel-ws` was successfully negotiated (`Dial`/`Upgrade`) or proven for `NewConn` via `isOTelWireProtocol` on the raw connection's negotiated subprotocol. A connection whose peer negotiated `otel-ws` SHALL continue to write envelopes after a revocation; in that state it SHALL inject no trace context and SHALL create no spans. A connection that did not negotiate SHALL use raw passthrough for the wire; while `feature` is on it MAY still create local send/receive spans without inject/extract.
 
@@ -38,7 +38,7 @@ Whether the connection writes the JSON envelope SHALL remain fixed for its lifet
 
 #### Scenario: Relay revokes tracing on a live connection
 - **WHEN** an established connection that negotiated `otel-ws` is creating spans and the relay subsequently resolves `otel-gorilla-ws-tracing` to `false`
-- **THEN** messages sent after the resolver's TTL expires create no spans and carry an envelope with no trace context, and the peer continues to parse them as envelopes
+- **THEN** messages sent after the revocation create no spans and carry an envelope with no trace context, and the peer continues to parse them as envelopes
 
 #### Scenario: Relay cannot enable tracing the deployment left off
 - **WHEN** `gate1` is enabled, `OTEL_GORILLA_WS_TRACING_ENABLED` is unset, and the relay resolves `otel-gorilla-ws-tracing` to `true`
@@ -50,7 +50,7 @@ Whether the connection writes the JSON envelope SHALL remain fixed for its lifet
 
 #### Scenario: Option-carrying connection still obeys a revocation
 - **WHEN** a connection constructed with `WithTracingEnabled(true)` (environment variable unset) and a truthy `OTEL_GORILLA_WS_TRACING_ENABLED` is creating spans, and the relay resolves the module flag to `false`
-- **THEN** messages sent after the resolver's TTL expires create no spans, while the envelope continues to be written if `otel-ws` was negotiated
+- **THEN** messages sent after the revocation create no spans, while the envelope continues to be written if `otel-ws` was negotiated
 
 ### Requirement: otel-ws negotiation gated on the effective feature flag
 `Dial` SHALL NOT offer, and `Upgrader.Upgrade` SHALL NOT confirm, the `otel-ws` subprotocol when the connection's **static capability** resolves to disabled. That capability SHALL be `gate1 && flags.EnvEnabled("OTEL_GORILLA_WS_TRACING_ENABLED")`, resolved **before** the handshake.

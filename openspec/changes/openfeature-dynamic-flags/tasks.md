@@ -66,7 +66,7 @@
 ## 6. Integration test against a real relay
 
 - [x] 6.1 Choose one module (`otel-nats`, the cheapest container footprint) and add a testcontainers-based test that starts a GO Feature Flag relay proxy with a configuration file defining `otel-nats-tracing`.
-- [x] 6.2 In that test, install the GO Feature Flag provider through `openfeature.SetProviderAndWait`, assert tracing is on, flip the flag in the relay configuration, wait for the provider's poll plus the resolver TTL, and assert tracing is off.
+- [x] 6.2 In that test, install the GO Feature Flag provider through `openfeature.SetProviderAndWait`, assert tracing is on, flip the flag in the relay configuration, wait for the provider's poll, and assert tracing is off.
 - [x] 6.3 Add the relay-proxy dependency and the configuration fixture to that module's `tests/integration/` sub-module only; leave the other three integration suites unchanged.
 - [x] 6.4 Confirm the new test is picked up by the existing `integration-test` CI job's `go list ./...` minus `/sampling` selection, and that it fits the 300 s timeout.
 
@@ -125,9 +125,9 @@
 - [ ] 9.1.1 Rewrite `EnvEnabled` as a truthy allow-list: enabled only for `1`/`true`/`yes`/`on` after `strings.ToLower(strings.TrimSpace(v))`; unset and every other value disabled. Update the doc comment to state the allow-list, not the falsy list.
 - [ ] 9.1.2 Add `EnvSet(name string) bool` (bare `os.LookupEnv` presence) plus `GlobalTracingSet()`. Document that `EnvSet` is for the mutual-exclusion check only and must never decide whether a switch is enabled.
 - [ ] 9.1.3 Change the resolver's evaluation default to a literal `true`. Delete the `Spec` type and replace `WithSpecs(...Spec)` with `WithFlagKeys(keys ...string)` — with the env var no longer the evaluation default, `Spec.EnvVar` has no reader and would rot. Rename `Enabled(i)` to `Allowed(i)` so the call site reads as a relay verdict, not a final answer.
-- [ ] 9.1.4 Add the multi-value accessor (`AllowedAll() []bool`) returning every spec's verdict from one snapshot load, for callers needing more than one flag of a module.
-- [ ] 9.1.5 Bound `refresh` with `context.WithTimeout(context.Background(), refreshTimeout)`; add `refreshTimeout` next to `refreshTTL` with a comment covering both why it exists (synchronous refresh on a caller goroutine) and why the context is not the caller's (process-scoped state must not inherit one request's cancellation).
-- [ ] 9.1.6 Rewrite `flags_test.go`: allow-list golden table including the empty string and `enabled`/`2`; `EnvSet` vs `EnvEnabled` divergence; `Allowed` returning `true` with no provider; `AllowedAll` single-snapshot consistency across a TTL boundary; refresh-timeout fallback to `true`; `at`-stamped-at-start. No `t.Parallel` where a provider or `t.Setenv` is involved.
+- [ ] 9.1.4 **Delete the cache.** Remove `snapshot`, the `atomic.Pointer`, `refreshTTL`, `refresh`, `now`/`WithClock`, and the TTL comparison. `Allowed(i)` becomes a bounds check plus one `client.Boolean(context.Background(), r.keys[i], true, openfeature.EvaluationContext{})`. Keep the lazy `clientOnce` construction. See design D4 for the measured cost this accepts (2.0 µs / 7 allocs per call vs 82 ns cached) and why it is a deferral rather than a rejection.
+- [ ] 9.1.5 Update the package doc comment: the file is still the highest-drift-risk shared code, it still never installs a provider, and it now caches nothing — with a pointer to D4 so anyone reintroducing a cache knows which questions come back with it.
+- [ ] 9.1.6 Rewrite `flags_test.go`: allow-list golden table including the empty string and `enabled`/`2`; `EnvSet` vs `EnvEnabled` divergence; `Allowed` returning `true` with no provider installed; `Allowed` returning `false` for an out-of-range index; a provider mutation observed on the very next call with no sleep. No `t.Parallel` where a provider or `t.Setenv` is involved.
 - [ ] 9.1.7 Copy `flags.go` and `flags_test.go` verbatim into the other three modules; verify byte-identity excluding the `package` line.
 
 ### 9.2 Per-module composition and conflict errors
@@ -152,7 +152,7 @@
 ### 9.5 Tests
 
 - [ ] 9.5.1 Rewrite every test that sets a tracing env var **and** passes the matching option (~89 call sites across 11 files) to use exactly one of them.
-- [ ] 9.5.2 Add per-module kill-switch asymmetry tests: relay `true` + module env off ⇒ no spans and no evaluation; relay `false` + module env on ⇒ running connection stops within the TTL.
+- [ ] 9.5.2 Add per-module kill-switch asymmetry tests: relay `true` + module env off ⇒ no spans and no evaluation; relay `false` + module env on ⇒ the running connection's next operation emits no span.
 - [ ] 9.5.3 Add constructor-conflict tests for all seven option-accepting constructors, asserting `errors.Is` against the module sentinel.
 - [ ] 9.5.4 Update the relay integration test to assert the revoke direction (start enabled, revoke, observe stop) instead of enabling from off.
 - [ ] 9.5.5 Run `go build`, `go test -race`, `golangci-lint` in every touched module until clean.

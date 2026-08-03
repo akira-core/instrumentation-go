@@ -21,7 +21,7 @@ This document has been revised once. An earlier model — in which the relay dec
 - An operator can **turn off** each module's tracing and propagation through a GO Feature Flag relay proxy without restarting the application.
 - No remote party can turn anything **on**. Everything that is enabled was enabled by a reviewed deployment.
 - Deployments that never configure an OpenFeature provider keep exactly their environment-driven behavior, modulo the `EnvEnabled` truthiness change in D14.
-- Hot paths pay a bounded, predictable cost: no network call and no OpenFeature evaluation on any given operation, and the evaluation pipeline is entered at most once per TTL window per module.
+- Hot paths pay a bounded, predictable cost with no network call, and the per-operation cost of resolving a flag is measured and recorded rather than assumed (D4).
 - The compiler-enforced disabled path survives. `internal/direct` still imports no `go.opentelemetry.io/otel` package, CI still greps for it, and a process whose switches are off still cannot reach OTel code.
 - A configuration that expresses two different intents for the same switch fails loudly at construction rather than silently picking one.
 - No new environment variables. New exported API is limited to what the mutual-exclusion rule forces: one error sentinel per module (two in `otel-mongo`) and one changed constructor signature.
@@ -70,14 +70,8 @@ useTracedImpl := gate1 && flags.EnvEnabled(moduleTracingEnv)
 
 ```go
 // Every operation. Only the relay verdicts can still change.
-//
-// AllowedAll, not two Allowed calls: a module that needs more than one verdict
-// must take them from one snapshot, or an operation can select the traced impl
-// on a pre-refresh tracing verdict and resolve propagation from a post-refresh one.
-allowed := resolver.AllowedAll()
-
-tracing     := useTracedImpl && allowed[idxTracing]
-propagation := tracing && gateProp && allowed[idxPropagation]               // otel-mongo only
+tracing     := useTracedImpl && resolver.Allowed(idxTracing)
+propagation := tracing && gateProp && resolver.Allowed(idxPropagation)     // otel-mongo only
 ```
 
 Three tiers, three owners, three distinct powers:
@@ -86,7 +80,7 @@ Three tiers, three owners, three distinct powers:
 |---|---|---|---|
 | `gate1` — `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` **or** `WithTracingEnabled`, never both | deployer, or the caller that constructs the wrapper | Every module in the process is off, only passthrough implementations are allocated, and no OpenFeature code path is reachable | No |
 | `OTEL_<MODULE>_TRACING_ENABLED` (and `OTEL_MONGO_PROPAGATION_ENABLED`) | deployer | That module is off, only its passthrough implementation is allocated, and its resolver is never consulted | No |
-| relay flag `otel-<module>-tracing` (and `otel-mongo-propagation`) | operator | That module stops emitting on a running process, within one TTL | **Yes — this is the only tier that can** |
+| relay flag `otel-<module>-tracing` (and `otel-mongo-propagation`) | operator | That module stops emitting on a running process as soon as the provider observes it | **Yes — this is the only tier that can** |
 
 The first two tiers are conjunctive and interchangeable in effect; they differ in scope (whole process vs one module) and in who owns them. The third is the only dynamic one, and it can only subtract from what the first two allow.
 
@@ -153,41 +147,50 @@ When `gate1` resolves off, the module constructs only its passthrough implementa
 
 *Consequence.* `WithTracingEnabled` is no longer a per-connection override of a process-wide setting. It is an alternative spelling of that setting, scoped to one connection, usable only where the environment stays silent.
 
-### D4. Per-module snapshot behind an `atomic.Pointer`, refreshed lazily with a one-second TTL
+### D4. No caching: the relay verdict is resolved on every operation
 
 ```go
 type Resolver struct {
-    client openfeature.IClient
+    domain string
     keys   []string   // OpenFeature flag keys, in Allowed-index order
-    ttl    time.Duration
-    now    func() time.Time
-    snap   atomic.Pointer[snapshot]
-}
 
-type snapshot struct {
-    at     time.Time
-    values []bool
+    clientOnce sync.Once
+    client     openfeature.IClient
 }
 
 func NewResolver(domain string, opts ...ResolverOption) *Resolver
 func WithFlagKeys(keys ...string) ResolverOption
-func (r *Resolver) Allowed(i int) bool     // relay verdict for key i; true means "not revoked"
-func (r *Resolver) AllowedAll() []bool     // every key's verdict from ONE snapshot load
+
+func (r *Resolver) Allowed(i int) bool {
+    if i < 0 || i >= len(r.keys) {
+        return false      // a mis-wired module degrades to disabled, not to a panic
+    }
+    return r.evaluator().Boolean(context.Background(), r.keys[i], true, openfeature.EvaluationContext{})
+}
 ```
 
-`Allowed` loads the snapshot pointer, compares one timestamp, and returns `values[i]`. On expiry the calling goroutine evaluates every key for that module and stores a fresh snapshot. Concurrent refreshes are permitted and unsynchronized: last store wins, and a lock on this path would cost more than the duplicate work it prevents.
+That is the whole resolver. There is no snapshot, no TTL, no clock, no refresh, and no timeout.
 
-**Snapshot timestamp.** `at` MUST be taken at the **start** of a refresh (before evaluating any key), not after the evaluation loop completes. Stamping at store time lets a slower refresh that read a stale relay value overwrite a fresher snapshot while carrying a newer clock, so the stale values appear fresh for a full TTL (PR #27 review, R3). Stamping at start means a late stale writer either loses on time-order reasoning or is immediately eligible for re-refresh; it does not eliminate brief last-writer races, only the "stale looks fresh for 1 s" failure mode. CAS/generation and singleflight remain non-goals.
+**What this costs, measured.** On an in-memory provider — the same shape as the GO Feature Flag in-process provider this design supports — one `client.Boolean` call is **2.0 µs, 336 B and 7 allocations**, against **82 ns and 0 allocations** for an atomic-pointer snapshot read. The 2 µs is not the flag lookup; it is the SDK's evaluation pipeline around it: before/after/finally hook chains, evaluation-context merging, the provider registry's RWMutex, interface dispatch. The provider being in memory does not help with any of it.
 
-**`AllowedAll` and cross-flag consistency.** `Allowed(i)` twice in one operation can straddle a TTL boundary and read two snapshots. `AllowedAll` exists so a caller that needs several of a module's flags observes one snapshot load, which is the only way to make the "all flags of a module share one instant" guarantee true rather than aspirational. `otel-mongo`'s tracing + propagation pair is the reason it exists; `otel-nats` and `otel-gorilla-ws` have one spec each and use `Allowed`.
+This is a real, known regression on the instrumented path. A wrapper that emits a span already pays roughly 1–3 µs for it, so resolving the flag per operation roughly doubles the instrumentation overhead of a NATS publish. Against a Mongo round trip it is noise. Against `0.7.0`, where the equivalent read was a plain struct field, it is 2 µs and 7 allocations that did not exist.
 
-**Refresh is bounded.** `refresh` evaluates under `context.WithTimeout(context.Background(), refreshTimeout)`. The context is deliberately **not** the caller's: a flag snapshot is process-scoped state, and letting whichever goroutine happened to trigger the refresh donate its cancellation would make the snapshot's fate depend on an unrelated request's lifetime. The timeout exists because `refresh` runs synchronously on a caller's goroutine, so a provider configured for remote evaluation (see D2's provider-mode constraint below) would otherwise block a Mongo or NATS operation for that provider's HTTP timeout — 10 s by default. On timeout `Boolean` returns its default `true`, which is exactly the documented "relay does not interfere" outcome, so the fail-safe path needs no extra handling.
+**Why it is accepted anyway.** Caching is a **pure internal optimisation behind an unchanged signature**. `Allowed(i) bool` reads identically whether the value came from a live evaluation or from a cached snapshot, so adding a cache later costs nothing at any call site. Deferring it is therefore not a bet — it can be added the moment a benchmark on a real workload says it matters, without touching a single module.
 
-**Supported provider mode.** The documented wiring uses the GO Feature Flag provider's default `EvaluationType`, `INPROCESS`, in which the provider polls the relay in the background (120 s by default) and each `Boolean` is a local lookup. `EvaluationTypeRemote` is **not supported**: it turns every evaluation into an HTTP request and therefore puts network I/O on the operation path once per TTL window. The `refreshTimeout` above bounds the damage if a site configures it anyway; it does not make it supported.
+What deferring buys is the removal of an entire class of concurrency subtleties from the file that must stay byte-identical across four copies, and that the package doc names as its highest drift risk:
 
-*Alternatives considered.* Calling `client.Boolean` on each operation is 100 ns – 1 µs (hooks chain, evaluation context assembly, provider lock, flag lookup) — acceptable next to a Mongo round trip, not acceptable on a NATS publish, and paid even when the flag is off. A per-flag TTL costs one clock read per flag rather than per module and permits torn reads. A background ticker goroutine writing the snapshot would remove the clock read entirely (~1 ns instead of ~25 ns) but adds a permanently resident goroutine per module and a shutdown story this repo has no API for. Parallelizing the per-key `Boolean` loop inside one refresh was rejected: modules have at most two keys, and fan-out complexity is not worth the gain (R13).
+- no TTL semantics to specify, document or test (no 900 ms / 1100 ms boundary tests, no injectable clock)
+- no snapshot timestamp question — whether `at` is stamped before or after the evaluation loop (R3) simply does not arise
+- no cross-flag consistency question: with no TTL there is no TTL boundary for a two-flag read to straddle, leaving only the microsecond window between two consecutive `Boolean` calls, which R19 already accepted as WONTFIX
+- no shared mutable snapshot slice to protect from callers
+- no refresh timeout, and therefore no magic number defending a configuration the design already declares unsupported
+- revocation takes effect immediately rather than immediately-plus-up-to-one-second
 
-*Consequence.* A revocation takes effect within one second of the provider observing it; the provider's own polling interval (minutes) dominates end-to-end latency. The TTL is therefore fixed at one second and not configurable — tightening it cannot meaningfully improve responsiveness and loosening it saves nanoseconds. Concurrent refreshes may still briefly surface a stale last-writer value; the next expiry self-heals.
+**The evaluation runs on the caller's goroutine.** With the supported in-process provider that is a local, allocation-heavy but bounded computation. With the unsupported remote evaluation mode it would be a synchronous HTTP request on the path of every Mongo query and every NATS publish — which is the reason that mode is unsupported rather than merely discouraged.
+
+*Alternatives considered.* A per-module snapshot behind an `atomic.Pointer` with a one-second TTL — the shape this design carried through PR #27 — is 25× faster and allocation-free, and was the right answer while the module environment variable was the evaluation default, because back then the resolver was consulted even for modules that were switched off. Under D2 and D7 it is consulted only by wrappers that are actively instrumenting, which narrows the population that pays. It was deferred rather than rejected: see *Consequence* below. A background ticker goroutine writing a cached value removes the cost entirely but adds a permanently resident goroutine per module and a shutdown story this repo has no API for.
+
+*Consequence — this is a deferral, not a decision that caching is unnecessary.* The measured numbers above stand. If a benchmark on a real workload shows the per-operation cost matters, the fix is a cache inside `Resolver` with no change to `Allowed`, and the design questions it reopens (TTL length, timestamp placement, multi-flag consistency, snapshot immutability) are recorded in this section so they do not have to be rediscovered.
 
 ### D5. Module-specific data lives outside the byte-identical file
 
@@ -219,9 +222,9 @@ var mongoResolver = flags.NewResolver("otel-mongo",
 )
 ```
 
-The refresh, timeout and TTL logic — the part most likely to drift if hand-copied — stays inside the byte-identical file, which is the whole point of that rule. The zero-dependency property that file used to have is given up here; the OpenFeature SDK is the only import added, and it is the reason the file is worth sharing at all.
+The evaluation call and the truthiness rules — the parts most likely to drift if hand-copied — stay inside the byte-identical file, which is the whole point of that rule. The zero-dependency property that file used to have is given up here; the OpenFeature SDK is the only import added, and it is the reason the file is worth sharing at all.
 
-*Alternatives considered.* Leaving `internal/flags` untouched and writing the TTL, snapshot, and OpenFeature logic separately in each module would keep the existing spec unchanged but would place the highest-risk shared logic outside the only mechanism this repo has for preventing drift.
+*Alternatives considered.* Leaving `internal/flags` untouched and writing the OpenFeature call and the truthiness rules separately in each module would keep the existing spec unchanged but would place the highest-risk shared logic outside the only mechanism this repo has for preventing drift — and that risk grows, not shrinks, if a cache is added later (D4).
 
 ### D6. `Gate` is deleted
 
@@ -241,7 +244,7 @@ The kill-switch model is what makes including `moduleEnv` safe. Under a relay th
 
 When `useTracedImpl` is false, only the passthrough implementation is constructed and no OTel SDK code path is reachable for that wrapper's lifetime. When it is true, both implementations exist and the per-operation relay verdict selects between them.
 
-*Consequence.* The previous release's zero-cost passthrough is preserved for every configuration that had it, including `gate1` on with the module switch off — a configuration the earlier revision of this design would have slowed down. The cost of dynamism is paid only where dynamism is possible: a wrapper built on the traced path pays one atomic load and one clock read per operation, amortized across the TTL window.
+*Consequence.* The previous release's zero-cost passthrough is preserved for every configuration that had it, including `gate1` on with the module switch off — a configuration the earlier revision of this design would have slowed down. The cost of dynamism is paid only where dynamism is possible: a wrapper built on the traced path resolves its relay verdict per operation, at the cost measured in D4.
 
 *Consequence.* Changing a module's environment variable after construction (`os.Setenv` in a long-running process) does not change which implementations exist. This already held for `gate1` and for `otel-gorilla-ws`'s capability; tests must set the environment before constructing, which is the discipline they already follow.
 
@@ -276,7 +279,7 @@ This keeps `internal/direct` free of OTel SDK imports (the CI grep and the packa
 
 *Consequence.* `collectionImpl` returns raw driver types for `Find`/`Aggregate`/`Watch` and the facade constructs both wrappers itself; `FindOne` keeps returning a `shared.SingleResultImpl` alongside its raw result. `traced.Collection`'s exported `PropagationEnabled bool` field is a `func() bool`, which facade-package tests that build `traced.Collection` literals must follow.
 
-**Per-operation tracing/propagation consistency (R5).** Within a single public operation, the tracing decision used to select `impl()` SHALL be the same value passed into `resolveDocumentPropagation` / `propagationOn` — callers MUST NOT re-resolve tracing for that operation's propagation decision. The operation's two relay verdicts SHALL come from one `AllowedAll` load (D4). Client and Database share one small gate-state helper so the rule is not hand-copied four times (R16).
+**Per-operation tracing/propagation consistency (R5).** Within a single public operation, the tracing decision used to select `impl()` SHALL be the same value passed into `resolveDocumentPropagation` / `propagationOn` — callers MUST NOT re-resolve tracing for that operation's propagation decision. The two relay verdicts an `otel-mongo` operation needs are two consecutive `Boolean` calls; the microsecond window between them is the one R19 accepted as WONTFIX, and is fail-safe because a false tracing verdict short-circuits propagation. Client and Database share one small gate-state helper so the rule is not hand-copied four times (R16).
 
 **Facade `impl()` selection (R14).** The `if traced != nil && tracing() { return traced }; return direct` pattern is factored once per module (v1 and v2) via a tiny generics helper; v1↔v2 parity copies remain required by CLAUDE.md.
 
@@ -344,11 +347,11 @@ The environment variable is **not** the flag's evaluation default (D2); it is a 
 
 The library passes an empty `openfeature.EvaluationContext{}`. Applications that want targeting install a global one with `openfeature.SetEvaluationContext`, which the SDK merges into every evaluation.
 
-The library has no non-arbitrary source for `service.name` or `deployment.environment` — it would have to guess between `OTEL_SERVICE_NAME`, the OTel resource, and hostname — and anything it invented would collide with what the application set. Per D4 the snapshot is process-wide, so only process-scoped attributes are meaningful anyway.
+The library has no non-arbitrary source for `service.name` or `deployment.environment` — it would have to guess between `OTEL_SERVICE_NAME`, the OTel resource, and hostname — and anything it invented would collide with what the application set. The resolver passes no attributes and holds no per-request state, so only process-scoped attributes are meaningful anyway.
 
 ### D13. Testing uses an in-memory provider and an injected clock
 
-`NewResolver` accepts `WithClock(func() time.Time)`, exported for tests in the same way `Gate.ResetForTest` was. Tests install `memprovider.NewInMemoryProvider(...)` through `SetProviderAndWait`, mutate flag values, advance the fake clock past the TTL, and assert the new value is observed. This makes TTL behavior itself testable — that 0.9 s does not refresh and 1.1 s does — which a reset hook could only bypass.
+Tests install `memprovider.NewInMemoryProvider(...)` through `SetProviderAndWait`, mutate a flag value, and assert the next operation observes it. Because D4 resolves per call, no clock injection, no reset hook and no waiting are involved: the change is visible on the very next operation. This is what replaces the deleted `Gate.ResetForTest` — the provider is the control surface, so tests drive the real code path instead of bypassing it.
 
 Tests must exercise the kill-switch asymmetry explicitly: a relay `true` against a falsy module environment variable must produce **no** spans and **no** evaluation, and a relay `false` against a truthy one must stop a running connection.
 
@@ -356,7 +359,7 @@ Because D3 makes the environment variable and the option mutually exclusive, eve
 
 One integration test stands up a real GO Feature Flag relay proxy container and drives one module end to end, verifying that the wiring recipe in the documentation actually resolves against a real relay: provider construction options, endpoint format, and flag keys matching a real relay configuration file. It must assert the revoke direction, since that is the only direction the relay has. Only one module is covered; the wiring is identical across the four and three more containers would add cost without information.
 
-A full harness-level assertion that spans stop reaching the OTLP sink after a revocation is deliberately excluded. It would have to outwait the TTL, the provider's poll interval, and the exporter's batch timeout, making it a timing race; its two halves are already covered separately by the integration test (the value propagates) and the unit tests (a false value emits no span).
+A full harness-level assertion that spans stop reaching the OTLP sink after a revocation is deliberately excluded. It would have to outwait the provider's poll interval and the exporter's batch timeout, making it a timing race; its two halves are already covered separately by the integration test (the value propagates) and the unit tests (a false value emits no span).
 
 Because the OpenFeature provider and the environment are both process-global, tests that touch them must not call `t.Parallel` — the same constraint that already applies to the environment-toggling tests.
 
@@ -411,9 +414,9 @@ Returned errors wrap the sentinel and name both observed values (`option=false, 
 
 **`NewConn` signature change.** → BREAKING; see D16.
 
-**`refresh` runs on a caller's goroutine.** With the supported in-process provider this is a local lookup once per TTL window. With an unsupported remote-evaluation provider it is an HTTP request on the operation path. → Bounded by `refreshTimeout` (D4), with the timeout resolving to "relay does not interfere"; and the supported mode is stated in the README.
+**Every evaluation runs on the caller's goroutine.** With the supported in-process provider that is 2 µs and 7 allocations per operation (D4). With an unsupported remote-evaluation provider it would be a synchronous HTTP request on the path of every Mongo query and NATS publish. → The per-operation cost is measured, recorded and accepted as a deferral; the unsupported mode is stated in `feature-flags.md` and in the README.
 
-**Revocations are not atomic across modules.** Each module refreshes independently, so a relay change touching Mongo and NATS together can be observed by one before the other, up to one TTL apart. → Within a module `AllowedAll` gives one snapshot, which is where combinations actually interact.
+**Revocations are not atomic across flags.** A relay change touching several flags is observed by consecutive `Boolean` calls microseconds apart, so an operation reading two of them can in principle see one old and one new value. → This is R19, already accepted: the window is microseconds, and for the pair that actually interacts — Mongo tracing and propagation — a false tracing verdict short-circuits propagation, so the combination fails safe.
 
 **`_oteltrace` is written into application documents and never removed.** Roughly 90 bytes per document across six write methods, with no strip on read, no undo, and a hard write failure against strict `$jsonSchema` validation. → D2 and D10 mean only the deployment can start this; the relay can only stop it. Documented in the module README with the field shape, the write methods, the size, and the fact that cleanup is a `$unset` migration.
 
@@ -447,6 +450,7 @@ This design was revised after PR #27 shipped an implementation of an earlier mod
 | Implementation selection keys on the global switch alone, so `gate1` on + module switch off allocates an instrumented wrapper it can never use | D7 — construction keys on `gate1 && EnvEnabled(moduleEnv)`, restoring the zero-cost passthrough and matching `otel-gorilla-ws` |
 | R4: "no provider ⇒ identical behavior" is false for otel-ws negotiation | Withdrawn — D9's capability is fully static, so the exception no longer arises |
 | Detecting whether the relay "has an opinion" (double `Boolean` evaluation) | Unnecessary — under D2 "relay silent" and "relay allows" are the same outcome |
+| A per-module snapshot behind an `atomic.Pointer` with a one-second TTL | D4 — deferred, not rejected. Caching is invisible behind `Allowed(i) bool`, so it can be added later at no call-site cost; the measured 2 µs it would save is recorded there |
 
 ## Post-review remediation (PR #27 grill, 2026-08)
 
@@ -456,9 +460,9 @@ Source: `reviews/code-review-pr-27-openfeature-dynamic-flags.zh-TW.html` and a d
 |----|--------|----------|----------------------|
 | R1 | `NewConn` wire corruption when capability on + feature off | Envelope only if negotiated/proven; fail → raw wire; local spans OK; no force-negotiated option; clamp with capable (R7) | Stands (D9) |
 | R2 | `MessageBatch` freezes flag at Fetch | Always return a dynamic batch wrapper; per-message gate re-check | Stands (D8) |
-| R3 | `Resolver.refresh` last-store-wins + late `at` | Stamp `at` at evaluation start; no CAS/mutex | Stands (D4) |
+| R3 | `Resolver.refresh` last-store-wins + late `at` | Stamp `at` at evaluation start; no CAS/mutex | **Moot** — D4 removes the snapshot, so there is no `at` and no refresh |
 | R4 | otel-ws negotiation vs "no provider ⇒ no change" | Was: keep behavior, document exception | **Withdrawn** — D9 removes the exception |
-| R5 | Mongo single-call-chain torn read of tracing | Pass resolved tracing into propagation; no internal recompute | Stands, strengthened by `AllowedAll` (D4/D8) |
+| R5 | Mongo single-call-chain torn read of tracing | Pass resolved tracing into propagation; no internal recompute | Stands |
 | R6 | JetStream per-message rebuild of tracer/attrs | Hoist tracer/prop/baseAttrs to construction; gate stays per-message | Stands |
 | R7 | `capable` / `tracingEnabled` no choke-point clamp | Subsumed into R1 | Stands |
 | R8 | Dead second return of `collectionImpl` Find/Aggregate/Watch | Drop second return; stop throwaway `New*` in impls | Stands |
@@ -466,13 +470,13 @@ Source: `reviews/code-review-pr-27-openfeature-dynamic-flags.zh-TW.html` and a d
 | R10 | Gate/propEnabledGate doc drift | Full sync: CLAUDE, test comments, jetstream godoc, main spec | Stands, widened by the revision |
 | R11 | `WriteMessage` nil span + dual guards | Feature-off uses noop span; drop nil guards | Stands |
 | R12 | NATS Consume path triple `impl()` per message | Resolve once per message; pass down | Stands |
-| R13 | `dynamicTracingPossible` duplication / parallel refresh | `flags.GlobalTracingPossible()`; no parallel Boolean in refresh | Stands, plus `GlobalTracingSet` (D5) |
+| R13 | `dynamicTracingPossible` duplication / parallel refresh | `flags.GlobalTracingPossible()` | Stands, plus `GlobalTracingSet` (D5); the parallel-refresh half is moot with no refresh |
 | R14 | Six copies of facade `impl()` selection | Generics `selectImpl` per mongo module | **Not yet implemented** — `collection.go`, `cursor.go` and `results.go` still hand-roll it |
 | R15 | Five copies of relay test helpers | Move to `otel-testkit/harness` | Stands |
 | R16 | Client/Database `effective*` duplication | Shared gateState | Stands |
 | R17 | otelnats `impl`/`msgHandler`/`traceEventMsgHandler` policy | WONTFIX extract; lockstep comment only | Stands |
 | R18 | Dead nil-handler guard in `tracedConsumeHandler` | Delete dead guard | Stands |
-| R19 | Same-refresh sequential Boolean micro-torn pair | WONTFIX | Superseded — `AllowedAll` (D4) removes the cross-TTL half; the intra-refresh microsecond window remains WONTFIX |
+| R19 | Same-refresh sequential Boolean micro-torn pair | WONTFIX | Stands, and is now the only tearing window — D4 removes the TTL boundary that was the larger half |
 
 ## Open Questions
 
