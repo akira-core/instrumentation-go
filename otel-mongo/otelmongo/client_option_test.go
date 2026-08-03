@@ -34,15 +34,16 @@ func clearMongoTracingEnv(t *testing.T) {
 			}
 		})
 	}
-	resetPropEnabledCacheForTest()
-	t.Cleanup(resetPropEnabledCacheForTest)
 }
 
 // TestConnectWithOptions_TracingEnabledOption_True_OverridesEnvUnset verifies
 // WithTracingEnabled(true) is authoritative when all tracing env vars are
 // unset: the Client traces and its Collections select the traced impl.
-func TestConnectWithOptions_TracingEnabledOption_True_OverridesEnvUnset(t *testing.T) {
+func TestConnectWithOptions_TracingEnabledOption_True_SuppliesGate1(t *testing.T) {
 	clearMongoTracingEnv(t)
+	// The option supplies gate1; OTEL_MONGO_TRACING_ENABLED is the separate,
+	// conjunctive tier that decides whether the instrumented impls are built.
+	t.Setenv(envMongoTracingEnabled, "1")
 	uri := requireMongoDB(t)
 
 	c, err := ConnectWithOptions(context.Background(), []ClientOption{WithTracingEnabled(true)}, options.Client().ApplyURI(uri))
@@ -56,17 +57,16 @@ func TestConnectWithOptions_TracingEnabledOption_True_OverridesEnvUnset(t *testi
 	assert.IsType(t, &traced.Collection{}, coll.impl(), "Collection must select the traced impl")
 }
 
-// TestConnectWithOptions_TracingEnabledOption_False_OverridesEnvTruthy
-// verifies WithTracingEnabled(false) is authoritative when all tracing env
-// vars are truthy: the Client does not trace, its Collections select the
-// direct impl, and WithTracePropagationEnabled(true) cannot enable
-// propagation despite tracing being force-disabled by the option.
-func TestConnectWithOptions_TracingEnabledOption_False_OverridesEnvTruthy(t *testing.T) {
-	t.Setenv(envGlobalTracingEnabled, "1")
+// TestConnectWithOptions_TracingEnabledOption_False_BuildsPassthrough verifies
+// that gate1 supplied as WithTracingEnabled(false) builds only the passthrough:
+// the Client does not trace, its Collections select the direct impl, and
+// WithTracePropagationEnabled(true) cannot enable propagation below a disabled
+// first tier.
+func TestConnectWithOptions_TracingEnabledOption_False_BuildsPassthrough(t *testing.T) {
+	// Both env variables that have an option counterpart are left UNSET: since
+	// D3 each pair is two spellings of one switch, and supplying both is a
+	// configuration error.
 	t.Setenv(envMongoTracingEnabled, "1")
-	t.Setenv(envMongoPropagationEnabled, "1")
-	resetPropEnabledCacheForTest()
-	t.Cleanup(resetPropEnabledCacheForTest)
 	uri := requireMongoDB(t)
 
 	c, err := ConnectWithOptions(context.Background(), []ClientOption{
@@ -76,7 +76,7 @@ func TestConnectWithOptions_TracingEnabledOption_False_OverridesEnvTruthy(t *tes
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Disconnect(context.Background()) })
 
-	assert.False(t, c.effectiveTracing(), "option must override the truthy env gates")
+	assert.False(t, c.effectiveTracing(), "gate1 off → no instrumented impl, whichever spelling supplied it")
 	assert.False(t, c.effectivePropagation(), "propagation cannot be enabled when effective tracing is off, even via WithTracePropagationEnabled")
 
 	coll := c.Database("otelmongo_test").Collection("option_false_overrides_env")
@@ -93,6 +93,9 @@ func TestConnectWithOptions_TracingEnabledOption_False_OverridesEnvTruthy(t *tes
 // internally instead of the Client's actual effective decision.
 func TestConnectWithOptions_TracingEnabledOption_True_PropagationOverrideWorks(t *testing.T) {
 	clearMongoTracingEnv(t)
+	// The option supplies gate1; the module switch is a separate, conjunctive
+	// tier and must be on for anything instrumented to be built.
+	t.Setenv(envMongoTracingEnabled, "1")
 	uri := requireMongoDB(t)
 
 	c, err := ConnectWithOptions(context.Background(), []ClientOption{
@@ -103,7 +106,7 @@ func TestConnectWithOptions_TracingEnabledOption_True_PropagationOverrideWorks(t
 	t.Cleanup(func() { _ = c.Disconnect(context.Background()) })
 
 	assert.True(t, c.effectiveTracing())
-	assert.True(t, c.effectivePropagation(), "WithTracePropagationEnabled must take effect when WithTracingEnabled(true) supplies the effective tracing state, even though the env gates are unset")
+	assert.True(t, c.effectivePropagation(), "WithTracePropagationEnabled supplies the propagation tier when its env var is unset")
 }
 
 // TestConnectWithOptions_TracingEnabledOption_Absent_MatchesEnvGate verifies
@@ -123,8 +126,6 @@ func TestConnectWithOptions_TracingEnabledOption_Absent_MatchesEnvGate(t *testin
 	t.Run("env enabled", func(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "1")
 		t.Setenv(envMongoTracingEnabled, "1")
-		resetPropEnabledCacheForTest()
-		t.Cleanup(resetPropEnabledCacheForTest)
 		c, err := ConnectWithOptions(context.Background(), nil, options.Client().ApplyURI(uri))
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = c.Disconnect(context.Background()) })
@@ -150,19 +151,16 @@ func TestConnectWithOptions_DoesNotMutateCallerOptions(t *testing.T) {
 		"ConnectWithOptions must not overwrite the caller's Monitor field")
 }
 
-// TestContextFromDocument_IgnoresPerClientOption verifies the package-level
-// ContextFromDocument gate stays env-only: a document written by a client
-// tracing via WithTracingEnabled(true) (env gates off) still fails
-// extraction, because ContextFromDocument resolves its own independent,
-// process-wide cached gate rather than any per-client state.
-func TestContextFromDocument_IgnoresPerClientOption(t *testing.T) {
+// TestContextFromDocument_IgnoresEveryFlag verifies D10: the package-level
+// helper carries no gate at all, so it neither consults per-client options nor
+// any switch. A revocation does not stop trace-context extraction.
+func TestContextFromDocument_IgnoresEveryFlag(t *testing.T) {
 	clearMongoTracingEnv(t)
-	resetPropEnabledCacheForTest()
-	t.Cleanup(resetPropEnabledCacheForTest)
 
 	doc := bson.M{"_oteltrace": bson.M{"traceparent": "00-11111111111111111111111111111111-2222222222222222-01"}}
 	_, ok := ContextFromDocument(context.Background(), doc)
-	assert.False(t, ok, "ContextFromDocument must stay disabled per the env-only cached gate regardless of any per-client WithTracingEnabled option")
+	assert.True(t, ok,
+		"extraction is ungated: it emits nothing, and the caller asked for it at the call site")
 }
 
 // TestNewClientConfig_SkipsNilOptions pins nil-tolerance of the option

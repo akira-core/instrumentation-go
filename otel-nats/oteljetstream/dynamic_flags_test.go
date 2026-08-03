@@ -2,6 +2,7 @@ package oteljetstream_test
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -49,28 +50,50 @@ func relayFlag(v bool) memprovider.InMemoryFlag {
 	}
 }
 
-func setJSRelay(t *testing.T, tracing bool) {
+// flagDomain is the OpenFeature domain every instrumentation module resolves
+// through. It is declared in otel-nats/otelnats/internal/flags, which this
+// package cannot import (a different internal/ subtree), so the literal is
+// repeated here; it must stay in step with flags.FlagDomain.
+const flagDomain = "otel-instrumentation-go"
+
+// clearGlobalSwitch removes OTEL_INSTRUMENTATION_GO_TRACING_ENABLED for the
+// duration of the test, so WithTracingEnabled can supply gate1 without
+// colliding with it.
+func clearGlobalSwitch(t *testing.T) {
 	t.Helper()
-	// No resolver rearm: this suite proves TTL re-read via awaitTTL.
-	require.NoError(t, openfeature.SetProviderAndWait(memprovider.NewInMemoryProvider(
-		map[string]memprovider.InMemoryFlag{jsTracingFlagKey: relayFlag(tracing)},
-	)))
+	const name = "OTEL_INSTRUMENTATION_GO_TRACING_ENABLED"
+	prev, existed := os.LookupEnv(name)
+	_ = os.Unsetenv(name)
 	t.Cleanup(func() {
-		require.NoError(t, openfeature.SetProviderAndWait(openfeature.NoopProvider{}))
+		if existed {
+			_ = os.Setenv(name, prev)
+		} else {
+			_ = os.Unsetenv(name)
+		}
 	})
 }
 
-// awaitTTL lets the resolver's snapshot expire so the next read sees the relay's
-// current value.
-func awaitTTL() { time.Sleep(1100 * time.Millisecond) }
+func setJSRelay(t *testing.T, tracing bool) {
+	t.Helper()
+	// Bind the NAMED domain: that is what the resolver reads, and a default
+	// provider would be shadowed by any named binding left behind elsewhere in
+	// this binary.
+	require.NoError(t, openfeature.SetNamedProviderAndWait(flagDomain,
+		memprovider.NewInMemoryProvider(
+			map[string]memprovider.InMemoryFlag{jsTracingFlagKey: relayFlag(tracing)},
+		)))
+	t.Cleanup(func() {
+		require.NoError(t, openfeature.SetNamedProviderAndWait(flagDomain, openfeature.NoopProvider{}))
+	})
+}
 
 func TestJetStreamPublishFollowsTheRelayWithoutRecreatingTheHandle(t *testing.T) {
 	url := startJetStreamServer(t)
 
-	// Kill switch on, module env var off: every observation below is
+	// Both environment tiers on: every observation below is
 	// attributable to the relay rather than to the environment.
 	t.Setenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED", "1")
-	t.Setenv("OTEL_NATS_TRACING_ENABLED", "false")
+	t.Setenv("OTEL_NATS_TRACING_ENABLED", "1")
 	setJSRelay(t, false)
 
 	sr := tracetest.NewSpanRecorder()
@@ -91,14 +114,12 @@ func TestJetStreamPublishFollowsTheRelayWithoutRecreatingTheHandle(t *testing.T)
 	})
 	require.NoError(t, err)
 
-	awaitTTL()
 	_, err = js.Publish(ctx, "dynflags.a", []byte("one"))
 	require.NoError(t, err)
 	assert.Empty(t, publishSpans(sr), "relay says off → no publish span")
 
 	// Operator flips the flag. Same conn, same js handle.
 	setJSRelay(t, true)
-	awaitTTL()
 	_, err = js.Publish(ctx, "dynflags.b", []byte("two"))
 	require.NoError(t, err)
 	assert.NotEmpty(t, publishSpans(sr),
@@ -106,16 +127,18 @@ func TestJetStreamPublishFollowsTheRelayWithoutRecreatingTheHandle(t *testing.T)
 
 	before := len(publishSpans(sr))
 	setJSRelay(t, false)
-	awaitTTL()
 	_, err = js.Publish(ctx, "dynflags.c", []byte("three"))
 	require.NoError(t, err)
 	assert.Len(t, publishSpans(sr), before,
 		"relay flipped back off → no further publish spans")
 }
 
-func TestOverriddenConnPinsJetStreamAgainstTheRelay(t *testing.T) {
+func TestGate1OffKeepsJetStreamPassthrough(t *testing.T) {
 	url := startJetStreamServer(t)
-	t.Setenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED", "1")
+	// startJetStreamServer sets both tracing variables; clear the global one so
+	// WithTracingEnabled is the only spelling of gate1 in play. Setting both is
+	// a configuration error since D3.
+	clearGlobalSwitch(t)
 	t.Setenv("OTEL_NATS_TRACING_ENABLED", "true")
 	setJSRelay(t, true)
 
@@ -137,12 +160,11 @@ func TestOverriddenConnPinsJetStreamAgainstTheRelay(t *testing.T) {
 	require.NoError(t, err)
 
 	setJSRelay(t, true)
-	awaitTTL()
 	_, err = js.Publish(ctx, "pinned.a", []byte("one"))
 	require.NoError(t, err)
 
 	assert.Empty(t, publishSpans(sr),
-		"WithTracingEnabled(false) pins every JetStream wrapper derived from the Conn")
+		"gate1 off builds only the passthrough, so no JetStream wrapper derived from the Conn can trace")
 }
 
 // publishSpans returns the recorded spans produced by JetStream publishes.
@@ -165,7 +187,7 @@ func publishSpans(sr *tracetest.SpanRecorder) []sdktrace.ReadOnlySpan {
 func TestConsumeFollowsTheRelayWithoutResubscribing(t *testing.T) {
 	url := startJetStreamServer(t)
 	t.Setenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED", "1")
-	t.Setenv("OTEL_NATS_TRACING_ENABLED", "false")
+	t.Setenv("OTEL_NATS_TRACING_ENABLED", "1")
 	setJSRelay(t, false)
 
 	sr := tracetest.NewSpanRecorder()
@@ -213,14 +235,12 @@ func TestConsumeFollowsTheRelayWithoutResubscribing(t *testing.T) {
 		return n
 	}
 
-	awaitTTL()
 	_, err = js.Publish(ctx, "dynconsume.a", []byte("one"))
 	require.NoError(t, err)
 	awaitDelivery()
 	assert.Zero(t, processSpans(), "relay off → the running Consume loop emits no process span")
 
 	setJSRelay(t, true)
-	awaitTTL()
 	_, err = js.Publish(ctx, "dynconsume.b", []byte("two"))
 	require.NoError(t, err)
 	awaitDelivery()
@@ -235,7 +255,7 @@ func TestConsumeFollowsTheRelayWithoutResubscribing(t *testing.T) {
 func TestMessagesIteratorFollowsTheRelayMidStream(t *testing.T) {
 	url := startJetStreamServer(t)
 	t.Setenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED", "1")
-	t.Setenv("OTEL_NATS_TRACING_ENABLED", "false")
+	t.Setenv("OTEL_NATS_TRACING_ENABLED", "1")
 	setJSRelay(t, false)
 
 	sr := tracetest.NewSpanRecorder()
@@ -272,7 +292,6 @@ func TestMessagesIteratorFollowsTheRelayMidStream(t *testing.T) {
 	}
 
 	// The iterator is created while the relay says off; first message must not trace.
-	awaitTTL()
 	_, err = js.Publish(ctx, "dynmsgs.a", []byte("one"))
 	require.NoError(t, err)
 	_, msg, err := iter.Next()
@@ -282,7 +301,6 @@ func TestMessagesIteratorFollowsTheRelayMidStream(t *testing.T) {
 
 	// Flip on; the SAME iterator must start tracing.
 	setJSRelay(t, true)
-	awaitTTL()
 	_, err = js.Publish(ctx, "dynmsgs.b", []byte("two"))
 	require.NoError(t, err)
 	_, msg, err = iter.Next()

@@ -7,11 +7,20 @@ import (
 	nats "github.com/nats-io/nats.go"
 )
 
-func resetNATSGateForTest() {
-	natsResolver = newNATSResolver()
+// natsCapable resolves the module's static ceiling from the environment: gate1
+// AND OTEL_NATS_TRACING_ENABLED. The truthiness rules themselves live in
+// internal/flags and are tested there; these cases pin how this module composes
+// the two tiers.
+func natsCapable(t *testing.T) bool {
+	t.Helper()
+	possible, err := tracedPossible(nil)
+	if err != nil {
+		t.Fatalf("tracedPossible: %v", err)
+	}
+	return possible
 }
 
-func TestNATSTracingEnabled_DefaultFalse(t *testing.T) {
+func TestNATSCapability_DefaultFalse(t *testing.T) {
 	prev, existed := os.LookupEnv(envNATSTracingEnabled)
 	_ = os.Unsetenv(envNATSTracingEnabled)
 	t.Cleanup(func() {
@@ -21,41 +30,44 @@ func TestNATSTracingEnabled_DefaultFalse(t *testing.T) {
 			_ = os.Unsetenv(envNATSTracingEnabled)
 		}
 	})
-	resetNATSGateForTest()
-	t.Cleanup(resetNATSGateForTest)
-	if natsTracingEnabled() {
-		t.Fatal("expected tracing disabled when env var is unset")
+	if natsCapable(t) {
+		t.Fatal("expected tracing disabled when the module env var is unset")
 	}
 }
 
-func TestNATSTracingEnabled_EmptyStringIsEnabled(t *testing.T) {
+// TestNATSCapability_EmptyStringIsDisabled is the BREAKING truthiness change:
+// `export VAR=` used to open the gate and now closes it.
+func TestNATSCapability_EmptyStringIsDisabled(t *testing.T) {
 	t.Setenv(envGlobalTracingEnabled, "")
 	t.Setenv(envNATSTracingEnabled, "")
-	resetNATSGateForTest()
-	t.Cleanup(resetNATSGateForTest)
-	if !natsTracingEnabled() {
-		t.Fatal("expected empty string to mean enabled")
+	if natsCapable(t) {
+		t.Fatal("expected an empty string to mean disabled")
 	}
 }
 
-func TestNATSTracingEnabled_FalseTokens(t *testing.T) {
+func TestNATSCapability_FalseTokens(t *testing.T) {
+	t.Setenv(envGlobalTracingEnabled, "1")
 	for _, v := range []string{"false", "0", "off", "no"} {
 		t.Setenv(envNATSTracingEnabled, v)
-		resetNATSGateForTest()
-		if natsTracingEnabled() {
+		if natsCapable(t) {
 			t.Fatalf("expected disabled for value %q", v)
 		}
 	}
-	t.Cleanup(resetNATSGateForTest)
 }
 
-func TestNATSTracingEnabled_GlobalOffOverridesModule(t *testing.T) {
+func TestNATSCapability_GlobalOffOverridesModule(t *testing.T) {
 	t.Setenv(envGlobalTracingEnabled, "false")
 	t.Setenv(envNATSTracingEnabled, "true")
-	resetNATSGateForTest()
-	t.Cleanup(resetNATSGateForTest)
-	if natsTracingEnabled() {
-		t.Fatal("expected global flag to disable nats tracing")
+	if natsCapable(t) {
+		t.Fatal("expected the global kill switch to disable nats tracing")
+	}
+}
+
+func TestNATSCapability_RequiresBothTiers(t *testing.T) {
+	t.Setenv(envGlobalTracingEnabled, "1")
+	t.Setenv(envNATSTracingEnabled, "1")
+	if !natsCapable(t) {
+		t.Fatal("expected capability with both tiers on")
 	}
 }
 
@@ -80,10 +92,11 @@ func TestNewConn_TracingDisabled_UsesDirectConn(t *testing.T) {
 			_ = os.Unsetenv(envNATSTracingEnabled)
 		}
 	})
-	resetNATSGateForTest()
-	t.Cleanup(resetNATSGateForTest)
 
-	conn := newConn(&nats.Conn{})
+	conn, err := newConn(&nats.Conn{})
+	if err != nil {
+		t.Fatalf("newConn: %v", err)
+	}
 	if _, ok := conn.impl().(*directConn); !ok {
 		t.Fatalf("expected *directConn impl when tracing gate is off, got %T", conn.impl())
 	}

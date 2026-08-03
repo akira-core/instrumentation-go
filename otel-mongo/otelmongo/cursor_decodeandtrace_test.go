@@ -121,7 +121,6 @@ func TestCursorDecodeAndTrace_NoFlagsNoSpan(t *testing.T) {
 	t.Setenv(envGlobalTracingEnabled, "false")
 	t.Setenv(envMongoTracingEnabled, "false")
 	t.Setenv(envMongoPropagationEnabled, "true")
-	resetPropEnabledCacheForTest()
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
 
 	sr := tracetest.NewSpanRecorder()

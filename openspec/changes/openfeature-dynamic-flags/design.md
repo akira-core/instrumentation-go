@@ -15,7 +15,7 @@ The OpenFeature Go SDK is at v1.17.2. Its relevant surface:
 - `openfeature.SetProviderAndWait(p)` installs a process-global **default** provider; `SetNamedProvider(domain, p)` installs one scoped to a domain, which takes precedence over the default for clients bound to that domain.
 - `openfeature.NewClient(domain)` returns a client that resolves through the named provider for `domain` when one exists and falls back to the default otherwise.
 - `client.Boolean(ctx, key, defaultValue, evalCtx)` returns `defaultValue` on any error — including when no provider was ever installed, since the SDK's default is a no-op provider.
-- `openfeature.ProviderMetadata().Name` reports the installed default provider's identity, and is `"NoopProvider"` exactly when nothing has been installed. This is a reliable "has the application configured a provider?" test, and D17 uses it.
+- `openfeature.ProviderMetadata().Name` reports the installed default provider's identity, and `openfeature.NamedProviderMetadata(domain).Name` reports the provider bound to a domain, **falling back to the default's metadata when none is bound** (`openfeature_api.go:178-181`). Either reads back `"NoopProvider"` exactly when nothing has been installed, which makes them a reliable "has the application configured a provider?" test; D17 uses the named form, because it answers the question for its own domain and for the default in one call.
 - `Client.evaluate` merges evaluation contexts in the order *API (global) → transaction → client → invocation* (`client.go:695`), so an attribute passed at the invocation site composes with — and wins over — the application's global context without the library ever calling `SetEvaluationContext`.
 - `openfeature/memprovider` provides an in-memory provider suitable for tests.
 
@@ -120,7 +120,7 @@ For the provider D17 installs, the first is **enforced in code**: `DataCollector
 
 The scenario that makes this matter is the ordinary one: an operator revokes a module to stop an incident, and the process restarts for an unrelated reason. Under the superseded design a not-ready provider fell back to the environment, which for a deployment expecting relay control was usually off, so it failed closed. Under this one it falls back to allow.
 
-**Blocking on readiness is the application's call, not a requirement of this design.** D17 installs non-blocking, deliberately: the alternative is to make the first instrumented operation of the process wait on a relay round trip, and a brake must not become a latency source. The window that leaves open is bounded by one relay fetch, and an application that cannot accept it closes it itself — install a provider with `openfeature.SetProviderAndWait` before constructing any wrapper, and D17 stands down (its trigger requires `ProviderMetadata().Name == "NoopProvider"`). The capability is not lost; it moves to the party that can decide whether the window matters.
+**Blocking on readiness is the application's call, not a requirement of this design.** D17 installs non-blocking, deliberately: the alternative is to make the first instrumented operation of the process wait on a relay round trip, and a brake must not become a latency source. The window that leaves open is bounded by one relay fetch, and an application that cannot accept it closes it itself — install a provider with `openfeature.SetProviderAndWait` before constructing any wrapper, and D17 stands down (its trigger requires `NamedProviderMetadata(FlagDomain).Name == "NoopProvider"`). The capability is not lost; it moves to the party that can decide whether the window matters.
 
 What the window costs is stated rather than hidden, because for `otel-mongo` it is not only spans: `_oteltrace` written during it is permanent (D10), and cleanup is a `$unset` migration. `feature-flags.md` states both the window and the way to close it.
 
@@ -551,13 +551,15 @@ An application obtains relay control by setting environment variables. It writes
 ```go
 // inside Resolver.evaluator(), under the existing clientOnce
 if endpoint := os.Getenv(EnvFlagsEndpoint); endpoint != "" &&
-    openfeature.ProviderMetadata().Name == "NoopProvider" {
+    openfeature.NamedProviderMetadata(FlagDomain).Name == "NoopProvider" {
     // ... construct, register (non-blocking), populate evalCtx per D12
 }
 r.client = openfeature.NewClient(FlagDomain)
 ```
 
 Two conditions, both necessary. The endpoint variable is the operator's expression of intent; the `NoopProvider` check is what makes the install an *allowance* rather than a takeover — an application that installs its own provider before constructing any wrapper keeps it, and this path stands down.
+
+The check is written against the **named** domain rather than the default provider because `NamedProviderMetadata` falls back to the default's metadata when no named provider is bound. One call therefore covers all three ways an application can already have made its choice — a default provider, a named provider deliberately bound to this domain, or an earlier auto-install by a sibling module — and only a process that has made none of them reads back `"NoopProvider"`. Checking the default alone would clobber an application that bound a provider to this domain on purpose.
 
 | Setting | Source | Note |
 |---|---|---|
@@ -650,7 +652,7 @@ This design was revised after PR #27 shipped an implementation of an earlier mod
 | A per-module snapshot behind an `atomic.Pointer` with a one-second TTL | D4 — deferred, not rejected. Caching is invisible behind `Allowed(i) bool`, so it can be added later at no call-site cost; the measured 2 µs it would save is recorded there |
 | The application owns the provider outright; the library never installs one | D17 — the library installs a **named** provider on its own domain when the environment asks for one and none exists. The default provider, the global evaluation context and shutdown remain the application's |
 | Applications SHALL install with `openfeature.SetProviderAndWait`, because a not-ready provider cannot revoke | D1 — downgraded to the application's call. D17 installs non-blocking so a brake never becomes a latency source; an application that needs the startup window closed installs its own provider and D17 stands down |
-| "The SDK offers no reliable way to ask whether the installed provider is still the no-op default" | Factually wrong. `openfeature.ProviderMetadata().Name == "NoopProvider"` answers it, and D17 makes it the auto-install trigger |
+| "The SDK offers no reliable way to ask whether the installed provider is still the no-op default" | Factually wrong. `openfeature.NamedProviderMetadata(FlagDomain).Name == "NoopProvider"` answers it, and D17 makes it the auto-install trigger |
 | Each module resolves through its own domain (`otel-mongo`, `otel-nats`, …) | D5/D17 — one process-scoped `FlagDomain`. Per-module domains would need one provider instance each, because `InProcess.Init` is not idempotent and registering one instance under N domains leaks N−1 unstoppable pollers |
 | Revocation takes effect immediately | D4 — end-to-end latency is the provider's poll interval, 60 s by default. The resolver adds nothing; it never did |
 

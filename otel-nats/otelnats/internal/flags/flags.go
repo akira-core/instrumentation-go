@@ -272,7 +272,15 @@ func installProviderFromEnv() openfeature.EvaluationContext {
 	if endpoint == "" {
 		return empty
 	}
-	if openfeature.ProviderMetadata().Name != noopProviderName {
+	// NamedProviderMetadata, not ProviderMetadata: it reports the provider bound
+	// to FlagDomain and falls back to the default provider's metadata when none
+	// is. One check therefore covers all three ways an application can already
+	// have made its choice — a default provider, a named provider on our domain,
+	// or an earlier auto-install by a sibling module — and only a process that
+	// has made none of them reads back "NoopProvider". Checking the default
+	// alone would clobber an application that deliberately bound a provider to
+	// this domain.
+	if openfeature.NamedProviderMetadata(FlagDomain).Name != noopProviderName {
 		return empty
 	}
 

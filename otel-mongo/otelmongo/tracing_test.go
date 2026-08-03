@@ -22,8 +22,6 @@ func enableTracing(t *testing.T) {
 	t.Helper()
 	t.Setenv(envGlobalTracingEnabled, "1")
 	t.Setenv(envMongoTracingEnabled, "1")
-	resetPropEnabledCacheForTest()
-	t.Cleanup(resetPropEnabledCacheForTest)
 }
 
 // enableDocumentPropagation sets the same env gates as Collection / ContextFrom* for _oteltrace.
@@ -33,8 +31,6 @@ func enableDocumentPropagation(t *testing.T) {
 	t.Setenv(envGlobalTracingEnabled, "1")
 	t.Setenv(envMongoTracingEnabled, "1")
 	t.Setenv(envMongoPropagationEnabled, "1")
-	resetPropEnabledCacheForTest()
-	t.Cleanup(resetPropEnabledCacheForTest)
 }
 
 func TestContextFromDocumentV1(t *testing.T) {
@@ -75,19 +71,19 @@ func TestContextFromDocumentV1(t *testing.T) {
 		assert.False(t, sc.IsValid())
 	})
 
-	t.Run("propagation_disabled_returns_false_despite_metadata", func(t *testing.T) {
+	// D10: the helper carries no gate, so a disabled propagation switch does not
+	// stop it. Extraction emits nothing and the caller asked for it explicitly.
+	t.Run("propagation_disabled_still_extracts", func(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "true")
 		t.Setenv(envMongoPropagationEnabled, "false")
-		resetPropEnabledCacheForTest()
-		t.Cleanup(resetPropEnabledCacheForTest)
 		fullDoc := bson.M{
 			"_oteltrace": bson.M{
 				"traceparent": "00-12345678901234567890123456789012-0123456789012345-01",
 			},
 		}
 		sc, ok := ContextFromDocument(context.Background(), fullDoc)
-		assert.False(t, ok)
-		assert.False(t, sc.IsValid())
+		assert.True(t, ok)
+		assert.True(t, sc.IsValid())
 	})
 }
 
@@ -107,11 +103,11 @@ func TestContextFromRawDocumentV1(t *testing.T) {
 	assert.Equal(t, "12345678901234567890123456789012", sc.TraceID().String())
 }
 
-func TestContextFromRawDocumentV1_PropagationDisabled(t *testing.T) {
+// TestContextFromRawDocumentV1_PropagationDisabledStillExtracts is the D10
+// counterpart: the raw-document helper is ungated too.
+func TestContextFromRawDocumentV1_PropagationDisabledStillExtracts(t *testing.T) {
 	t.Setenv(envGlobalTracingEnabled, "true")
 	t.Setenv(envMongoPropagationEnabled, "false")
-	resetPropEnabledCacheForTest()
-	t.Cleanup(resetPropEnabledCacheForTest)
 	traceparent := "00-12345678901234567890123456789012-0123456789012345-01"
 	doc := bson.D{
 		{Key: TraceMetadataKey, Value: bson.D{
@@ -122,8 +118,9 @@ func TestContextFromRawDocumentV1_PropagationDisabled(t *testing.T) {
 	require.NoError(t, err)
 	ctx := context.Background()
 	out := ContextFromRawDocument(ctx, raw)
-	assert.Equal(t, ctx, out)
-	assert.False(t, trace.SpanFromContext(out).SpanContext().IsValid())
+	sc := trace.SpanFromContext(out).SpanContext()
+	assert.True(t, sc.IsValid(), "extraction is ungated")
+	assert.Equal(t, "12345678901234567890123456789012", sc.TraceID().String())
 }
 
 func Test_injectTraceIntoUpdate_DotNotationPreserved(t *testing.T) {

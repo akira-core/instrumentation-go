@@ -87,26 +87,32 @@ func startRelayProxy(t *testing.T) string {
 	return fmt.Sprintf("http://%s:%s", host, port.Port())
 }
 
-func TestRelayProxyDecidesTracingOverTheEnvironment(t *testing.T) {
+// flagDomain is the OpenFeature domain every instrumentation module resolves
+// through. It is declared in each module's internal/flags, which this package
+// cannot import, so the literal is repeated here and must stay in step.
+const flagDomain = "otel-instrumentation-go"
+
+func TestRelayProxyRevokesTracingTheEnvironmentEnabled(t *testing.T) {
 	endpoint := startRelayProxy(t)
 
-	// This is the wiring an application copies: build the GO Feature Flag
-	// provider against the relay proxy and install it globally. The
-	// instrumentation modules never do this themselves.
+	// This is the wiring an application copies when it installs its own
+	// provider: build the GO Feature Flag provider against the relay proxy and
+	// bind it to the domain the modules resolve through. DataCollectorDisabled
+	// is required — see feature-flags.md — and the auto-install path hardcodes
+	// it for applications that set OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT
+	// instead of writing this.
 	provider, err := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{
-		Endpoint: endpoint,
+		Endpoint:              endpoint,
+		DataCollectorDisabled: true,
 	})
 	require.NoError(t, err, "construct GO Feature Flag provider")
-	require.NoError(t, openfeature.SetProviderAndWait(provider))
+	require.NoError(t, openfeature.SetNamedProviderAndWait(flagDomain, provider))
 	t.Cleanup(func() {
-		require.NoError(t, openfeature.SetProviderAndWait(openfeature.NoopProvider{}))
-		// Let the resolver's snapshot expire so sibling tests are not left
-		// looking at a value this test installed.
-		time.Sleep(1100 * time.Millisecond)
+		require.NoError(t, openfeature.SetNamedProviderAndWait(flagDomain, openfeature.NoopProvider{}))
 	})
 
-	// Outwait the resolver's one-second TTL so the next read consults the relay.
-	time.Sleep(1100 * time.Millisecond)
+	// No waiting: the resolver caches nothing, so the next operation consults
+	// the relay directly.
 
 	sr := tracetest.NewSpanRecorder()
 	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr)))
@@ -118,7 +124,7 @@ func TestRelayProxyDecidesTracingOverTheEnvironment(t *testing.T) {
 	require.NoError(t, conn.Publish(context.Background(), "relayflags.subject", []byte("payload")))
 
 	assert.False(t, conn.TracingEnabled(),
-		"relay serves otel-nats-tracing=false, which must beat OTEL_NATS_TRACING_ENABLED=1")
+		"relay serves otel-nats-tracing=false, which REVOKES what OTEL_NATS_TRACING_ENABLED=1 deployed")
 	assert.Empty(t, sr.Ended(),
 		"no spans while the relay says off, even though the module env var says on")
 }

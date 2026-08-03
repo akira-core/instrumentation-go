@@ -1,96 +1,72 @@
 package otelnats
 
 import (
+	"errors"
 	"os"
 	"testing"
 
 	nats "github.com/nats-io/nats.go"
 )
 
-// clearTracingEnv unsets both tracing env vars for the duration of the test,
-// restoring their prior values on cleanup, and resets the process-wide gate
-// so the change is observed.
-func clearTracingEnv(t *testing.T) {
-	t.Helper()
-	prevGlobal, globalExisted := os.LookupEnv(envGlobalTracingEnabled)
-	prevNATS, natsExisted := os.LookupEnv(envNATSTracingEnabled)
-	_ = os.Unsetenv(envGlobalTracingEnabled)
-	_ = os.Unsetenv(envNATSTracingEnabled)
-	t.Cleanup(func() {
-		if globalExisted {
-			_ = os.Setenv(envGlobalTracingEnabled, prevGlobal)
-		} else {
-			_ = os.Unsetenv(envGlobalTracingEnabled)
-		}
-		if natsExisted {
-			_ = os.Setenv(envNATSTracingEnabled, prevNATS)
-		} else {
-			_ = os.Unsetenv(envNATSTracingEnabled)
-		}
-	})
-	resetNATSGateForTest()
-	t.Cleanup(resetNATSGateForTest)
-}
-
-// TestWithTracingEnabled_EnvOptionMatrix pins the full env × option decision
-// table. Option is authoritative in either direction when present; when absent,
-// the GLOBAL∧MODULE env gate decides (unset/falsy → off).
-func TestWithTracingEnabled_EnvOptionMatrix(t *testing.T) {
-	type envState string
-	const (
-		envUnset envState = "unset"
-		envOn    envState = "on"
-		envOff   envState = "off" // explicit falsy, not merely unset
-	)
-	type optState string
-	const (
-		optAbsent optState = "absent"
-		optOn     optState = "on"
-		optOff    optState = "off"
-	)
+// TestTracingTiers_EnvOptionMatrix pins how the three tiers compose.
+//
+// gate1 has two spellings — OTEL_INSTRUMENTATION_GO_TRACING_ENABLED and
+// WithTracingEnabled — and supplying both is a configuration error (D3), so the
+// table has no "both set" success row. The module switch is a separate,
+// conjunctive tier: gate1 alone is never enough, and with it off only the
+// passthrough implementation is constructed.
+func TestTracingTiers_EnvOptionMatrix(t *testing.T) {
+	type v struct {
+		set   bool
+		value string
+	}
+	unset := v{}
+	on := v{set: true, value: "1"}
+	off := v{set: true, value: "false"}
 
 	cases := []struct {
-		name string
-		env  envState
-		opt  optState
-		want bool
+		name         string
+		global       v
+		module       v
+		option       *bool
+		want         bool
+		wantConflict bool
 	}{
-		{"env unset, option absent → off", envUnset, optAbsent, false},
-		{"env unset, option on → on", envUnset, optOn, true},
-		{"env unset, option off → off", envUnset, optOff, false},
-		{"env on, option absent → on", envOn, optAbsent, true},
-		{"env off, option absent → off", envOff, optAbsent, false},
-		{"env on, option off → off", envOn, optOff, false},
-		{"env off, option on → on", envOff, optOn, true},
-		{"env on, option on → on", envOn, optOn, true},
+		{name: "nothing set", global: unset, module: unset, want: false},
+		{name: "global on, module on", global: on, module: on, want: true},
+		{name: "global on, module off", global: on, module: off, want: false},
+		{name: "global on, module unset", global: on, module: unset, want: false},
+		{name: "global off, module on", global: off, module: on, want: false},
+
+		{name: "option on supplies gate1", global: unset, module: on, option: boolPtr(true), want: true},
+		{name: "option off supplies gate1", global: unset, module: on, option: boolPtr(false), want: false},
+		{name: "option on still needs the module tier", global: unset, module: off, option: boolPtr(true), want: false},
+
+		{name: "both spellings of gate1 conflict", global: on, module: on, option: boolPtr(true), wantConflict: true},
+		{name: "conflict even when they agree", global: off, module: on, option: boolPtr(false), wantConflict: true},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			switch tc.env {
-			case envUnset:
-				clearTracingEnv(t)
-			case envOn:
-				t.Setenv(envGlobalTracingEnabled, "1")
-				t.Setenv(envNATSTracingEnabled, "1")
-				resetNATSGateForTest()
-				t.Cleanup(resetNATSGateForTest)
-			case envOff:
-				t.Setenv(envGlobalTracingEnabled, "false")
-				t.Setenv(envNATSTracingEnabled, "false")
-				resetNATSGateForTest()
-				t.Cleanup(resetNATSGateForTest)
-			}
+			setOrUnset(t, envGlobalTracingEnabled, tc.global.set, tc.global.value)
+			setOrUnset(t, envNATSTracingEnabled, tc.module.set, tc.module.value)
 
 			var opts []Option
-			switch tc.opt {
-			case optOn:
-				opts = []Option{WithTracingEnabled(true)}
-			case optOff:
-				opts = []Option{WithTracingEnabled(false)}
+			if tc.option != nil {
+				opts = []Option{WithTracingEnabled(*tc.option)}
 			}
 
-			conn := newConn(&nats.Conn{}, opts...)
+			conn, err := newConn(&nats.Conn{}, opts...)
+			if tc.wantConflict {
+				if !errors.Is(err, ErrTracingConfigConflict) {
+					t.Fatalf("error = %v, want ErrTracingConfigConflict", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("newConn: %v", err)
+			}
+
 			if got := conn.TracingEnabled(); got != tc.want {
 				t.Fatalf("TracingEnabled() = %v, want %v", got, tc.want)
 			}
@@ -103,6 +79,27 @@ func TestWithTracingEnabled_EnvOptionMatrix(t *testing.T) {
 			}
 		})
 	}
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+// setOrUnset makes an environment variable present with value, or absent,
+// restoring the previous state when the test ends.
+func setOrUnset(t *testing.T, name string, set bool, value string) {
+	t.Helper()
+	if set {
+		t.Setenv(name, value)
+		return
+	}
+	prev, existed := os.LookupEnv(name)
+	_ = os.Unsetenv(name)
+	t.Cleanup(func() {
+		if existed {
+			_ = os.Setenv(name, prev)
+		} else {
+			_ = os.Unsetenv(name)
+		}
+	})
 }
 
 // TestNewConnConfig_SkipsNilOptions pins the ConnectTLS/ConnectWithCredentials

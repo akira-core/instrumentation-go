@@ -25,10 +25,6 @@ type Database struct {
 // effectiveTracing reports whether THIS call should be instrumented.
 func (d *Database) effectiveTracing() bool { return d.gate.effectiveTracing() }
 
-// effectivePropagation reports whether THIS call should inject or extract
-// _oteltrace. See gateState for static-client and R5 rules.
-func (d *Database) effectivePropagation() bool { return d.gate.effectivePropagation() }
-
 // propagationWhenTracing is the propagation gate for the instrumented impls,
 // which are reached only once tracing has already resolved true (design R5).
 func (d *Database) propagationWhenTracing() bool { return d.gate.propagationWhenTracing() }

@@ -39,10 +39,6 @@ func (c *Client) effectiveTracing() bool { return c.gate.effectiveTracing() }
 // _oteltrace. See gateState for static-client and R5 single-operation rules.
 func (c *Client) effectivePropagation() bool { return c.gate.effectivePropagation() }
 
-// propagationWhenTracing is the propagation gate for the instrumented impls,
-// which are reached only once tracing has already resolved true (design R5).
-func (c *Client) propagationWhenTracing() bool { return c.gate.propagationWhenTracing() }
-
 // ClientOption configures Connect/NewClient. Per OTel contrib: accept TracerProvider and Propagators.
 type ClientOption interface {
 	apply(*clientConfig)

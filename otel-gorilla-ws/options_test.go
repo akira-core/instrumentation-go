@@ -28,7 +28,7 @@ func TestConfigureConn_GlobalFallback(t *testing.T) {
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 
 	c := &Conn{}
-	configureConn(c, resolveConnOptions(nil))
+	configureConn(c, resolveConnOptions(nil), mustCap(t, resolveConnOptions(nil)))
 
 	_, span := c.tracer.Start(context.Background(), "global-fallback")
 	span.End()
@@ -45,7 +45,7 @@ func TestConfigureConn_FeatureDisabled_UsesNoopTracer(t *testing.T) {
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 
 	c := &Conn{}
-	configureConn(c, resolveConnOptions(nil))
+	configureConn(c, resolveConnOptions(nil), mustCap(t, resolveConnOptions(nil)))
 
 	_, span := c.tracer.Start(context.Background(), "should-not-be-recorded")
 	span.End()
@@ -63,10 +63,11 @@ func TestApplyOptions_UsesProvidedOptionsWithoutMutatingGlobals(t *testing.T) {
 	customProp := propagation.NewCompositeTextMapPropagator(propagation.Baggage{})
 
 	c := &Conn{}
-	configureConn(c, resolveConnOptions([]Option{
+	cfg := resolveConnOptions([]Option{
 		WithTracerProvider(customTP),
 		WithPropagators(customProp),
-	}))
+	})
+	configureConn(c, cfg, mustCap(t, cfg))
 
 	_, span := c.tracer.Start(context.Background(), "custom-provider")
 	span.End()

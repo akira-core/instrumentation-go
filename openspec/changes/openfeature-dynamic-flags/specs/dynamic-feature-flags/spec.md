@@ -70,7 +70,7 @@ An application SHALL be able to obtain relay control by setting environment vari
 `Resolver` SHALL, inside the same `sync.Once` that lazily creates the OpenFeature client, construct and register a provider when **both** of the following hold:
 
 1. `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` is set to a non-empty value; and
-2. `openfeature.ProviderMetadata().Name` equals `"NoopProvider"`, i.e. the application has installed no provider of its own.
+2. `openfeature.NamedProviderMetadata(FlagDomain).Name` equals `"NoopProvider"` — which is true only when the application has bound neither a default provider nor a named one to this domain, since that call falls back to the default provider's metadata.
 
 Registration SHALL use `SetNamedProvider` on `FlagDomain` and SHALL be non-blocking. The provider SHALL be configured as follows, and no setting other than the three variables SHALL be exposed:
 

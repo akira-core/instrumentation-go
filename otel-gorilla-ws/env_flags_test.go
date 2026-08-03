@@ -14,11 +14,20 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
-func resetWSGateForTest() {
-	wsResolver = newWSResolver()
+// wsCapable resolves the module's static capability from the environment, which
+// is what decides whether this connection could ever trace. The truthiness rules
+// themselves live in internal/flags and are tested there; these cases pin how
+// this module composes the two tiers.
+func wsCapable(t *testing.T) bool {
+	t.Helper()
+	capable, err := effectiveCapability(resolveConnOptions(nil))
+	if err != nil {
+		t.Fatalf("effectiveCapability: %v", err)
+	}
+	return capable
 }
 
-func TestWSTracingEnabled_DefaultFalse(t *testing.T) {
+func TestWSCapability_DefaultFalse(t *testing.T) {
 	prev, existed := os.LookupEnv(envWSTracingEnabled)
 	_ = os.Unsetenv(envWSTracingEnabled)
 	t.Cleanup(func() {
@@ -28,41 +37,44 @@ func TestWSTracingEnabled_DefaultFalse(t *testing.T) {
 			_ = os.Unsetenv(envWSTracingEnabled)
 		}
 	})
-	resetWSGateForTest()
-	t.Cleanup(resetWSGateForTest)
-	if wsTracingEnabled() {
-		t.Fatal("expected tracing disabled when env var is unset")
+	if wsCapable(t) {
+		t.Fatal("expected tracing disabled when the module env var is unset")
 	}
 }
 
-func TestWSTracingEnabled_EmptyStringIsEnabled(t *testing.T) {
+// TestWSCapability_EmptyStringIsDisabled is the BREAKING truthiness change:
+// `export VAR=` used to open the gate and now closes it.
+func TestWSCapability_EmptyStringIsDisabled(t *testing.T) {
 	t.Setenv(envGlobalTracingEnabled, "")
 	t.Setenv(envWSTracingEnabled, "")
-	resetWSGateForTest()
-	t.Cleanup(resetWSGateForTest)
-	if !wsTracingEnabled() {
-		t.Fatal("expected empty string to mean enabled")
+	if wsCapable(t) {
+		t.Fatal("expected an empty string to mean disabled")
 	}
 }
 
-func TestWSTracingEnabled_FalseTokens(t *testing.T) {
+func TestWSCapability_FalseTokens(t *testing.T) {
+	t.Setenv(envGlobalTracingEnabled, "1")
 	for _, v := range []string{"false", "0", "off", "no"} {
 		t.Setenv(envWSTracingEnabled, v)
-		resetWSGateForTest()
-		if wsTracingEnabled() {
+		if wsCapable(t) {
 			t.Fatalf("expected disabled for value %q", v)
 		}
 	}
-	t.Cleanup(resetWSGateForTest)
 }
 
-func TestWSTracingEnabled_GlobalOffOverridesModule(t *testing.T) {
+func TestWSCapability_GlobalOffOverridesModule(t *testing.T) {
 	t.Setenv(envGlobalTracingEnabled, "false")
 	t.Setenv(envWSTracingEnabled, "true")
-	resetWSGateForTest()
-	t.Cleanup(resetWSGateForTest)
-	if wsTracingEnabled() {
-		t.Fatal("expected global flag to disable ws tracing")
+	if wsCapable(t) {
+		t.Fatal("expected the global kill switch to disable ws tracing")
+	}
+}
+
+func TestWSCapability_RequiresBothTiers(t *testing.T) {
+	t.Setenv(envGlobalTracingEnabled, "1")
+	t.Setenv(envWSTracingEnabled, "1")
+	if !wsCapable(t) {
+		t.Fatal("expected capability with both tiers on")
 	}
 }
 
@@ -73,9 +85,6 @@ func TestWSTracingEnabled_GlobalOffOverridesModule(t *testing.T) {
 func TestFeatureDisabled_PassesThroughToNativeConn(t *testing.T) {
 	t.Setenv(envGlobalTracingEnabled, "false")
 	t.Setenv(envWSTracingEnabled, "false")
-	resetWSGateForTest()
-	t.Cleanup(resetWSGateForTest)
-
 	sr := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
 	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
@@ -102,7 +111,10 @@ func TestFeatureDisabled_PassesThroughToNativeConn(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = rawConn.Close() })
 
-	conn := newConn(rawConn, false)
+	conn, err := newConn(rawConn, false)
+	if err != nil {
+		t.Fatalf("newConn: %v", err)
+	}
 	if conn.featureEnabled() {
 		t.Fatal("expected featureEnabled false")
 	}

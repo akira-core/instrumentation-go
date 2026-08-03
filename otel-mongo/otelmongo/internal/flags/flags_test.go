@@ -1,6 +1,9 @@
 package flags
 
 import (
+	"bytes"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -9,61 +12,130 @@ import (
 	"github.com/open-feature/go-sdk/openfeature/memprovider"
 )
 
-func TestEnvEnabled(t *testing.T) {
-	const key = "OTELMONGO_TEST_FLAGS_ENVENABLED"
+// No test in this file may call t.Parallel: the OpenFeature provider registry,
+// the process environment and slog's default logger are all process-global.
 
+const testEnvKey = "OTEL_INSTRUMENTATION_GO_FLAGS_TEST_SWITCH"
+
+func TestEnvEnabled(t *testing.T) {
 	tests := []struct {
 		name  string
-		setup func(t *testing.T)
+		value string
+		set   bool
 		want  bool
 	}{
-		{name: "unset", setup: func(t *testing.T) {}, want: false},
-		{name: "explicit zero", setup: func(t *testing.T) { t.Setenv(key, "0") }, want: false},
-		{name: "lower false", setup: func(t *testing.T) { t.Setenv(key, "false") }, want: false},
-		{name: "upper FALSE", setup: func(t *testing.T) { t.Setenv(key, "FALSE") }, want: false},
-		{name: "no", setup: func(t *testing.T) { t.Setenv(key, "no") }, want: false},
-		{name: "off", setup: func(t *testing.T) { t.Setenv(key, "off") }, want: false},
-		{name: "padded zero", setup: func(t *testing.T) { t.Setenv(key, " 0 ") }, want: false},
-		{name: "one", setup: func(t *testing.T) { t.Setenv(key, "1") }, want: true},
-		{name: "lower true", setup: func(t *testing.T) { t.Setenv(key, "true") }, want: true},
-		{name: "yes", setup: func(t *testing.T) { t.Setenv(key, "yes") }, want: true},
-		{name: "on", setup: func(t *testing.T) { t.Setenv(key, "on") }, want: true},
-		{name: "enabled word", setup: func(t *testing.T) { t.Setenv(key, "enabled") }, want: true},
-		{name: "arbitrary string", setup: func(t *testing.T) { t.Setenv(key, "hello") }, want: true},
-		{name: "empty string", setup: func(t *testing.T) { t.Setenv(key, "") }, want: true},
+		{name: "unset", want: false},
+
+		{name: "one", value: "1", set: true, want: true},
+		{name: "true", value: "true", set: true, want: true},
+		{name: "yes", value: "yes", set: true, want: true},
+		{name: "on", value: "on", set: true, want: true},
+		{name: "upper TRUE", value: "TRUE", set: true, want: true},
+		{name: "mixed On", value: "On", set: true, want: true},
+		{name: "padded yes", value: "  yes  ", set: true, want: true},
+
+		{name: "zero", value: "0", set: true, want: false},
+		{name: "false", value: "false", set: true, want: false},
+		{name: "no", value: "no", set: true, want: false},
+		{name: "off", value: "off", set: true, want: false},
+		{name: "upper FALSE", value: "FALSE", set: true, want: false},
+
+		// The rows that changed in this release. Each one enabled the switch
+		// before the allow-list.
+		{name: "empty string", value: "", set: true, want: false},
+		{name: "enabled word", value: "enabled", set: true, want: false},
+		{name: "two", value: "2", set: true, want: false},
+		{name: "y", value: "y", set: true, want: false},
+		{name: "t", value: "t", set: true, want: false},
+		{name: "arbitrary string", value: "hello", set: true, want: false},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			tc.setup(t)
-			got := EnvEnabled(key)
-			if got != tc.want {
-				t.Fatalf("EnvEnabled(%q) = %v, want %v", key, got, tc.want)
+			if tc.set {
+				t.Setenv(testEnvKey, tc.value)
+			}
+			if got := EnvEnabled(testEnvKey); got != tc.want {
+				t.Fatalf("EnvEnabled(%q=%q) = %v, want %v", testEnvKey, tc.value, got, tc.want)
 			}
 		})
 	}
 }
 
-// fakeClock is a race-safe manual time source for TTL tests.
-type fakeClock struct {
-	mu sync.Mutex
-	t  time.Time
+// captureLogs redirects slog's default logger into a buffer for the test.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
 }
 
-func newFakeClock() *fakeClock {
-	return &fakeClock{t: time.Unix(1_700_000_000, 0)}
+func TestEnvEnabled_WarnsOnlyOnUnrecognisedValue(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    string
+		set      bool
+		wantWarn bool
+	}{
+		{name: "unset is silent", wantWarn: false},
+		{name: "truthy is silent", value: "true", set: true, wantWarn: false},
+		{name: "explicitly falsy is silent", value: "off", set: true, wantWarn: false},
+		{name: "empty string is silent", value: "", set: true, wantWarn: false},
+		{name: "unrecognised warns", value: "enabled", set: true, wantWarn: true},
+		{name: "numeric two warns", value: "2", set: true, wantWarn: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := captureLogs(t)
+			if tc.set {
+				t.Setenv(testEnvKey, tc.value)
+			}
+			_ = EnvEnabled(testEnvKey)
+
+			got := strings.Contains(buf.String(), "unrecognised boolean value")
+			if got != tc.wantWarn {
+				t.Fatalf("warning emitted = %v, want %v (log: %q)", got, tc.wantWarn, buf.String())
+			}
+			if tc.wantWarn {
+				if !strings.Contains(buf.String(), testEnvKey) {
+					t.Errorf("warning does not name the variable: %q", buf.String())
+				}
+				if !strings.Contains(buf.String(), tc.value) {
+					t.Errorf("warning does not name the observed value: %q", buf.String())
+				}
+			}
+		})
+	}
 }
 
-func (c *fakeClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.t
+func TestEnvSet_DistinguishesUnsetFromFalsy(t *testing.T) {
+	if EnvSet(testEnvKey) {
+		t.Fatalf("EnvSet reported an unset variable as present")
+	}
+
+	t.Setenv(testEnvKey, "false")
+	if !EnvSet(testEnvKey) {
+		t.Fatalf("EnvSet(%q=false) = false, want true", testEnvKey)
+	}
+	if EnvEnabled(testEnvKey) {
+		t.Fatalf("EnvEnabled(%q=false) = true, want false", testEnvKey)
+	}
 }
 
-func (c *fakeClock) Advance(d time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.t = c.t.Add(d)
+func TestGlobalTracingHelpers(t *testing.T) {
+	if GlobalTracingSet() || GlobalTracingPossible() {
+		t.Fatalf("expected the global switch to be unset in the test environment")
+	}
+	t.Setenv(EnvGlobalTracing, "0")
+	if !GlobalTracingSet() {
+		t.Errorf("GlobalTracingSet() = false for an explicitly falsy value")
+	}
+	if GlobalTracingPossible() {
+		t.Errorf("GlobalTracingPossible() = true for an explicitly falsy value")
+	}
 }
 
 // boolFlag builds an in-memory flag that always resolves to v.
@@ -79,207 +151,254 @@ func boolFlag(v bool) memprovider.InMemoryFlag {
 	}
 }
 
-// setProvider installs an in-memory provider for the duration of the test and
-// restores the no-op provider afterwards. Not parallel-safe: the OpenFeature
-// provider is process-global, so tests calling this MUST NOT call t.Parallel.
+// setProvider installs an in-memory provider on FlagDomain for the duration of
+// the test.
+//
+// It binds the NAMED domain, not the default provider. A named provider
+// outranks the default for the clients this package creates, so a test that
+// installed a default provider would be silently shadowed the moment anything
+// in the process had auto-installed — and clientOnce makes that unrepeatable.
 func setProvider(t *testing.T, flags map[string]memprovider.InMemoryFlag) {
 	t.Helper()
-	if err := openfeature.SetProviderAndWait(memprovider.NewInMemoryProvider(flags)); err != nil {
-		t.Fatalf("SetProviderAndWait: %v", err)
+	if err := openfeature.SetNamedProviderAndWait(FlagDomain, memprovider.NewInMemoryProvider(flags)); err != nil {
+		t.Fatalf("SetNamedProviderAndWait: %v", err)
 	}
-	t.Cleanup(func() {
-		if err := openfeature.SetProviderAndWait(openfeature.NoopProvider{}); err != nil {
-			t.Fatalf("restoring NoopProvider: %v", err)
-		}
-	})
+	t.Cleanup(func() { clearProvider(t) })
 }
 
-// clearProvider installs the no-op provider, modelling an application that never
-// wires OpenFeature at all.
+// clearProvider rebinds FlagDomain to the no-op provider, modelling an
+// application that never wires OpenFeature at all.
 func clearProvider(t *testing.T) {
 	t.Helper()
-	if err := openfeature.SetProviderAndWait(openfeature.NoopProvider{}); err != nil {
-		t.Fatalf("SetProviderAndWait(Noop): %v", err)
+	if err := openfeature.SetNamedProviderAndWait(FlagDomain, openfeature.NoopProvider{}); err != nil {
+		t.Fatalf("SetNamedProviderAndWait(Noop): %v", err)
 	}
 }
 
-func TestResolver_NoProviderFallsBackToEnv(t *testing.T) {
-	const envVar = "OTEL_TEST_FLAGS_NO_PROVIDER"
+func TestResolver_NoProviderAllows(t *testing.T) {
 	clearProvider(t)
 
-	t.Setenv(envVar, "true")
-	r := NewResolver("test", WithSpecs(Spec{Key: "test-flag", EnvVar: envVar}))
-	if !r.Enabled(0) {
-		t.Fatal("Enabled(0) = false with truthy env and no provider, want true")
-	}
-
-	t.Setenv(envVar, "false")
-	r2 := NewResolver("test", WithSpecs(Spec{Key: "test-flag", EnvVar: envVar}))
-	if r2.Enabled(0) {
-		t.Fatal("Enabled(0) = true with falsy env and no provider, want false")
+	r := NewResolver(WithFlagKeys("some-key"))
+	if !r.Allowed(0) {
+		t.Fatalf("Allowed = false with no provider installed; an unresolvable flag must mean 'do not interfere'")
 	}
 }
 
-func TestResolver_MissingFlagFallsBackToEnv(t *testing.T) {
-	const envVar = "OTEL_TEST_FLAGS_MISSING_KEY"
-	// Provider is installed but knows nothing about our key: Boolean returns the
-	// default, which is the env value.
-	setProvider(t, map[string]memprovider.InMemoryFlag{"some-other-flag": boolFlag(true)})
+func TestResolver_MissingFlagAllows(t *testing.T) {
+	setProvider(t, map[string]memprovider.InMemoryFlag{"other-key": boolFlag(false)})
 
-	t.Setenv(envVar, "true")
-	r := NewResolver("test", WithSpecs(Spec{Key: "absent-flag", EnvVar: envVar}))
-	if !r.Enabled(0) {
-		t.Fatal("Enabled(0) = false for an absent flag with truthy env, want true")
+	r := NewResolver(WithFlagKeys("absent-key"))
+	if !r.Allowed(0) {
+		t.Fatalf("Allowed = false for a key absent from the relay configuration; want true")
 	}
 }
 
-func TestResolver_ProviderOverridesEnvBothDirections(t *testing.T) {
-	const envVar = "OTEL_TEST_FLAGS_OVERRIDE"
+func TestResolver_RelayCanRevoke(t *testing.T) {
+	setProvider(t, map[string]memprovider.InMemoryFlag{"k": boolFlag(false)})
 
-	t.Run("relay true beats env off", func(t *testing.T) {
-		setProvider(t, map[string]memprovider.InMemoryFlag{"test-flag": boolFlag(true)})
-		t.Setenv(envVar, "false")
-		r := NewResolver("test", WithSpecs(Spec{Key: "test-flag", EnvVar: envVar}))
-		if !r.Enabled(0) {
-			t.Fatal("Enabled(0) = false, want true (relay overrides falsy env)")
-		}
-	})
-
-	t.Run("relay false beats env on", func(t *testing.T) {
-		setProvider(t, map[string]memprovider.InMemoryFlag{"test-flag": boolFlag(false)})
-		t.Setenv(envVar, "true")
-		r := NewResolver("test", WithSpecs(Spec{Key: "test-flag", EnvVar: envVar}))
-		if r.Enabled(0) {
-			t.Fatal("Enabled(0) = true, want false (relay overrides truthy env)")
-		}
-	})
-}
-
-func TestResolver_TTLBoundary(t *testing.T) {
-	const envVar = "OTEL_TEST_FLAGS_TTL"
-	setProvider(t, map[string]memprovider.InMemoryFlag{"test-flag": boolFlag(false)})
-	t.Setenv(envVar, "false")
-
-	clock := newFakeClock()
-	r := NewResolver("test",
-		WithSpecs(Spec{Key: "test-flag", EnvVar: envVar}),
-		WithClock(clock.Now),
-	)
-
-	if r.Enabled(0) {
-		t.Fatal("initial Enabled(0) = true, want false")
-	}
-
-	// Flip the provider; the cached snapshot must survive until the TTL elapses.
-	setProvider(t, map[string]memprovider.InMemoryFlag{"test-flag": boolFlag(true)})
-
-	clock.Advance(900 * time.Millisecond)
-	if r.Enabled(0) {
-		t.Fatal("Enabled(0) = true at 900ms, want false (snapshot still fresh)")
-	}
-
-	clock.Advance(200 * time.Millisecond)
-	if !r.Enabled(0) {
-		t.Fatal("Enabled(0) = false at 1100ms, want true (snapshot expired)")
+	r := NewResolver(WithFlagKeys("k"))
+	if r.Allowed(0) {
+		t.Fatalf("Allowed = true while the relay serves false")
 	}
 }
 
-func TestResolver_SnapshotIsConsistentAcrossSpecs(t *testing.T) {
-	const (
-		envA = "OTEL_TEST_FLAGS_CONSISTENT_A"
-		envB = "OTEL_TEST_FLAGS_CONSISTENT_B"
-	)
-	setProvider(t, map[string]memprovider.InMemoryFlag{
-		"flag-a": boolFlag(false),
-		"flag-b": boolFlag(false),
-	})
-	t.Setenv(envA, "false")
-	t.Setenv(envB, "false")
+func TestResolver_RevocationIsVisibleOnTheNextCall(t *testing.T) {
+	setProvider(t, map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})
 
-	clock := newFakeClock()
-	r := NewResolver("test",
-		WithSpecs(
-			Spec{Key: "flag-a", EnvVar: envA},
-			Spec{Key: "flag-b", EnvVar: envB},
-		),
-		WithClock(clock.Now),
-	)
-
-	if r.Enabled(0) || r.Enabled(1) {
-		t.Fatalf("initial values = (%v, %v), want (false, false)", r.Enabled(0), r.Enabled(1))
+	r := NewResolver(WithFlagKeys("k"))
+	if !r.Allowed(0) {
+		t.Fatalf("Allowed = false while the relay serves true")
 	}
 
-	// Both flags change together on the relay.
-	setProvider(t, map[string]memprovider.InMemoryFlag{
-		"flag-a": boolFlag(true),
-		"flag-b": boolFlag(true),
-	})
-	clock.Advance(2 * time.Second)
-
-	// Reading both must yield the same generation — never one old, one new.
-	a, b := r.Enabled(0), r.Enabled(1)
-	if a != b {
-		t.Fatalf("torn read across specs: (%v, %v), want both equal", a, b)
+	// Re-bind with the flag revoked. No sleep, no clock, no reset hook: the
+	// resolver caches nothing, so the very next call must observe it.
+	if err := openfeature.SetNamedProviderAndWait(FlagDomain,
+		memprovider.NewInMemoryProvider(map[string]memprovider.InMemoryFlag{"k": boolFlag(false)})); err != nil {
+		t.Fatalf("SetNamedProviderAndWait: %v", err)
 	}
-	if !a {
-		t.Fatal("values = (false, false) after refresh, want (true, true)")
+	if r.Allowed(0) {
+		t.Fatalf("Allowed = true on the call after a revocation; the verdict must not be cached")
 	}
 }
 
 func TestResolver_OutOfRangeIndexIsDisabled(t *testing.T) {
-	const envVar = "OTEL_TEST_FLAGS_RANGE"
-	setProvider(t, map[string]memprovider.InMemoryFlag{"test-flag": boolFlag(true)})
-	t.Setenv(envVar, "true")
+	clearProvider(t)
 
-	r := NewResolver("test", WithSpecs(Spec{Key: "test-flag", EnvVar: envVar}))
-	if r.Enabled(1) {
-		t.Fatal("Enabled(1) = true for a single-spec resolver, want false")
-	}
-	if r.Enabled(-1) {
-		t.Fatal("Enabled(-1) = true, want false")
+	r := NewResolver(WithFlagKeys("k"))
+	for _, i := range []int{-1, 1, 99} {
+		if r.Allowed(i) {
+			t.Errorf("Allowed(%d) = true for an out-of-range index; a mis-wired module must degrade to disabled", i)
+		}
 	}
 }
 
 func TestResolver_NilOptionIsSkipped(t *testing.T) {
-	clearProvider(t)
-	r := NewResolver("test", nil, WithSpecs(Spec{Key: "k", EnvVar: "OTEL_TEST_FLAGS_NIL_OPT"}), nil)
-	if r.Enabled(0) {
-		t.Fatal("Enabled(0) = true with unset env, want false")
+	r := NewResolver(nil, WithFlagKeys("k"), nil)
+	if len(r.keys) != 1 {
+		t.Fatalf("keys = %v, want one key; a nil option must be skipped rather than panic", r.keys)
 	}
 }
 
-func TestResolver_ConcurrentEnabled(t *testing.T) {
-	const envVar = "OTEL_TEST_FLAGS_CONCURRENT"
-	setProvider(t, map[string]memprovider.InMemoryFlag{"test-flag": boolFlag(true)})
-	t.Setenv(envVar, "false")
+func TestResolver_ConcurrentAllowed(t *testing.T) {
+	setProvider(t, map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})
 
-	clock := newFakeClock()
-	r := NewResolver("test",
-		WithSpecs(Spec{Key: "test-flag", EnvVar: envVar}),
-		WithClock(clock.Now),
-	)
-
-	// Hammer Enabled while the clock keeps crossing the TTL boundary, so readers
-	// and refreshers overlap. Correctness here is "no race, always true".
+	r := NewResolver(WithFlagKeys("k"))
 	var wg sync.WaitGroup
-	for i := 0; i < 64; i++ {
+	for range 32 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 100; j++ {
-				if !r.Enabled(0) {
-					t.Error("Enabled(0) = false under concurrency, want true")
-					return
-				}
-			}
+			_ = r.Allowed(0)
 		}()
 	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for j := 0; j < 200; j++ {
-			clock.Advance(10 * time.Millisecond)
-		}
-	}()
 	wg.Wait()
+}
+
+// --- provider auto-install -------------------------------------------------
+
+// A syntactically valid endpoint that nothing listens on. Construction performs
+// no I/O, and registration is non-blocking, so the provider's background fetch
+// failing is exactly the "relay down at startup" path — logged, not fatal.
+const unreachableEndpoint = "http://127.0.0.1:1"
+
+func TestAutoInstall_FiresWhenEndpointSetAndNoProvider(t *testing.T) {
+	clearProvider(t)
+	t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+	t.Cleanup(func() { clearProvider(t) })
+
+	r := NewResolver(WithFlagKeys("k"))
+	_ = r.Allowed(0)
+
+	if got := openfeature.NamedProviderMetadata(FlagDomain).Name; got == noopProviderName {
+		t.Fatalf("no provider was installed on %q; want a GO Feature Flag provider", FlagDomain)
+	}
+}
+
+func TestAutoInstall_StandsDownWhenAProviderExists(t *testing.T) {
+	setProvider(t, map[string]memprovider.InMemoryFlag{"k": boolFlag(false)})
+	before := openfeature.NamedProviderMetadata(FlagDomain).Name
+	t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+
+	r := NewResolver(WithFlagKeys("k"))
+	if r.Allowed(0) {
+		t.Fatalf("Allowed = true; the application's own provider must still decide")
+	}
+	if after := openfeature.NamedProviderMetadata(FlagDomain).Name; after != before {
+		t.Fatalf("provider changed from %q to %q; the auto-install must stand down", before, after)
+	}
+}
+
+func TestAutoInstall_UnsetEndpointInstallsNothing(t *testing.T) {
+	clearProvider(t)
+
+	r := NewResolver(WithFlagKeys("k"))
+	_ = r.Allowed(0)
+
+	if got := openfeature.NamedProviderMetadata(FlagDomain).Name; got != noopProviderName {
+		t.Fatalf("provider = %q with no endpoint configured; want no OpenFeature state written", got)
+	}
+	if len(r.evalCtx.Attributes()) != 0 {
+		t.Fatalf("evaluation context = %v, want empty off the auto-install path", r.evalCtx.Attributes())
+	}
+}
+
+func TestAutoInstall_ServiceNameOnlyOnThisPath(t *testing.T) {
+	t.Run("attached when auto-installed", func(t *testing.T) {
+		clearProvider(t)
+		t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+		t.Setenv(EnvServiceName, "checkout-api")
+		t.Cleanup(func() { clearProvider(t) })
+
+		r := NewResolver(WithFlagKeys("k"))
+		_ = r.Allowed(0)
+
+		if got := r.evalCtx.Attributes()["service.name"]; got != "checkout-api" {
+			t.Fatalf("service.name = %v, want checkout-api", got)
+		}
+	})
+
+	t.Run("absent when the application installed the provider", func(t *testing.T) {
+		setProvider(t, map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})
+		t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+		t.Setenv(EnvServiceName, "checkout-api")
+
+		r := NewResolver(WithFlagKeys("k"))
+		_ = r.Allowed(0)
+
+		if len(r.evalCtx.Attributes()) != 0 {
+			t.Fatalf("evaluation context = %v, want empty; the application owns its own context",
+				r.evalCtx.Attributes())
+		}
+	})
+}
+
+func TestPollIntervalFromEnv(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    string
+		set      bool
+		want     time.Duration
+		wantWarn bool
+	}{
+		{name: "unset uses the default", want: defaultPollInterval},
+		{name: "duration string", value: "5s", set: true, want: 5 * time.Second},
+		{name: "minutes", value: "2m", set: true, want: 2 * time.Minute},
+		// A bare integer must NOT be read as milliseconds: misreading a polling
+		// interval that way turns 60 into 60ms.
+		{name: "bare integer is rejected", value: "60", set: true, want: defaultPollInterval, wantWarn: true},
+		{name: "garbage is rejected", value: "soon", set: true, want: defaultPollInterval, wantWarn: true},
+		{name: "zero is rejected", value: "0s", set: true, want: defaultPollInterval, wantWarn: true},
+		{name: "negative is rejected", value: "-5s", set: true, want: defaultPollInterval, wantWarn: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := captureLogs(t)
+			if tc.set {
+				t.Setenv(EnvFlagsPollInterval, tc.value)
+			}
+			if got := pollIntervalFromEnv(); got != tc.want {
+				t.Fatalf("pollIntervalFromEnv() = %v, want %v", got, tc.want)
+			}
+			if warned := strings.Contains(buf.String(), EnvFlagsPollInterval); warned != tc.wantWarn {
+				t.Fatalf("warning emitted = %v, want %v (log: %q)", warned, tc.wantWarn, buf.String())
+			}
+		})
+	}
+}
+
+func TestAutoInstall_MalformedIntervalStillInstalls(t *testing.T) {
+	clearProvider(t)
+	buf := captureLogs(t)
+	t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+	t.Setenv(EnvFlagsPollInterval, "not-a-duration")
+	t.Cleanup(func() { clearProvider(t) })
+
+	r := NewResolver(WithFlagKeys("k"))
+	_ = r.Allowed(0)
+
+	if got := openfeature.NamedProviderMetadata(FlagDomain).Name; got == noopProviderName {
+		t.Fatalf("a malformed poll interval prevented the install; a typo in an optional " +
+			"tuning value must not delete the kill switch")
+	}
+	if !strings.Contains(buf.String(), EnvFlagsPollInterval) {
+		t.Errorf("the malformed value was not reported: %q", buf.String())
+	}
+}
+
+func TestAutoInstall_APIKeyIsNeverLogged(t *testing.T) {
+	const secret = "super-secret-relay-key"
+	clearProvider(t)
+	buf := captureLogs(t)
+	t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+	t.Setenv(EnvFlagsAPIKey, secret)
+	t.Setenv(EnvFlagsPollInterval, "also-broken") // force the warning path
+	t.Cleanup(func() { clearProvider(t) })
+
+	r := NewResolver(WithFlagKeys("k"))
+	_ = r.Allowed(0)
+
+	if strings.Contains(buf.String(), secret) {
+		t.Fatalf("the API key appeared in a log line: %q", buf.String())
+	}
 }
