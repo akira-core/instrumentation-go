@@ -53,8 +53,8 @@ OTEL-WS Server 會檢查收到的協議是否帶有 `otel-ws` 前綴，決定是
 
 | 閘 | 決定什麼 | 由誰決定 | 何時解析 |
 | --- | --- | --- | --- |
-| **negotiation capability** | Dial 是否 offer、Upgrade 是否 confirm `otel-ws` | `WithTracingEnabled(v)`(若有),否則**僅** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | handshake **之前**,終生不變 |
-| **span gate** | 每次 `WriteMessage`/`ReadMessage` 是否建 span、是否 inject/extract | `WithTracingEnabled(v)`(若有),否則全域開關 **AND** 動態 flag `otel-gorilla-ws-tracing` | **每次呼叫**,連線存活期間可變 |
+| **negotiation capability** | Dial 是否 offer、Upgrade 是否 confirm `otel-ws`;是否建立真的 tracer | `gate1`(`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` **或** `WithTracingEnabled`,兩者只能設一個)**AND** `OTEL_GORILLA_WS_TRACING_ENABLED` | handshake **之前**,終生不變 |
+| **span gate** | 每次 `WriteMessage`/`ReadMessage` 是否建 span、是否 inject/extract | capability **AND** relay flag `otel-gorilla-ws-tracing` | **每次呼叫**,連線存活期間可變 |
 
 協商表:
 
@@ -63,10 +63,53 @@ OTEL-WS Server 會檢查收到的協議是否帶有 `otel-ws` 前綴，決定是
 | **off** | 完全不注入 `otel-ws` token | 即使客戶端提出 `otel-ws` 也不回傳確認,改走一般協議選擇(等同情境 H) | 雙方都不封裝 envelope,純透傳 |
 | **on** | 依情境 C–E 注入並判定 | 依情境 F–H 判定 | 原表格行為 |
 
-**為什麼 capability 不看動態 flag。** 協商只發生在 handshake,事後無法重來。若以動態值閘控,則「flag 關著的期間建立的連線」永遠無法在 flag 打開後傳遞 trace context —— 而 WebSocket 連線動輒存活數小時。代價是:兩端都使用本 library 且全域開關為 on 時,即使 tracing 動態關閉,每則訊息仍帶 envelope。這是刻意的取捨,參見 `design.md` D9。
+**為什麼 capability 不看 relay flag。** 協商只發生在 handshake,事後無法重來。而 relay 只能**撤銷**:一條在模組環境開關關著時建立的連線,之後不可能被任何 relay 值打開,所以不存在「未來需要 envelope」的狀態 —— 排除 relay 因此**零代價**。沒有安裝 provider 的部署,wire 行為與前一個版本完全相同。參見 `design.md` D9。
+
+代價落在另一處:兩端都使用本 library 且兩個環境層都為 on 時,即使 relay 已撤銷 tracing,每則訊息仍帶 envelope。**撤銷停的是遙測,不是開銷** —— 要移除這個 wire 成本必須把 `OTEL_GORILLA_WS_TRACING_ENABLED` 關掉並重新部署。
 
 **為什麼 capability off 時不能協商。** capability off 的一方不會解包 JSON envelope。若仍允許協商成功(0.7.0 之前的行為),對端會封裝每一則訊息,而 capability-off 端的 `ReadMessage` 直通路徑把原始 `{"header":...,"data":...}` bytes 交給應用層 —— 靜默資料損毀。
 
 **反向不成立。** `WithTracingEnabled(true)` 或動態 flag 打開,都無法強迫未協商 otel-ws 的對端使用 envelope;`Conn.tracingEnabled`(協商結果)仍需雙方同意。
 
-**中途翻轉的行為。** 已協商 otel-ws 的連線在動態 flag 關閉後:仍照常寫出 envelope(對端預期如此),但 header 為空、不建 span。讀取端的 `tryUnmarshalWire` 是探測式的,非 envelope 訊息會回退成原始 payload,所以任一方向都不會壞。
+**中途翻轉的行為。** 已協商 otel-ws 的連線在 relay 撤銷後:仍照常寫出 envelope(對端預期如此),但 header 為空、不建 span。讀取端照常解包。
+
+**capability 只箝制寫入端。** 對端是否包 envelope 是 handshake 的**事實**,不是本端閘門有權管的事。所以一個 capability 關掉、卻包裝了已協商連線的 `Conn`(只有 `NewConn` 產得出這種狀態)會寫**原始幀** —— 安全,因為對端的探測會退回 payload —— 但**讀取時仍然解包**。把讀取路徑綁在 capability 上,會把原始的 `{"header":...,"data":...}` bytes 交給應用層。
+
+### 5.1 自行處理 handshake
+
+`NewConn` 只在原始連線的 negotiated subprotocol 證明了 otel-ws 時才啟用 envelope,而且**沒有**「宣稱已協商」的逃生選項 —— 那會讓強制 envelope 的 wire 損毀回來。自行處理 handshake 的呼叫端要用這兩個導出符號:
+
+```go
+// 提出(client)或回應(server)這個 token
+const SubprotocolOTelWS = "otel-ws"
+
+// 驗證 NewConn 會不會在這條連線上啟用 envelope
+func IsOTelNegotiated(conn *websocket.Conn) bool
+```
+
+```go
+dialer := &websocket.Dialer{
+    Subprotocols: []string{otelgorillaws.SubprotocolOTelWS, "json"},
+}
+raw, _, err := dialer.Dial(url, hdr)
+if !otelgorillaws.IsOTelNegotiated(raw) {
+    logger.Warn("otel-ws not negotiated; no WS trace propagation on this conn")
+}
+conn, err := otelgorillaws.NewConn(raw)
+```
+
+限制:原生的 `websocket.Dialer` / `Upgrader` 只能達成**裸 `otel-ws`** 形式,因為 gorilla 只原樣回應完全比對的項目。`otel-ws+<app>` 這種同時帶應用層協定的複合形式,只有本 package 的 `Upgrader.Upgrade` 產得出來。
+
+## 6. Envelope 是保留結構
+
+在一條協商了 `otel-ws` 的連線上,以下 JSON 外層結構是**保留的**:
+
+```json
+{"header": { ... }, "data": <payload>}
+```
+
+讀取端會把符合這個形狀的訊息當成 envelope 解開,把 `data` 交給應用層,外層結構捨棄。因此**應用層 payload 不得使用這個外層形狀** —— 否則會被無聲拆解。
+
+收緊比對(例如要求 `header` 只能含 `traceparent` / `tracestate`)是刻意**不做**的:JS 端未來若在 header 多加一個成員,整包會掉進 legacy 分支,結果更糟。
+
+反過來,不帶 trace key 的一般 JSON object 是**位元組透明**的:探測認不出它,就原樣回傳呼叫端的位元組,不會重排 key、不會正規化空白。做簽章驗證或雜湊的呼叫端因此安全。

@@ -4,7 +4,35 @@ All notable changes to the `otel-nats` module (`otelnats` + `oteljetstream`) are
 
 > **Coverage note**: this file starts at `0.6.0`. Earlier history lives only in git tags (`otel-nats/vX.Y.Z`) and predates the module's rename from `Marz32onE/instrumentation-go` — see the repo root `VERSIONING.md` for the root cause and the release-tag CI guard that now keeps the version constant and tag in sync going forward.
 
-## [0.8.0] - 2026-07-31
+## [0.8.0] - unreleased
+
+### Changed
+
+- **BREAKING** The relay proxy is now a **revoke-only kill switch**. Its evaluation default is a literal `true` and the module's environment variable is ANDed separately rather than passed as that default, so a relay flag can turn this module **off** but can never turn it **on**. This replaces the model shipped in the previous release, in which the relay decided in both directions. Deployments that used the relay to *enable* instrumentation must move that decision into their environment configuration.
+- **BREAKING** `flags.EnvEnabled` now uses a truthy **allow-list**: only `1`, `true`, `yes`, `on` (trimmed, case-insensitive) enable a switch. Every other set value — including the **empty string**, `enabled`, `2`, `y` and `t` — now reads as disabled, where previously anything outside a four-item falsy list enabled it. `export OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=` no longer opens the gate. The direction is fail-safe (less instrumentation, never more), and a set-but-unrecognised value now emits one `slog.Warn` naming the variable, the observed value and the accepted set, so the change announces itself rather than presenting as "spans disappeared after upgrading".
+- **BREAKING** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` and `WithTracingEnabled(v bool)` are now two spellings of **one** switch and are **mutually exclusive**. Supplying both — even with the same value — returns an error from the constructor, matchable with `errors.Is` against the module's exported sentinel. The check is on presence, not value.
+- **BREAKING** `WithTracingEnabled` no longer makes a connection **static**. It supplies the first tier and nothing more: a connection carrying it still reads the module environment variable at construction and the relay verdict on **every operation**, and still stops when the relay revokes. There is no way to opt a connection out of a revocation.
+- **BREAKING** Implementation selection now keys on `gate1 && OTEL_<MODULE>_TRACING_ENABLED` rather than on the global switch alone. A process with the global switch on and this module's switch off returns to the **zero-cost passthrough** — it no longer allocates the instrumented wrapper — which reverses the regression the previous release introduced. This is only safe because the relay can no longer enable: with the module switch off, no relay value could ever reach the instrumented path.
+- Relay verdicts are **no longer cached**. The one-second TTL, its snapshot and its injectable clock are gone, so a revocation takes effect on the next operation rather than up to a TTL later. The cost is roughly 2 µs and 7 allocations per instrumented operation, paid only by wrappers that are actively instrumenting. End-to-end revocation latency is dominated by the provider's poll interval — 60 s by default — not by this library.
+
+### Added
+
+- **Relay control with no application code.** Setting `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` makes the module build a GO Feature Flag provider on first use and bind it to the OpenFeature domain `otel-instrumentation-go`, with `DataCollectorDisabled: true` and in-process evaluation hardcoded. `OTEL_INSTRUMENTATION_GO_FLAGS_API_KEY` and `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` (Go duration strings, default `60s`) tune it; a malformed interval warns and falls back rather than removing the kill switch. An application that installs its own provider first keeps it and is unaffected — the auto-install stands down.
+  - **This adds the GO Feature Flag provider's dependency tree to this module's `go.mod`** (roughly ten modules, including a full ANTLR runtime), for every consumer, whether or not they set the endpoint. It is the price of relay control without an application code change: Go cannot run code from `go.mod` alone.
+  - The provider's polling goroutine has **no shutdown**. It lives for the process lifetime. Applications needing lifecycle control install their own provider.
+- Setting `OTEL_SERVICE_NAME` supplies a `service.name` attribute on every evaluation, so a relay rule can revoke one service instead of the whole fleet. Supplied on the auto-install path only; an application that installs its own provider owns its evaluation context.
+
+### Changed
+
+- **BREAKING** `Conn.static` is deleted. No connection is static any more, including one carrying `WithTracingEnabled`; every JetStream wrapper derived from a `Conn` follows the relay per message.
+
+<details>
+<summary>Superseded within this same unreleased version</summary>
+
+The entries below describe the first implementation of dynamic flags, in which the
+relay decided in both directions and `WithTracingEnabled` pinned a connection static.
+That model was replaced during design review before release; where the two disagree,
+the entries above win. Kept as the record of what changed and why it changed again.
 
 ### Changed
 
@@ -31,6 +59,8 @@ All notable changes to the `otel-nats` module (`otelnats` + `oteljetstream`) are
 | `otel-nats-tracing` | `OTEL_NATS_TRACING_ENABLED` |
 
 `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` has **no** relay counterpart: it is an out-of-band kill switch that works when the relay is unreachable or misconfigured.
+
+</details>
 
 ## [0.7.0] - 2026-07-15
 

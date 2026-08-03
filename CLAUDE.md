@@ -84,23 +84,27 @@ Applications call `otelsetup.Init()` at startup to configure the global provider
 
 | Transport | Carrier | Where context lives |
 |---|---|---|
-| MongoDB | Document field `_oteltrace` | `{ traceparent, tracestate }` injected on every write; stripped on read |
+| MongoDB | Document field `_oteltrace` | `{ traceparent, tracestate }` injected on every write. **Never stripped on read** — once written it is visible to the application on every subsequent read, and cleanup is a `$unset` migration. Injection removes any existing `_oteltrace` before appending, so a read-modify-write yields exactly one |
 | NATS/JetStream | Message headers | `traceparent`, `tracestate` headers via `HeaderCarrier` |
 | WebSocket | JSON message body | `{"header":{"traceparent":...,"tracestate":...},"data":<payload>}` envelope on write; non-JSON payloads are JSON-string-encoded (not base64) into `data`; legacy flat top-level `traceparent`/`tracestate` fields still accepted as a read-only fallback |
 
 ### Feature Flags (otel-mongo)
 
-Three switches plus optional `ConnectWithOptions` overrides. Since 0.9.0 the two module switches are **dynamic** — the env var is the fallback the relay overrides, not the final say (see **Dynamic feature flags** below).
+Five switches. The relay ones can only **revoke**; every env var is read once, at construction.
 
 | Switch | Scope |
 |---|---|
-| `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` (env only) | global kill switch. Off ⇒ no OpenFeature evaluation, no relay value can enable anything, and only the passthrough implementations are constructed |
-| `otel-mongo-tracing` (relay; default `OTEL_MONGO_TRACING_ENABLED`) | gates **both** wrapper **CLIENT** spans **and** `_oteltrace` document propagation for this package |
-| `otel-mongo-propagation` (relay; default `OTEL_MONGO_PROPAGATION_ENABLED`) | only consulted when the global switch and `otel-mongo-tracing` are on; final say on `_oteltrace` inject/extract on Collection/Cursor/ChangeStream and **ContextFromDocument** / **ContextFromRawDocument** |
+| `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` **or** `WithTracingEnabled` (`gate1`, never both) | process-wide kill switch. Off ⇒ no OpenFeature evaluation, no relay value can enable anything, and only the passthrough implementations are constructed |
+| `OTEL_MONGO_TRACING_ENABLED` (env only) | ANDed with `gate1` to give `gate.tracedBuilt`. Off ⇒ the instrumented implementations are **not allocated** and the resolver is never consulted |
+| `OTEL_MONGO_PROPAGATION_ENABLED` **or** `WithTracePropagationEnabled` (never both) | the `_oteltrace` tier, one level below tracing |
+| relay `otel-mongo-tracing` | resolved per operation; revokes wrapper CLIENT spans and, through them, `_oteltrace` |
+| relay `otel-mongo-propagation` | resolved per operation; revokes `_oteltrace` alone |
 
-Both module flags live in **one** `flags.Resolver` so they always come from the same snapshot instant — a torn read reporting tracing off while propagation read on could never correspond to a relay state.
+Both relay keys live in **one** `flags.Resolver`, but they are two consecutive `Boolean` calls, not one atomic read — the microsecond window is R19, accepted, and fail-safe because a false tracing verdict short-circuits propagation.
 
-When `otel-mongo-tracing` resolves off, this package emits no wrapper spans **and** force-disables `_oteltrace` propagation — Mongo tracing and Mongo trace propagation share a single kill switch. `WithTracePropagationEnabled` only overrides the propagation default while tracing resolves on; it **cannot** enable propagation when the global switch or `otel-mongo-tracing` is off.
+When tracing resolves off, this package emits no wrapper spans **and** writes no `_oteltrace` — Mongo tracing and Mongo trace propagation share a single kill switch. `WithTracePropagationEnabled` only supplies the propagation tier; it **cannot** enable propagation when `gate1`, `OTEL_MONGO_TRACING_ENABLED` or the relay says no.
+
+`ContextFromDocument` / `ContextFromRawDocument` are **not** in this table — they carry no gate at all; see below.
 
 `WithTracingEnabled(v bool)` (0.7.0+) overrides all of the above for a single `Client`, in either direction, and makes that client fully static — see **Per-connection tracing override** below.
 
@@ -119,15 +123,20 @@ Three module-specific pitfalls to know if you touch this:
 
 All four modules vendor their own copy of `internal/flags` (`flags.go` + `flags_test.go`); its doc comment requires the file contents (excluding the `package` line) to stay byte-identical across every copy. It exports:
 
-- `EnvEnabled(name string) bool` — default-off env var read; unset or falsy (`0`/`false`/`no`/`off`, case-insensitive) → `false`.
+- `EnvEnabled(name string) bool` — default-off env var read with a truthy **allow-list**: only `1`/`true`/`yes`/`on` (trimmed, case-insensitive) → `true`. Unset, the empty string and every other value → `false`.
 - `EnvGlobalTracing` / `GlobalTracingPossible()` — the process-wide kill-switch name (`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`, the only `OTEL_*` literal allowed in this shared file) and its default-off read. Each module's `env_flags.go` aliases `envGlobalTracingEnabled = flags.EnvGlobalTracing` rather than repeating the literal.
-- `Resolver` — resolves a module's dynamic flags through the process-global OpenFeature client and caches them in an immutable snapshot behind an `atomic.Pointer` with a **fixed one-second TTL**. `NewResolver(domain, WithSpecs(...), WithClock(...))` constructs one; `Enabled(i)` reads spec `i`. `WithClock` is test-only.
+- `EnvSet(name string) bool` / `GlobalTracingSet()` — bare presence tests, for the mutual-exclusion check only. Never use them to decide whether a switch is enabled.
+- `FlagDomain` (`otel-instrumentation-go`) — the single OpenFeature domain **all four** modules resolve through. One per module is impossible: `InProcess.Init` is not idempotent, so one provider instance under N domains leaks N−1 unstoppable pollers.
+- `EnvFlagsEndpoint` / `EnvFlagsAPIKey` / `EnvFlagsPollInterval` / `EnvServiceName` — the provider auto-install and its targeting attribute. Process-scoped, so allowed in the shared file.
+- `Resolver` — resolves a module's relay verdicts through the OpenFeature client on **every call**. It caches **nothing**: no snapshot, no TTL, no clock, no refresh. `NewResolver(WithFlagKeys(...))` constructs one (no domain parameter); `Allowed(i)` reads key `i` and returns `false` for an out-of-range index.
 
-`Gate`/`NewGate`/`ResetForTest` were **removed in 0.8.0/0.9.0** — a process-lifetime cache is incompatible with runtime flag changes.
+`Gate`/`NewGate`/`ResetForTest` were **removed in 0.8.0/0.9.0** — a process-lifetime cache is incompatible with runtime flag changes. So were the module-level reset hooks (`resetPropEnabledCacheForTest`, `resetNATSGateForTest`, `resetWSGateForTest`): with nothing cached there is nothing to re-arm, and tests drive the real path by rebinding the provider.
 
-Each `Spec` pairs an OpenFeature key with the env var passed as the evaluation **default**, so `client.Boolean(ctx, key, EnvEnabled(envVar), ...)` expresses the whole fallback policy in one call: the relay decides when it has an opinion, otherwise the environment does. `Client.Boolean` returns the default on every failure path (no provider, not ready, flag absent, evaluation error), so there is no error handling and no undefined state.
+The evaluation default is a literal `true` and the module env var is ANDed **separately** by each module, never passed as that default. That is what makes the relay revoke-only: `Client.Boolean` returns the default on every failure path (no provider, not ready, flag absent, evaluation error, type mismatch), so all of them mean *do not interfere* and the environment alone decides. Nothing on the relay can enable what the deployment left off.
 
-The file names no module: flag keys and env var names live in each module's own `env_flags.go` and are passed in as `Spec` values.
+`EnvEnabled` emits one `slog.Warn` when a variable is set to a value in neither the truthy nor the falsy list, then returns `false`. Unset, truthy and explicitly-falsy values stay silent, so a correct deployment logs nothing. Deliberately not deduplicated.
+
+The file names no **module**: module flag keys and module env var names live in each module's own `env_flags.go` and are passed in through `WithFlagKeys`. Process-scoped names (the kill switch, the three `_FLAGS_*` variables, `OTEL_SERVICE_NAME`, `FlagDomain`) do belong here — they are properties of the binary, not of any module.
 
 ### Dynamic feature flags (0.8.0/0.9.0+)
 
@@ -140,13 +149,23 @@ Tracing and Mongo propagation are resolved at **runtime** through [OpenFeature](
 | `otel-nats-tracing` | `OTEL_NATS_TRACING_ENABLED` | `otel-nats` |
 | `otel-gorilla-ws-tracing` | `OTEL_GORILLA_WS_TRACING_ENABLED` | `otel-gorilla-ws` |
 
-Precedence, highest first:
+Three **conjunctive** tiers — `tracing = gate1 && OTEL_<MODULE>_TRACING_ENABLED && relayVerdict` — not a precedence list. The relay can only **subtract**:
 
-1. **`WithTracingEnabled(v)`** — when present the connection/client is fully **static**: implementation fixed at construction, no OpenFeature evaluation ever runs for it, no relay change reaches it.
-2. **`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`** — an out-of-band **kill switch with no relay counterpart**. Off ⇒ no evaluation happens at all and no relay value can enable anything. It is the only brake that works when the relay is unreachable or misconfigured.
-3. **The relay flag**, defaulting to the module env var when the relay has no opinion.
+1. **`gate1`** — `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` **or** `WithTracingEnabled(v)`, two spellings of one switch. Setting **both is a configuration error** returned by the constructor (`ErrTracingConfigConflict`), even when they agree; the check is on presence, not value. Off ⇒ no evaluation happens at all.
+2. **`OTEL_<MODULE>_TRACING_ENABLED`** — read once at construction. Together with `gate1` it decides whether the instrumented implementation is **allocated at all**, so a module-off process keeps the pre-dynamic zero-cost passthrough.
+3. **The relay flag** — resolved on **every operation**, with an evaluation default of `true`. It is the only tier that can change without a redeploy, and it can only revoke.
 
-**Never call `openfeature.SetProvider`** (or `SetNamedProvider`/`SetEvaluationContext`/`AddHooks`/`Shutdown`) from library code — same rule as never initializing a `TracerProvider`. Applications install a provider at startup:
+`WithTracingEnabled` no longer pins anything: a connection carrying it still reads the relay verdict per operation and still stops when the relay revokes.
+
+Three further **process-scoped** variables configure the relay connection rather than any module: `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` (unset ⇒ no provider is installed), `_API_KEY`, and `_POLL_INTERVAL` (Go duration strings only, default `60s`). `OTEL_SERVICE_NAME` supplies a `service.name` targeting attribute, on the auto-install path only.
+
+**Revocation latency is the provider's poll interval — 60 s by default — not "immediate".** The resolver adds none of its own.
+
+**Never touch the DEFAULT provider from library code** — never `openfeature.SetProvider`, `SetEvaluationContext`, `AddHooks` or `Shutdown`, the same rule as never initializing a `TracerProvider`. Nothing the library does may change how the application's own feature flags resolve.
+
+The one deliberate exception is the environment-driven auto-install: when `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` is set **and** `openfeature.NamedProviderMetadata(flags.FlagDomain).Name == "NoopProvider"` (no default provider and none bound to our domain), `Resolver.evaluator()` builds a GO Feature Flag provider and registers it with the non-blocking `SetNamedProvider(flags.FlagDomain, p)`. `DataCollectorDisabled: true` and in-process evaluation are hardcoded there. An application that installs its own provider first keeps it — the trigger fails and nothing is written.
+
+Applications may still install a provider themselves, which also closes the non-blocking startup window:
 
 ```go
 provider, _ := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{
@@ -157,15 +176,11 @@ provider, _ := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{
 _ = openfeature.SetProviderAndWait(provider)
 ```
 
-Two provider settings are load-bearing and easy to omit. `DataCollectorDisabled: true` avoids a
-buffer that flushes synchronously from the evaluating goroutine once full, which wedges every
-instrumented operation behind a failing 10 s request while the relay is down. `SetProviderAndWait`
-rather than `SetProvider` closes the startup window in which an unfetched provider cannot revoke
-anything. Both are explained in `feature-flags.md`.
+Two provider settings are load-bearing and easy to omit **on this path only** — the auto-install hardcodes both. `DataCollectorDisabled: true` avoids a buffer that flushes synchronously from the evaluating goroutine once full, which wedges every instrumented operation behind a failing 10 s request while the relay is down. `SetProviderAndWait` rather than `SetProvider` closes the startup window in which an unfetched provider cannot revoke anything; the auto-install deliberately does not block, so that window is the application's to close. Both are explained in `feature-flags.md`.
 
 With no provider installed, every module's **span on/off** behavior is driven by the same environment variables as before dynamic flags. **Exception (otel-gorilla-ws):** subprotocol negotiation is gated on the global kill switch alone, not `GLOBAL && OTEL_GORILLA_WS_TRACING_ENABLED`, so env-only deployments with global on + module env off may negotiate otel-ws between library peers (envelope on the wire, no spans while the module flag is off). Peers that do not negotiate otel-ws still see raw payloads. The library passes an empty `EvaluationContext{}`; targeting is the application's job via `SetEvaluationContext`. Because the snapshot is process-wide, only process-scoped targeting attributes are meaningful — **per-request targeting is not supported**.
 
-**Tests that toggle env vars or install a provider must re-arm the module's resolver** (`resetPropEnabledCacheForTest` in otel-mongo, `resetNATSGateForTest`, `resetWSGateForTest`) and **must not call `t.Parallel`** — the provider, the environment and the resolver are all process-global.
+**Tests install their in-memory provider with `openfeature.SetNamedProviderAndWait(flags.FlagDomain, …)`, never `SetProviderAndWait`** — a named provider outranks the default for these clients, so a default install is silently shadowed once anything in the binary has auto-installed, and `clientOnce` makes that unrepeatable. There is no reset hook to call: the resolver caches nothing, so a rebound provider is observed on the very next operation. Tests **must not call `t.Parallel`** (the provider and the environment are process-global) and **must leave `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` unset**, or they will auto-install and reach the network. A **module** env var is read once at construction, so a test that changes one must reconstruct the wrapper.
 
 ### Consumer Context
 
@@ -177,13 +192,17 @@ Async consumers (NATS subscribers, MongoDB change stream readers, WebSocket read
 
 ### Disabled-mode invariant (0.3.0+)
 
-When any feature flag returns false, **no OTel SDK code path may run**: no `tracer.Start` on a real tracer, no `sdktrace.NewTracerProvider`, no `otlptracegrpc.New` / `otlptracehttp.New`, no `[]attribute.KeyValue` build, no propagator inject/extract. Two enforcement patterns coexist:
+When any feature flag returns false, **no OTel SDK code path may run** inside a **gated** path: no `tracer.Start` on a real tracer, no `sdktrace.NewTracerProvider`, no `otlptracegrpc.New` / `otlptracehttp.New`, no `[]attribute.KeyValue` build, and no trace-context **injection**.
+
+The clause is scoped to code the flags govern. Two things are deliberately outside it: the explicitly-invoked read-only helpers `ContextFromDocument` / `ContextFromRawDocument`, which emit nothing and are called only when the caller wants extraction; and `otelgorillaws`'s envelope unwrap on a negotiated connection, which is `json.Unmarshal` with the headers discarded. Neither touches the OTel **SDK** — `propagation` is API — so the `internal/direct` package boundary and the CI grep are unaffected. Two enforcement patterns coexist:
 
 **1. Strategy split (preferred — otel-mongo Collection / Cursor / SingleResult / ChangeStream).** The facade type holds an `impl` interface satisfied by either `internal/direct.X` (passthrough) or `internal/traced.X` (instrumented). Construction picks the impl once; per-method runtime gates disappear. `internal/direct/*.go` imports no `go.opentelemetry.io/otel/sdk/*` and no `otel/exporters/*` — the disabled path is **compiler-enforced** by package boundary.
 
-**2. Per-call gate (otel-nats `oteljetstream`, otel-gorilla-ws).** Every public method starts with `if !c.on() { /* delegate to native */ }`, where `on()` re-resolves the flag. Reviewer-enforced. These packages have no `internal/direct` boundary — direct and traced live in the same package — so there is nothing for the compiler to enforce.
+**2. Per-call gate (otel-gorilla-ws).** Every public method starts with `if !c.featureEnabled() { /* delegate to native */ }`, which re-resolves the relay verdict. Reviewer-enforced: `Conn` embeds `*websocket.Conn` (which is what gives callers the whole gorilla API for free) and only `WriteMessage`/`ReadMessage` need wrapping, so splitting two methods would cost an interface over roughly thirty.
 
-**Which switch selects the implementation.** Since 0.8.0/0.9.0 the choice is `option != nil ? *option : EnvEnabled(GLOBAL)` — the **global switch alone**, not the module flag. This is load-bearing: keying it on the module flag would make `WithTracingEnabled(true)` with every env var off select the passthrough path, so the option could never produce a span. Consequence: a process with the global switch on and a module flag off now allocates the instrumented wrapper and pays one atomic load plus one clock read per operation. It still emits no spans.
+`otel-nats` — both `otelnats.Conn` and the `oteljetstream` wrappers — is a **strategy split**, not a per-call gate: `directConn`/`tracedConn` and `directJSImpl`/`tracedJSImpl` are selected per operation by `impl()`. It keeps both implementations in one package, so its equivalent of the boundary is reviewer-enforced rather than compiler-enforced.
+
+**Which switch selects the implementation.** `gate1 && EnvEnabled(moduleEnv)` — the **whole static part** of the decision, both terms fixed at construction. Keying it on the global switch alone (the 0.8.0 shape) allocated the instrumented wrapper for module-off processes and made them pay per operation for nothing. Including the module flag is safe **only because the relay can never enable**: with it off, no relay value could raise the answer, so the instrumented path is unreachable and there is no reason to build it — nor to register `shared.NewCommandMonitor`, which otherwise runs on every MongoDB command. The previous release's zero-cost passthrough is preserved for every configuration that had it.
 
 Independent of pattern:
 - For otel-mongo, `Connect` substitutes `noop.NewTracerProvider()` when disabled so any stray `tracer.Start` is inert.
@@ -225,9 +244,13 @@ Key rules:
 - v1/v2 parity extends to `internal/{direct,traced,shared}/`. The helpers in `internal/shared/{bulkwrite.go,semconv.go,tracing.go,impls.go,monitor.go,hostport.go}` are intentionally duplicated across modules (separate `internal/` trees cannot share). A drift-check CI step to catch divergence between the two copies is planned but not yet implemented.
 - `internal/shared/monitor.go` builds the `event.CommandMonitor` (`shared.NewCommandMonitor`) that captures the real per-command server address from `CommandStartedEvent.ConnectionID` into a context-scoped holder (`shared.WithAddrCapture`/`*shared.AddrCapture.Resolve`), chaining any caller-supplied monitor rather than replacing it. `client.go`'s `ConnectWithOptions` registers it (tracing-enabled branch only, via `options.MergeClientOptions`); `internal/traced/collection.go` call sites read it back after the raw driver call to overwrite `server.address`/`server.port` on the span, falling back to the static URI-parsed value when nothing was captured. `internal/shared/hostport.go` (`SplitHostPort`) is the shared IPv6-aware host:port parser used by both `monitor.go` and `client.go`'s `parseServerFromURI`.
 
-### Propagation flag caching (otel-mongo)
+### The ungated document helpers (otel-mongo)
 
-`ContextFromDocument` / `ContextFromRawDocument` (`tracing.go`, both v1 and v2) call `cachedPropagationEnabled()`, which resolves through the module's `flags.Resolver` snapshot (`env_flags.go`) — the global env kill switch AND the dynamic `otel-mongo-tracing` AND `otel-mongo-propagation` values. **They follow the relay within the resolver's TTL** (changed in 0.9.0; previously a permanently cached env-only gate), so a flag that stops the `Collection` path also stops a change-stream reader in the same loop. They still ignore per-connection options — they are package-level functions with no client to consult. Tests that toggle any of those three vars via `t.Setenv` **must** call `resetPropEnabledCacheForTest()` after the Setenv to reset the cache. Helpers `enableTracing` / `enableDocumentPropagation` in `tracing_test.go` already invoke reset + `t.Cleanup` (and `enableDocumentPropagation` now sets all three flags). Do **not** add `t.Parallel()` to tests that touch these env vars — the reset is not parallel-safe.
+`ContextFromDocument` / `ContextFromRawDocument` (`tracing.go`, both v1 and v2) carry **no feature-flag gate at all** — not `gate1`, not the module env vars, not the relay verdicts. They start no span, build no attributes, initialise no part of the OTel SDK and write nothing: they read `_oteltrace` out of a value the caller already holds and return what it encodes, and you only call them when you want extraction.
+
+`Cursor.DecodeAndTrace` / `ChangeStream.DecodeAndTrace` look similar and **are** gated, because each starts and ends a real `mongo.cursor.decode` span. So **a revocation stops those but does not stop extraction here** — this pair is the supported way to keep trace linking while the library is silenced, and `feature-flags.md` says so in those words. **BREAKING in 0.9.0:** a fully-disabled process now gets a valid span context from them where it previously got nothing.
+
+Consequences worth knowing: they cost no relay evaluation, so a per-document change-stream loop no longer pays one; and there is nothing for them to misread when `gate1` is supplied as `WithTracingEnabled` rather than the environment variable, which removes the option blind spot the previous design had.
 
 ### `oteljetstream.MessageBatch.Stop()`
 
@@ -263,7 +286,7 @@ Bump on any code change to a module before pushing release tag. Module pre-1.0 (
 - `_oteltrace` field adds ~100–120 bytes per document.
 - Use `Cursor.DecodeAndTrace(ctx, v)` (not `Decode`) when reading in a change-stream context — it extracts the trace from the document and links spans correctly.
 - `ContextFromDocument(ctx, doc)` extracts trace from an already-decoded document map; it respects the same propagation env gates as the Collection wrapper (not a bypass).
-- **Strategy-split layout:** Collection / Cursor / SingleResult / ChangeStream all live in `internal/{direct,traced}/` (see *Strategy-split layout (otel-mongo)* above). Client and Database still use the cached-gate pattern.
+- **Strategy-split layout:** Collection / Cursor / SingleResult / ChangeStream all live in `internal/{direct,traced}/` (see *Strategy-split layout (otel-mongo)* above). Client and Database are **gate carriers**: neither creates a span, so there is nothing to split and nothing to gate — they resolve the static tiers once into a shared `gateState` and hand it down.
 - **v1 and v2 parity rule:** `otelmongo/` (v1) and `v2/` are parallel implementations. All logic changes — new flags, new fields, new inject/extract paths, new strategy methods — must be applied to **both** sub-packages identically, including their `internal/{direct,traced,shared}/` trees. Run lint and tests for both when either is touched.
 
 ### otel-nats
