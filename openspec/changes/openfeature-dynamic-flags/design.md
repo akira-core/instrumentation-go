@@ -230,13 +230,24 @@ var mongoResolver = flags.NewResolver("otel-mongo",
 )
 ```
 
-The evaluation call and the truthiness rules — the parts most likely to drift if hand-copied — stay inside the byte-identical file, which is the whole point of that rule. The zero-dependency property that file used to have is given up here; the OpenFeature SDK is the only import added, and it is the reason the file is worth sharing at all.
+The evaluation call and the truthiness rules — the parts most likely to drift if hand-copied — stay inside the byte-identical file. The zero-dependency property that file used to have is given up here; the OpenFeature SDK is the only import added, and it is the reason the file is worth sharing at all.
+
+**The byte-identical rule is maintained by code review, not by a check.** There is no CI step comparing the four copies; the package doc comment currently claims otherwise and is corrected as part of this change. All four are identical today, so the discipline has held, but it is worth naming what a single drifted copy would do, because this change concentrates more load-bearing logic in that file than it previously held:
+
+| Drifted line | Silent consequence |
+|---|---|
+| the `true` evaluation default reverting to `EnvEnabled(...)` | that module's relay can **enable** again — the property the whole design rests on, gone for one module, in a diff that looks like the previous release |
+| the truthiness allow-list | that module accepts `enabled` or an empty string where the others do not |
+| `EnvSet` | the mutual-exclusion check misfires or fails to fire for that module |
+| lazy client construction | "switches off ⇒ the OpenFeature SDK is never touched" stops holding for that module |
+
+A CI step comparing the copies' hashes, alongside the existing "Verify direct/ has no OTel SDK imports" grep that protects an invariant of exactly this shape, would turn the rule into a check. It is deliberately out of scope here — this change's mandate is the kill switch, not CI infrastructure — and is recorded so the option is not lost.
 
 *Alternatives considered.* Leaving `internal/flags` untouched and writing the OpenFeature call and the truthiness rules separately in each module would keep the existing spec unchanged but would place the highest-risk shared logic outside the only mechanism this repo has for preventing drift — and that risk grows, not shrinks, if a cache is added later (D4).
 
 ### D6. `Gate` is deleted
 
-`natsGate`, `wsGate`, and `propEnabledGate` are the only users of `flags.Gate`, and all three are replaced by `Resolver`. `Gate`, `NewGate`, and `ResetForTest` are removed rather than left as dead code. The package is `internal/`, so nothing consumer-visible is removed.
+`natsGate`, `wsGate`, and `propEnabledGate` are the only users of `flags.Gate` — four call sites, not three, because `otel-mongo` v1 and v2 each carry their own `propEnabledGate` in their own `env_flags.go`. All four are replaced by `Resolver`. `Gate`, `NewGate`, and `ResetForTest` are removed rather than left as dead code. The package is `internal/`, so nothing consumer-visible is removed.
 
 ### D7. Strategy selection keys on the whole static part of the decision
 
@@ -252,15 +263,23 @@ The kill-switch model is what makes including `moduleEnv` safe. Under a relay th
 
 When `useTracedImpl` is false, only the passthrough implementation is constructed and no OTel SDK code path is reachable for that wrapper's lifetime. When it is true, both implementations exist and the per-operation relay verdict selects between them.
 
+**Construction fixes the ceiling; the relay fixes the current state.** This is not in tension with D8's rule that no connection is ever static. D7 answers "could this wrapper ever trace?", which only the two environment-derived terms can decide and which therefore cannot change. D8 answers "is it tracing on this operation?", which the relay decides and which changes freely. Because the relay can only lower the answer and never raise it, deriving the ceiling from the static terms loses nothing.
+
+**Everything derived from a wrapper inherits its decision.** `oteljetstream.New(conn)`, `Client.Database()` and `Database.Collection()` are called after their source was constructed, and they SHALL inherit its implementations rather than re-resolving. Re-resolving would let a passthrough-only `Conn` hand out an instrumented JetStream wrapper that has no tracer to use.
+
 *Consequence.* The previous release's zero-cost passthrough is preserved for every configuration that had it, including `gate1` on with the module switch off — a configuration the earlier revision of this design would have slowed down. The cost of dynamism is paid only where dynamism is possible: a wrapper built on the traced path resolves its relay verdict per operation, at the cost measured in D4.
+
+*Consequence.* `otel-mongo` registers `shared.NewCommandMonitor` on the same condition. That monitor runs on **every** MongoDB command, capturing the real server address out of `CommandStartedEvent.ConnectionID` into a context-scoped holder, and exists only to correct `server.address` on a span. Under the earlier revision a process with `gate1` on and the module switch off registered it and paid it per command while emitting no spans at all; under D7 it is not registered, so that cost disappears with the rest.
 
 *Consequence.* Changing a module's environment variable after construction (`os.Setenv` in a long-running process) does not change which implementations exist. This already held for `gate1` and for `otel-gorilla-ws`'s capability; tests must set the environment before constructing, which is the discipline they already follow.
 
 ### D8. Long-lived objects consult the flags per call; no connection is ever static
 
-Because the relay must be able to revoke on a running process, **no wrapper may cache its tracing decision**. This holds even for connections constructed with `WithTracingEnabled`: that option fixes `gate1`, not the module tier, so such a connection still reads `EnvEnabled(moduleEnv) && resolver.Allowed(...)` on every operation and still stops when the relay revokes.
+Because the relay must be able to revoke on a running process, **no wrapper may cache the relay's verdict**. This holds even for connections constructed with `WithTracingEnabled`: that option supplies `gate1`, which D7 folds into the construction-time decision along with the module environment variable, but it says nothing about the relay. Such a connection still calls `resolver.Allowed(...)` on every operation and still stops when the relay revokes.
 
-The cached-gate modules convert cheaply: `if !c.tracingEnabled` becomes `if !c.tracingEnabled()`. The strategy-split types need a structural change — each facade type holds **both** implementations and selects per call:
+**No environment variable is read on any hot path.** D7 fixes both environment-derived terms at construction, so what remains per operation is one relay verdict and nothing else — `tracedBuilt && Allowed(idx)` for the Mongo and NATS wrappers, `capable && Allowed(idx)` for `otelgorillaws.Conn`. Every `os.LookupEnv` in the flag path happens once, during construction. This is worth stating as an invariant because it is cheap to check and easy to lose: a future change that re-reads a module switch inside a gate would reintroduce a per-operation syscall-shaped cost without changing any behaviour, so nothing would fail.
+
+`otel-gorilla-ws`, the one cached-gate module, converts cheaply: `if !c.featureEnabled` becomes `if !c.featureEnabled()`, where the method is `capable && wsResolver.Allowed(idxTracing)`. The strategy-split types need a structural change — each facade type holds **both** implementations and selects per call:
 
 ```go
 type Collection struct {
@@ -279,7 +298,7 @@ func (c *Collection) impl() collectionImpl {
 
 This keeps `internal/direct` free of OTel SDK imports (the CI grep and the package boundary are both unchanged) and keeps `internal/traced` free of gating code. The alternative — a runtime gate at the top of every `traced` method — would duplicate the entire `direct` package inside `traced` and defeat the split.
 
-`otelnats.Conn` needs the same treatment. Contrary to the pattern table this design originally carried, `otelnats.Conn` was already a strategy split (`connImpl` = `directConn` / `tracedConn`, chosen once at construction), not a cached gate, so it gains a `direct`/`traced` pair and an `impl()` selector rather than a field-to-method rename. `oteljetstream` wrappers, consumers, `MessagesContext` and `MessageBatch` forwarders derive their gate from the `Conn` and re-read it per message.
+`otelnats.Conn` needs the same treatment. It has always been a strategy split (`connImpl` = `directConn` / `tracedConn`, chosen once at construction), so it gains a `direct`/`traced` pair and an `impl()` selector rather than a field-to-method rename. `oteljetstream` wrappers, consumers, `MessagesContext` and `MessageBatch` forwarders derive their gate from the `Conn` and re-read it per message.
 
 `Cursor` and `ChangeStream` follow the same dual-implementation shape rather than inheriting a fixed choice from the call that produced them. This matters most for `ChangeStream`, which can outlive many revocations. Both are structurally able to: `traced.Cursor` and `traced.ChangeStream` hold only a tracer, a propagator and their propagation flag — no per-call span state — so the facade can build an instrumented and a passthrough wrapper around the same raw driver object.
 
@@ -289,7 +308,9 @@ This keeps `internal/direct` free of OTel SDK imports (the CI grep and the packa
 
 **Per-operation tracing/propagation consistency (R5).** Within a single public operation, the tracing decision used to select `impl()` SHALL be the same value passed into `resolveDocumentPropagation` / `propagationOn` — callers MUST NOT re-resolve tracing for that operation's propagation decision. The two relay verdicts an `otel-mongo` operation needs are two consecutive `Boolean` calls; the microsecond window between them is the one R19 accepted as WONTFIX, and is fail-safe because a false tracing verdict short-circuits propagation. Client and Database share one small gate-state helper so the rule is not hand-copied four times (R16).
 
-**Facade `impl()` selection (R14).** The `if traced != nil && tracing() { return traced }; return direct` pattern is factored once per module (v1 and v2) via a tiny generics helper; v1↔v2 parity copies remain required by CLAUDE.md.
+**Facade `impl()` selection (R14) — WONTFIX.** The six `impl()` methods (`Collection`, `Cursor`, `ChangeStream`, in v1 and v2) each hand-roll `if traced != nil && tracing() { return traced }; return direct`. R14 proposed factoring that through a generics helper, and this design previously recorded it as decided; it is now explicitly declined.
+
+The three types return three different interfaces (`collectionImpl`, `shared.CursorImpl`, `shared.ChangeStreamImpl`) over three different concrete types, so the helper needs both an interface type parameter and a comparable concrete one just to express the nil check — a signature longer than the four lines it removes, sitting on the most-read entry point of the facade. R14 was raised when `impl()` still carried an option branch and a three-tier conjunction; D3 and D7 reduced it to four lines, and the duplication is no longer worth an abstraction. `c.tracing()` in that snippet is now the relay verdict alone, not a conjunction.
 
 ### D9. `otel-gorilla-ws` negotiates `otel-ws` on the static portion of the decision
 
@@ -481,7 +502,7 @@ Source: `reviews/code-review-pr-27-openfeature-dynamic-flags.zh-TW.html` and a d
 | R11 | `WriteMessage` nil span + dual guards | Feature-off uses noop span; drop nil guards | Stands |
 | R12 | NATS Consume path triple `impl()` per message | Resolve once per message; pass down | Stands |
 | R13 | `dynamicTracingPossible` duplication / parallel refresh | `flags.GlobalTracingPossible()` | Stands, plus `GlobalTracingSet` (D5); the parallel-refresh half is moot with no refresh |
-| R14 | Six copies of facade `impl()` selection | Generics `selectImpl` per mongo module | **Not yet implemented** — `collection.go`, `cursor.go` and `results.go` still hand-roll it |
+| R14 | Six copies of facade `impl()` selection | Was: generics `selectImpl` per mongo module | **WONTFIX** — never implemented despite being marked done; declined in D8 now that `impl()` is four lines and the three impl interfaces differ |
 | R15 | Five copies of relay test helpers | Move to `otel-testkit/harness` | Stands |
 | R16 | Client/Database `effective*` duplication | Shared gateState | Stands |
 | R17 | otelnats `impl`/`msgHandler`/`traceEventMsgHandler` policy | WONTFIX extract; lockstep comment only | Stands |

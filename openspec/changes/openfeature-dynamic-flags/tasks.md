@@ -97,7 +97,7 @@
 - [x] 8.2.2 **R8 collectionImpl second returns:** Change Find/Aggregate/Watch to `(raw, error)` only; stop throwaway NewCursor/NewChangeStream in direct/traced; keep FindOne dual return. v1+v2.
 - [x] 8.2.3 **R11 WriteMessage noop span:** On feature-off capable path use noop span; remove `span != nil` guards.
 - [x] 8.2.4 **R13-B1 GlobalTracingPossible:** Add `EnvGlobalTracing` + `GlobalTracingPossible` to four flags copies; delete module `dynamicTracingPossible`/`wsNegotiationPossible`; call sites use `flags.GlobalTracingPossible()`; move D9 prose to Dial/Upgrade/capability docs. Do **not** parallelize refresh Booleans.
-- [x] 8.2.5 **R14 selectImpl:** Generics helper for Collection/Cursor/ChangeStream `impl()` in v1 and v2.
+- [x] 8.2.5 **R14 selectImpl — WONTFIX, not done.** This item was marked complete but the helper was never written; it is now formally declined rather than pending. **WONTFIX** — was marked done but never implemented; formally declined in design D8. The three types return three different interfaces over three different concrete types, so the helper's signature would exceed the four lines it removes.
 - [x] 8.2.6 **R15 relay test helpers:** Move setRelay/InMemoryFlag lifecycle into `otel-testkit/harness`; switch five `dynamic_flags_test.go` files; reset via callback.
 - [x] 8.2.7 **R18 dead nil guard:** Remove unreachable nil check in `tracedConsumeHandler`.
 
@@ -109,10 +109,15 @@
 - [x] 8.3.4 Confirm delta specs under this change match R1–R3, R5, R8, R13 (websocket, nats-jetstream, mongodb, dynamic-feature-flags, shared-feature-flags).
 - [x] 8.3.5 Run `go build`, `go test -race`, `golangci-lint` in every touched module until clean.
 
+### Deferred, deliberately
+
+- **CI check for `internal/flags` byte-identity.** The rule has no enforcement today and the package doc comment falsely claims it does (corrected in 9.1.5). A hash comparison of the four copies, next to the existing "Verify direct/ has no OTel SDK imports" step, would make it real. Out of scope here — this change's mandate is the kill switch, not CI infrastructure. Design D5 records what a drifted copy would silently break.
+
 ### Explicit non-work
 
 - **R19** same-refresh Boolean micro-torn: WONTFIX.
 - **R17** policy extract: WONTFIX (comment only).
+- **R14** facade `impl()` generics helper: WONTFIX — see design D8.
 - Resolver CAS/singleflight, parallel Boolean fan-out: out of scope.
 
 ## 9. Kill-switch model rework
@@ -126,7 +131,7 @@
 - [ ] 9.1.2 Add `EnvSet(name string) bool` (bare `os.LookupEnv` presence) plus `GlobalTracingSet()`. Document that `EnvSet` is for the mutual-exclusion check only and must never decide whether a switch is enabled.
 - [ ] 9.1.3 Change the resolver's evaluation default to a literal `true`. Delete the `Spec` type and replace `WithSpecs(...Spec)` with `WithFlagKeys(keys ...string)` — with the env var no longer the evaluation default, `Spec.EnvVar` has no reader and would rot. Rename `Enabled(i)` to `Allowed(i)` so the call site reads as a relay verdict, not a final answer.
 - [ ] 9.1.4 **Delete the cache.** Remove `snapshot`, the `atomic.Pointer`, `refreshTTL`, `refresh`, `now`/`WithClock`, and the TTL comparison. `Allowed(i)` becomes a bounds check plus one `client.Boolean(context.Background(), r.keys[i], true, openfeature.EvaluationContext{})`. Keep the lazy `clientOnce` construction. See design D4 for the measured cost this accepts (2.0 µs / 7 allocs per call vs 82 ns cached) and why it is a deferral rather than a rejection.
-- [ ] 9.1.5 Update the package doc comment: the file is still the highest-drift-risk shared code, it still never installs a provider, and it now caches nothing — with a pointer to D4 so anyone reintroducing a cache knows which questions come back with it.
+- [ ] 9.1.5 Update the package doc comment: the file is still the highest-drift-risk shared code, it still never installs a provider, and it now caches nothing — with a pointer to D4 so anyone reintroducing a cache knows which questions come back with it. **Delete the false claim that "drift is caught by CI"** — no such step exists; say the rule is maintained by review, and name the `true` evaluation default as the line whose drift would silently restore the relay's ability to enable.
 - [ ] 9.1.6 Rewrite `flags_test.go`: allow-list golden table including the empty string and `enabled`/`2`; `EnvSet` vs `EnvEnabled` divergence; `Allowed` returning `true` with no provider installed; `Allowed` returning `false` for an out-of-range index; a provider mutation observed on the very next call with no sleep. No `t.Parallel` where a provider or `t.Setenv` is involved.
 - [ ] 9.1.7 Copy `flags.go` and `flags_test.go` verbatim into the other three modules; verify byte-identity excluding the `package` line.
 
@@ -152,6 +157,7 @@
 ### 9.5 Tests
 
 - [ ] 9.5.1 Rewrite every test that sets a tracing env var **and** passes the matching option (~89 call sites across 11 files) to use exactly one of them.
+- [ ] 9.5.1b Rewrite any test that changes a **module** environment variable after constructing a wrapper and expects the change to take effect. Under D7 the module env var is read once, at construction, so such a test must now reconstruct the wrapper. Only the relay verdict is observable without reconstruction — tests exercising a live change should mutate the in-memory provider instead.
 - [ ] 9.5.2 Add per-module kill-switch asymmetry tests: relay `true` + module env off ⇒ no spans and no evaluation; relay `false` + module env on ⇒ the running connection's next operation emits no span.
 - [ ] 9.5.3 Add constructor-conflict tests for all seven option-accepting constructors, asserting `errors.Is` against the module sentinel.
 - [ ] 9.5.4 Update the relay integration test to assert the revoke direction (start enabled, revoke, observe stop) instead of enabling from off.
@@ -159,7 +165,7 @@
 
 ### 9.6 Outstanding correctness items found during review
 
-- [ ] 9.6.1 **R14 was marked done but is not implemented.** `collection.go`, `cursor.go` and `results.go` each hand-roll `impl()` in both Mongo modules. Either add the generics helper or reopen R14 as WONTFIX with a reason.
+- [x] 9.6.1 **R14 resolved as WONTFIX.** It was marked done in 8.2.5 but never implemented; design D8 now records the reason for declining it and 8.2.5 is struck through. No code change.
 - [ ] 9.6.2 Write a test for read-modify-write duplicate `_oteltrace`: read a document into `bson.M`, modify, `ReplaceOne`. If the field is written twice, make `InjectTraceIntoDocument`/`InjectTraceIntoUpdate` remove any existing key before appending. Independent of the relay; affects v1 and v2.
 
 ### 9.7 Documentation
