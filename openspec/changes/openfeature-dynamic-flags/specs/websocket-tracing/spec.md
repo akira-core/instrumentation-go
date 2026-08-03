@@ -1,75 +1,110 @@
 ## MODIFIED Requirements
 
 ### Requirement: Two-tier tracing feature-flag gating
-The package SHALL gate span creation and trace-context propagation behind `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` (global, environment-only) and the dynamic flag `otel-gorilla-ws-tracing` (module), the latter resolving through the module's `flags.Resolver` with `OTEL_GORILLA_WS_TRACING_ENABLED` as its OpenFeature default value. An unset environment variable SHALL be treated as disabled; values `0`/`false`/`no`/`off` (case-insensitive) SHALL disable; any other set value, including an empty string, SHALL enable. With no OpenFeature provider installed, **span on/off** behavior SHALL match the environment-only resolution of the preceding release, **except** that otel-ws **negotiation** follows the global switch alone (see negotiation requirement and design D9/R4) and may therefore differ from the preceding release when global is on and the module env is off.
+The package SHALL gate span creation and trace-context propagation behind a conjunction of tiers:
 
-The global switch SHALL be a hard kill switch: when it is disabled and no `WithTracingEnabled` option is present, no OpenFeature evaluation SHALL occur and no relay value SHALL enable tracing.
+```
+capable  := gate1 && EnvEnabled(OTEL_GORILLA_WS_TRACING_ENABLED)   // static, resolved at construction
+feature  := capable && resolver.Allowed(idxTracing)                 // re-read per WriteMessage/ReadMessage
+```
 
-The dynamic value SHALL be read per `WriteMessage`/`ReadMessage` call rather than cached on the `Conn`, so a live connection observes a relay change within the resolver's TTL. When the caller passes the `WithTracingEnabled(v bool)` `Option` to `NewConn`, `Dial`, or an `Upgrader`-based construction path, that value SHALL be authoritative for the connection's **feature / span gate** (and SHALL suppress OpenFeature evaluation for that connection), per the shared `WithTracingEnabled` decision table in `shared-feature-flags`. The option SHALL NOT force the JSON envelope onto a peer that did not negotiate `otel-ws`.
+`gate1` SHALL be `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` or the `WithTracingEnabled(v bool)` `Option`, which are mutually exclusive per the shared `shared-feature-flags` rule; supplying both SHALL make the constructor return an error.
 
-Whether the connection writes the JSON envelope SHALL remain fixed for its lifetime and SHALL be determined solely by whether otel-ws was successfully negotiated (Dial/Upgrade) or proven for `NewConn` via `isOTelWireProtocol` on the raw connection's negotiated subprotocol. A connection whose peer negotiated `otel-ws` SHALL continue to write envelopes even while the dynamic value resolves to disabled; in that state it SHALL inject no trace context and SHALL create no spans. A connection that did not negotiate (or cannot prove negotiation) SHALL use raw passthrough for the wire; when capability and the dynamic feature gate are on it MAY still create local send/receive spans without inject/extract.
+`capable` SHALL be resolved once, before the WebSocket handshake, and SHALL remain fixed for the connection's lifetime, because it decides two things that cannot be revisited: whether to negotiate the `otel-ws` subprotocol, and whether to build a real tracer at all. A connection whose `capable` is false SHALL delegate directly to the underlying `*websocket.Conn`, SHALL create no spans, SHALL perform no envelope handling, and SHALL perform no OpenFeature evaluation.
 
-#### Scenario: Global flag off
+The relay flag `otel-gorilla-ws-tracing` SHALL be resolved with an evaluation default of `true` and SHALL only ever subtract. No relay value SHALL make a non-`capable` connection trace. Because `capable` already carries both environment tiers, a connection whose environment tiers were off at construction performs no evaluation for its lifetime.
+
+Environment truthiness SHALL follow the allow-list in `shared-feature-flags`: only `1`, `true`, `yes`, `on` (trimmed, case-insensitive) enable; every other value, including the empty string, disables.
+
+`feature` SHALL be re-read per `WriteMessage`/`ReadMessage` call rather than cached on the `Conn`, so a live connection observes a revocation within the resolver's TTL. `WithTracingEnabled` SHALL NOT make a connection static: it supplies `gate1` only, and a connection carrying it still stops creating spans when the relay revokes.
+
+Whether the connection writes the JSON envelope SHALL remain fixed for its lifetime and SHALL be determined solely by whether `otel-ws` was successfully negotiated (`Dial`/`Upgrade`) or proven for `NewConn` via `isOTelWireProtocol` on the raw connection's negotiated subprotocol. A connection whose peer negotiated `otel-ws` SHALL continue to write envelopes after a revocation; in that state it SHALL inject no trace context and SHALL create no spans. A connection that did not negotiate SHALL use raw passthrough for the wire; while `feature` is on it MAY still create local send/receive spans without inject/extract.
+
+#### Scenario: First tier off
 - **WHEN** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is unset or falsy and no `WithTracingEnabled` option is passed
 - **THEN** the connection delegates directly to the underlying `*websocket.Conn` with no spans and no envelope handling, regardless of `OTEL_GORILLA_WS_TRACING_ENABLED` or any relay value, and no OpenFeature evaluation is performed
 
-#### Scenario: Both tiers on
-- **WHEN** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is truthy, the dynamic `otel-gorilla-ws-tracing` value resolves to enabled, and no `WithTracingEnabled` option is passed
+#### Scenario: Module switch off makes the connection incapable
+- **WHEN** `gate1` is enabled and `OTEL_GORILLA_WS_TRACING_ENABLED` is unset or falsy
+- **THEN** the connection is not capable, `otel-ws` is neither offered nor confirmed, the wire stays raw, no spans are created, and no `Client.Boolean` call is made
+
+#### Scenario: Both environment tiers on and the relay does not interfere
+- **WHEN** `gate1` is enabled, `OTEL_GORILLA_WS_TRACING_ENABLED` is truthy, and the relay resolves `otel-gorilla-ws-tracing` to `true` or has no such flag
 - **THEN** `WriteMessage`/`ReadMessage` create send/receive spans
 
-#### Scenario: No provider installed reproduces environment-only span behavior
-- **WHEN** no OpenFeature provider is installed and `OTEL_GORILLA_WS_TRACING_ENABLED` is set to any value
-- **THEN** span creation on/off matches the environment-only resolution of the preceding release (module env as the sole module-tier input), subject to the negotiation exception below
+#### Scenario: No provider installed reproduces the previous release exactly
+- **WHEN** no OpenFeature provider is installed and the two tracing environment variables are set to any combination of allow-list values
+- **THEN** both span creation and subprotocol negotiation match the release preceding this change, with no wire-format exception
 
-#### Scenario: No provider still changes negotiation when only global is on
-- **WHEN** no OpenFeature provider is installed, `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is truthy, `OTEL_GORILLA_WS_TRACING_ENABLED` is falsy, and two peers both use this library's Dial/Upgrade
-- **THEN** otel-ws MAY be negotiated and messages MAY carry the JSON envelope with empty headers and no spans — this is the documented D9/R4 exception to "no provider ⇒ identical wire to previous release"
-
-#### Scenario: Relay disables tracing on a live connection
+#### Scenario: Relay revokes tracing on a live connection
 - **WHEN** an established connection that negotiated `otel-ws` is creating spans and the relay subsequently resolves `otel-gorilla-ws-tracing` to `false`
 - **THEN** messages sent after the resolver's TTL expires create no spans and carry an envelope with no trace context, and the peer continues to parse them as envelopes
 
-#### Scenario: Relay enables tracing on a live connection
-- **WHEN** an established connection that negotiated `otel-ws` was not creating spans because the dynamic value was disabled, and the relay subsequently resolves it to `true`
-- **THEN** messages sent after the resolver's TTL expires create spans and carry injected trace context, without the connection being re-established
+#### Scenario: Relay cannot enable tracing the deployment left off
+- **WHEN** `gate1` is enabled, `OTEL_GORILLA_WS_TRACING_ENABLED` is unset, and the relay resolves `otel-gorilla-ws-tracing` to `true`
+- **THEN** the connection creates no spans, writes no envelope, and performs no evaluation
 
-#### Scenario: NewConn without otel-ws subprotocol stays raw on the wire
-- **WHEN** `NewConn` wraps a connection whose negotiated subprotocol is not an otel-ws protocol, the global switch is on, and the dynamic module flag resolves to disabled
-- **THEN** `WriteMessage` sends the application payload bytes unchanged (no JSON envelope), and a non-instrumented peer observes the original payload
+#### Scenario: Option and environment variable together are rejected
+- **WHEN** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is set to any value and `NewConn`, `Dial`, or `Upgrader.Upgrade` is passed `WithTracingEnabled(v)` for either value of `v`
+- **THEN** the constructor returns an error matching the module's tracing-conflict sentinel and no `Conn` is produced
 
-#### Scenario: NewConn with otel-ws subprotocol may envelope
-- **WHEN** `NewConn` wraps a connection whose negotiated subprotocol is `otel-ws` or `otel-ws+…` and the connection is capable
-- **THEN** `WriteMessage`/`ReadMessage` use the JSON envelope for the connection lifetime, independent of later dynamic flag flips for the envelope decision
+#### Scenario: Option-carrying connection still obeys a revocation
+- **WHEN** a connection constructed with `WithTracingEnabled(true)` (environment variable unset) and a truthy `OTEL_GORILLA_WS_TRACING_ENABLED` is creating spans, and the relay resolves the module flag to `false`
+- **THEN** messages sent after the resolver's TTL expires create no spans, while the envelope continues to be written if `otel-ws` was negotiated
 
-#### Scenario: Option enables spans with env off but does not force envelope without negotiation
-- **WHEN** `NewConn(raw, WithTracingEnabled(true))` is called with both tracing env vars unset or explicitly falsy and the raw connection's subprotocol is not otel-ws
-- **THEN** the connection MAY create send/receive spans, SHALL NOT write the JSON envelope, and no OpenFeature evaluation is performed for that connection
+### Requirement: otel-ws negotiation gated on the effective feature flag
+`Dial` SHALL NOT offer, and `Upgrader.Upgrade` SHALL NOT confirm, the `otel-ws` subprotocol when the connection's **static capability** resolves to disabled. That capability SHALL be `gate1 && flags.EnvEnabled("OTEL_GORILLA_WS_TRACING_ENABLED")`, resolved **before** the handshake.
 
-#### Scenario: Option enables spans and envelope when subprotocol proves otel-ws
-- **WHEN** `NewConn(raw, WithTracingEnabled(true))` is called with env vars off and the raw connection's subprotocol is an otel-ws protocol
-- **THEN** the connection creates send/receive spans and handles the JSON envelope, and no OpenFeature evaluation is performed for that connection
+The capability SHALL NOT consult the relay verdict. Excluding it is free rather than a compromise: because the relay can only revoke (see `dynamic-feature-flags`), a connection whose environment tiers are off at handshake time can never be switched on later, so there is no future state in which it would need the envelope. This removes the wire-format exception that a relay capable of enabling would have forced, and restores the property that upgrading without a provider changes nothing on the wire.
 
-#### Scenario: Option disables tracing despite truthy env vars and a truthy relay flag
-- **WHEN** both env gates are truthy, the relay resolves `otel-gorilla-ws-tracing` to `true`, and a connection is constructed with `WithTracingEnabled(false)`
-- **THEN** that connection delegates directly to the native `*websocket.Conn` (no spans, no envelope) for its lifetime regardless of any subsequent relay change, while other connections without the option follow the dynamic value
-
-### Requirement: otel-ws negotiation gated on the negotiation capability
-`Dial` SHALL NOT offer, and `Upgrader.Upgrade` SHALL NOT confirm, the `otel-ws` subprotocol when the connection's **negotiation capability** resolves to disabled. That capability SHALL be the `WithTracingEnabled` option's value when the option is present, and `flags.GlobalTracingPossible()` / `flags.EnvEnabled("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED")` otherwise. It SHALL NOT consult the dynamic `otel-gorilla-ws-tracing` value, because negotiation cannot be revisited after the handshake and a connection that did not negotiate `otel-ws` could never begin propagating trace context when the relay later enables the flag.
-
-The capability SHALL be resolved **before** the WebSocket handshake, so the negotiation outcome always reflects the connection's actual envelope capability — a capability-off side neither writes nor unwraps the JSON envelope, so letting it negotiate otel-ws would commit the peer to a wire format whose frames the capability-off side hands to the application unparsed (silent payload corruption). Construction SHALL clamp the negotiation outcome so `tracingEnabled` is false whenever capability is false. The reverse direction is unchanged: neither `WithTracingEnabled(true)` nor a truthy relay value can force the envelope onto a connection whose peer did not negotiate otel-ws — the negotiation outcome still requires both sides to agree, and `NewConn` proves agreement only via the raw connection's subprotocol. (Scenario tables including this gate live in `otel-ws.md` §5.)
+Letting a capability-off side negotiate `otel-ws` would commit the peer to a wire format whose frames that side hands to the application unparsed (silent payload corruption), so construction SHALL clamp the negotiation outcome such that `tracingEnabled` is false whenever capability is false. The reverse direction is unchanged: neither `WithTracingEnabled(true)` nor any relay value can force the envelope onto a connection whose peer did not negotiate `otel-ws` — the negotiation outcome still requires both sides to agree, and `NewConn` proves agreement only via the raw connection's subprotocol. (Scenario tables including this gate live in `otel-ws.md` §5.)
 
 #### Scenario: Capability-off server does not confirm otel-ws
-- **WHEN** a client proposes `otel-ws,json` and the server upgrades with `WithTracingEnabled(false)` (or with the global env switch off)
+- **WHEN** a client proposes `otel-ws,json` and the server upgrades with capability off (either tier)
 - **THEN** the upgrade succeeds via normal application-protocol selection (`json`), otel-ws is not confirmed, and payloads round-trip between both sides without the envelope
 
 #### Scenario: Capability-off client does not offer otel-ws
-- **WHEN** a client dials with `WithTracingEnabled(false)` (or with the global env switch off) and a non-empty subprotocol list against an otel-ws-aware server
+- **WHEN** a client dials with capability off and a non-empty subprotocol list against an otel-ws-aware server
 - **THEN** the handshake proposes only the application protocols, the server does not confirm otel-ws, and messages round-trip unwrapped
 
-#### Scenario: Negotiation ignores the dynamic flag
-- **WHEN** the global env switch is truthy, the relay resolves `otel-gorilla-ws-tracing` to `false`, and no `WithTracingEnabled` option is passed
-- **THEN** `Dial` still offers and `Upgrader.Upgrade` still confirms `otel-ws`, so the connection retains the capability to propagate trace context if the relay later enables the flag
+#### Scenario: Module switch off suppresses negotiation
+- **WHEN** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is truthy, `OTEL_GORILLA_WS_TRACING_ENABLED` is unset or falsy, and two peers both use this library's Dial/Upgrade
+- **THEN** `otel-ws` is not negotiated and the wire carries raw payloads, matching the release preceding this change
 
-#### Scenario: Envelope is carried while tracing is dynamically off
-- **WHEN** two peers both running this library with the global env switch on establish a connection while the dynamic flag resolves to `false`
-- **THEN** `otel-ws` is negotiated, every message carries the JSON envelope with no trace context, no spans are created, and the receiving application observes the original payload
+#### Scenario: Negotiation ignores the relay verdict
+- **WHEN** both environment tiers are truthy and the relay resolves `otel-gorilla-ws-tracing` to `false` at handshake time
+- **THEN** `Dial` still offers and `Upgrader.Upgrade` still confirms `otel-ws`, so a later restoration of the flag resumes trace propagation on the same connection
+
+#### Scenario: Envelope is carried while tracing is revoked
+- **WHEN** two capable peers establish a connection and the relay then revokes `otel-gorilla-ws-tracing`
+- **THEN** every message still carries the JSON envelope with no trace context, no spans are created, and the receiving application observes the original payload
+
+### Requirement: NewConn always wraps envelopes
+`NewConn(rawConn, opts...)` SHALL enable envelope wrapping **only** when the raw connection's negotiated subprotocol proves `otel-ws` (`isOTelWireProtocol`). It SHALL NOT force envelope wrapping on a connection whose subprotocol does not prove negotiation, because the peer would then receive `{"header":...,"data":...}` frames it never agreed to and hand them to its application unparsed.
+
+Callers that manage the handshake themselves SHALL leave a correct negotiated subprotocol on the raw connection. There SHALL be no option that asserts negotiation without subprotocol evidence. Construction SHALL clamp the outcome with capability, so a raw connection carrying an `otel-ws` subprotocol wrapped by a non-capable process still uses raw passthrough.
+
+#### Scenario: NewConn without otel-ws subprotocol stays raw on the wire
+- **WHEN** `NewConn` wraps a connection whose negotiated subprotocol is not an otel-ws protocol and the connection is capable
+- **THEN** `WriteMessage` sends the application payload bytes unchanged, and a non-instrumented peer observes the original payload
+
+#### Scenario: NewConn with otel-ws subprotocol may envelope
+- **WHEN** `NewConn` wraps a connection whose negotiated subprotocol is `otel-ws` or `otel-ws+…` and the connection is capable
+- **THEN** `WriteMessage`/`ReadMessage` use the JSON envelope for the connection lifetime, independent of later relay revocations for the envelope decision
+
+#### Scenario: Incapable wrapper of a negotiated connection stays raw
+- **WHEN** `NewConn` wraps a connection whose subprotocol is `otel-ws+json` while capability is off
+- **THEN** the wrapper delegates directly to the native connection and performs no envelope handling
+
+## ADDED Requirements
+
+### Requirement: NewConn reports configuration errors
+`NewConn` SHALL have the signature `NewConn(conn *websocket.Conn, opts ...Option) (*Conn, error)` so that a configuration conflict detected at construction can be reported, in line with every other option-accepting constructor in the repository (`Dial`, `Upgrader.Upgrade`, and the Mongo and NATS connect variants, all of which already return an error).
+
+#### Scenario: NewConn rejects a conflicting configuration
+- **WHEN** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is set and `NewConn(raw, WithTracingEnabled(true))` is called
+- **THEN** `NewConn` returns a nil `*Conn` and an error matching the module's tracing-conflict sentinel
+
+#### Scenario: NewConn returns a nil error on success
+- **WHEN** `NewConn(raw)` is called with no conflicting configuration
+- **THEN** it returns a usable `*Conn` and a nil error

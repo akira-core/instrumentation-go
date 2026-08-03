@@ -1,3 +1,9 @@
+> **Sections 1–8 record the first implementation** (commits `f9f363d`, `1d124f1`), built against the
+> earlier model in which the relay decided in both directions and `WithTracingEnabled` pinned a
+> connection static. That model was replaced during design review; see `design.md` §
+> "Superseded decisions". Those sections are kept as the historical record of what shipped —
+> **section 9 revises it** and is the work that remains. Where the two disagree, section 9 wins.
+
 ## 1. Shared `internal/flags` foundation
 
 - [x] 1.1 In `otel-nats/otelnats/internal/flags/flags.go`, delete `Gate`, `NewGate`, and `ResetForTest`; keep `EnvEnabled` unchanged.
@@ -108,3 +114,62 @@
 - **R19** same-refresh Boolean micro-torn: WONTFIX.
 - **R17** policy extract: WONTFIX (comment only).
 - Resolver CAS/singleflight, parallel Boolean fan-out: out of scope.
+
+## 9. Kill-switch model rework
+
+> Locked in `design.md` D2/D3/D14/D15/D16 and the five delta specs. Do not start code until those
+> artifacts are reviewed. All four modules land in one commit.
+
+### 9.1 Shared `internal/flags` (four byte-identical copies)
+
+- [ ] 9.1.1 Rewrite `EnvEnabled` as a truthy allow-list: enabled only for `1`/`true`/`yes`/`on` after `strings.ToLower(strings.TrimSpace(v))`; unset and every other value disabled. Update the doc comment to state the allow-list, not the falsy list.
+- [ ] 9.1.2 Add `EnvSet(name string) bool` (bare `os.LookupEnv` presence) plus `GlobalTracingSet()`. Document that `EnvSet` is for the mutual-exclusion check only and must never decide whether a switch is enabled.
+- [ ] 9.1.3 Change the resolver's evaluation default to a literal `true`. Delete the `Spec` type and replace `WithSpecs(...Spec)` with `WithFlagKeys(keys ...string)` — with the env var no longer the evaluation default, `Spec.EnvVar` has no reader and would rot. Rename `Enabled(i)` to `Allowed(i)` so the call site reads as a relay verdict, not a final answer.
+- [ ] 9.1.4 Add the multi-value accessor (`AllowedAll() []bool`) returning every spec's verdict from one snapshot load, for callers needing more than one flag of a module.
+- [ ] 9.1.5 Bound `refresh` with `context.WithTimeout(context.Background(), refreshTimeout)`; add `refreshTimeout` next to `refreshTTL` with a comment covering both why it exists (synchronous refresh on a caller goroutine) and why the context is not the caller's (process-scoped state must not inherit one request's cancellation).
+- [ ] 9.1.6 Rewrite `flags_test.go`: allow-list golden table including the empty string and `enabled`/`2`; `EnvSet` vs `EnvEnabled` divergence; `Allowed` returning `true` with no provider; `AllowedAll` single-snapshot consistency across a TTL boundary; refresh-timeout fallback to `true`; `at`-stamped-at-start. No `t.Parallel` where a provider or `t.Setenv` is involved.
+- [ ] 9.1.7 Copy `flags.go` and `flags_test.go` verbatim into the other three modules; verify byte-identity excluding the `package` line.
+
+### 9.2 Per-module composition and conflict errors
+
+- [ ] 9.2.1 In each module's `env_flags.go`, compose `gate1 && EnvEnabled(moduleEnv) && resolver.Allowed(idx)` with short-circuit ordering so a falsy module env var never reaches the resolver.
+- [ ] 9.2.2 Export `ErrTracingConfigConflict` per module, and `ErrTracePropagationConfigConflict` in `otel-mongo` v1 and v2. Returned errors wrap the sentinel and name both observed values. In `otel-mongo`, run both checks before returning and combine with `errors.Join` in a fixed order (tracing, then propagation) — never return on the first failure.
+- [ ] 9.2.3 Add the presence-based mutual-exclusion check to every option-accepting constructor: `otelnats.ConnectWithOptions`/`ConnectTLSWithOptions`/`ConnectWithCredentialsWithOptions`, `otelmongo.ConnectWithOptions` (v1 and v2), `otelgorillaws.NewConn`/`Dial`/`Upgrader.Upgrade`. Check before any other work so a rejected construction opens no connection. `otelmongo.NewClient` (v1 and v2) delegates to `ConnectWithOptions` and inherits the check — do not duplicate it there.
+
+### 9.3 Remove static connections
+
+- [ ] 9.3.1 `otel-nats`: delete `Conn.static`; `impl()` selects on the per-operation conjunction. Keep the lockstep comment tying `impl`/`msgHandler`/`traceEventMsgHandler` together.
+- [ ] 9.3.2 `otel-mongo` v1 and v2: delete `mongoPropagationEnvOnly()` and `gateState`'s static branch; `effectiveTracing`/`propagationGiven` read the relay verdict per call; `tracedBuilt` keys on `gate1 && EnvEnabled(envMongoTracingEnabled)` so a module-off process allocates no instrumented wrapper (D7). Same for `otel-nats`'s `traced` field in 9.3.1.
+- [ ] 9.3.3 `otel-gorilla-ws`: `capable = gate1 && EnvEnabled(envWSTracingEnabled)` resolved once at construction; `featureEnabled()` = `capable && wsResolver.Allowed(idxTracing)` per call; delete the `featureOverride` short-circuit in `featureEnabled`.
+- [ ] 9.3.4 Remove the feature-flag gate from `ContextFromDocument`/`ContextFromRawDocument` (v1+v2): delete the `if !cachedPropagationEnabled()` early return from both, then delete `cachedPropagationEnabled()` and `mongoFlagsPair()`, which lose their only caller. Neither helper emits a span or writes a document (D10).
+
+### 9.4 otel-gorilla-ws surface
+
+- [ ] 9.4.1 Change `NewConn` to `(*Conn, error)`; update the four in-repo call sites and both module READMEs.
+- [ ] 9.4.2 Gate negotiation on the static capability from 9.3.3 in `Dial` and `Upgrader.Upgrade`; confirm `TestUpgrader_TracingDisabled_DoesNotNegotiateOTelWS` and `TestDial_TracingDisabled_DoesNotOfferOTelWS` still pass and add the module-switch-off case.
+- [ ] 9.4.3 Update `otel-ws.md` §5: capability is now fully static and there is no relay-driven negotiation exception.
+
+### 9.5 Tests
+
+- [ ] 9.5.1 Rewrite every test that sets a tracing env var **and** passes the matching option (~89 call sites across 11 files) to use exactly one of them.
+- [ ] 9.5.2 Add per-module kill-switch asymmetry tests: relay `true` + module env off ⇒ no spans and no evaluation; relay `false` + module env on ⇒ running connection stops within the TTL.
+- [ ] 9.5.3 Add constructor-conflict tests for all seven option-accepting constructors, asserting `errors.Is` against the module sentinel.
+- [ ] 9.5.4 Update the relay integration test to assert the revoke direction (start enabled, revoke, observe stop) instead of enabling from off.
+- [ ] 9.5.5 Run `go build`, `go test -race`, `golangci-lint` in every touched module until clean.
+
+### 9.6 Outstanding correctness items found during review
+
+- [ ] 9.6.1 **R14 was marked done but is not implemented.** `collection.go`, `cursor.go` and `results.go` each hand-roll `impl()` in both Mongo modules. Either add the generics helper or reopen R14 as WONTFIX with a reason.
+- [ ] 9.6.2 Write a test for read-modify-write duplicate `_oteltrace`: read a document into `bson.M`, modify, `ReplaceOne`. If the field is written twice, make `InjectTraceIntoDocument`/`InjectTraceIntoUpdate` remove any existing key before appending. Independent of the relay; affects v1 and v2.
+
+### 9.7 Documentation
+
+- [ ] 9.7.1 Correct `CLAUDE.md`'s transport table: `_oteltrace` is **not** stripped on read. Check `README`s and module docs for the same claim.
+- [ ] 9.7.2 Create `feature-flags.md` at the repo root — following the existing convention of flat, English-only design notes (`otel-ws.md`, `VERSIONING.md`) — as the single home for the flag reference. It holds: the `gate1` resolution table (env var × option, including the construction-error row), the effective-tracing table (`gate1` × module env × relay verdict), the `otel-mongo` `_oteltrace` propagation table, the `otel-gorilla-ws` capability / negotiation / span-gate table, the truthiness allow-list with its worked examples (empty string and `enabled` both disable), the flag key ↔ environment variable pairing, and the list of what "the relay has no opinion" covers.
+- [ ] 9.7.3 In `feature-flags.md`, state plainly that the relay can only revoke: it cannot enable anything, sites wanting relay control must deploy with the module switches on, and there is no relay key that stops the whole process — all four flags must be revoked individually.
+- [ ] 9.7.4 In `feature-flags.md`, document the supported provider evaluation mode (in-process, the provider's default) and that remote evaluation is unsupported because it puts an HTTP request on the operation path.
+- [ ] 9.7.4b In `feature-flags.md` and in every wiring snippet, state that `openfeature.SetProviderAndWait` is **required**, not preferred, and give the reason: an unresolvable flag means "allow", so a not-ready provider cannot revoke, and a process restarting under an active revocation would run instrumented until the provider catches up.
+- [ ] 9.7.4c Reduce the flag material in `README.md` and `README.zh-TW.md` to a short summary plus a link to `feature-flags.md`, matching how they already link to `VERSIONING.md`. Add `feature-flags.md` to the repo-tree listing in both READMEs. Do not duplicate the tables — one home only, so the two cannot drift.
+- [ ] 9.7.5 Rewrite `CLAUDE.md`'s feature-flag, disabled-mode-invariant and `internal/flags` sections for the kill-switch model. The invariant's bullet list must say what it protects rather than list mechanisms: within **gated** code paths, no span creation, no SDK or exporter initialisation, no attribute-slice build, and no trace-context **injection** or extraction — with explicitly-invoked read-only helpers (`ContextFromDocument`, `ContextFromRawDocument`) named as outside its scope, since they emit no telemetry and the caller has already stated intent. replace the two-pattern table with the three-pattern one from `design.md` § Context. The current table is wrong twice: it calls `otel-nats` a cached gate and `oteljetstream` a per-call gate (both were strategy splits — `directConn`/`tracedConn`, `directJSImpl`/`tracedJSImpl`), and it groups `otel-mongo` Client/Database with `otel-gorilla-ws` as cached gates when neither creates a span and neither holds a gate — they are gate carriers.
+- [ ] 9.7.6 Rewrite each module's `CHANGELOG.md` entry for the new BREAKING set: truthiness allow-list, mutual exclusion, no static connections, `NewConn` signature, and the ungating of `ContextFromDocument`/`ContextFromRawDocument` (a fully-disabled process now gets a span context from them where it previously got nothing — deployments that switched the env var off specifically to stop trace linking must stop calling them instead). Remove the withdrawn otel-ws negotiation exception.
+- [ ] 9.7.7 File a follow-up for the `instrumentation-demo` parent project: its NATS demo enables tracing from the relay, which this model forbids; the deployment must set `OTEL_NATS_TRACING_ENABLED=true` and the demo must invert to revoke-then-restore.
