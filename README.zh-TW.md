@@ -44,6 +44,10 @@ go get github.com/akira-core/instrumentation-go/otel-gorilla-ws@otel-gorilla-ws/
 
 ## 追蹤功能開關
 
+> 完整參考:**[feature-flags.md](feature-flags.md)**(英文)—— 全部解析表格、真值判定規則、provider
+> 接線要求與維運摘要。該文件描述的是 `otel-mongo` 0.9.0 / `otel-nats` 0.8.0 /
+> `otel-gorilla-ws` 0.8.0 將導入的模型:relay 變成**只能撤銷**的斷路器。以下摘要描述的是**目前已發布**的行為。
+
 開關透過 [OpenFeature](https://openfeature.dev) 於**執行期**解析,operator 可經由 GO Feature Flag relay proxy **不重啟應用程式**即開關追蹤。未安裝 OpenFeature provider 時,每個開關回退到對應環境變數,行為與導入動態旗標之前完全相同。
 
 環境變數為**未設定視為關閉**。設成 `0`、`false`、`no`、`off`(不分大小寫)亦為關閉;其餘非空字串視為**開啟**。
@@ -136,6 +140,7 @@ instrumentation-go/
 │   ├── go.mod
 │   └── README.md
 ├── otel-ws.md               # 子協定／傳播設計筆記（跨語言）
+├── feature-flags.md         # 追蹤功能開關完整參考（英文）
 ├── CLAUDE.md                # 貢獻者／代理用說明
 └── README.md
 ```

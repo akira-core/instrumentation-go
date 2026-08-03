@@ -44,6 +44,12 @@ Then import subpackages as needed (`.../otelmongo`, `.../otelnats`, `.../oteljet
 
 ## Tracing feature flags
 
+> Full reference: **[feature-flags.md](feature-flags.md)** — every resolution table, the
+> truthiness rules, the provider wiring requirements, and the operational summary. That document
+> describes the model being introduced in `otel-mongo` 0.9.0 / `otel-nats` 0.8.0 /
+> `otel-gorilla-ws` 0.8.0, in which the relay becomes a **revoke-only** kill switch. The summary
+> below describes the currently released behaviour.
+
 Switches resolve at **runtime** through [OpenFeature](https://openfeature.dev), so an operator can turn tracing on or off through a GO Feature Flag relay proxy **without restarting the application**. When no OpenFeature provider is installed, every switch falls back to its environment variable and behavior is identical to before dynamic flags existed.
 
 Environment variables are **opt-in**: if a variable is **unset**, it is treated as **off**. Set it to any value other than `0`, `false`, `no`, or `off` (case-insensitive) to turn **on**.
@@ -136,6 +142,7 @@ instrumentation-go/
 │   ├── go.mod
 │   └── README.md
 ├── otel-ws.md               # Subprotocol / propagation design notes (cross-language)
+├── feature-flags.md         # Full tracing feature-flag reference
 ├── CLAUDE.md                # Contributor / agent notes
 └── README.md
 ```
