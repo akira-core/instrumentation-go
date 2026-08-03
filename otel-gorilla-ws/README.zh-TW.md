@@ -31,35 +31,36 @@ go get github.com/akira-core/instrumentation-go/otel-gorilla-ws
 
 ### Tracing 功能旗標
 
-`otel-gorilla-ws` 支援：
+```
+capability = gate1 && OTEL_GORILLA_WS_TRACING_ENABLED        （建構時固定）
+span gate  = capability && relay otel-gorilla-ws-tracing      （每次呼叫重讀）
+```
 
-- `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`（全域總開關）
-- `OTEL_GORILLA_WS_TRACING_ENABLED`（ws 模組開關）
+`gate1` 是 `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` **或** `WithTracingEnabled(v)` —— 同一個開關的兩種
+拼法,**兩個都給是設定錯誤**(`ErrTracingConfigConflict`)。開關只有設成 `1`、`true`、`yes`、`on` 才算開。
 
-預設值：未設定即停用（opt-in）— 經 env 啟用時兩個變數都必須為 truthy。值為 `false/0/no/off`（不分大小寫）停用；其他已設定值（含空字串）視為 truthy。
+**capability** 決定是否提出(`Dial`)或確認(`Upgrader.Upgrade`)`otel-ws`,在 handshake **之前**解析,
+因為 handshake 無法重來。它刻意排除 relay —— 在只能撤銷的 relay 下這零代價。**span gate** 是疊在上面的
+relay verdict,每次讀寫重讀,所以執行中的連線會跟上撤銷。
 
-停用時，send/receive span 與 envelope 注入/抽取皆關閉（直接委派 `*websocket.Conn`）。
+三件要知道的事:
 
-#### Env × `WithTracingEnabled`（`featureEnabled`）
+- capability 只箝制**寫入**路徑。對端是否包 envelope 是 handshake 的事實,所以 capability 關掉、卻包裝了
+  已協商連線的 wrapper 會寫原始幀,但**讀取時仍然解包** —— 否則你的應用程式會收到原始的
+  `{"header":…,"data":…}` bytes。
+- 撤銷會停掉 span 與 injection,但**不會**停掉已協商連線上的 envelope:對端把每一幀都當 envelope 解析。
+  這是唯一撤銷後回不到零成本路徑的模組;要移除那個 wire 開銷必須重新部署。
+- 自己處理 handshake?提出或回應 `SubprotocolOTelWS`,並在 `NewConn` 前用 `IsOTelNegotiated(raw)` 檢查 ——
+  見 [otel-ws.md](../otel-ws.md)。
 
-`NewConn`、`Dial`、`Upgrader.Upgrade` 的 `WithTracingEnabled(v bool)` 會針對該 `Conn` 覆寫兩個環境變數（`featureEnabled` — 是否跑任何 OTel SDK 路徑）。沒傳時聽 env。
-
-| Env（`GLOBAL` ∧ `OTEL_GORILLA_WS_TRACING_ENABLED`） | `WithTracingEnabled` | 有效功能 |
-|----------------------------------------------------|----------------------|----------|
-| 關（未設或 falsy） | （無） | **關** |
-| 關（未設或 falsy） | `true` | **開** |
-| 關（未設或 falsy） | `false` | **關** |
-| 開 | （無） | **開** |
-| 開 | `false` | **關** |
-| 開 | `true` | **開** |
-
-對 `Dial`／`Upgrader.Upgrade`，**有效**功能旗標會在 handshake **之前**解析：關閉時不會 offer／confirm `otel-ws`（避免 wire 損壞）。`WithTracingEnabled(true)` 仍無法把 envelope 強加給未協商 otel-ws 的對端 — 那是 `Conn.tracingEnabled`（協商結果），與 `featureEnabled` 是兩個布林。
+> 完整參考 —— 全部解析表格、零程式碼連上 relay、撤銷延遲、針對單一服務的 targeting、維運速查:
+> **[feature-flags.zh-TW.md](../feature-flags.zh-TW.md)** · English:**[feature-flags.md](../feature-flags.md)**
 
 ### NewConn 與 Dial / Upgrader 的差異
 
 上述有效功能旗標控制 tracing 是否運作。至於 wire envelope 是否寫入/讀取，則取決於**建立 `Conn` 的建構子**（以及 Dial/Upgrade 是否協商到 otel-ws）：
 
-- **`NewConn(rawConn, opts...)`** 包裝你自己已經 dial/upgrade 好的 `*websocket.Conn`。只要功能旗標開啟，無論 subprotocol 為何，一律啟用 envelope wrapping — 這是為了相容自行處理 handshake 的呼叫端而保留的行為。
+- **`NewConn(rawConn, opts...) (*Conn, error)`** 包裝你自己已經 dial/upgrade 好的 `*websocket.Conn`。**只有在原始連線協商出的 subprotocol 證明了 `otel-ws` 時**才啟用 envelope wrapping —— 在你的 handshake 裡提出或回應 `SubprotocolOTelWS`,並用 `IsOTelNegotiated(raw)` 驗證。設定矛盾時回傳錯誤(`ErrTracingConfigConflict`)。
 - **`Dial(ctx, urlStr, requestHeader, subprotocols, opts...)`** 是符合規格的 client 進入點。它會在 handshake 中注入 `otel-ws` subprotocol；只有當伺服器以 `otel-ws`/`otel-ws+<proto>` subprotocol 確認支援時，才會啟用 envelope wrapping。
 - **`Upgrader{}.Upgrade(w, r, responseHeader)`** 是符合規格的 server 進入點（對應 `websocket.Upgrader.Upgrade`）。它會偵測 client 提出的 subprotocol 清單中是否含有 `otel-ws`，並以 `otel-ws`/`otel-ws+<proto>` 回應；只有在此接受路徑下才會啟用 envelope wrapping。
 
@@ -67,7 +68,10 @@ go get github.com/akira-core/instrumentation-go/otel-gorilla-ws
 
 ```go
 raw, _, _ := websocket.DefaultDialer.DialContext(ctx, serverURL, nil)
-conn := otelgorillaws.NewConn(raw)
+conn, err := otelgorillaws.NewConn(raw)
+if err != nil {
+	return err
+}
 
 _ = conn.WriteMessage(ctx, websocket.TextMessage, []byte("hello"))
 recvCtx, msgType, data, _ := conn.ReadMessage(context.Background())

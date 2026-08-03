@@ -44,29 +44,26 @@ otel-nats/
 
 ### Tracing feature flags
 
-`otel-nats` (`otelnats` + `oteljetstream`) supports:
+```
+tracing = gate1 && OTEL_NATS_TRACING_ENABLED && relay otel-nats-tracing
+```
 
-- `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` (global master switch)
-- `OTEL_NATS_TRACING_ENABLED` (nats module switch)
+`gate1` is `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` **or** `WithTracingEnabled(v)` — two spellings
+of one switch, and supplying **both is a configuration error** (`ErrTracingConfigConflict`), even
+when they agree.
 
-Defaults: **DISABLED** when unset — both vars must be explicitly set to a truthy value to enable tracing via env. Values `false/0/no/off` (case-insensitive) disable; any other set value is truthy.
+The two environment tiers are read **once, at construction**, and decide whether the instrumented
+implementation is built at all. The relay verdict is resolved on **every operation** and can only
+**revoke**. A switch is on only when set to `1`, `true`, `yes` or `on`.
 
-When disabled, both span creation and W3C header propagation are turned off (there is no separate propagation option — tracing and header propagation share one gate).
+`WithTracingEnabled` does **not** pin a connection: it supplies `gate1` and nothing more, so a
+connection carrying it — and every `oteljetstream` wrapper derived from it — still stops when the
+relay revokes. Subscriptions and JetStream consumers re-resolve the verdict **per message**, so one
+created before a revocation follows it without being re-established.
 
-#### Env × `WithTracingEnabled`
-
-`WithTracingEnabled(v bool)` on `ConnectWithOptions` / `ConnectTLSWithOptions` / `ConnectWithCredentialsWithOptions` overrides the two env vars for that `Conn` only. `oteljetstream` wrappers built from that `Conn` inherit the effective state. When the option is absent, env decides.
-
-| Env (`GLOBAL` ∧ `OTEL_NATS_TRACING_ENABLED`) | `WithTracingEnabled` | Effective tracing |
-|----------------------------------------------|----------------------|-------------------|
-| off (unset or falsy) | *(absent)* | **off** |
-| off (unset or falsy) | `true` | **on** |
-| off (unset or falsy) | `false` | **off** |
-| on | *(absent)* | **on** |
-| on | `false` | **off** |
-| on | `true` | **on** |
-
-Useful for deriving NATS tracing from your application's own toggle, and for constructing both traced and untraced connections in the same test binary (the env-only gate is cached for the process lifetime).
+> Full reference — every resolution table, connecting a relay with no application code, revocation
+> latency, per-service targeting, and the operational summary:
+> **[feature-flags.md](../feature-flags.md)** · 繁體中文:**[feature-flags.zh-TW.md](../feature-flags.zh-TW.md)**
 
 ### 1. Initialize provider and propagator (application responsibility)
 

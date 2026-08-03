@@ -44,29 +44,22 @@ otel-nats/
 
 ### 追蹤功能旗標
 
-`otel-nats`（`otelnats` + `oteljetstream`）支援：
+```
+tracing = gate1 && OTEL_NATS_TRACING_ENABLED && relay otel-nats-tracing
+```
 
-- `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`（全域總開關）
-- `OTEL_NATS_TRACING_ENABLED`（nats 模組開關）
+`gate1` 是 `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` **或** `WithTracingEnabled(v)` —— 同一個開關的兩種
+拼法,**兩個都給是設定錯誤**(`ErrTracingConfigConflict`),即使兩者一致也一樣。
 
-預設值：**未設定即停用** — 經 env 啟用時兩個變數都必須明確設為 truthy。值為 `false/0/no/off`（不分大小寫）視為停用；其他任何已設定的值皆視為啟用。
+兩個環境層在**建構時讀一次**,決定 instrumented 實作要不要被建立。relay verdict 在**每次操作**解析,而且
+**只能撤銷**。開關只有設成 `1`、`true`、`yes`、`on` 才算開。
 
-停用時，span 建立與 W3C header 傳播皆關閉（沒有獨立的 propagation option — tracing 與 header 傳播共用同一閘門）。
+`WithTracingEnabled` **不會**把連線釘死:它只供給 `gate1`,帶著它的連線 —— 以及所有從它衍生的
+`oteljetstream` wrapper —— 在 relay 撤銷時仍然會停。訂閱與 JetStream consumer **每則訊息**重新解析 verdict,
+所以撤銷前建立的訂閱不用重建就會跟上。
 
-#### Env × `WithTracingEnabled`
-
-`ConnectWithOptions`／`ConnectTLSWithOptions`／`ConnectWithCredentialsWithOptions` 的 `WithTracingEnabled(v bool)` 會針對該 `Conn` 覆寫兩個環境變數。由該 `Conn` 建立的 `oteljetstream` wrapper 繼承有效狀態。沒傳 option 時聽 env。
-
-| Env（`GLOBAL` ∧ `OTEL_NATS_TRACING_ENABLED`） | `WithTracingEnabled` | 有效 tracing |
-|----------------------------------------------|----------------------|--------------|
-| 關（未設或 falsy） | （無） | **關** |
-| 關（未設或 falsy） | `true` | **開** |
-| 關（未設或 falsy） | `false` | **關** |
-| 開 | （無） | **開** |
-| 開 | `false` | **關** |
-| 開 | `true` | **開** |
-
-適合讓 NATS tracing 跟隨應用程式自身開關，或在同一測試執行檔中同時建立已追蹤與未追蹤連線（純 env 閘門在 process 生命週期內只解析一次並快取）。
+> 完整參考 —— 全部解析表格、零程式碼連上 relay、撤銷延遲、針對單一服務的 targeting、維運速查:
+> **[feature-flags.zh-TW.md](../feature-flags.zh-TW.md)** · English:**[feature-flags.md](../feature-flags.md)**
 
 ### 1. 初始化 Provider 與 Propagator（應用程式負責）
 

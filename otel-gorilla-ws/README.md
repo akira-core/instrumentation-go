@@ -27,35 +27,40 @@ go get github.com/akira-core/instrumentation-go/otel-gorilla-ws
 
 ### Tracing feature flags
 
-`otel-gorilla-ws` supports:
+```
+capability = gate1 && OTEL_GORILLA_WS_TRACING_ENABLED        (fixed at construction)
+span gate  = capability && relay otel-gorilla-ws-tracing      (re-read every call)
+```
 
-- `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` (global master switch)
-- `OTEL_GORILLA_WS_TRACING_ENABLED` (ws module switch)
+`gate1` is `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` **or** `WithTracingEnabled(v)` — two spellings
+of one switch, and supplying **both is a configuration error** (`ErrTracingConfigConflict`). A
+switch is on only when set to `1`, `true`, `yes` or `on`.
 
-Defaults: disabled when unset (opt-in) — both vars must be truthy to enable via env. Values `false/0/no/off` (case-insensitive) disable; any other set value (including empty string) is truthy.
+**Capability** decides whether `otel-ws` is offered (`Dial`) or confirmed (`Upgrader.Upgrade`), and
+is resolved *before* the handshake because a handshake cannot be revisited. It deliberately excludes
+the relay, which costs nothing under a revoke-only relay. **The span gate** is the relay verdict on
+top, re-read on every read and write, so a live connection follows a revocation.
 
-When disabled, send/receive spans and envelope inject/extract are off (passthrough to `*websocket.Conn`).
+Three things to know:
 
-#### Env × `WithTracingEnabled` (`featureEnabled`)
+- Capability clamps the **write** path only. Whether the peer envelopes is a fact of the handshake,
+  so a capability-off wrapper of a negotiated connection writes raw frames but **still unwraps on
+  read** — otherwise your application would receive raw `{"header":…,"data":…}` bytes.
+- Revoking stops spans and injection but **not** the envelope on an already-negotiated connection:
+  the peer parses every frame as one. This module alone does not return to the zero-cost path on
+  revocation; removing that wire overhead needs a redeploy.
+- Running your own handshake? Offer or echo `SubprotocolOTelWS` and check `IsOTelNegotiated(raw)`
+  before `NewConn` — see [otel-ws.md](../otel-ws.md).
 
-`WithTracingEnabled(v bool)` on `NewConn`, `Dial`, or `Upgrader.Upgrade` overrides the two env vars for that `Conn` only (`featureEnabled` — whether any OTel SDK path runs). When absent, env decides.
-
-| Env (`GLOBAL` ∧ `OTEL_GORILLA_WS_TRACING_ENABLED`) | `WithTracingEnabled` | Effective feature |
-|----------------------------------------------------|----------------------|-------------------|
-| off (unset or falsy) | *(absent)* | **off** |
-| off (unset or falsy) | `true` | **on** |
-| off (unset or falsy) | `false` | **off** |
-| on | *(absent)* | **on** |
-| on | `false` | **off** |
-| on | `true` | **on** |
-
-For `Dial` / `Upgrader.Upgrade`, the **effective** feature is also resolved **before** the handshake: when off, the side neither offers nor confirms `otel-ws` (avoids wire corruption). `WithTracingEnabled(true)` still cannot force the envelope onto a peer that did not negotiate otel-ws — that outcome is `Conn.tracingEnabled` (negotiation), a separate boolean from `featureEnabled`.
+> Full reference — every resolution table, connecting a relay with no application code, revocation
+> latency, per-service targeting, and the operational summary:
+> **[feature-flags.md](../feature-flags.md)** · 繁體中文:**[feature-flags.zh-TW.md](../feature-flags.zh-TW.md)**
 
 ### NewConn vs. Dial / Upgrader
 
 The effective feature flag above gates whether tracing runs at all. Separately, whether the wire envelope gets written/read depends on **which constructor** created the `Conn` (and, for Dial/Upgrade, whether otel-ws was negotiated):
 
-- **`NewConn(rawConn, opts...)`** wraps a `*websocket.Conn` you already dialed/upgraded yourself. It always enables envelope wrapping when the feature flags are on, regardless of subprotocol — kept for backward compatibility with callers that manage their own handshake.
+- **`NewConn(rawConn, opts...) (*Conn, error)`** wraps a `*websocket.Conn` you already dialed/upgraded yourself. It enables envelope wrapping **only when the raw connection's negotiated subprotocol proves `otel-ws`** — offer or echo `SubprotocolOTelWS` during your handshake, and check `IsOTelNegotiated(raw)` to verify. It returns an error when the configuration is contradictory (`ErrTracingConfigConflict`).
 - **`Dial(ctx, urlStr, requestHeader, subprotocols, opts...)`** is the spec-compliant client entry point. It injects the `otel-ws` subprotocol into the handshake; envelope wrapping is enabled only if the server confirms support by returning an `otel-ws`/`otel-ws+<proto>` subprotocol.
 - **`Upgrader{}.Upgrade(w, r, responseHeader)`** is the spec-compliant server entry point (mirrors `websocket.Upgrader.Upgrade`). It detects `otel-ws` in the client's proposed subprotocols and responds with `otel-ws`/`otel-ws+<proto>`, enabling envelope wrapping only on that acceptance path.
 
@@ -63,7 +68,10 @@ For `Dial`/`Upgrade`, when the peer does not negotiate `otel-ws`, the connection
 
 ```go
 raw, _, _ := websocket.DefaultDialer.DialContext(ctx, serverURL, nil)
-conn := otelgorillaws.NewConn(raw)
+conn, err := otelgorillaws.NewConn(raw)
+if err != nil {
+	return err
+}
 
 _ = conn.WriteMessage(ctx, websocket.TextMessage, []byte("hello"))
 recvCtx, msgType, data, _ := conn.ReadMessage(context.Background())
