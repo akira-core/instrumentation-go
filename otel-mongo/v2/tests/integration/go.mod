@@ -98,5 +98,3 @@ replace github.com/akira-core/instrumentation-go/otel-mongo/v2 => ../..
 replace github.com/akira-core/instrumentation-go/otel-sampler => ../../../../otel-sampler
 
 replace github.com/akira-core/instrumentation-go/otel-testkit => ../../../../otel-testkit
-
-replace github.com/akira-core/instrumentation-go/otel-flags => ../../../../otel-flags

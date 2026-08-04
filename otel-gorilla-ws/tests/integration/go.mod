@@ -37,5 +37,3 @@ require (
 )
 
 replace github.com/akira-core/instrumentation-go/otel-gorilla-ws => ../..
-
-replace github.com/akira-core/instrumentation-go/otel-flags => ../../../otel-flags

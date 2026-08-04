@@ -289,7 +289,7 @@
 - [x] 10.6.2 Set `GOWORK=off` on every per-module build, test and lint step so each module is verified exactly as a consumer resolves it, not through the workspace.
 - [x] 10.6.3 Add an `otel-flags/v[0-9]*` trigger pattern to `.github/workflows/release-guard.yml`, validated against `otel-flags/version.go`.
 - [x] 10.6.3b **Guard the development-time `replace`.** Until `otel-flags/v0.1.0` is tagged, each of the four modules carries `replace github.com/akira-core/instrumentation-go/otel-flags => ../otel-flags` so `go mod tidy` and `GOWORK=off` builds work. A `replace` that reaches a published tag breaks every consumer silently, so `release-guard.yml` SHALL fail any module tag whose `go.mod` contains a `replace` directive pointing at another module in this repository. Human discipline is not sufficient here: the failure is invisible until a consumer tries to build.
-- [ ] 10.6.3c Remove the four `replace` directives immediately after `otel-flags/v0.1.0` is pushed, and re-run `GOWORK=off go mod tidy` in each module so the requirement resolves from the proxy.
+- [x] 10.6.3c Remove the four `replace` directives immediately after `otel-flags/v0.1.0` is pushed, and re-run `GOWORK=off go mod tidy` in each module so the requirement resolves from the proxy.
 - [x] 10.6.4 Update `VERSIONING.md` with `otel-flags`, its tag shape, and the two-stage release ordering (`otel-flags` first, then the four modules requiring a published version — never a `replace`).
 
 ### 10.7 Documentation

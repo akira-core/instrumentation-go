@@ -5,12 +5,13 @@ go 1.25.0
 require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/open-feature/go-sdk v1.17.2
-	github.com/open-feature/go-sdk-contrib/providers/go-feature-flag v1.1.1
 	github.com/stretchr/testify v1.11.1
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/sdk v1.44.0
 	go.opentelemetry.io/otel/trace v1.44.0
 )
+
+require github.com/open-feature/go-sdk-contrib/providers/go-feature-flag v1.1.1 // indirect
 
 require (
 	github.com/akira-core/instrumentation-go/otel-flags v0.1.0
@@ -32,8 +33,5 @@ require (
 	go.uber.org/mock v0.6.0 // indirect
 	golang.org/x/exp v0.0.0-20240719175910-8a7402abbf56 // indirect
 	golang.org/x/sys v0.46.0 // indirect
-	golang.org/x/text v0.38.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/akira-core/instrumentation-go/otel-flags => ../otel-flags

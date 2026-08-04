@@ -84,5 +84,3 @@ require (
 )
 
 replace github.com/akira-core/instrumentation-go/otel-mongo => ../..
-
-replace github.com/akira-core/instrumentation-go/otel-flags => ../../../otel-flags
