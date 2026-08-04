@@ -18,18 +18,19 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
-	"github.com/akira-core/instrumentation-go/otel-gorilla-ws/internal/flags"
+	otelflags "github.com/akira-core/instrumentation-go/otel-flags"
 )
 
 // These tests cover the three things this module gates on, which are
 // deliberately different:
 //
-//   - Static capability (gate1 AND OTEL_GORILLA_WS_TRACING_ENABLED) decides
-//     whether otel-ws is negotiated and whether a real tracer is built. It is
-//     fixed at construction because a handshake cannot be revisited, and it
-//     excludes the relay — which costs nothing, since the relay can only revoke.
-//   - The relay verdict decides, per call, whether spans are created and trace
-//     context injected. A live connection follows it without being re-established.
+//   - The effective tracing value (master AND module, down the whole ladder,
+//     relay included) decides per call whether spans are created and trace
+//     context injected. A live connection follows a relay change without being
+//     re-established.
+//   - The SAME expression, evaluated once immediately before the handshake,
+//     decides whether otel-ws is negotiated. A handshake cannot be revisited, so
+//     enabling the module reaches connections opened afterwards only.
 //   - The negotiated wire fact decides whether frames are enveloped. It belongs
 //     to the peer, so this side's gate cannot clamp the read path.
 //
@@ -64,28 +65,30 @@ func relayFlag(v bool) memprovider.InMemoryFlag {
 // moment anything in the process had auto-installed.
 func setRelay(t *testing.T, tracing bool) {
 	t.Helper()
-	require.NoError(t, openfeature.SetNamedProviderAndWait(flags.FlagDomain,
+	require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain,
 		memprovider.NewInMemoryProvider(
 			map[string]memprovider.InMemoryFlag{flagKeyWSTracing: relayFlag(tracing)},
 		)))
 	t.Cleanup(func() {
-		require.NoError(t, openfeature.SetNamedProviderAndWait(flags.FlagDomain, openfeature.NoopProvider{}))
+		require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, openfeature.NoopProvider{}))
 	})
 }
 
-// capableEnv turns on both environment-derived tiers, so every assertion that
-// follows is attributable to the relay rather than to the environment.
-func capableEnv(t *testing.T) {
+// moduleOnEnv turns this module's variable on and leaves the master switch
+// unset, which under a default of enabled is the ordinary deployment shape.
+func moduleOnEnv(t *testing.T) {
 	t.Helper()
-	t.Setenv(envGlobalTracingEnabled, "1")
+	clearWSFlagEnv(t)
 	t.Setenv(envWSTracingEnabled, "1")
 }
 
-func mustCapability(t *testing.T, opts ...Option) bool {
+// mustTracing resolves the effective tracing value — the same expression the
+// handshake uses to decide negotiation.
+func mustTracing(t *testing.T, opts ...Option) bool {
 	t.Helper()
-	capable, err := effectiveCapability(resolveConnOptions(opts))
+	gate, err := resolveGates(resolveConnOptions(opts))
 	require.NoError(t, err)
-	return capable
+	return gate.tracing()
 }
 
 func newTestConn(t *testing.T, enveloped bool, opts ...Option) *Conn {
@@ -96,7 +99,7 @@ func newTestConn(t *testing.T, enveloped bool, opts ...Option) *Conn {
 }
 
 func TestSpanGateFollowsTheRelayOnALiveConn(t *testing.T) {
-	capableEnv(t)
+	moduleOnEnv(t)
 	setRelay(t, false)
 
 	c := newTestConn(t, false)
@@ -110,83 +113,97 @@ func TestSpanGateFollowsTheRelayOnALiveConn(t *testing.T) {
 	assert.False(t, c.featureEnabled(), "relay flipped back off → spans stop")
 }
 
-func TestNegotiationIgnoresTheRelay(t *testing.T) {
-	capableEnv(t)
+// TestNegotiationFollowsTheRelayAtHandshakeTime is the reversal of the
+// superseded rule. The relay can enable now, so excluding it from negotiation
+// would leave a connection unable to carry trace context in a process the
+// operator has just switched on.
+func TestNegotiationFollowsTheRelayAtHandshakeTime(t *testing.T) {
+	clearWSFlagEnv(t)
 	setRelay(t, false)
-
-	assert.True(t, mustCapability(t),
-		"both env tiers are on, so otel-ws is still negotiated even though the relay says off — "+
-			"the handshake cannot be revisited, and the relay can only revoke")
+	assert.False(t, mustTracing(t),
+		"relay off at handshake time → otel-ws is not offered")
 
 	setRelay(t, true)
-	assert.True(t, mustCapability(t))
+	assert.True(t, mustTracing(t),
+		"relay on at handshake time → otel-ws is offered, even with the environment silent")
 }
 
-func TestCapabilityRequiresBothEnvironmentTiers(t *testing.T) {
+func TestMasterVetoStopsNegotiationAndSpans(t *testing.T) {
 	setRelay(t, true)
 
-	t.Run("module switch off", func(t *testing.T) {
-		t.Setenv(envGlobalTracingEnabled, "1")
-		t.Setenv(envWSTracingEnabled, "false")
-
-		assert.False(t, mustCapability(t),
-			"module switch off → never negotiate, and no relay value can raise it")
-		assert.False(t, newTestConn(t, false).featureEnabled())
-	})
-
-	t.Run("global kill switch off", func(t *testing.T) {
-		t.Setenv(envGlobalTracingEnabled, "false")
+	t.Run("master environment veto", func(t *testing.T) {
+		clearWSFlagEnv(t)
+		t.Setenv(otelflags.EnvGlobalTracing, "false")
 		t.Setenv(envWSTracingEnabled, "1")
 
-		assert.False(t, mustCapability(t), "kill switch off → never negotiate otel-ws")
+		assert.False(t, mustTracing(t), "master veto → never negotiate otel-ws")
 		assert.False(t, newTestConn(t, false).featureEnabled(),
-			"kill switch off → no spans regardless of the relay")
+			"master veto → no spans regardless of the relay")
+	})
+
+	t.Run("module variable off with the relay silent", func(t *testing.T) {
+		clearWSFlagEnv(t)
+		t.Setenv(envWSTracingEnabled, "false")
+		require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain,
+			memprovider.NewInMemoryProvider(map[string]memprovider.InMemoryFlag{})))
+		t.Cleanup(func() {
+			require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, openfeature.NoopProvider{}))
+		})
+
+		assert.False(t, mustTracing(t), "module variable off and the relay silent → no negotiation")
+		assert.False(t, newTestConn(t, false).featureEnabled())
 	})
 }
 
-// TestWithTracingEnabledSuppliesGate1AndDoesNotPin is the replacement for the
-// superseded "an overridden Conn is static" behaviour. The option is now one
-// spelling of the first tier: it decides whether the connection could ever
-// trace, and says nothing about the relay.
-func TestWithTracingEnabledSuppliesGate1AndDoesNotPin(t *testing.T) {
-	// Environment variable left UNSET: the option is the only source of gate1.
-	t.Setenv(envWSTracingEnabled, "1")
-
-	t.Run("option true still obeys a revocation", func(t *testing.T) {
+// TestWithTracingEnabledDoesNotPin: the option supplies one rung and says
+// nothing about the relay or the master.
+func TestWithTracingEnabledDoesNotPin(t *testing.T) {
+	t.Run("option true still follows a relay disable", func(t *testing.T) {
+		clearWSFlagEnv(t)
 		setRelay(t, true)
 		c := newTestConn(t, false, WithTracingEnabled(true))
 		assert.True(t, c.featureEnabled())
 
 		setRelay(t, false)
 		assert.False(t, c.featureEnabled(),
-			"the option supplies gate1 only — there is no way to opt a connection out of a revocation")
+			"there is no way to opt a connection out of a relay decision")
 	})
 
-	t.Run("option false suppresses everything", func(t *testing.T) {
+	t.Run("option false still follows a relay enable", func(t *testing.T) {
+		clearWSFlagEnv(t)
+		setRelay(t, false)
+		c := newTestConn(t, false, WithTracingEnabled(false))
+		assert.False(t, c.featureEnabled())
+
 		setRelay(t, true)
-		assert.False(t, mustCapability(t, WithTracingEnabled(false)),
-			"option false also suppresses negotiation")
-		assert.False(t, newTestConn(t, false, WithTracingEnabled(false)).featureEnabled())
+		assert.True(t, c.featureEnabled(),
+			"the relay is authoritative in both directions, over the option too")
 	})
 }
 
-func TestConfigConflictIsReported(t *testing.T) {
-	t.Setenv(envGlobalTracingEnabled, "1")
-	t.Setenv(envWSTracingEnabled, "1")
+// TestEnvironmentBeatsOptionForNegotiation pins the ordering change where it is
+// most visible: a deployment can stop this module negotiating otel-ws even
+// though the application's Go code asked for tracing.
+func TestEnvironmentBeatsOptionForNegotiation(t *testing.T) {
+	clearWSFlagEnv(t)
+	t.Setenv(envWSTracingEnabled, "false")
+	require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain,
+		memprovider.NewInMemoryProvider(map[string]memprovider.InMemoryFlag{})))
+	t.Cleanup(func() {
+		require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, openfeature.NoopProvider{}))
+	})
 
-	_, err := effectiveCapability(resolveConnOptions([]Option{WithTracingEnabled(true)}))
-	require.ErrorIs(t, err, ErrTracingConfigConflict,
-		"setting the env var AND passing the option must fail, even when they agree")
-	assert.Contains(t, err.Error(), envGlobalTracingEnabled, "the error must name both observed values")
+	assert.False(t, mustTracing(t, WithTracingEnabled(true)),
+		"OTEL_GORILLA_WS_TRACING_ENABLED=false must beat WithTracingEnabled(true)")
 }
 
-// TestUpgraderNegotiatesOTelWSWhileRelayFlagIsOff is the full-stack proof of the
-// negotiation rule: the handshake commits to the envelope even though tracing is
-// dynamically off, so a later flip can start producing linked spans on the very
-// same connection.
-func TestUpgraderNegotiatesOTelWSWhileRelayFlagIsOff(t *testing.T) {
-	capableEnv(t)
-	setRelay(t, false)
+// TestUpgraderNegotiationIsDecidedAtHandshakeTime is the full-stack proof of the
+// asymmetry: the relay decides the wire once, when the handshake runs. Turning
+// the module off afterwards stops spans but leaves the envelope, because the
+// peer is still parsing every frame as one.
+func TestUpgraderNegotiationIsDecidedAtHandshakeTime(t *testing.T) {
+	clearWSFlagEnv(t)
+	setRelay(t, true)
 
 	// The handler runs on the server's goroutine; hand the Conn back over a
 	// channel rather than a shared variable so the read is ordered and race-free.
@@ -207,7 +224,7 @@ func TestUpgraderNegotiatesOTelWSWhileRelayFlagIsOff(t *testing.T) {
 	t.Cleanup(func() { _ = raw.Close() })
 
 	assert.True(t, strings.HasPrefix(resp.Header.Get("Sec-WebSocket-Protocol"), SubprotocolOTelWS),
-		"server confirms otel-ws on the static tiers alone, not on the relay value")
+		"the relay said on at handshake time, so the server confirms otel-ws")
 	var srvConn *Conn
 	select {
 	case srvConn = <-conns:
@@ -216,17 +233,19 @@ func TestUpgraderNegotiatesOTelWSWhileRelayFlagIsOff(t *testing.T) {
 	}
 	require.NotNil(t, srvConn)
 	assert.True(t, srvConn.enveloped, "negotiation succeeded → envelopes are on the wire")
-	assert.False(t, srvConn.featureEnabled(), "…while the relay keeps span creation off")
+	assert.True(t, srvConn.featureEnabled(), "…and the relay keeps span creation on")
 
-	// The flag flips; the already-established connection can now both trace and
-	// propagate, because it negotiated the envelope up front.
-	setRelay(t, true)
-	assert.True(t, srvConn.featureEnabled())
-	assert.True(t, srvConn.enveloped)
+	// The operator turns the module off. Spans stop immediately; the envelope
+	// does not, because the peer committed to it at the handshake and removing it
+	// mid-connection would desynchronise the wire.
+	setRelay(t, false)
+	assert.False(t, srvConn.featureEnabled())
+	assert.True(t, srvConn.enveloped,
+		"disabling stops spans and inject/extract, but never the envelope")
 }
 
 func TestWriteMessageEmitsSpansOnlyWhileTheRelaySaysOn(t *testing.T) {
-	capableEnv(t)
+	moduleOnEnv(t)
 	setRelay(t, false)
 
 	sr := tracetest.NewSpanRecorder()
@@ -264,26 +283,30 @@ func TestWriteMessageEmitsSpansOnlyWhileTheRelaySaysOn(t *testing.T) {
 }
 
 func TestNoProviderReproducesEnvOnlyBehavior(t *testing.T) {
-	require.NoError(t, openfeature.SetNamedProviderAndWait(flags.FlagDomain, openfeature.NoopProvider{}))
+	clearWSFlagEnv(t)
+	require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, openfeature.NoopProvider{}))
 
-	t.Setenv(envGlobalTracingEnabled, "1")
 	t.Setenv(envWSTracingEnabled, "1")
 	assert.True(t, newTestConn(t, false).featureEnabled(),
-		"env vars on and no provider → spans, exactly as before dynamic flags existed")
+		"module variable on and no provider → spans")
 
 	t.Setenv(envWSTracingEnabled, "false")
-	assert.False(t, newTestConn(t, false).featureEnabled(), "module env var off → no spans")
+	assert.False(t, newTestConn(t, false).featureEnabled(), "module variable off → no spans")
 }
 
-// TestNegotiatedPairSurvivesAsymmetricRelayVerdicts is the wire-corruption
-// regression test for the envelope contract. Both peers negotiated otel-ws while
-// the relay says off, so BOTH must keep speaking the envelope: the write path
-// still wraps (empty header) and the read path still unwraps. The payload is
-// deliberately shaped like an envelope — if either side dropped to raw
-// passthrough, the peer would dismember it.
-func TestNegotiatedPairSurvivesAsymmetricRelayVerdicts(t *testing.T) {
-	capableEnv(t)
-	setRelay(t, false)
+// TestNegotiatedPairSurvivesADisable is the wire-corruption regression test for
+// the envelope contract. The pair negotiates otel-ws while the relay says on,
+// the operator then turns the module off, and BOTH sides must keep speaking the
+// envelope: the write path still wraps (empty header) and the read path still
+// unwraps. The payload is deliberately shaped like an envelope — if either side
+// dropped to raw passthrough, the peer would dismember it.
+//
+// This is the asymmetry stated in the module docs: disabling stops spans and
+// inject/extract immediately, but never the envelope, because the peer committed
+// to it at a handshake that cannot be revisited.
+func TestNegotiatedPairSurvivesADisable(t *testing.T) {
+	moduleOnEnv(t)
+	setRelay(t, true)
 
 	trap := []byte(`{"header":{"traceparent":"fake"},"data":"inner"}`)
 
@@ -304,7 +327,7 @@ func TestNegotiatedPairSurvivesAsymmetricRelayVerdicts(t *testing.T) {
 	require.True(t, strings.HasPrefix(resp.Header.Get("Sec-WebSocket-Protocol"), SubprotocolOTelWS),
 		"pair must negotiate otel-ws for this test to mean anything")
 	require.True(t, client.enveloped)
-	require.False(t, client.featureEnabled(), "the relay verdict must be off")
+	require.True(t, client.featureEnabled(), "the pair negotiated while the relay said on")
 
 	var server *Conn
 	select {
@@ -313,18 +336,23 @@ func TestNegotiatedPairSurvivesAsymmetricRelayVerdicts(t *testing.T) {
 		t.Fatal("server never completed the upgrade")
 	}
 
+	// The operator turns the module off AFTER both sides committed to the wire.
+	setRelay(t, false)
+	require.False(t, client.featureEnabled(), "spans must stop")
+	require.True(t, client.enveloped, "…while the envelope must not")
+
 	require.NoError(t, client.WriteMessage(context.Background(), websocket.TextMessage, trap))
 	_, _, got, err := server.ReadMessage(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, string(trap), string(got),
-		"a revoked writer must still envelope, or the reader dismembers the payload")
+		"a disabled writer must still envelope, or the reader dismembers the payload")
 
 	reply := []byte(`{"msg":"plain"}`)
 	require.NoError(t, server.WriteMessage(context.Background(), websocket.TextMessage, reply))
 	_, _, got, err = client.ReadMessage(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, string(reply), string(got),
-		"a revoked reader must still unwrap, or the application sees envelope bytes")
+		"a disabled reader must still unwrap, or the application sees envelope bytes")
 }
 
 // TestIncapableWrapperOfNegotiatedConnStillUnwraps pins the R7 amendment: the
@@ -333,7 +361,9 @@ func TestNegotiatedPairSurvivesAsymmetricRelayVerdicts(t *testing.T) {
 // that on capability is what handed raw {"header":...,"data":...} bytes to the
 // application.
 func TestIncapableWrapperOfNegotiatedConnStillUnwraps(t *testing.T) {
-	// No environment tier set at all ⇒ capable == false.
+	// Nothing configured and no relay possible ⇒ capable == false.
+	clearWSFlagEnv(t)
+	require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, openfeature.NoopProvider{}))
 	payload := []byte(`{"msg":"plain"}`)
 	envelope, err := marshalWire(map[string]string{TraceparentHeader: "tp"}, payload)
 	require.NoError(t, err)
@@ -393,4 +423,40 @@ func TestExportedNegotiationHelpersAgreeWithNewConn(t *testing.T) {
 		assert.Equal(t, tc.want, isOTelWireProtocol(tc.proto),
 			"IsOTelNegotiated must agree with what NewConn keys on, for %q", tc.proto)
 	}
+}
+
+// TestWrapperBuiltBeforeTheProviderStaysStatic pins the ordering rule an
+// application is most likely to trip over. relayPossible is resolved once, at
+// construction; a Conn built while no relay could exist resolves from its
+// environment and options for the rest of its life, and installing a provider
+// afterwards never reaches it.
+func TestWrapperBuiltBeforeTheProviderStaysStatic(t *testing.T) {
+	clearWSFlagEnv(t)
+	require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, openfeature.NoopProvider{}))
+	t.Setenv(envWSTracingEnabled, "1")
+
+	c := newTestConn(t, false)
+	require.False(t, c.gate.relayPossible, "no endpoint and no provider at construction time")
+	require.True(t, c.featureEnabled(), "the environment enabled it")
+
+	setRelay(t, false) // installed too late
+
+	assert.True(t, c.featureEnabled(),
+		"a Conn built before any relay existed never consults one")
+	assert.False(t, newTestConn(t, false).featureEnabled(),
+		"a Conn built after the install does observe it — the fix is ordering, not a reset hook")
+}
+
+// TestTwoConnectionsCanDiffer is what the option is uniquely able to express,
+// and it survives the option moving below the environment variable — on the
+// condition that the deployment leaves that variable unset.
+func TestTwoConnectionsCanDiffer(t *testing.T) {
+	clearWSFlagEnv(t)
+	require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, openfeature.NoopProvider{}))
+
+	on := newTestConn(t, false, WithTracingEnabled(true))
+	off := newTestConn(t, false, WithTracingEnabled(false))
+
+	assert.True(t, on.featureEnabled(), "the connection built with WithTracingEnabled(true) must trace")
+	assert.False(t, off.featureEnabled(), "…and the one built with (false) must not")
 }

@@ -563,13 +563,16 @@ harness.AssertConsistentRV(t, full)             // rv 全相同
 1. **宣告你的 library 的 gate**:
    ```go
    var gate = harness.GateEnv{
-       Global:      "OTEL_INSTRUMENTATION_GO_TRACING_ENABLED", // 共用總開關
-       Tracing:     "OTEL_<YOURLIB>_TRACING_ENABLED",           // 你的 library tracing 開關
-       Propagation: "OTEL_<YOURLIB>_PROPAGATION_ENABLED",       // 沒有獨立 propagation 開關就留空
+       // 留空即使用 otel-flags 自己的總開關變數。總開關是 process 層級的,
+       // 全世界只有一個,幾乎沒有理由自訂。
+       Global:      "",
+       Tracing:     "OTEL_<YOURLIB>_TRACING_ENABLED",     // 你的 library tracing 開關
+       Propagation: "OTEL_<YOURLIB>_PROPAGATION_ENABLED", // 沒有獨立 propagation 開關就留空
    }
    ```
-2. **`harness.ExpectationFromEnv(gate)`** 把當前 env 轉成 `{TracingEnabled, PropagationEnabled}`,你的測試據此**分流**該跑哪組斷言。
-3. **flag gate 每個 process 只快取一次** → 每個 flag 組合要用**不同 env 各跑一次 `go test`**(別在單一 run 內切換)。
+2. **`harness.ExpectationFromEnv(gate)`** 把當前 env 轉成 `{TracingEnabled, PropagationEnabled}`,你的測試據此**分流**該跑哪組斷言。它直接呼叫 `otelflags.Lookup`,所以真值規則不可能與模組漂移,並套用同一組預設值:**總開關預設開啟**(它是否決權),**各模組開關預設關閉**。
+3. **環境變數在建構時讀取一次** → 每個 flag 組合要用**不同 env 各跑一次 `go test`**(別在單一 run 內切換)。
+4. **無效值會讓建構失敗。** 只有 `1`/`true`/`yes`/`on` 與 `0`/`false`/`no`/`off` 算數;其他任何值——包含空字串——都會讓被測模組的建構子回傳錯誤。矩陣的每一格都要用其中一組值,不要用 `-e VAR`(那會產生空字串)。
 
 > **把 sampling 測試放在獨立 package**:很多模組的 `tests/integration` 有 `TestMain` 會**強制設好所有 flag**(force-enable)。若你把 flag 矩陣測試放進那個 package,env 會被 `TestMain` 蓋掉、矩陣失效。參考做法:mongo 的 sampling 測試自成一個 `sampling` package(見 [`chain.go`](../otel-mongo/v2/tests/integration/sampling/chain.go) 開頭註解),讓 Makefile/CI 從外部用 env 控制旗標軸。
 

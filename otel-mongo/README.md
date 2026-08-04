@@ -47,22 +47,35 @@ otel-mongo/
 ### Tracing feature flags
 
 ```
-tracing     = gate1 && OTEL_MONGO_TRACING_ENABLED && relay otel-mongo-tracing
-propagation = tracing && OTEL_MONGO_PROPAGATION_ENABLED && relay otel-mongo-propagation
+tracing     = master && mongoTracing
+propagation = tracing && mongoPropagation
 ```
 
-`gate1` is `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` **or** `WithTracingEnabled(v)` — two spellings
-of one switch, and supplying **both is a configuration error** (`ErrTracingConfigConflict`), even
-when they agree. `OTEL_MONGO_PROPAGATION_ENABLED` and `WithTracePropagationEnabled` follow the same
-rule, with `ErrTracePropagationConfigConflict`.
+Each switch resolves down a four-step ladder, first source with an opinion winning:
 
-The environment tiers are read **once, at construction**, and decide whether the instrumented
-implementations are built at all. The relay verdicts are resolved on **every operation** and can
-only **revoke** — nothing on the relay can enable what the deployment left off. A switch is on only
-when set to `1`, `true`, `yes` or `on`.
+```
+relay  >  env  >  option (With*Enabled)  >  hardcoded default
+```
 
-`WithTracingEnabled` does **not** pin a client: it supplies `gate1` and nothing more, so a client
-carrying it still stops when the relay revokes.
+The relay is authoritative in **both** directions — it can disable a running module and enable one
+the deployment left off. Safety comes from the defaults: the master switch
+`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` defaults to `true` and is a **veto** (only `false` has an
+effect; it accepts no option), while every per-module switch defaults to **off**.
+
+**The option sits below its environment variable**, reversing `0.7.0`. ``OTEL_MONGO_TRACING_ENABLED`=false` disables
+this module even where the Go code passed `WithTracingEnabled(true)`, so an operator has a per-module
+setting application code cannot override. With the variable unset the option decides, so two
+connections in one process can still differ.
+
+A switch is decided only by `1`/`true`/`yes`/`on` or `0`/`false`/`no`/`off`. Unset means "no opinion".
+**Anything else — including the empty string — fails construction** with an error wrapping
+`otelflags.ErrInvalidFlagValue`.
+
+`WithTracingEnabled` does **not** pin anything: a wrapper carrying it resolves the master switch and
+the relay on every operation.
+
+The mutual-exclusion rule and both `Err*ConfigConflict` sentinels are **gone**: supplying an option
+alongside its variable is ordinary configuration, and the variable wins.
 
 Two module-specific points:
 
@@ -127,7 +140,7 @@ Optional: **ConnectWithOptions(ctx, traceOpts, mongoOpts)** (v1) or **ConnectWit
 
 ### 3. Restore trace from document (e.g. change streams)
 
-`ContextFromDocument` / `ContextFromRawDocument` carry **no feature-flag gate**. They start no span and write nothing, so there is nothing for a kill switch to protect you from — and a relay revocation does not stop them. They return zero / `ok == false` only when the document has no `_oteltrace`, or its `traceparent` is absent or invalid.
+`ContextFromDocument` / `ContextFromRawDocument` carry **no feature-flag gate at all**. They start no span, write nothing, and perform no OpenFeature evaluation, so there is nothing for a switch to protect you from — and turning this module off does not stop them. That is deliberate: `Decode` + `ContextFromDocument` is the supported way to keep trace linking while the library is silenced. They return zero / `ok == false` only when the document has no `_oteltrace`, or its `traceparent` is absent or invalid.
 
 ```go
 fullDoc := changeStreamEvent.FullDocument
@@ -201,7 +214,7 @@ Every `InsertOne`, `InsertMany`, `ReplaceOne`, and `UpdateOne`/`UpdateMany`/`Upd
 
 ### `NewCollection` vs `Connect`
 
-`NewCollection` accepts no options, so it resolves the environment tiers itself: `gate1` and `OTEL_MONGO_TRACING_ENABLED` decide whether the instrumented implementation is built at all, and `OTEL_MONGO_PROPAGATION_ENABLED` gates `_oteltrace` below that. The relay verdicts still apply per operation. There is no per-collection functional option for propagation; use **`ConnectWithOptions`** with **`WithTracePropagationEnabled`** when you need to supply that tier for a client from code instead of the environment (note: it cannot bypass a disabled tracing tier or a relay revocation).
+`NewCollection` accepts no options, so it resolves the switches from the environment alone. Whether the instrumented implementation is built at all depends on whether a relay could ever enable this module, or whether the environment already does; the effective per-operation answer is the master switch AND `OTEL_MONGO_TRACING_ENABLED`, each down the full ladder, with `OTEL_MONGO_PROPAGATION_ENABLED` a further switch below that for `_oteltrace`. There is no per-collection functional option for propagation; use **`ConnectWithOptions`** with **`WithTracePropagationEnabled`** to supply that rung for a client from code instead of the environment — note that it loses to `OTEL_MONGO_PROPAGATION_ENABLED` and to the relay, and cannot bypass a disabled tracing switch.
 
 ### DecodeAndTrace vs Decode on Cursor
 

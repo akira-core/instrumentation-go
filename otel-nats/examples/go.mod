@@ -13,6 +13,7 @@ require (
 )
 
 require (
+	github.com/akira-core/instrumentation-go/otel-flags v0.1.0 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.0 // indirect
 	github.com/blang/semver v3.5.1+incompatible // indirect
 	github.com/bluele/gcache v0.0.2 // indirect
@@ -47,3 +48,5 @@ require (
 	google.golang.org/grpc v1.81.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
+
+replace github.com/akira-core/instrumentation-go/otel-flags => ../../otel-flags

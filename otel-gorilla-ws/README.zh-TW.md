@@ -32,24 +32,44 @@ go get github.com/akira-core/instrumentation-go/otel-gorilla-ws
 ### Tracing 功能旗標
 
 ```
-capability = gate1 && OTEL_GORILLA_WS_TRACING_ENABLED        （建構時固定）
-span gate  = capability && relay otel-gorilla-ws-tracing      （每次呼叫重讀）
+effective tracing = master && wsTracing        （各自走完整階梯）
+negotiation       = effective tracing          （handshake 前解析一次）
+span gate         = effective tracing          （每次讀寫重讀）
 ```
 
-`gate1` 是 `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` **或** `WithTracingEnabled(v)` —— 同一個開關的兩種
-拼法,**兩個都給是設定錯誤**(`ErrTracingConfigConflict`)。開關只有設成 `1`、`true`、`yes`、`on` 才算開。
+每個開關沿著一道四階梯解析,最先表態的那一層贏:
 
-**capability** 決定是否提出(`Dial`)或確認(`Upgrader.Upgrade`)`otel-ws`,在 handshake **之前**解析,
-因為 handshake 無法重來。它刻意排除 relay —— 在只能撤銷的 relay 下這零代價。**span gate** 是疊在上面的
-relay verdict,每次讀寫重讀,所以執行中的連線會跟上撤銷。
+```
+relay  >  env  >  option(WithTracingEnabled)  >  寫死的預設值
+```
+
+relay **兩個方向都有權威**。安全性來自預設值:總開關 `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` 預設
+`true` 且是**否決權**(只有 `false` 有效果,且不接受 option),而 `OTEL_GORILLA_WS_TRACING_ENABLED`
+預設**關閉**。
+
+**選項排在它的環境變數之下**,與 `0.7.0` 相反。即使 Go 程式碼傳了 `WithTracingEnabled(true)`,
+`OTEL_GORILLA_WS_TRACING_ENABLED=false` 依然能關掉這個模組。變數未設定時由選項決定。
+
+開關只由 `1`/`true`/`yes`/`on` 或 `0`/`false`/`no`/`off` 決定,未設定代表「沒有意見」。
+**其他任何值——包含空字串——都會讓建構失敗。** 互斥規則與 `ErrTracingConfigConflict` **已移除**。
+
+**negotiation 與 span gate 是同一個運算式,只是解析時機不同。** 這是本模組全部的微妙之處:handshake 無法
+重來,所以線路決策只做一次,而 span 決策每次呼叫都做。由此產生的不對稱必須事先規劃:
+
+- **打開只影響之後建立的連線。** 在模組關閉期間建立的連線永遠不會取得 envelope,`WithTracingEnabled(true)`
+  也救不回來 —— 沒有協商 `otel-ws` 的對端不會去解析它。這種連線仍可產生**本地** span,只是無法
+  inject/extract。需要它被追蹤就必須重連。
+- **關閉會立刻影響每條連線的 span 與 inject/extract,但不影響 envelope**,因為對端還在解析它。
+  這是唯一關掉後回不到零成本路徑的模組;要移除那份 wire 開銷必須讓連線重連。
+
+**沒有配置 relay 的部署**,協商結果與 `0.7.0` 完全相同,wire 一個 byte 都不會變。
 
 三件要知道的事:
 
-- capability 只箝制**寫入**路徑。對端是否包 envelope 是 handshake 的事實,所以 capability 關掉、卻包裝了
-  已協商連線的 wrapper 會寫原始幀,但**讀取時仍然解包** —— 否則你的應用程式會收到原始的
-  `{"header":…,"data":…}` bytes。
-- 撤銷會停掉 span 與 injection,但**不會**停掉已協商連線上的 envelope:對端把每一幀都當 envelope 解析。
-  這是唯一撤銷後回不到零成本路徑的模組;要移除那個 wire 開銷必須重新部署。
+- capability(本地的 `relayPossible || (master && module)`,建構時固定)只箝制**寫入**路徑。對端是否包
+  envelope 是 handshake 的事實,所以 capability 關掉、卻包裝了已協商連線的 wrapper 會寫原始幀,但
+  **讀取時仍然解包** —— 否則你的應用程式會收到原始的 `{"header":…,"data":…}` bytes。
+- 關閉會停掉 span 與 injection,但**不會**停掉已協商連線上的 envelope:對端把每一幀都當 envelope 解析。
 - 自己處理 handshake?提出或回應 `SubprotocolOTelWS`,並在 `NewConn` 前用 `IsOTelNegotiated(raw)` 檢查 ——
   見 [otel-ws.md](../otel-ws.md)。
 

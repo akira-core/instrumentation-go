@@ -4,12 +4,26 @@ This is a multi-module repository. Two groups of modules live here:
 
 **Instrumentation wrappers (4)** — `otel-mongo`, `otel-mongo/v2`, `otel-nats`, `otel-gorilla-ws`. Each has its own `go.mod`, its own version constant reported as `otel.scope.version` on every span it emits, and its own release tag line.
 
-**Supporting modules (2)** — `otel-sampler` and `otel-testkit`. They emit no spans of their own, so they have no instrumentation scope to version, but they differ in whether they are released:
+**Supporting modules (3)** — `otel-flags`, `otel-sampler` and `otel-testkit`. They emit no spans of their own, so they have no instrumentation scope to version, but they differ in whether they are released:
 
 | Module | Released? | Tag shape | Version constant |
 |---|---|---|---|
+| `otel-flags` | **Yes** — the four wrappers `require` it | `otel-flags/vX.Y.Z` | `otel-flags/version.go` |
 | `otel-sampler` | **Yes** — applications import it to configure their `sdktrace.Sampler` | `otel-sampler/vX.Y.Z` | `otel-sampler/otelsampler/version.go` |
 | `otel-testkit` | **No** — test-only harness, consumed via `replace`/pseudo-version from this repo's own test modules | untagged | none |
+
+### `otel-flags` is released BEFORE the modules that require it
+
+`otel-flags` holds the shared feature-switch layer, and the four wrappers depend on it. That makes it the one module in this repository with a **release ordering constraint**, because a published `go.mod` cannot carry a `replace` directive — consumers ignore it, so a wrapper can only `require` an `otel-flags` version that already exists.
+
+Every release touching the flag layer is therefore two stages:
+
+1. Tag `otel-flags/vX.Y.Z`. It depends on nothing else here, so it can be cut from the same commit that introduces the change.
+2. In each wrapper, set `require github.com/akira-core/instrumentation-go/otel-flags vX.Y.Z`, **remove any `replace` for it**, run `GOWORK=off go mod tidy`, commit, then tag the wrappers.
+
+During development between those stages the wrappers carry `replace …/otel-flags => ../otel-flags` so the working tree builds against itself. That replace must never reach a tag: the release guard fails any module tag whose `go.mod` still contains a `replace` pointing at an in-repo module, because the resulting tag is unbuildable for everyone outside this repository and nothing else would notice.
+
+A repo-root `go.work` covers local development; CI never uses it (`GOWORK: off` on every job) so each module is verified exactly as a consumer resolves it.
 
 `examples/` and `tests/integration/` sub-modules follow their parent module's version informally (they are not separately tagged) and are expected to build against the parent's `HEAD`.
 
@@ -27,7 +41,7 @@ The published `otel-sampler/v0.1.0` tag points at a pre-rebase commit that is **
 
 Examples: `otel-nats/v0.7.0`, `otel-mongo/v0.7.0`. The module segment matches the directory path relative to the repo root — with one exception, below.
 
-Each tag must point at a commit where that module's version constant equals the tag's version. A CI workflow enforces this on every push of a tag matching one of the five module patterns (`otel-mongo/v[0-9]*`, `otel-mongo/v2/v[0-9]*`, `otel-nats/v[0-9]*`, `otel-gorilla-ws/v[0-9]*`, `otel-sampler/v[0-9]*`) — see [CI enforcement](#ci-enforcement) below.
+Each tag must point at a commit where that module's version constant equals the tag's version. A CI workflow enforces this on every push of a tag matching one of the six module patterns (`otel-mongo/v[0-9]*`, `otel-mongo/v2/v[0-9]*`, `otel-nats/v[0-9]*`, `otel-gorilla-ws/v[0-9]*`, `otel-sampler/v[0-9]*`, `otel-flags/v[0-9]*`) — see [CI enforcement](#ci-enforcement) below.
 
 ### Exception: `otel-mongo/v2` is tagged `otel-mongo/v2.x.y`
 
@@ -51,7 +65,7 @@ All five released modules are pre-1.0 (`otel-mongo/v2` is on the fixed-major `2.
 
 ## Where release notes live
 
-1. **Module-level `CHANGELOG.md`** (`otel-nats/CHANGELOG.md`, `otel-mongo/CHANGELOG.md`, `otel-mongo/v2/CHANGELOG.md`, `otel-gorilla-ws/CHANGELOG.md`, `otel-sampler/CHANGELOG.md`) — inside the module directory, so it ships in the Go module zip served by the module proxy. This is the canonical, per-module record; add an entry before tagging a release.
+1. **Module-level `CHANGELOG.md`** (`otel-nats/CHANGELOG.md`, `otel-mongo/CHANGELOG.md`, `otel-mongo/v2/CHANGELOG.md`, `otel-gorilla-ws/CHANGELOG.md`, `otel-sampler/CHANGELOG.md`, `otel-flags/CHANGELOG.md`) — inside the module directory, so it ships in the Go module zip served by the module proxy. This is the canonical, per-module record; add an entry before tagging a release.
 2. **GitHub Releases**, one per tag, summarizing that module's `CHANGELOG.md` entry for the version being released.
 3. **Root-level `RELEASE-NOTES-<version>.md`** (e.g. `RELEASE-NOTES-0.6.0.md`) for releases that touch all four modules together and warrant a single cross-module summary — optional, used for major coordinated releases, not required for every tag.
 
@@ -68,12 +82,17 @@ The CI guard (below) and any manual version bump need to know exactly where each
 | `otel-mongo/v2` | `otel-mongo/v2/version.go` | `instrumentationVersion` const |
 | `otel-gorilla-ws` | `otel-gorilla-ws/version.go` | `Version()` return literal |
 | `otel-sampler` | `otel-sampler/otelsampler/version.go` | `instrumentationVersion` const |
+| `otel-flags` | `otel-flags/version.go` | `instrumentationVersion` const |
 
-For the four wrapper modules this constant is what the package reports as its `TracerProvider.Tracer(..., trace.WithInstrumentationVersion(Version()))` instrumentation-scope version — it appears on every span the module emits, real or noop. `otel-sampler` emits no spans, so its constant serves only the release guard and callers that want to record which sampler build they run. Bump it in the same commit as the rest of the release's code changes, before tagging.
+For the four wrapper modules this constant is what the package reports as its `TracerProvider.Tracer(..., trace.WithInstrumentationVersion(Version()))` instrumentation-scope version — it appears on every span the module emits, real or noop. `otel-sampler` and `otel-flags` emit no spans, so their constants serve only the release guard and callers that want to record which build they run. Bump it in the same commit as the rest of the release's code changes, before tagging.
 
 ## CI enforcement
 
-`.github/workflows/release-guard.yml` triggers on any pushed tag matching one of five explicit patterns — `otel-mongo/v[0-9]*`, `otel-mongo/v2/v[0-9]*`, `otel-nats/v[0-9]*`, `otel-gorilla-ws/v[0-9]*`, `otel-sampler/v[0-9]*` (a single `otel-*/v*` glob would miss tags containing a second `/`, since GitHub Actions tag globs do not cross `/`). It parses the module and version out of the tag name, extracts the corresponding version constant using the table above, and fails the workflow if they don't match. This exists because a hand-maintained constant with no automated check has already shipped wrong once (`otel-nats` `0.5.0` reported `0.4.1` on every span) — the guard makes that class of mistake fail loudly at tag-push time instead of shipping silently.
+`.github/workflows/release-guard.yml` triggers on any pushed tag matching one of six explicit patterns — `otel-mongo/v[0-9]*`, `otel-mongo/v2/v[0-9]*`, `otel-nats/v[0-9]*`, `otel-gorilla-ws/v[0-9]*`, `otel-sampler/v[0-9]*`, `otel-flags/v[0-9]*` (a single `otel-*/v*` glob would miss tags containing a second `/`, since GitHub Actions tag globs do not cross `/`). It runs two checks.
+
+**Version constant.** It parses the module and version out of the tag name, extracts the corresponding version constant using the table above, and fails the workflow if they don't match. This exists because a hand-maintained constant with no automated check has already shipped wrong once (`otel-nats` `0.5.0` reported `0.4.1` on every span) — the guard makes that class of mistake fail loudly at tag-push time instead of shipping silently.
+
+**No in-repo `replace`.** It greps the tagged module's `go.mod` for a `replace` pointing at another module in this repository and fails if it finds one. Same reasoning: a `replace` that reaches a tag is silently ignored by consumers, leaving the module requiring a version that may not exist, and the failure is invisible until someone outside this repository tries to build. See [the two-stage release above](#otel-flags-is-released-before-the-modules-that-require-it).
 
 Two `otel-mongo` routing details:
 

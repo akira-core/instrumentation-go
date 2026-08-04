@@ -2,32 +2,43 @@ package otelmongo
 
 import (
 	"errors"
-	"fmt"
-	"os"
 
-	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/flags"
+	otelflags "github.com/akira-core/instrumentation-go/otel-flags"
 )
 
+// This module's own switches. The process-wide master switch is not named here:
+// it belongs to otel-flags, which owns every process-scoped name.
 const (
-	// envGlobalTracingEnabled aliases the shared kill-switch name so the literal
-	// has exactly one home (internal/flags) and cannot drift from it.
-	envGlobalTracingEnabled    = flags.EnvGlobalTracing
 	envMongoTracingEnabled     = "OTEL_MONGO_TRACING_ENABLED"
 	envMongoPropagationEnabled = "OTEL_MONGO_PROPAGATION_ENABLED"
 )
 
 // OpenFeature keys an operator flips on the relay proxy to turn this module's
-// behavior off without restarting the application. v1 and v2 share both keys, as
-// they share both env vars, so revoking otel-mongo-tracing stops both.
+// behavior on or off without restarting the application. v1 and v2 share both
+// keys, as they share both env vars, so a change to otel-mongo-tracing reaches
+// both.
 //
-// The relay can only REVOKE. Both keys resolve with an evaluation default of
-// true and are ANDed with their paired env var, so nothing on the relay can
-// enable what the deployment left off. That matters most for propagation:
-// _oteltrace is roughly 90 bytes written into the application's own documents,
-// never stripped on read, and removable only by a $unset migration.
+// The relay is authoritative in BOTH directions, which matters most for
+// propagation: _oteltrace is roughly 90 bytes written into the application's own
+// documents, never stripped on read, and removable only by a $unset migration.
+// Three things bound that — the master switch above, the propagation tier's
+// hardcoded default of false, and the fact that a process with no relay
+// configured never asks.
 const (
 	flagKeyMongoTracing     = "otel-mongo-tracing"
 	flagKeyMongoPropagation = "otel-mongo-propagation"
+)
+
+// Hardcoded defaults — the bottom rung of the ladder. Both false, so a process
+// that configures nothing traces nothing and writes nothing.
+//
+// defaultMongoPropagation is the one default in this repository that protects
+// stored data rather than telemetry volume: nothing may write _oteltrace unless
+// an option, an environment variable or a deliberately created relay flag says
+// so. Absence in every source can never enable it.
+const (
+	defaultMongoTracing     = false
+	defaultMongoPropagation = false
 )
 
 // Indices into mongoResolver's flag keys.
@@ -36,105 +47,53 @@ const (
 	idxPropagation
 )
 
-// Configuration-conflict sentinels. The env var and the option are two spellings
-// of one switch, so supplying both is an error even when they agree: the rule to
-// remember is "set one", which is checkable at a glance, rather than "make them
-// match", which depends on the truthiness allow-list.
-var (
-	ErrTracingConfigConflict = errors.New(
-		"otelmongo/v2: WithTracingEnabled and " + envGlobalTracingEnabled +
-			" are mutually exclusive; set exactly one")
-
-	ErrTracePropagationConfigConflict = errors.New(
-		"otelmongo/v2: WithTracePropagationEnabled and " + envMongoPropagationEnabled +
-			" are mutually exclusive; set exactly one")
-)
-
-// mongoResolver resolves this module's relay verdicts through the process-global
-// OpenFeature client. It caches nothing, so a revocation reaches a live client on
-// its very next operation.
-//
-// The global switch is deliberately NOT a flag key: it is an out-of-band kill
-// switch with no relay counterpart, ANDed ahead of the resolver so that no
-// OpenFeature code path runs at all while it is off.
-var mongoResolver = flags.NewResolver(
-	flags.WithFlagKeys(
-		flagKeyMongoTracing,     // paired with envMongoTracingEnabled, ANDed by this package
-		flagKeyMongoPropagation, // paired with envMongoPropagationEnabled, ANDed by this package
+// mongoResolver resolves this module's relay values through the process-global
+// OpenFeature client. It caches nothing, so a relay change reaches a live client
+// on its very next operation.
+var mongoResolver = otelflags.NewResolver(
+	otelflags.WithFlagKeys(
+		flagKeyMongoTracing,
+		flagKeyMongoPropagation,
 	),
 )
 
-// mongoRelayAllowsTracing and mongoRelayAllowsPropagation report the relay
-// verdicts alone.
-//
-// Each is only part of the answer: callers MUST AND them with the client's
-// static tiers, which is what gateState does. Reading either on its own would
-// let the relay enable what the deployment left off.
-func mongoRelayAllowsTracing() bool     { return mongoResolver.Allowed(idxTracing) }
-func mongoRelayAllowsPropagation() bool { return mongoResolver.Allowed(idxPropagation) }
-
-// resolveGate1 resolves the process-wide first tier for one client.
-//
-// Rejection is on PRESENCE, not on value: EnvSet is required because EnvEnabled
-// cannot tell "unset" (the deployment expressed no opinion, and the option may
-// supply one) from "set to something falsy".
-func resolveGate1(override *bool) (bool, error) {
-	if flags.GlobalTracingSet() && override != nil {
-		return false, fmt.Errorf("%w: option=%v, %s=%q",
-			ErrTracingConfigConflict, *override,
-			envGlobalTracingEnabled, os.Getenv(envGlobalTracingEnabled))
-	}
-	if override != nil {
-		return *override, nil
-	}
-	return flags.GlobalTracingPossible(), nil
-}
-
-// resolvePropagationTier resolves the _oteltrace propagation tier for one client.
-// Same presence rule as resolveGate1, with its own sentinel.
-func resolvePropagationTier(override *bool) (bool, error) {
-	if flags.EnvSet(envMongoPropagationEnabled) && override != nil {
-		return false, fmt.Errorf("%w: option=%v, %s=%q",
-			ErrTracePropagationConfigConflict, *override,
-			envMongoPropagationEnabled, os.Getenv(envMongoPropagationEnabled))
-	}
-	if override != nil {
-		return *override, nil
-	}
-	return flags.EnvEnabled(envMongoPropagationEnabled), nil
-}
-
 // resolveGates resolves every static tier for one client, collecting ALL
-// configuration conflicts before returning any of them.
+// configuration errors before returning any of them.
 //
-// A caller can violate both rules at once — one configuration file setting every
-// environment variable, one code path passing every option — so both checks run
-// and the failures are joined in a fixed order (tracing first, propagation
-// second). Returning only the first would make the caller fix one conflict and
-// rediscover the other on the next run, which is the failure mode configuration
-// errors are worst at.
-func resolveGates(tracingOverride, propagationOverride *bool) (gateState, error) {
-	gate1, tracingErr := resolveGate1(tracingOverride)
-	gateProp, propErr := resolvePropagationTier(propagationOverride)
+// A deployment can carry more than one unreadable value — one configuration file
+// setting every OTEL_*_ENABLED variable — so all three reads run and the
+// failures are joined in a fixed order (master, tracing, propagation). Returning
+// only the first would make the caller fix one and rediscover the next on the
+// following run, which is the failure mode configuration errors are worst at.
+func resolveGates(tracingOption, propagationOption *bool) (gateState, error) {
+	masterLocal, masterErr := otelflags.MasterLocal()
+	tracingLocal, tracingErr := otelflags.ResolveLocal(tracingOption, envMongoTracingEnabled, defaultMongoTracing)
+	propLocal, propErr := otelflags.ResolveLocal(propagationOption, envMongoPropagationEnabled, defaultMongoPropagation)
 
-	if err := errors.Join(tracingErr, propErr); err != nil {
+	if err := errors.Join(masterErr, tracingErr, propErr); err != nil {
 		return gateState{}, err
 	}
 
 	return gateState{
-		// Both terms are environment-derived and fixed here, so they also decide
-		// which implementations are allocated at all. Including the module env
-		// var is safe because the relay can only revoke: with it off, no relay
-		// value could raise the answer.
-		tracedBuilt: gate1 && flags.EnvEnabled(envMongoTracingEnabled),
-		propagation: gateProp,
+		relayPossible: otelflags.RelayPossible(),
+		masterLocal:   masterLocal,
+		tracingLocal:  tracingLocal,
+		propLocal:     propLocal,
 	}, nil
 }
 
 // envGates resolves the static tiers from the environment alone, for the
-// constructors that accept no options. It cannot fail: a configuration conflict
-// requires an option to conflict with, and there is none here.
+// constructors that accept no options.
+//
+// It can still fail — an unreadable environment value does not need an option to
+// conflict with — but its callers have no error return, so it falls back to a
+// fully-disabled gate. That is the safe direction and it is not silent: every
+// option-accepting constructor in this module reports the same value properly,
+// so a deployment carrying one learns about it at its first Connect.
 func envGates() gateState {
-	g, _ := resolveGates(nil, nil)
+	g, err := resolveGates(nil, nil)
+	if err != nil {
+		return gateState{}
+	}
 	return g
 }

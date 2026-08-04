@@ -2,407 +2,356 @@
 
 > 繁體中文版本:[feature-flags.zh-TW.md](feature-flags.zh-TW.md)
 
-Every instrumentation module can be switched off. This document is the single reference for how
-that decision is made — what each switch does, who owns it, and what can and cannot change while
-a process is running.
+Every instrumentation module can be switched on or off. This document is the single reference for
+how that decision is made — what each switch does, who owns it, which ones can change while a
+process is running, and which cannot.
 
-Applies to `otel-mongo` 0.9.0, `otel-mongo/v2` 2.9.0, `otel-nats` 0.8.0 and `otel-gorilla-ws`
-0.8.0 and later. Design record: `openspec/changes/openfeature-dynamic-flags/design.md`.
+Applies to `otel-flags` 0.1.0, `otel-mongo` 0.9.0, `otel-mongo/v2` 2.9.0, `otel-nats` 0.8.0 and
+`otel-gorilla-ws` 0.8.0 and later. Design record:
+`openspec/changes/openfeature-dynamic-flags/design.md`.
 
 ## The model in one paragraph
 
-Instrumentation is enabled by a deployment and can be revoked by an operator. A [GO Feature Flag]
-relay proxy, reached through [OpenFeature], acts as a **kill switch only**: a flag set to `false`
-turns a running module off as soon as the provider observes it, and nothing on the relay can turn
-anything on.
-Everything that is on was turned on by a deployment that someone reviewed. When the relay is
-unreachable, misconfigured, or absent, every flag reads as "do not interfere" and the
-environment alone decides — so an application that never installs a provider behaves exactly as
-its environment says.
+Each switch is resolved down a four-step ladder, and the first source with an opinion wins. A
+[GO Feature Flag] relay proxy, reached through [OpenFeature], sits at the top and is **authoritative
+in both directions**: it can turn a running module off, and it can turn one on that the deployment
+left off. Below it, an environment variable, then a constructor option, then a hardcoded default.
+What keeps that safe is the defaults, not a restriction on the relay: every per-module switch
+defaults to **off**, so a process that configures nothing traces nothing, and the process-wide
+master switch defaults to **on** only because it is a veto rather than an enabler. When no relay is
+configured, no OpenFeature code runs at all and the environment and options alone decide.
 
 [GO Feature Flag]: https://gofeatureflag.org
 [OpenFeature]: https://openfeature.dev
 
-## Three tiers
+## Which setting wins
 
 ```
-tracing = gate1 && OTEL_<MODULE>_TRACING_ENABLED && relay verdict
+relay  >  env  >  option (With*Enabled)  >  hardcoded default
 ```
 
-| Tier | Owner | When it is off | Changeable without a redeploy? |
+The order is **how late each source is decided**: the default is compiled in, the option is written
+when the wrapper is constructed, the environment variable is set when the process is deployed, and
+the relay changes while it runs. Each later stage overrides the earlier ones. That is the ordinary
+layering, and it needs no separate rule to remember.
+
+| Source | Owner | Scope | Changeable without a redeploy? |
 |---|---|---|---|
-| **`gate1`** — `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` **or** `WithTracingEnabled`, never both | whoever deploys, or whoever constructs the wrapper | every module in the process is off, only passthrough implementations are allocated, and no OpenFeature code path is reachable | No |
-| **`OTEL_<MODULE>_TRACING_ENABLED`** | whoever deploys | that module is off, only its passthrough implementation is allocated, and its relay flag is never evaluated | No |
-| **relay flag `otel-<module>-tracing`** | whoever operates | that module stops emitting on a running process, from its next operation | **Yes — this is the only tier that can** |
+| relay flag | operator | fleet, or one service (see [Targeting](#targeting-one-service-instead-of-the-fleet)) | **Yes — the only one that can** |
+| `OTEL_*` environment variable | deployer | one process | No |
+| `With*Enabled` option | the caller that constructs the wrapper | one connection or client | No |
+| hardcoded default | this library | everywhere nobody spoke | No |
 
-The first two tiers are both environment-derived and both fixed at construction. They differ only
-in scope — whole process versus one module — and in who owns them. The third is the only dynamic
-one, and it can only subtract from what the first two allow.
+**The option sits below its environment variable.** This is deliberate, and it is the one place this
+release breaks with `0.7.0`, where the option won. Three reasons, in order of weight:
 
-## Resolving `gate1`
+1. It gives an operator a **per-module** setting that application code cannot override.
+   `OTEL_MONGO_TRACING_ENABLED=false` disables that module for that deployment even when the Go
+   code passed `WithTracingEnabled(true)` — without silencing the whole process, and without
+   deploying a relay.
+2. It closes the asymmetry on the one switch that writes data. `WithTracePropagationEnabled(true)`
+   would otherwise override `OTEL_MONGO_PROPAGATION_ENABLED=false` and start appending permanent
+   `_oteltrace` fields to the operator's own documents. Every other switch only produces or
+   withholds telemetry; that one leaves state behind.
+3. The ladder stays monotonic in deployment order, so it is one sentence rather than a specificity
+   rule that reverses between two adjacent rungs.
 
-`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` and the `WithTracingEnabled(v bool)` constructor option
-are two spellings of the same switch. Set **exactly one**. Supplying both is a configuration
-error, reported by the constructor, even when the two agree — the rule is "set one", not "make
-them match".
+**What it costs.** An option is consulted only when its environment variable is unset, so a process
+that sets the variable cannot differentiate two connections through options. That is the one thing
+the option uniquely expresses — trace one of two Mongo clients — and it survives on the condition
+that the deployment leaves the variable unset. Under a default of `off`, that is the ordinary state,
+not a sacrifice.
 
-| `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | `WithTracingEnabled` | `gate1` |
-|---|---|---|
-| unset | not passed | disabled |
-| unset | `true` | enabled |
-| unset | `false` | disabled |
-| set, truthy | not passed | enabled |
-| set, falsy | not passed | disabled |
-| **set, any value** | **passed, any value** | **construction error** |
+## The three switches
 
-The error wraps a per-module sentinel, so it can be matched with `errors.Is`, and names both
-observed values:
+| Switch | Relay key | Option | Environment variable | Default |
+|---|---|---|---|---|
+| master | `otel-instrumentation-go-tracing` | — | `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | `true` |
+| per-module tracing | `otel-<module>-tracing` | `WithTracingEnabled` | `OTEL_<MODULE>_TRACING_ENABLED` | `false` |
+| Mongo propagation | `otel-mongo-propagation` | `WithTracePropagationEnabled` | `OTEL_MONGO_PROPAGATION_ENABLED` | `false` |
 
-```go
-conn, err := otelnats.ConnectWithOptions(url, nil, otelnats.WithTracingEnabled(true))
-if errors.Is(err, otelnats.ErrTracingConfigConflict) {
-    // OTEL_INSTRUMENTATION_GO_TRACING_ENABLED is also set — remove one of them
-}
+They compose by conjunction:
+
+```
+tracing     = master && moduleTracing
+propagation = tracing && mongoPropagation
 ```
 
-`otel-mongo` applies the same rule to `OTEL_MONGO_PROPAGATION_ENABLED` and
-`WithTracePropagationEnabled`, with its own sentinel. A call that violates both rules gets a
-single `errors.Join`ed error matching both sentinels, so you do not fix one conflict only to
-discover the other on the next run.
+**The master switch is a veto, not an enabler.** Its default is `true`, which means "express no
+objection". Setting it to `true` — in the environment or on the relay — changes nothing at all. The
+only value with an effect is `false`, which stops every module in the process, including connections
+whose Go code passed an option. Do not create `otel-instrumentation-go-tracing: true` on a relay
+expecting it to enable something; it will read as a broken flag.
 
-## Effective tracing
+**Nothing turns on because the master is `true`.** The per-module default of `false` is what keeps a
+zero-configuration process silent.
 
-| `gate1` | `OTEL_<MODULE>_TRACING_ENABLED` | relay `otel-<module>-tracing` | Tracing | Relay consulted? |
-|---|---|---|---|---|
-| disabled | anything | anything | **off** | No |
-| enabled | unset or falsy | anything | **off** | No |
-| enabled | truthy | `false` | **off** | Yes |
-| enabled | truthy | `true` | **on** | Yes |
-| enabled | truthy | no opinion | **on** | Yes |
+### Worked examples
 
-Two properties fall out of this table and are worth stating on their own:
-
-- **The relay cannot enable anything.** Row 2 holds no matter what the relay serves. To put a
-  module under relay control you must deploy it with its environment switch on and use the relay
-  to hold it off.
-- **A module switched off in the environment costs nothing.** Rows 1 and 2 allocate only the
-  passthrough implementation and never evaluate a flag, so the zero-cost path is preserved.
-
-## What "no opinion" covers
-
-The relay verdict is resolved with an evaluation default of `true`, and OpenFeature returns that
-default on every failure path. All of the following therefore mean *do not interfere*:
-
-- no OpenFeature provider was installed
-- a provider is installed but not yet ready
-- the relay configuration contains no flag with that key
-- evaluation returned an error
-- the flag exists but is not a boolean
-- the relay is unreachable and the provider has no cached configuration
-
-There is no way to distinguish these from a relay that explicitly serves `true`, and no reason
-to: both mean the environment decides.
-
-## Truthiness
-
-A switch is enabled only when it is set to one of `1`, `true`, `yes`, `on` — lowercased and
-whitespace-trimmed before comparison. **Everything else is disabled**, including an unset
-variable and the empty string.
-
-| Value | Result |
+| Configuration | Result |
 |---|---|
-| unset | disabled |
-| `1` / `true` / `yes` / `on` | enabled |
-| `TRUE` / `On` / `  yes  ` | enabled |
-| `0` / `false` / `no` / `off` | disabled |
-| `` (set but empty, `export VAR=`) | **disabled** |
-| `enabled` / `2` / `y` / `t` | **disabled** |
+| nothing set anywhere | off |
+| `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true` only | off — the master enables nothing |
+| `OTEL_NATS_TRACING_ENABLED=true` only | **NATS on** — the master defaults to `true` |
+| `WithTracingEnabled(true)`, no variables | on for that connection |
+| `WithTracingEnabled(true)` + `OTEL_NATS_TRACING_ENABLED=false` | **off** — the variable outranks the option |
+| `WithTracingEnabled(false)` + `OTEL_NATS_TRACING_ENABLED=true` | **on** — same rule, other direction |
+| `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=false` + everything else on | off — the veto beats everything |
+| relay `otel-mongo-tracing: true`, `OTEL_MONGO_TRACING_ENABLED` unset | **Mongo on** — the relay can enable |
+| relay `otel-mongo-tracing: false`, `OTEL_MONGO_TRACING_ENABLED=true` | off — the relay can disable |
+| `OTEL_MONGO_TRACING_ENABLED=` (empty) | **construction error** — see below |
 
-The last two rows are the ones that catch people. `export OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=`
-does not open the gate, and neither does `=enabled`. If a switch is not doing what you expect,
-check its value against the four accepted words before looking anywhere else.
+## Environment values are a strict tri-state
+
+An environment variable has exactly three outcomes:
+
+| Value | Outcome |
+|---|---|
+| unset | no opinion — resolution falls through to the option, then the default |
+| `1` `true` `yes` `on` / `0` `false` `no` `off` (trimmed, case-insensitive) | this source decides |
+| anything else, **including the empty string** | the constructor returns an error wrapping `otelflags.ErrInvalidFlagValue` |
+
+**There is no guessing.** Under a ladder there is no safe direction to guess in: the master tier
+defaults to `true` and every other tier to `false`, so a value silently read as `false` would stop a
+whole fleet on one tier and change nothing on the others — the same input meaning two different
+things, with a log line as the only evidence.
+
+**`export VAR=` is invalid**, not falsy. Both available readings are wrong somewhere: as `false` it
+lets an unexpanded `${SOMETHING}` template variable express an opinion the deployment never had; as
+unset it silently reverses meaning for anyone who used it as an off switch. The rule has no
+exceptions: **set it to a recognised value, or do not set it.**
+
+The error names the variable and the observed value. A constructor that reads several switches
+reports **all** of the bad ones in one joined error, so one run tells you everything to fix.
+
+## Before you upgrade
+
+**Grep your deployment configuration for `OTEL_*_ENABLED` and confirm every value is in one of the
+two accepted lists.** This is the one change in this release that can stop a process from starting:
+`=enabled`, `=2`, `=y` and `=` (empty) were previously tolerated and now fail at the first
+constructor. An unexpanded `${SOMETHING}` in a Kubernetes manifest reaches exactly the empty case.
+
+Then re-read what the defaults mean. Against `0.7.0`:
+
+- A **module** variable set without the global one now takes effect. It used to be inert, which was
+  a common "I set the flag and nothing happened" report; it is still a change.
+- An option alongside its paired environment variable now loses to the variable.
+- `_oteltrace` is unaffected in both cases: propagation defaults to `false` and needs its own
+  explicit `true`.
 
 ## Flag keys
 
-Each relay flag is paired with one environment variable. The pairing is a convention for
-operators — the environment variable is a separate conjunctive tier, **not** the flag's
-evaluation default.
+| Flag key | Paired environment variable | Option | Default | Modules |
+|---|---|---|---|---|
+| `otel-instrumentation-go-tracing` | `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | — | `true` | all |
+| `otel-mongo-tracing` | `OTEL_MONGO_TRACING_ENABLED` | `WithTracingEnabled` | `false` | `otel-mongo`, `otel-mongo/v2` |
+| `otel-mongo-propagation` | `OTEL_MONGO_PROPAGATION_ENABLED` | `WithTracePropagationEnabled` | `false` | `otel-mongo`, `otel-mongo/v2` |
+| `otel-nats-tracing` | `OTEL_NATS_TRACING_ENABLED` | `WithTracingEnabled` | `false` | `otel-nats` |
+| `otel-gorilla-ws-tracing` | `OTEL_GORILLA_WS_TRACING_ENABLED` | `WithTracingEnabled` | `false` | `otel-gorilla-ws` |
 
-| Relay flag key | Paired environment variable | Modules |
-|---|---|---|
-| `otel-mongo-tracing` | `OTEL_MONGO_TRACING_ENABLED` | `otel-mongo`, `otel-mongo/v2` |
-| `otel-mongo-propagation` | `OTEL_MONGO_PROPAGATION_ENABLED` | `otel-mongo`, `otel-mongo/v2` |
-| `otel-nats-tracing` | `OTEL_NATS_TRACING_ENABLED` | `otel-nats` |
-| `otel-gorilla-ws-tracing` | `OTEL_GORILLA_WS_TRACING_ENABLED` | `otel-gorilla-ws` |
-
-There is **no relay key for `gate1`**, and therefore no single switch that silences a whole
-process from the relay. Stopping every module means revoking all four flags.
-
-`otel-mongo` v1 and v2 share both keys: revoking `otel-mongo-tracing` stops both.
-
-Three further variables configure the connection to the relay rather than any module's behaviour,
-and have no relay counterpart:
-
-| Variable | Purpose |
-|---|---|
-| `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` | relay proxy URL; unset ⇒ no provider is installed |
-| `OTEL_INSTRUMENTATION_GO_FLAGS_API_KEY` | relay API key |
-| `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` | poll interval, Go duration string, default `60s` |
-
-All four modules resolve through a single OpenFeature domain, `otel-instrumentation-go`. One
-provider serves all of them; there is no per-module provider.
+Keys are fixed and not overridable at runtime. `otel-mongo` and `otel-mongo/v2` share both keys, so
+one relay change reaches both.
 
 ## otel-mongo: `_oteltrace` document propagation
 
-Mongo has a second switch, one level below tracing, controlling whether an `_oteltrace`
-subdocument is written into your documents.
+This is the one switch whose "on" state leaves something behind, and the one to read carefully.
 
-| Effective tracing | `gateProp` (`OTEL_MONGO_PROPAGATION_ENABLED` or `WithTracePropagationEnabled`) | relay `otel-mongo-propagation` | `_oteltrace` written and read |
-|---|---|---|---|
-| **off** | anything | anything | **no** |
-| on | disabled | anything | **no** |
-| on | enabled | `false` | **no** |
-| on | enabled | `true` or no opinion | **yes** |
+When propagation is on, `InsertOne`, `InsertMany`, `ReplaceOne`, `UpdateOne`, `UpdateMany`,
+`UpdateByID` and `BulkWrite` append an `_oteltrace` subdocument — roughly 90 bytes of BSON, more with
+a `tracestate` — to the documents they write.
 
-Read this switch more carefully than the others, because it is the only one that changes what is
-**persisted**:
+- **It is never stripped on read.** Once written, the field is visible to your application on every
+  subsequent read of that document, permanently.
+- **Turning the switch back off does not undo anything.** New writes stop carrying it; existing
+  documents keep it. Cleanup is a `$unset` migration you run yourself.
+- **Against a collection with `$jsonSchema` and `additionalProperties: false`, the write fails
+  outright.**
 
-- The field is roughly 90 bytes of BSON per document, more when a `tracestate` is present. It is
-  written by `InsertOne`, `InsertMany`, `UpdateOne`, `UpdateMany`, `UpdateByID`, `ReplaceOne` and
-  `BulkWrite`.
-- **Nothing removes it.** The module reads `_oteltrace` to restore trace context but never strips
-  it from a decoded document, so once written it is visible to your application on every
-  subsequent read.
-- **Turning it off does not undo anything.** New writes stop carrying the field; documents that
-  already have it keep it. Cleaning up is an application-side `$unset` migration.
-- A collection with `$jsonSchema` validation and `additionalProperties: false` will **reject
-  every write** while this is on.
+### The relay can enable this
 
-Because of that, only a deployment can turn it on. As with tracing, the relay can only revoke.
+Unlike the superseded revoke-only model, a relay flag can start these writes. Four things bound it,
+and a site that cannot accept the risk uses one of them:
 
-## otel-gorilla-ws: three distinct booleans
+1. **The master veto.** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=false` stops everything in the
+   process regardless of any relay value.
+2. **The environment variable.** `OTEL_MONGO_PROPAGATION_ENABLED=false` cannot be overridden by
+   application code — only by the relay. This is why the option sits below it.
+3. **The default of `false`.** Absence in every source can never enable it. Something must
+   deliberately say `true`: an option, a variable, or a relay flag that somebody created — and the
+   relay configuration is written by your own site.
+4. **No relay, no reach.** A process with no `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` and no
+   application-installed provider cannot be reached by a relay at all — see
+   [Install your provider first](#install-your-provider-before-constructing-wrappers).
 
-The WebSocket module has three values with similar names and different lifetimes. Only the last
-one is dynamic.
+## otel-gorilla-ws: negotiation is a handshake fact
 
-| Name | Resolved as | Decides | Fixed for the connection? |
-|---|---|---|---|
-| **capability** | `gate1 && OTEL_GORILLA_WS_TRACING_ENABLED` | whether to offer (`Dial`) or confirm (`Upgrade`) the `otel-ws` subprotocol, and whether to build a real tracer | Yes — resolved before the handshake |
-| **negotiation outcome** | the handshake result, or `otel-ws` proven on the raw connection's subprotocol for `NewConn` | whether the **peer** envelopes every frame | Yes — a handshake cannot be revisited |
-| **span gate** | capability `&&` relay verdict | whether spans are created and trace context injected or extracted | **No — re-read on every read and write** |
+Three distinct booleans, easily confused:
 
-Capability clamps the **write** decision only. Whether the peer envelopes is a fact of the
-handshake, not something this side's gate has authority over, so a capability-off wrapper of a
-negotiated connection writes raw frames — safe, because the peer's probe falls back to the payload
-— while still **unwrapping on read**. Keying the read path on capability would hand raw
-`{"header":…,"data":…}` bytes to your application.
+| | What it means | When it is decided |
+|---|---|---|
+| effective tracing | should this call create spans and inject/extract? | per `WriteMessage`/`ReadMessage` |
+| negotiated (`otel-ws`) | does the peer parse every frame as an envelope? | once, during the handshake |
+| capability | could any OTel SDK path ever run on this connection? | once, at construction |
 
-| capability | negotiated | span gate | Wire out | Wire in | Spans | Trace propagation |
-|---|---|---|---|---|---|---|
-| false | false | not evaluated | raw | raw | none | none |
-| false | true | not evaluated | raw | **unwrapped** | none | none |
-| true | false | false | raw | raw | none | none |
-| true | false | true | raw | raw | local only | none — no carrier |
-| true | true | false | envelope, empty header | unwrapped | none | none |
-| true | true | true | envelope with `traceparent` | unwrapped | yes | yes |
+`Dial` offers, and `Upgrader.Upgrade` confirms, the `otel-ws` subprotocol when the connection's
+effective tracing value — master, module, relay included — is on **immediately before the
+handshake**. A handshake cannot be revisited, so this produces an asymmetry that must be planned
+around:
 
-Row 5 is the cost of keeping propagation possible: a connection that negotiated `otel-ws` keeps
-writing the envelope after a revocation, because its peer parses every frame as one. It carries
-no trace context and creates no span.
+- **Enabling reaches only connections opened afterwards.** A long-lived connection opened while this
+  module was off never gains the envelope, and `WithTracingEnabled(true)` cannot restore it: a peer
+  that did not negotiate `otel-ws` will not parse one. Such a connection can still emit **local**
+  send/receive spans once the flag is on — it simply cannot inject or extract. An operator who needs
+  an existing connection instrumented must cycle it.
+- **Disabling reaches every connection immediately for spans and inject/extract, but not for the
+  envelope.** A disabled connection that negotiated `otel-ws` keeps writing the envelope and keeps
+  running the read probe, because the peer is still parsing every frame as one. This is the one
+  module of the four that does not return to the zero-cost path when you turn it off; removing that
+  wire overhead requires cycling the connection.
 
-**Revoking `otel-gorilla-ws` stops telemetry, not overhead.** It is the one module of the four
-that does not return to the zero-cost path: the envelope is still marshalled on every write and
-probed on every read. Removing that wire cost requires a redeploy with
-`OTEL_GORILLA_WS_TRACING_ENABLED` off. Dropping the envelope on revocation instead would
-desynchronise the wire from a peer that is still enveloping, and silently dismember any
-application payload shaped like one.
-
-The envelope structure `{"header":…,"data":…}` is **reserved** on an `otel-ws` connection — see
-[otel-ws.md](otel-ws.md).
-
-Negotiation deliberately ignores the relay verdict. That costs nothing under a revoke-only relay:
-a connection whose environment switch was off at handshake time could never be switched on
-later, so there is no future state in which it would need the envelope. Upgrading without a
-provider therefore changes nothing on the wire.
+`NewConn` has no handshake of its own: it enables the envelope only when the raw connection's
+negotiated subprotocol proves `otel-ws`. Callers running their own handshake use the exported
+`SubprotocolOTelWS` token and can verify with `IsOTelNegotiated(conn)`. See `otel-ws.md` for the full
+negotiation matrix.
 
 ## What is not gated
 
-`otelmongo.ContextFromDocument` and `otelmongo.ContextFromRawDocument` carry **no flag gate at
-all**. They read an `_oteltrace` field out of a document you already hold and return the span
-context it encodes. They start no span, allocate no attributes, initialise nothing in the OTel
-SDK and write nothing anywhere — and you only call them when you want trace extraction, so there
-is nothing for a kill switch to protect you from.
+`ContextFromDocument` and `ContextFromRawDocument` (`otel-mongo`, v1 and v2) carry **no switch at
+all** — not the master, not the module variables, not the options, not the relay.
 
-`Cursor.DecodeAndTrace` and `ChangeStream.DecodeAndTrace` look similar but **are** gated: each
-starts and ends a `mongo.cursor.decode` span on every call, so they emit telemetry and belong
-under the switch.
+They start no span, build no attributes, initialise nothing in the OTel SDK, write nothing anywhere,
+and perform no OpenFeature evaluation. They read a field out of a value you already hold and return
+what it encodes. The switches exist to stop the library doing work on your behalf as a side effect of
+a business operation; these two do only the thing you invoked them for.
 
-**A revocation therefore does not stop trace-context extraction.** That is worth stating plainly,
-because "to stop a module now, set its relay flag to `false`" otherwise reads as though everything
-stops:
+**Turning a module off therefore does not stop trace-context extraction.** That is deliberate, and it
+is the supported way to keep trace linking while the library is silenced: use `Decode` followed by
+`ContextFromDocument` rather than `DecodeAndTrace`.
 
-| | after a revocation |
-|---|---|
-| `Collection.InsertOne` and siblings | no span, no `_oteltrace` written |
-| `Cursor.DecodeAndTrace` | no span, and **no extraction** — returns `ctx` unchanged |
-| `ContextFromDocument` / `ContextFromRawDocument` | **still extract**, exactly as before |
-
-The gate on `DecodeAndTrace` governs the span it emits, not the linking. If you want linking to
-survive the library being silenced, call `Decode` followed by `ContextFromDocument` — that is the
-supported way to do it, not a loophole.
+`Cursor.DecodeAndTrace` and `ChangeStream.DecodeAndTrace` **are** gated, because each starts and ends
+a real `mongo.cursor.decode` span.
 
 ## Connecting to a relay
 
-**Set an environment variable. There is no code to write.**
+### The zero-code path
 
-```sh
-OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT=http://relay:1031
-```
+Set environment variables. No import, no Go code, nothing else to remember.
 
-With that set and no OpenFeature provider of your own installed, the first instrumented operation
-builds a GO Feature Flag provider, binds it to the OpenFeature domain `otel-instrumentation-go`,
-and every module resolves through it from then on. Two further variables tune it:
+| Variable | Meaning |
+|---|---|
+| `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` | relay proxy URL. Unset ⇒ nothing is installed, no OpenFeature state is written, and no evaluation ever happens |
+| `OTEL_INSTRUMENTATION_GO_FLAGS_API_KEY` | optional; never logged |
+| `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` | optional; Go duration strings only (`30s`, `2m`), default `60s`. A malformed value warns, falls back and still installs |
+| `OTEL_SERVICE_NAME` | optional; supplies a `service.name` targeting attribute, on this path only |
 
-| Variable | Meaning | Default |
-|---|---|---|
-| `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` | Relay proxy URL. **Unset ⇒ nothing is installed** and no OpenFeature state is written | unset |
-| `OTEL_INSTRUMENTATION_GO_FLAGS_API_KEY` | API key, if your relay authenticates. Never logged | empty |
-| `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` | How often the provider polls the relay. **Go duration strings only** — `60` is rejected, `60s` is not | `60s` |
+The library installs a GO Feature Flag provider as a **named** provider on the domain
+`otel-instrumentation-go`, and only when your application has installed no provider of its own. It
+hardcodes `DataCollectorDisabled: true` and in-process evaluation, so this path cannot be
+misconfigured into the failures described below.
 
-A malformed poll interval warns and falls back to `60s`; it does **not** abort the install,
-because a typo in an optional tuning value must not silently delete your kill switch.
+Exactly one provider is installed per process, however many modules the binary links: the shared
+`otel-flags` module holds the install behind a single lock.
 
-Two settings are hardcoded and deliberately not exposed, because getting either wrong turns a
-relay outage into an application stall: `DataCollectorDisabled: true` and in-process evaluation.
-Both are explained below.
+The library never touches the **default** provider, the global evaluation context, hooks, or
+shutdown. Nothing it does can change how your own feature flags resolve.
 
 ### Installing your own provider instead
 
-The library stands down entirely when you have already installed a provider — the trigger requires
-that no provider is bound to `otel-instrumentation-go` and none is installed as the default. Do
-this when you need lifecycle control, a shared provider with your own business flags, or a blocking
-install:
-
 ```go
-import (
-    gofeatureflag "github.com/open-feature/go-sdk-contrib/providers/go-feature-flag/pkg"
-    "github.com/open-feature/go-sdk/openfeature"
-)
-
 provider, err := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{
-    Endpoint:              "http://relay:1031",
-    DataCollectorDisabled: true,   // required — see below
+    Endpoint: "http://relay:1031",
+
+    // Required. See "Disable the data collector" below.
+    DataCollectorDisabled: true,
 })
 if err != nil {
-    return err
-}
-if err := openfeature.SetProviderAndWait(provider); err != nil {
-    // Log and continue. Do not fail startup — see below.
-    logger.Error("feature flag provider unavailable; continuing without relay control", "error", err)
+    slog.Warn("feature flag provider unavailable; switches are environment-only", "error", err)
+} else if err := openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, provider); err != nil {
+    // Log and continue: the relay is a control plane, not a prerequisite.
+    slog.Warn("feature flag provider registration failed", "error", err)
 }
 ```
 
-Install it at startup, next to your `otelsetup.Init()` call, and **before constructing any
-wrapper**. Do not also set `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT`: it would be ignored, which is
-harmless but misleading.
+Bind the **named** domain `otel-instrumentation-go` (`otelflags.FlagDomain`), not the default
+provider. When you do, the zero-code install stands down and you own the provider's lifecycle.
 
-Whichever path you take, the library never touches the **default** provider, the global evaluation
-context, hooks, or `Shutdown`. Nothing it does can change how your own feature flags resolve.
+### Install your provider before constructing wrappers
+
+Whether a relay can exist is resolved **once, when a wrapper is constructed** — an endpoint is
+configured, or a provider is already bound. A wrapper built before either is true resolves from its
+environment and options for the rest of its life and **never consults the relay**, even if you
+install a provider a moment later.
+
+So: install the provider, *then* construct your clients and connections. Applications using the
+zero-code path are unaffected, since the endpoint variable exists before the process starts.
+
+This is also what keeps the pre-dynamic cost profile for everyone else: a process with no relay
+allocates no instrumented implementation it cannot use, registers no MongoDB command monitor, and
+never initialises any part of the OpenFeature SDK.
 
 ### Disable the data collector
 
-On the zero-code path this is hardcoded. It matters if you install your own provider, where
-`DataCollectorDisabled: true` is **required**, not tuning.
+`DataCollectorDisabled: true` is not optional on the path where you configure it yourself.
 
-The provider's data collector is on by default. It appends one event per evaluation to an
-in-memory buffer and flushes it to the relay on a two-minute ticker. Two details make that
-dangerous for this library's usage pattern, in which one evaluation happens per instrumented
-operation:
+The provider's data collector is on by default. It appends one event per evaluation to a bounded
+in-memory buffer and does not clear that buffer when a flush fails. Once the buffer fills, **every
+subsequent append flushes synchronously, on the evaluating goroutine, holding the buffer's mutex** —
+so a relay outage stalls every instrumented operation behind a failing 10-second request. Because
+flags are resolved per operation, the buffer fills in proportion to your traffic.
 
-- A **failed** flush does not clear the buffer.
-- Once the buffer reaches its cap (100,000 events by default), **every subsequent `AddEvent`
-  flushes synchronously, on the evaluating goroutine, while holding the buffer's mutex.**
-
-With the relay down, that synchronous flush fails after the HTTP client's timeout — 10 seconds by
-default — and the buffer is never drained, so it happens again on the next evaluation, with every
-other evaluating goroutine queued behind the same mutex. A relay outage would then stall the
-application's own Mongo queries and NATS publishes, which is exactly the thing the rest of this
-design is built to prevent.
-
-Nothing is lost by disabling it. The collector reports flag-evaluation analytics to the relay's
-dashboards; with process-wide flags evaluated once per operation, those analytics are a copy of
-your traffic volume.
+Nothing is lost by disabling it: it feeds the relay's evaluation-analytics dashboards, and for
+process-wide flags evaluated per operation those analytics are a copy of your traffic volume.
 
 ### The relay is not a startup dependency
 
-If the relay is unreachable when the process starts, the provider's first fetch fails. The
-zero-code path logs and carries on; if you install your own provider, **log and continue** rather
-than returning the error. Aborting startup makes the relay a hard dependency of your service,
-which inverts the point of a brake.
+If the relay is unreachable when the provider is installed, log it and carry on. The process comes up
+at the state its environment and options declare, with no relay control until the provider fetches
+successfully.
 
-Continuing costs exactly one thing, and it is unavoidable: a process that starts while the relay
-is down cannot know about an active revocation, so it comes up at the state its environment
-declares. There is no way to read a revocation you cannot reach.
+Once a fetch has succeeded, an outage changes nothing: the in-process evaluator serves its last
+fetched configuration, and no evaluation performs network I/O.
 
-Once the provider is installed and has fetched successfully, a later relay outage changes nothing:
-the in-process evaluator keeps serving its last successfully fetched configuration, so an active
-revocation survives the outage. Only evaluation errors — which cannot happen for an in-process
-provider holding a configuration — fall back to "allow".
+### The startup window
 
-### The startup window, and how to close it
+The zero-code install is non-blocking, so between it and the provider's first successful fetch every
+switch resolves to its **local** value — environment, option, default.
 
-An unresolvable flag means "allow", so a provider that has not yet fetched its configuration
-**cannot revoke anything**. The zero-code install is non-blocking on purpose — a brake must not
-become a latency source, and blocking would put a relay round trip in front of your first Mongo
-query — so between the install and the provider's first fetch every flag reads as enabled.
-
-The case that makes this matter is ordinary: an operator revokes a module to stop an incident, and
-the process restarts for an unrelated reason. It comes back instrumented until the provider
-catches up. For `otel-mongo` that window is not only spans: any `_oteltrace` written during it is
-permanent, and cleaning up is a `$unset` migration.
-
-**To close it, install your own provider with `openfeature.SetProviderAndWait` before constructing
-any wrapper.** That both blocks on readiness and makes the auto-install stand down. Whether the
-window is acceptable is your decision, not the library's — which is why it is documented here
-rather than enforced.
+This is fail-safe. The window can delay a relay-driven *enable*; it can never introduce one, and for
+`otel-mongo` it can never write an `_oteltrace` field your deployment did not configure. If you want
+the relay's answer before the first operation, install your own provider with `SetProviderAndWait`,
+which also makes the zero-code install stand down.
 
 ### In-process evaluation only
 
-The provider polls the relay in the background and every flag lookup is local. On the zero-code
-path `EvaluationType` is hardcoded to `INPROCESS`; if you install your own provider, use that
-default. **Remote evaluation is not supported**: it turns each lookup into an HTTP request, which
-would put network I/O on the path of a Mongo query or a NATS publish.
+The provider's in-process mode — background polling, local lookups — is the only supported one. The
+zero-code path hardcodes it. Remote evaluation turns every evaluation into an HTTP request, which
+would put two or three synchronous network round trips on the path of every Mongo query and NATS
+publish.
 
 ### Targeting one service instead of the fleet
 
-A relay flag applies to every process that resolves it, so `otel-mongo-tracing: false` stops
-tracing in your whole fleet unless the rule can tell services apart.
-
-Set **`OTEL_SERVICE_NAME`** — the OpenTelemetry-specified variable your exporter already reads —
-and the zero-code path supplies it as a `service.name` attribute on every evaluation:
+Set `OTEL_SERVICE_NAME` and write the relay rule against `service.name`:
 
 ```yaml
 otel-mongo-tracing:
   variations: { enabled: true, disabled: false }
   targeting:
     - query: service.name eq "checkout-api"
-      variation: disabled     # only this service stops
-  defaultRule:
-    variation: enabled
+      variation: enabled
+  defaultRule: { variation: disabled }
 ```
 
-Two limits. The attribute is supplied **only** on the zero-code path: if you install your own
-provider you own your evaluation context and set it yourself, with
-`openfeature.SetEvaluationContext`. And it is process-scoped, so targeting can key on
-process-level attributes — service, environment, host — but **not** on per-request attributes.
+Without it, a relay flag applies to **every process the relay serves** — which matters more now that
+a flag can enable. The attribute is supplied only on the zero-code path; if you install your own
+provider, set a global evaluation context yourself.
 
-## Revocation latency
+Per-request targeting is not supported. The resolver holds no request state.
 
-A revocation is **not instantaneous**, and the delay is not in this library.
+## How long a change takes to take effect
 
-The modules resolve a verdict on every instrumented operation and cache nothing, so they add no
-delay of their own. What you wait for is the **provider's poll interval**: the relay is polled in
-the background, and a flag change is invisible until the next poll lands.
+**The provider's poll interval — 60 seconds by default.** The library adds nothing of its own: it
+re-resolves on every operation, so the moment the provider has the new configuration, the next
+operation uses it.
 
 | | Delay |
 |---|---|
@@ -410,62 +359,82 @@ the background, and a flag change is invisible until the next poll lands.
 | Provider poll interval (zero-code path) | **up to 60 s**, tunable with `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` |
 | Provider poll interval (your own provider) | whatever you set; the GO Feature Flag default is **120 s** |
 
-Plan an incident response around the poll interval, not around "immediately". If 60 s is too slow
-for your risk profile, lower it — the poll is a conditional `GET` that returns 304 when nothing
-changed, so tightening it is cheap.
+Plan an incident response around the poll interval, not around "immediately" — in **both**
+directions, enabling as well as disabling. If 60 s is too slow for your risk profile, lower it: the
+poll is a conditional `GET` that returns 304 when nothing changed, so tightening it is cheap.
 
 ## What resolution costs
 
-The relay verdict is resolved on **every instrumented operation**; nothing is cached. Measured
-against an in-memory provider, one evaluation is roughly **2 µs and 7 allocations**. That is not
-the flag lookup — it is the OpenFeature SDK's evaluation pipeline around it (hook chains,
-evaluation-context merging, the provider registry lock), and it does not get cheaper because the
-provider keeps its configuration in memory.
+Roughly **2 µs, 336 B and 7 allocations per evaluation**, and an instrumented operation makes more
+than one:
 
-Two things bound where that cost lands:
+| Module | Evaluations per instrumented operation |
+|---|---|
+| `otel-nats`, `otel-gorilla-ws` | 2 — master, module |
+| `otel-mongo` read | 2 — master, tracing |
+| `otel-mongo` write | 3 — master, tracing, propagation |
 
-- It is paid only by wrappers that are **actively instrumenting**. A module switched off in the
-  environment allocates only its passthrough implementation and never evaluates anything.
-- Against a Mongo round trip it is noise. Against a NATS publish, which already pays 1–3 µs to
-  create a span, it roughly doubles the instrumentation overhead.
+That is the OpenFeature SDK's evaluation pipeline — hook chains, evaluation-context merging, the
+provider registry lock — not the flag lookup, so keeping the configuration in memory does not make it
+cheaper. Against a Mongo round trip it is noise; against a NATS publish, which already pays 1–3 µs to
+create a span, it is not.
 
-Caching sits behind an unchanged internal signature, so it can be added without affecting any
-API if a benchmark on a real workload shows it matters. It is deliberately deferred rather than
-ruled out; the reasoning is recorded in the design document.
+**A process with no relay configured pays none of it**, and allocates no instrumented implementation
+it cannot reach.
+
+Nothing is cached, deliberately: a cache would make a flag change take effect later than the poll
+interval already implies. It sits behind an unchanged internal signature, so it can be added without
+affecting any API if a benchmark on a real workload shows it matters. The reasoning is recorded in
+the design document.
 
 ## Per-connection options
 
-`WithTracingEnabled(v bool)` supplies `gate1` for one connection or client, for callers that
-cannot set a process environment variable — tests, or several independently configured clients in
-one binary. It is accepted by `otelnats.ConnectWithOptions` and its TLS and credentials variants,
-`otelmongo.ConnectWithOptions` and `NewClient` (v1 and v2), and
-`otelgorillaws.NewConn` / `Dial` / `Upgrader.Upgrade`.
+`WithTracingEnabled(v bool)` supplies the **module** tier for one connection or client, for callers
+that cannot set a process environment variable — tests, or several independently configured clients
+in one binary. It is accepted by `otelnats.ConnectWithOptions` and its TLS and credentials variants,
+`otelmongo.ConnectWithOptions` and `NewClient` (v1 and v2), and `otelgorillaws.NewConn` / `Dial` /
+`Upgrader.Upgrade`. `otel-mongo` also accepts `WithTracePropagationEnabled(v bool)`.
 
-It supplies one tier and nothing more. A connection carrying it still reads its module
-environment variable at construction and the relay verdict on every operation, and still stops when
-the relay revokes. There is no way to opt a connection out of a revocation.
+- It **cannot** supply the master switch, which is process-scoped and accepts no option. A connection
+  carrying `WithTracingEnabled(true)` still stops when the master is vetoed.
+- It **loses** to its paired environment variable, and to the relay.
+- It does **not** make a connection static. A connection carrying one still resolves the master
+  switch and the relay on every operation.
+- Supplying it alongside its environment variable is legal; the variable wins. (This replaced a rule
+  that made it a construction error.)
+- An unreadable environment value is still an error even when an option was supplied — the option
+  does not excuse a variable that outranks it.
 
-It is an alternative **spelling** of `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`, not an override of
-it: supplying both is a configuration error, reported by the constructor. `otel-mongo` applies the
-same rule to `WithTracePropagationEnabled` and `OTEL_MONGO_PROPAGATION_ENABLED`. See
-*Resolving `gate1`*.
+With the variable unset, the option is the deciding rung, so a tracing and a non-tracing connection
+can coexist in one process.
 
 ## Operational summary
 
-- **To make a module revocable:** deploy with `gate1` and the module switch on, set
-  `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT`, and create its flag on the relay. No application code.
-- **To stop a module now:** set its relay flag to `false`. It takes effect on the next poll —
-  **up to 60 s** by default, not instantly. See *Revocation latency*.
-- **To stop one service rather than the fleet:** set `OTEL_SERVICE_NAME` and target
-  `service.name` in the relay rule.
-- **To stop everything now:** revoke all four relay flags. There is no single key.
-- **To stop a module permanently:** change its environment variable and redeploy.
-- **To investigate an incident by turning tracing on:** not possible from the relay. Change the
-  environment and redeploy.
+**To turn a module on right now:** set its relay flag to `true`. It takes effect within the poll
+interval. For `otel-gorilla-ws` this reaches only connections opened afterwards.
 
-Two things a revocation does **not** do, both easy to assume it does:
+**To turn a module off right now:** set its relay flag to `false`. Two limits to know:
 
-- It does not stop `otelmongo.ContextFromDocument` / `ContextFromRawDocument`. Those are ungated —
+- It does not stop `ContextFromDocument` / `ContextFromRawDocument` — those are ungated by design;
   see *What is not gated*.
-- It does not remove `otel-gorilla-ws`'s per-message envelope cost on an already-negotiated
-  connection. That needs a redeploy — see *otel-gorilla-ws: three distinct booleans*.
+- For `otel-gorilla-ws` it stops spans and inject/extract but **not** the JSON envelope, so the wire
+  overhead remains until the connection is cycled.
+
+**To stop everything in a fleet:** set `otel-instrumentation-go-tracing` to `false`. Nothing below it
+can escape that, including connections whose Go code passed an option.
+
+**To stop everything in one deployment, without a relay:** set
+`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=false`.
+
+**To stop one module in one deployment, without a relay:** set `OTEL_<MODULE>_TRACING_ENABLED=false`.
+Application code cannot override it.
+
+**To stop one service rather than the fleet:** set `OTEL_SERVICE_NAME` and target `service.name` in
+the relay rule.
+
+**To make a module relay-controllable:** set `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` and create its
+flag on the relay. No application code. Deploy at whatever resting state you want — the relay can
+move it in either direction from there.
+
+**If you have no relay at all:** the environment and options decide, exactly as before dynamic flags
+existed, at exactly the previous cost.

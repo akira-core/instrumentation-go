@@ -44,30 +44,30 @@ otel-mongo/
 ### Tracing 功能旗標
 
 ```
-tracing     = gate1 && OTEL_MONGO_TRACING_ENABLED && relay otel-mongo-tracing
-propagation = tracing && OTEL_MONGO_PROPAGATION_ENABLED && relay otel-mongo-propagation
+tracing     = master && mongoTracing
+propagation = tracing && mongoPropagation
 ```
 
-`gate1` 是 `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` **或** `WithTracingEnabled(v)` —— 同一個開關的兩種
-拼法,**兩個都給是設定錯誤**(`ErrTracingConfigConflict`),即使兩者一致也一樣。
-`OTEL_MONGO_PROPAGATION_ENABLED` 與 `WithTracePropagationEnabled` 適用同一條規則,對應
-`ErrTracePropagationConfigConflict`。
+每個開關沿著一道四階梯解析,最先表態的那一層贏:
 
-環境層在**建構時讀一次**,決定 instrumented 實作要不要被建立。relay verdict 在**每次操作**解析,而且
-**只能撤銷** —— relay 上沒有任何東西能打開部署沒打開的東西。開關只有設成 `1`、`true`、`yes`、`on` 才算開。
+```
+relay  >  env  >  option(With*Enabled)  >  寫死的預設值
+```
 
-`WithTracingEnabled` **不會**把 client 釘死:它只供給 `gate1`,帶著它的 client 在 relay 撤銷時仍然會停。
+relay **兩個方向都有權威** —— 能關掉執行中的模組,也能打開部署原本沒開的模組。安全性來自**預設值**:
+總開關 `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` 預設 `true` 且是**否決權**(只有 `false` 有效果,
+且不接受任何 option),而每個 per-module 開關預設**關閉**。
 
-兩個模組專屬要點:
+**選項排在它的環境變數之下**,與 `0.7.0` 相反。即使 Go 程式碼傳了 `WithTracingEnabled(true)`,
+``OTEL_MONGO_TRACING_ENABLED`=false` 依然能關掉這個模組,所以維運者握有一個程式碼無法覆寫的單模組設定。變數未設定時
+由選項決定,所以同一個 process 裡兩條連線仍然可以不同。
 
-- **`_oteltrace` 會改變持久化內容。** 每份文件約 90 bytes,由 `InsertOne`、`InsertMany`、`UpdateOne`、
-  `UpdateMany`、`UpdateByID`、`ReplaceOne`、`BulkWrite` 寫入。**沒有任何東西會移除它** —— 關掉傳播只會停止
-  新的寫入,不會還原舊的;清理要靠 `$unset` migration。使用 `$jsonSchema` + `additionalProperties: false`
-  的 collection 在它開著時會拒絕每一次寫入。對已經有這個欄位的文件重新注入會**取代**而不是重複。
-- **`ContextFromDocument` / `ContextFromRawDocument` 完全沒有閘門。** 它們不開 span、不寫入任何東西、不初始化
-  OTel SDK 的任何部分 —— 只從你手上已有的值讀一個欄位。**撤銷不會停掉它們**,這使它們成為「library 被靜音後
-  仍要維持 trace 連結」的受支援做法。`Cursor.DecodeAndTrace` / `ChangeStream.DecodeAndTrace` **有**閘門,
-  因為它們會送出 span。
+開關只由 `1`/`true`/`yes`/`on` 或 `0`/`false`/`no`/`off` 決定,未設定代表「沒有意見」。
+**其他任何值——包含空字串——都會讓建構失敗**,錯誤包裹 `otelflags.ErrInvalidFlagValue`。
+
+`WithTracingEnabled` **不會**把任何東西釘死:帶著它的 wrapper 每次操作仍然解析總開關與 relay。
+
+互斥規則與兩個 `Err*ConfigConflict` sentinel **已移除**:選項與變數同時出現是一般設定,變數贏。
 
 > 完整參考 —— 全部解析表格、零程式碼連上 relay、撤銷延遲、針對單一服務的 targeting、維運速查:
 > **[feature-flags.zh-TW.md](../feature-flags.zh-TW.md)** · English:**[feature-flags.md](../feature-flags.md)**
@@ -117,7 +117,7 @@ coll := db.Collection("mycoll")
 
 ### 3. 從文件還原 trace（例如 change stream）
 
-`ContextFromDocument` / `ContextFromRawDocument` **沒有任何 feature-flag 閘門**。它們不開 span、不寫入任何東西,所以沒有什麼需要 kill switch 保護 —— relay 撤銷也不會停掉它們。只有在文件沒有 `_oteltrace`、或 `traceparent` 缺漏/無效時才回傳零值 / `ok == false`。
+`ContextFromDocument` / `ContextFromRawDocument` **完全沒有任何 feature-flag 閘門**。它們不開 span、不寫入任何東西、也不做任何 OpenFeature 評估,所以沒有什麼需要開關保護 —— 關掉這個模組也不會停掉它們。這是刻意的:`Decode` 加 `ContextFromDocument` 是函式庫被靜音後保留 trace 連結的官方做法。只有在文件沒有 `_oteltrace`、或 `traceparent` 缺漏/無效時才回傳零值 / `ok == false`。
 
 ```go
 fullDoc := changeStreamEvent.FullDocument
@@ -191,7 +191,7 @@ Cursor.DecodeAndTrace (INTERNAL；文件帶 `_oteltrace` 時連結回原始 span
 
 ### `NewCollection` 與 `Connect`
 
-`NewCollection` 不接受任何 option,所以它自己解析環境層:`gate1` 與 `OTEL_MONGO_TRACING_ENABLED` 決定 instrumented 實作要不要被建立,`OTEL_MONGO_PROPAGATION_ENABLED` 在那之下管 `_oteltrace`。relay verdict 仍然每次操作生效。並沒有針對單一 collection 的 propagation functional option;若要用程式碼而非環境變數供給那一層,請使用 **`ConnectWithOptions`** 搭配 **`WithTracePropagationEnabled`**(注意:它無法跨越已停用的 tracing 層,也無法跨越 relay 撤銷)。
+`NewCollection` 不接受任何 option,所以它單從環境變數解析。instrumented 實作要不要被建立,取決於 relay 是否可能打開這個模組,或環境是否已經打開了;每次操作的實際答案是總開關 AND `OTEL_MONGO_TRACING_ENABLED`,各自走完整階梯,而 `OTEL_MONGO_PROPAGATION_ENABLED` 是它下面管 `_oteltrace` 的另一個開關。並沒有針對單一 collection 的 propagation functional option;若要用程式碼而非環境變數供給那一層,請使用 **`ConnectWithOptions`** 搭配 **`WithTracePropagationEnabled`** —— 注意它輸給 `OTEL_MONGO_PROPAGATION_ENABLED` 與 relay,也無法跨越已停用的 tracing 開關。
 
 ### Cursor 上的 DecodeAndTrace 與 Decode
 

@@ -28,25 +28,51 @@ go get github.com/akira-core/instrumentation-go/otel-gorilla-ws
 ### Tracing feature flags
 
 ```
-capability = gate1 && OTEL_GORILLA_WS_TRACING_ENABLED        (fixed at construction)
-span gate  = capability && relay otel-gorilla-ws-tracing      (re-read every call)
+effective tracing = master && wsTracing        (each down the full ladder)
+negotiation       = effective tracing          (resolved ONCE, just before the handshake)
+span gate         = effective tracing          (re-read every read and write)
 ```
 
-`gate1` is `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` **or** `WithTracingEnabled(v)` — two spellings
-of one switch, and supplying **both is a configuration error** (`ErrTracingConfigConflict`). A
-switch is on only when set to `1`, `true`, `yes` or `on`.
+Each switch resolves down a four-step ladder, first source with an opinion winning:
 
-**Capability** decides whether `otel-ws` is offered (`Dial`) or confirmed (`Upgrader.Upgrade`), and
-is resolved *before* the handshake because a handshake cannot be revisited. It deliberately excludes
-the relay, which costs nothing under a revoke-only relay. **The span gate** is the relay verdict on
-top, re-read on every read and write, so a live connection follows a revocation.
+```
+relay  >  env  >  option (WithTracingEnabled)  >  hardcoded default
+```
+
+The relay is authoritative in **both** directions. Safety comes from the defaults: the master switch
+`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` defaults to `true` and is a **veto** (only `false` has an
+effect; it accepts no option), while `OTEL_GORILLA_WS_TRACING_ENABLED` defaults to **off**.
+
+**The option sits below its environment variable**, reversing `0.7.0`.
+`OTEL_GORILLA_WS_TRACING_ENABLED=false` disables this module even where the Go code passed
+`WithTracingEnabled(true)`. With the variable unset the option decides.
+
+A switch is decided only by `1`/`true`/`yes`/`on` or `0`/`false`/`no`/`off`. Unset means "no opinion".
+**Anything else — including the empty string — fails construction.** The mutual-exclusion rule and
+`ErrTracingConfigConflict` are **gone**.
+
+**Negotiation and the span gate are the same expression, evaluated at different times.** That is the
+whole subtlety of this module: a handshake cannot be revisited, so the wire decision is made once and
+the span decision is made per call. The asymmetry it produces must be planned around:
+
+- **Enabling reaches only connections opened afterwards.** A connection opened while this module was
+  off never gains the envelope, and `WithTracingEnabled(true)` cannot restore it — a peer that did
+  not negotiate `otel-ws` will not parse one. Such a connection can still emit **local** spans; it
+  just cannot inject or extract. Cycle the connection if you need it instrumented.
+- **Disabling reaches every connection immediately for spans and inject/extract, but not for the
+  envelope**, which the peer is still parsing. This module alone does not return to the zero-cost
+  path when you turn it off; removing that wire overhead requires cycling the connection.
+
+With **no relay configured**, negotiation resolves to exactly what `0.7.0` computed, so such
+deployments see the previous release's wire byte for byte.
 
 Three things to know:
 
-- Capability clamps the **write** path only. Whether the peer envelopes is a fact of the handshake,
-  so a capability-off wrapper of a negotiated connection writes raw frames but **still unwraps on
-  read** — otherwise your application would receive raw `{"header":…,"data":…}` bytes.
-- Revoking stops spans and injection but **not** the envelope on an already-negotiated connection:
+- Capability (`relayPossible || (master && module)` locally, fixed at construction) clamps the
+  **write** path only. Whether the peer envelopes is a fact of the handshake, so a capability-off
+  wrapper of a negotiated connection writes raw frames but **still unwraps on read** — otherwise your
+  application would receive raw `{"header":…,"data":…}` bytes.
+- Disabling stops spans and injection but **not** the envelope on an already-negotiated connection:
   the peer parses every frame as one. This module alone does not return to the zero-cost path on
   revocation; removing that wire overhead needs a redeploy.
 - Running your own handshake? Offer or echo `SubprotocolOTelWS` and check `IsOTelNegotiated(raw)`

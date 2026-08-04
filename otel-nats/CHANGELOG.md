@@ -8,59 +8,28 @@ All notable changes to the `otel-nats` module (`otelnats` + `oteljetstream`) are
 
 ### Changed
 
-- **BREAKING** The relay proxy is now a **revoke-only kill switch**. Its evaluation default is a literal `true` and the module's environment variable is ANDed separately rather than passed as that default, so a relay flag can turn this module **off** but can never turn it **on**. This replaces the model shipped in the previous release, in which the relay decided in both directions. Deployments that used the relay to *enable* instrumentation must move that decision into their environment configuration.
-- **BREAKING** `flags.EnvEnabled` now uses a truthy **allow-list**: only `1`, `true`, `yes`, `on` (trimmed, case-insensitive) enable a switch. Every other set value — including the **empty string**, `enabled`, `2`, `y` and `t` — now reads as disabled, where previously anything outside a four-item falsy list enabled it. `export OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=` no longer opens the gate. The direction is fail-safe (less instrumentation, never more), and a set-but-unrecognised value now emits one `slog.Warn` naming the variable, the observed value and the accepted set, so the change announces itself rather than presenting as "spans disappeared after upgrading".
-- **BREAKING** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` and `WithTracingEnabled(v bool)` are now two spellings of **one** switch and are **mutually exclusive**. Supplying both — even with the same value — returns an error from the constructor, matchable with `errors.Is` against the module's exported sentinel. The check is on presence, not value.
-- **BREAKING** `WithTracingEnabled` no longer makes a connection **static**. It supplies the first tier and nothing more: a connection carrying it still reads the module environment variable at construction and the relay verdict on **every operation**, and still stops when the relay revokes. There is no way to opt a connection out of a revocation.
-- **BREAKING** Implementation selection now keys on `gate1 && OTEL_<MODULE>_TRACING_ENABLED` rather than on the global switch alone. A process with the global switch on and this module's switch off returns to the **zero-cost passthrough** — it no longer allocates the instrumented wrapper — which reverses the regression the previous release introduced. This is only safe because the relay can no longer enable: with the module switch off, no relay value could ever reach the instrumented path.
-- Relay verdicts are **no longer cached**. The one-second TTL, its snapshot and its injectable clock are gone, so a revocation takes effect on the next operation rather than up to a TTL later. The cost is roughly 2 µs and 7 allocations per instrumented operation, paid only by wrappers that are actively instrumenting. End-to-end revocation latency is dominated by the provider's poll interval — 60 s by default — not by this library.
+- **BREAKING** Feature switches now resolve down a **four-step ladder** — `relay > env > option > default`, first source with an opinion winning — and the relay proxy is **authoritative in both directions**: it can turn this module off, and it can turn it on when the deployment left it off. This replaces the revoke-only model that was developed but never released. Safety now comes from the defaults rather than from a restriction on the relay: every per-module switch defaults to **off**, and the process-wide master switch defaults to **on** only because it is a veto rather than an enabler.
+- **BREAKING** `OTEL_NATS_TRACING_ENABLED` now takes effect **without** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` also being set. The master switch defaults to enabled, so the module variable alone decides. Previously it was inert unless the global one was set too — a common "I set the flag and nothing happened" report. Deployments that set the module variable expecting it to be ignored will now see this module trace.
+- **BREAKING** `WithTracingEnabled` now sits **below** its environment variable, reversing `0.7.0`, where the option won. `OTEL_NATS_TRACING_ENABLED` overrides the option, so a deployment can disable this module even where the application's Go code asked for tracing. With the variable unset the option still decides, so two connections in one process can still differ. Three reasons, in order of weight: the operator gets a per-module setting code cannot override; the rule is uniform across the repository, and the case that forces it is `otel-mongo`'s document propagation, where an option must not be able to bypass an operator's `OTEL_MONGO_PROPAGATION_ENABLED=false` and write permanent fields into their documents; and the ladder stays monotonic in deployment order.
+- **BREAKING** The option no longer supplies the process-wide master switch. It supplies this module's tier for one connection or client. A per-connection value cannot coherently spell a process-wide switch, and keeping the master option-free is what guarantees a single environment variable still stops everything.
+- **BREAKING** Environment values are now a strict **tri-state**, and an unreadable one **fails construction**. Unset means "no opinion" and falls through to the option, then the default. `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off` (trimmed, case-insensitive) decide. **Everything else — including the empty string, `enabled`, `2`, `y` and `t` — returns an error** wrapping `otelflags.ErrInvalidFlagValue`, naming the variable and the observed value. Under a ladder there is no safe direction to guess in: the master tier defaults to `true` and every other tier to `false`, so a value silently read as `false` would stop a whole fleet on one tier and change nothing on the others. **Before upgrading, grep your deployment configuration for `OTEL_*_ENABLED` and confirm every value is in one of those two lists** — an unexpanded `${SOMETHING}` in a Kubernetes manifest reaches exactly the empty-string case, and this is the one change that can stop a process from starting.
+- **BREAKING** A constructor that reads several switches reports **all** the bad values in one joined error, so one run tells you everything to fix.
+- **BREAKING** This module now requires `github.com/akira-core/instrumentation-go/otel-flags`, which replaces the vendored `internal/flags` package. That module carries the OpenFeature SDK and the GO Feature Flag provider, so their dependency trees enter your build transitively — roughly ten modules including a full ANTLR runtime, a JSONLogic evaluator and a rules engine. The cost lands on `go.sum`, vulnerability-scanning surface and licence review, not on runtime; the linker drops unreached code. It exists to guarantee **exactly one** OpenFeature provider per binary, which four independent vendored copies could not.
+- **BREAKING** The master switch gains a relay key, `otel-instrumentation-go-tracing`. Setting it to `true` has **no effect** — that is already the default. Setting it to `false` stops every module in every process the relay serves, including connections whose Go code passed an option. Do not create it expecting an enable; it will read as a broken flag.
+- The relay is resolved on **every operation** and nothing is cached, so a flag change takes effect on the next one. An instrumented operation now makes two evaluations at roughly 2 µs and 7 allocations each. A process with **no relay configured** pays none of it and allocates no instrumented implementation it cannot reach — the pre-dynamic zero-cost path is preserved exactly.
+- **New ordering requirement.** Whether a relay can exist is resolved once, when a wrapper is constructed. An application that installs its own OpenFeature provider must do so **before** constructing any wrapper; one built earlier resolves statically for its whole life and never consults the relay. Applications using the zero-code path (`OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT`) are unaffected.
+- The non-blocking startup window is now **fail-safe**: until the provider's first fetch every switch resolves to its local value, so the window can delay a relay-driven enable but can never introduce one.
 
-### Added
+### Removed
 
-- **Relay control with no application code.** Setting `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` makes the module build a GO Feature Flag provider on first use and bind it to the OpenFeature domain `otel-instrumentation-go`, with `DataCollectorDisabled: true` and in-process evaluation hardcoded. `OTEL_INSTRUMENTATION_GO_FLAGS_API_KEY` and `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` (Go duration strings, default `60s`) tune it; a malformed interval warns and falls back rather than removing the kill switch. An application that installs its own provider first keeps it and is unaffected — the auto-install stands down.
-  - **This adds the GO Feature Flag provider's dependency tree to this module's `go.mod`** (roughly ten modules, including a full ANTLR runtime), for every consumer, whether or not they set the endpoint. It is the price of relay control without an application code change: Go cannot run code from `go.mod` alone.
-  - The provider's polling goroutine has **no shutdown**. It lives for the process lifetime. Applications needing lifecycle control install their own provider.
-- Setting `OTEL_SERVICE_NAME` supplies a `service.name` attribute on every evaluation, so a relay rule can revoke one service instead of the whole fleet. Supplied on the auto-install path only; an application that installs its own provider owns its evaluation context.
+- **BREAKING** `ErrTracingConfigConflict` and the mutual-exclusion rule they reported. Supplying an option alongside its paired environment variable is now ordinary configuration with a defined winner (the variable). Roughly 89 in-repo call sites that combined the two become legal again.
+- **BREAKING (internal)** The vendored `internal/flags` package, including `Gate`, `NewGate`, `ResetForTest`, `EnvEnabled` and `EnvSet`. `otelflags.Lookup` replaces the last two; the rest have no successor, because nothing is cached and therefore nothing needs re-arming.
 
-### Changed
+### Notes
 
-- **BREAKING** `Conn.static` is deleted. No connection is static any more, including one carrying `WithTracingEnabled`; every JetStream wrapper derived from a `Conn` follows the relay per message.
-
-<details>
-<summary>Superseded within this same unreleased version</summary>
-
-The entries below describe the first implementation of dynamic flags, in which the
-relay decided in both directions and `WithTracingEnabled` pinned a connection static.
-That model was replaced during design review before release; where the two disagree,
-the entries above win. Kept as the record of what changed and why it changed again.
-
-### Changed
-
-- **BREAKING** The module's tracing environment variable is demoted from *final say* to the **default value** used when the relay proxy has no opinion. A relay flag can now turn this module on when the environment variable leaves it off, and off when the environment variable turns it on. Operators who relied on setting it to `false` as a hard guarantee must use `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=false` (whole process) or `WithTracingEnabled(false)` (one connection) instead — neither can be crossed by the relay.
-- **BREAKING** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` alone now decides whether the instrumented or the passthrough implementation is constructed. A process running with the global switch on and this module's switch off previously took the zero-cost passthrough path; it now allocates the instrumented wrapper and performs one atomic load plus one monotonic clock read per operation. It still emits no spans.
-
-### Added
-
-- Tracing is resolved at runtime through [OpenFeature](https://openfeature.dev) instead of once at process start, so an operator can turn it on or off through a GO Feature Flag relay proxy without restarting the application. Values are cached in a per-module snapshot with a fixed one-second TTL; hot paths never enter the OpenFeature evaluation pipeline.
-- Applications opt in by installing a provider at startup — the library never calls `openfeature.SetProvider`, exactly as it never initializes a `TracerProvider`:
-
-  ```go
-  provider, _ := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{Endpoint: "http://relay:1031"})
-  _ = openfeature.SetProviderAndWait(provider)
-  ```
-
-  With no provider installed, span on/off still follows the environment variables as before.
-- `github.com/open-feature/go-sdk` is a new dependency. The GO Feature Flag provider is an application-side dependency, not a library one.
-
-### Flag keys
-
-| OpenFeature key | Fallback environment variable |
-|---|---|
-| `otel-nats-tracing` | `OTEL_NATS_TRACING_ENABLED` |
-
-`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` has **no** relay counterpart: it is an out-of-band kill switch that works when the relay is unreachable or misconfigured.
-
-</details>
+- **Flag changes are not immediate.** End-to-end latency is the provider's poll interval — 60 s by default — in **both** directions. This module adds none of its own.
+- The library still never touches the **default** OpenFeature provider, the global evaluation context, hooks or shutdown. The one piece of state it may write is a **named** provider on `otel-instrumentation-go`, and only when the environment asks for one and the application installed none. `DataCollectorDisabled: true` and in-process evaluation are hardcoded on that path.
+- Full reference: [`feature-flags.md`](../feature-flags.md) ([繁體中文](../feature-flags.zh-TW.md)).
 
 ## [0.7.0] - 2026-07-15
 

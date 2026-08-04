@@ -3,6 +3,7 @@ module github.com/akira-core/instrumentation-go/otel-nats/tests/integration
 go 1.25.0
 
 require (
+	github.com/akira-core/instrumentation-go/otel-flags v0.1.0
 	github.com/akira-core/instrumentation-go/otel-nats v0.0.0
 	github.com/akira-core/instrumentation-go/otel-testkit v0.0.0
 	github.com/google/uuid v1.6.0
@@ -93,3 +94,5 @@ replace github.com/akira-core/instrumentation-go/otel-nats => ../..
 replace github.com/akira-core/instrumentation-go/otel-testkit => ../../../otel-testkit
 
 replace github.com/akira-core/instrumentation-go/otel-sampler => ../../../otel-sampler
+
+replace github.com/akira-core/instrumentation-go/otel-flags => ../../../otel-flags

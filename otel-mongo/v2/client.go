@@ -123,21 +123,21 @@ func Connect(opts ...*options.ClientOptions) (*Client, error) {
 func ConnectWithOptions(traceOpts []ClientOption, opts ...*options.ClientOptions) (*Client, error) {
 	cfg := newClientConfig(traceOpts)
 	// Which implementations to build is necessarily a static decision, and it
-	// keys on the WHOLE static part: gate1 (however spelled) AND the module
-	// switch. Every conflict is collected before any is returned, so a caller
-	// violating both rules learns both at once. This runs before mongo.Connect,
+	// keys on whether a relay could ever have an opinion here. Every unreadable
+	// value is collected before any is returned, so a deployment carrying more
+	// than one learns about all of them at once. This runs before mongo.Connect,
 	// so a rejected configuration opens no connection.
 	//
-	// Including the module switch is safe only because the relay can never
-	// enable: with it off, no relay value could raise the answer, so the
-	// instrumented path could never be reached and there is no reason to
-	// allocate it — nor to register the command monitor that runs on every
-	// MongoDB command.
+	// It cannot key on the environment alone any more: the relay can ENABLE, so
+	// a client whose environment says off must still be able to start tracing
+	// later, and construction happens once. When no relay can exist the static
+	// answer is final and a switched-off client allocates nothing instrumented —
+	// nor registers the command monitor that runs on every MongoDB command.
 	gate, err := resolveGates(cfg.TracingEnabled, cfg.PropagationEnabled)
 	if err != nil {
 		return nil, err
 	}
-	if !gate.tracedBuilt {
+	if !gate.tracedPossible() {
 		merged := options.MergeClientOptions(opts...)
 		mc, err := mongo.Connect(merged)
 		if err != nil {

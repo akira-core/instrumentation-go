@@ -2,89 +2,100 @@ package otelnats
 
 import (
 	"errors"
-	"fmt"
-	"os"
 
-	"github.com/akira-core/instrumentation-go/otel-nats/otelnats/internal/flags"
+	otelflags "github.com/akira-core/instrumentation-go/otel-flags"
 )
 
-const (
-	// envGlobalTracingEnabled aliases the shared kill-switch name so the literal
-	// has exactly one home (internal/flags) and cannot drift from it.
-	envGlobalTracingEnabled = flags.EnvGlobalTracing
-	envNATSTracingEnabled   = "OTEL_NATS_TRACING_ENABLED"
-)
+// envNATSTracingEnabled is this module's own switch. The process-wide master
+// switch is not named here: it belongs to otel-flags, which owns every
+// process-scoped name.
+const envNATSTracingEnabled = "OTEL_NATS_TRACING_ENABLED"
 
 // flagKeyNATSTracing is the OpenFeature key an operator flips on the relay proxy
-// to turn this module's tracing off without restarting the application.
+// to turn this module's tracing on or off without restarting the application.
 //
-// The relay can only REVOKE. The key is resolved with an evaluation default of
-// true and ANDed with envNATSTracingEnabled, so a module the deployment left off
-// can never be switched on remotely.
+// The relay is authoritative in BOTH directions: it can disable tracing the
+// deployment enabled and enable tracing the deployment left off. What bounds it
+// is the master switch above (otel-flags), which no relay value for this key can
+// escape, and the fact that a process with no relay configured never asks.
 const flagKeyNATSTracing = "otel-nats-tracing"
+
+// defaultNATSTracing is the bottom rung of the ladder. It is false so a process
+// that configures nothing traces nothing.
+const defaultNATSTracing = false
 
 // Index into natsResolver's flag keys.
 const idxTracing = 0
 
-// ErrTracingConfigConflict reports that both OTEL_INSTRUMENTATION_GO_TRACING_ENABLED
-// and WithTracingEnabled were supplied. They are two spellings of one switch, so
-// setting both is an error even when they agree: the rule to remember is "set
-// one", which is checkable at a glance, rather than "make them match", which
-// depends on the truthiness allow-list.
-var ErrTracingConfigConflict = errors.New(
-	"otelnats: WithTracingEnabled and " + envGlobalTracingEnabled +
-		" are mutually exclusive; set exactly one")
-
-// natsResolver resolves this module's relay verdict through the process-global
-// OpenFeature client. It caches nothing, so a revocation reaches a live
+// natsResolver resolves this module's relay value through the process-global
+// OpenFeature client. It caches nothing, so a relay change reaches a live
 // connection on its very next operation.
-//
-// The global switch is deliberately NOT a flag key: it is an out-of-band kill
-// switch with no relay counterpart, ANDed ahead of the resolver so that no
-// OpenFeature code path runs at all while it is off.
-var natsResolver = flags.NewResolver(
-	flags.WithFlagKeys(flagKeyNATSTracing),
+var natsResolver = otelflags.NewResolver(
+	otelflags.WithFlagKeys(flagKeyNATSTracing),
 )
 
-// natsRelayAllows reports the relay verdict alone.
+// gateState carries everything about a connection's switches that is fixed at
+// construction, so no hot path reads an environment variable.
 //
-// It is only half the answer: callers MUST AND it with the connection's static
-// capability (gate1 && envNATSTracingEnabled, fixed at construction), which is
-// what Conn.tracingOn does. Reading it on its own would let the relay enable a
-// module the deployment left off.
-func natsRelayAllows() bool {
-	return natsResolver.Allowed(idxTracing)
+// It is copied by value into everything derived from a Conn — oteljetstream
+// wrappers, consumers, iterators, batch forwarders — so a derived wrapper
+// inherits the connection's decision rather than re-resolving it.
+type gateState struct {
+	// relayPossible was resolved once, at construction. False means the relay is
+	// structurally incapable of returning anything but the value passed to it,
+	// so this connection resolves statically and never touches the OpenFeature
+	// SDK.
+	relayPossible bool
+
+	// masterLocal and tracingLocal are the env > option > default answers. They
+	// are the evaluation defaults handed to the relay, not a separate tier.
+	masterLocal  bool
+	tracingLocal bool
 }
 
-// resolveGate1 resolves the process-wide first tier for one connection.
+// resolveGates resolves every static tier for one connection, collecting BOTH
+// configuration errors before returning either.
 //
-// The environment variable and the option are two spellings of one switch, so
-// supplying both is rejected on PRESENCE, not on value: EnvSet is required
-// because EnvEnabled cannot tell "unset" (the deployment expressed no opinion,
-// and the option may supply one) from "set to something falsy".
-func resolveGate1(override *bool) (bool, error) {
-	if flags.GlobalTracingSet() && override != nil {
-		return false, fmt.Errorf("%w: option=%v, %s=%q",
-			ErrTracingConfigConflict, *override,
-			envGlobalTracingEnabled, os.Getenv(envGlobalTracingEnabled))
+// One configuration file can carry every OTEL_*_ENABLED variable, and each is
+// read independently, so returning the first failure alone would make the caller
+// fix one and rediscover the next on the following run.
+func resolveGates(tracingOption *bool) (gateState, error) {
+	masterLocal, masterErr := otelflags.MasterLocal()
+	tracingLocal, tracingErr := otelflags.ResolveLocal(tracingOption, envNATSTracingEnabled, defaultNATSTracing)
+
+	if err := errors.Join(masterErr, tracingErr); err != nil {
+		return gateState{}, err
 	}
-	if override != nil {
-		return *override, nil
-	}
-	return flags.GlobalTracingPossible(), nil
+
+	return gateState{
+		relayPossible: otelflags.RelayPossible(),
+		masterLocal:   masterLocal,
+		tracingLocal:  tracingLocal,
+	}, nil
 }
 
-// tracedPossible reports whether a connection may EVER trace: both
-// environment-derived tiers, ANDed and fixed at construction. When it is false
-// only the passthrough implementation is built, so no OTel SDK code path is
-// reachable for that connection's lifetime and the resolver is never consulted.
+// tracedPossible reports whether the instrumented implementation must be built
+// at all.
 //
-// Including the module env var is safe precisely because the relay can only
-// revoke: with it off, no relay value could ever raise the answer.
-func tracedPossible(override *bool) (bool, error) {
-	gate1, err := resolveGate1(override)
-	if err != nil {
-		return false, err
+// It is `relayPossible || (masterLocal && tracingLocal)` rather than the static
+// answer alone, because the relay can now ENABLE: a connection whose environment
+// says off must still be able to start tracing when the relay says so, and
+// construction happens once. When no relay can exist, the static answer is
+// final and a switched-off connection allocates nothing instrumented — the
+// pre-dynamic zero-cost path, preserved exactly.
+func (g gateState) tracedPossible() bool {
+	return g.relayPossible || (g.masterLocal && g.tracingLocal)
+}
+
+// tracing resolves this connection's effective tracing state for one operation.
+//
+// With no relay possible it is pure arithmetic on two booleans fixed at
+// construction — no evaluation, no allocation. Otherwise it is two Boolean
+// calls, master first so a veto short-circuits the module's own key.
+func (g gateState) tracing() bool {
+	if !g.relayPossible {
+		return g.masterLocal && g.tracingLocal
 	}
-	return gate1 && flags.EnvEnabled(envNATSTracingEnabled), nil
+	return otelflags.MasterEnabled(g.masterLocal) &&
+		natsResolver.Value(idxTracing, g.tracingLocal)
 }

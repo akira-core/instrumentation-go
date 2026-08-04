@@ -1,0 +1,33 @@
+// Workspace for local development only.
+//
+// It exists because `otel-flags` is a published module that the four
+// instrumentation modules require, and a published `go.mod` cannot carry a
+// `replace` directive — consumers ignore it, so the requirement has to name a
+// version that already exists. This file lets the working tree build against
+// itself in the window before `otel-flags` is tagged, and after it, without any
+// `replace` reaching a consumer.
+//
+// CI must NOT use it. Every per-module build, test and lint step sets
+// `GOWORK=off` so each module is verified exactly as a consumer resolves it.
+// Run local checks the same way before pushing.
+
+go 1.25.0
+
+use (
+	./otel-flags
+	./otel-gorilla-ws
+	./otel-gorilla-ws/examples
+	./otel-gorilla-ws/tests/integration
+	./otel-mongo
+	./otel-mongo/examples
+	./otel-mongo/tests/integration
+	./otel-mongo/v2
+	./otel-mongo/v2/tests/integration
+	./otel-nats
+	./otel-nats/examples
+	./otel-nats/tests/integration
+	./otel-sampler
+	./otel-testkit
+	./otel-testkit/examples/httpdirect
+	./otel-testkit/examples/httpdirect-stdlib
+)

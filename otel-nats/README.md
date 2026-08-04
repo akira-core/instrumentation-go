@@ -19,7 +19,7 @@ otel-nats/
 │   ├── conn_direct.go      # directConn: passthrough connImpl used when tracing is disabled
 │   ├── traceevent.go       # WithTraceDestination / SubscribeTraceEvents / TraceEvent / TraceHop (NATS 2.11+ trace events)
 │   ├── propagation.go      # HeaderCarrier (nats.Header ↔ TextMapCarrier)
-│   ├── env_flags.go        # tracing feature-flag gate (OTEL_INSTRUMENTATION_GO_TRACING_ENABLED + OTEL_NATS_TRACING_ENABLED)
+│   ├── env_flags.go        # this module's flag key, env var, default, and gateState
 │   ├── internal/flags/     # shared EnvEnabled/Gate helpers (byte-identical across instrumentation modules)
 │   └── doc.go
 ├── oteljetstream/          # JetStream: New, JetStream, Stream, Consumer, Consume, Messages, Fetch
@@ -45,21 +45,37 @@ otel-nats/
 ### Tracing feature flags
 
 ```
-tracing = gate1 && OTEL_NATS_TRACING_ENABLED && relay otel-nats-tracing
+tracing = master && natsTracing
 ```
 
-`gate1` is `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` **or** `WithTracingEnabled(v)` — two spellings
-of one switch, and supplying **both is a configuration error** (`ErrTracingConfigConflict`), even
-when they agree.
+Each switch resolves down a four-step ladder, first source with an opinion winning:
 
-The two environment tiers are read **once, at construction**, and decide whether the instrumented
-implementation is built at all. The relay verdict is resolved on **every operation** and can only
-**revoke**. A switch is on only when set to `1`, `true`, `yes` or `on`.
+```
+relay  >  env  >  option (With*Enabled)  >  hardcoded default
+```
 
-`WithTracingEnabled` does **not** pin a connection: it supplies `gate1` and nothing more, so a
-connection carrying it — and every `oteljetstream` wrapper derived from it — still stops when the
-relay revokes. Subscriptions and JetStream consumers re-resolve the verdict **per message**, so one
-created before a revocation follows it without being re-established.
+The relay is authoritative in **both** directions — it can disable a running module and enable one
+the deployment left off. Safety comes from the defaults: the master switch
+`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` defaults to `true` and is a **veto** (only `false` has an
+effect; it accepts no option), while every per-module switch defaults to **off**.
+
+**The option sits below its environment variable**, reversing `0.7.0`. ``OTEL_NATS_TRACING_ENABLED`=false` disables
+this module even where the Go code passed `WithTracingEnabled(true)`, so an operator has a per-module
+setting application code cannot override. With the variable unset the option decides, so two
+connections in one process can still differ.
+
+A switch is decided only by `1`/`true`/`yes`/`on` or `0`/`false`/`no`/`off`. Unset means "no opinion".
+**Anything else — including the empty string — fails construction** with an error wrapping
+`otelflags.ErrInvalidFlagValue`.
+
+`WithTracingEnabled` does **not** pin anything: a wrapper carrying it resolves the master switch and
+the relay on every operation.
+
+The mutual-exclusion rule and `ErrTracingConfigConflict` are **gone**: supplying an option alongside
+its variable is ordinary configuration, and the variable wins.
+
+Subscriptions and JetStream consumers re-resolve per **message**, so one created before a flag
+change follows it without being re-established.
 
 > Full reference — every resolution table, connecting a relay with no application code, revocation
 > latency, per-service targeting, and the operational summary:

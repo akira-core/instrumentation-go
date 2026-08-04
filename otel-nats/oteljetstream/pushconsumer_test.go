@@ -109,7 +109,11 @@ func TestPushConsumerConsumeTraceContext(t *testing.T) {
 // test had resolved it to enabled (see the removed NOTE this replaces).
 func TestOteljetstreamInheritsConnTracingOption(t *testing.T) {
 	url := startJetStreamServer(t) // sets both tracing env vars true as a side effect
-	clearGlobalSwitch(t)           // …so the option can supply gate1 without conflicting
+	// Clear BOTH: the option is the third rung of the ladder, so it decides only
+	// when its environment variable is silent. Leaving OTEL_NATS_TRACING_ENABLED
+	// set would make the variable win and this test assert the wrong thing.
+	clearEnv(t, "OTEL_INSTRUMENTATION_GO_TRACING_ENABLED")
+	clearEnv(t, "OTEL_NATS_TRACING_ENABLED")
 	sr := tracetest.NewSpanRecorder()
 	tp := trace.NewTracerProvider(trace.WithSpanProcessor(sr))
 	otel.SetTracerProvider(tp)

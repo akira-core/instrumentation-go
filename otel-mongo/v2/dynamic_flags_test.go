@@ -12,16 +12,20 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace/noop"
 
+	otelflags "github.com/akira-core/instrumentation-go/otel-flags"
 	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/direct"
-	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/flags"
 	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/shared"
 	"github.com/akira-core/instrumentation-go/otel-mongo/v2/internal/traced"
 )
 
 // These tests prove the wrappers RE-READ the flags rather than caching a value
-// at construction. The resolver reset stands in for "one TTL elapsed" — the TTL
-// boundary itself is unit-tested in internal/flags, and sleeping a real second
-// per case would be the slowest possible way to test the same thing.
+// at construction, and that the relay decides in BOTH directions. Nothing is
+// cached and there is no reset hook: a rebound provider is observed on the very
+// next operation.
+//
+// Every test binds the provider BEFORE building the wrapper. relayPossible is
+// resolved at construction, so a wrapper built while no relay could exist
+// resolves statically for its whole life.
 //
 // None of them need a live MongoDB: the observable is which implementation a
 // wrapper dispatches to, which is decided before any driver call happens.
@@ -58,7 +62,7 @@ func boolFlag(v bool) memprovider.InMemoryFlag {
 // binding left behind elsewhere in this binary.
 func setRelay(t *testing.T, tracing, propagation bool) {
 	t.Helper()
-	require.NoError(t, openfeature.SetNamedProviderAndWait(flags.FlagDomain,
+	require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain,
 		memprovider.NewInMemoryProvider(
 			map[string]memprovider.InMemoryFlag{
 				flagKeyMongoTracing:     boolFlag(tracing),
@@ -66,19 +70,24 @@ func setRelay(t *testing.T, tracing, propagation bool) {
 			},
 		)))
 	t.Cleanup(func() {
-		require.NoError(t, openfeature.SetNamedProviderAndWait(flags.FlagDomain, openfeature.NoopProvider{}))
+		require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, openfeature.NoopProvider{}))
 	})
 }
 
-// capableEnv turns on every environment-derived tier, so each assertion that
-// follows is attributable to the relay and not to the environment. All three
-// are required: since D7 the module switches decide which implementations are
-// constructed at all, and the relay can only revoke below them.
+// capableEnv turns on both module switches and leaves the master unset, which
+// under a default of enabled is the ordinary deployment shape. Each assertion
+// that follows is then attributable to the relay.
 func capableEnv(t *testing.T) {
 	t.Helper()
-	t.Setenv(envGlobalTracingEnabled, "1")
+	silentFlagEnv(t)
 	t.Setenv(envMongoTracingEnabled, "1")
 	t.Setenv(envMongoPropagationEnabled, "1")
+}
+
+// silentRelayEnv leaves every switch unset, so the relay alone decides.
+func silentRelayEnv(t *testing.T) {
+	t.Helper()
+	silentFlagEnv(t)
 }
 
 // envGateState is the gateState a client built in capableEnv would carry.
@@ -134,66 +143,84 @@ func TestRelayFlipsPropagationIndependentlyOfTracing(t *testing.T) {
 		"tracing revoked → the facade selects the passthrough, which writes no _oteltrace")
 }
 
-func TestGlobalKillSwitchBeatsTheRelay(t *testing.T) {
+// TestRelayEnablesWhatTheDeploymentLeftOff is the capability the revoke-only
+// model did not have, and the reason this revision exists.
+func TestRelayEnablesWhatTheDeploymentLeftOff(t *testing.T) {
+	silentRelayEnv(t)
+	setRelay(t, true, true)
+
+	coll := NewCollection(&mongo.Collection{}, noop.NewTracerProvider().Tracer("test"), otel.GetTextMapPropagator())
+	require.NotNil(t, coll.traced,
+		"the instrumented impl must be allocated whenever a relay could enable it")
+	assert.IsType(t, &traced.Collection{}, coll.impl(),
+		"the relay enabled a module whose environment says nothing")
+}
+
+// TestMasterVetoBeatsTheRelay: the master switch is ANDed above everything, in
+// either spelling.
+func TestMasterVetoBeatsTheRelay(t *testing.T) {
+	capableEnv(t)
 	t.Setenv(envGlobalTracingEnabled, "false")
-	t.Setenv(envMongoTracingEnabled, "true")
-	t.Setenv(envMongoPropagationEnabled, "true")
 	setRelay(t, true, true)
 
 	coll := NewCollection(&mongo.Collection{}, noop.NewTracerProvider().Tracer("test"), otel.GetTextMapPropagator())
 
 	assert.IsType(t, &direct.Collection{}, coll.impl(),
-		"global kill switch off → passthrough regardless of the relay")
-	assert.Nil(t, coll.traced,
-		"instrumented impl must not even be constructed, so no OTel path is reachable")
+		"master veto → passthrough regardless of the relay")
 
-	// Flipping the relay cannot revive it.
-	setRelay(t, true, true)
-	assert.IsType(t, &direct.Collection{}, coll.impl())
+	g := envGateState(t)
+	assert.False(t, g.effectiveTracing(), "…so no relay value can produce a span")
+	assert.False(t, g.effectivePropagation(), "…nor a byte of _oteltrace")
 }
 
-// TestWithTracingEnabledSuppliesGate1AndDoesNotPin replaces the superseded
-// "an overridden client is static" behaviour. The option is now one spelling of
-// the first tier: it decides whether the instrumented implementations are built
-// at all, and says nothing about the relay.
-func TestWithTracingEnabledSuppliesGate1AndDoesNotPin(t *testing.T) {
-	// Global variable left UNSET: since D3, setting it as well as passing the
-	// option is a configuration error.
-	t.Setenv(envMongoTracingEnabled, "1")
-	t.Setenv(envMongoPropagationEnabled, "1")
-
-	t.Run("option true still obeys a revocation", func(t *testing.T) {
+// TestWithTracingEnabledDoesNotPin: the option supplies one rung and says
+// nothing about the relay or the master.
+func TestWithTracingEnabledDoesNotPin(t *testing.T) {
+	t.Run("option true still follows a relay disable", func(t *testing.T) {
+		silentRelayEnv(t)
 		setRelay(t, true, true)
-		on := true
-		g, err := resolveGates(&on, nil)
+
+		g, err := resolveGates(boolPtr(true), boolPtr(true))
 		require.NoError(t, err)
-		assert.True(t, g.tracedBuilt, "gate1 supplied by the option → instrumented impls are built")
+		require.True(t, g.tracedPossible())
 		assert.True(t, g.effectiveTracing())
 
 		setRelay(t, false, false)
 		assert.False(t, g.effectiveTracing(),
-			"the option supplies gate1 only — there is no way to opt a client out of a revocation")
+			"there is no way to opt a client out of a relay decision")
 	})
 
-	t.Run("option false builds only the passthrough", func(t *testing.T) {
-		setRelay(t, true, true)
-		off := false
-		g, err := resolveGates(&off, nil)
+	t.Run("option false still follows a relay enable", func(t *testing.T) {
+		silentRelayEnv(t)
+		setRelay(t, false, false)
+
+		g, err := resolveGates(boolPtr(false), boolPtr(false))
 		require.NoError(t, err)
-		assert.False(t, g.tracedBuilt, "gate1 off must not allocate the instrumented impls")
 		assert.False(t, g.effectiveTracing())
+
+		setRelay(t, true, true)
+		assert.True(t, g.effectiveTracing(),
+			"the relay is authoritative in both directions, over the option too")
 	})
 }
 
-func TestConfigConflictsAreReportedTogether(t *testing.T) {
-	t.Setenv(envGlobalTracingEnabled, "1")
-	t.Setenv(envMongoPropagationEnabled, "1")
+// TestEnvironmentBeatsOptionUnderASilentRelay pins the ordering that reverses
+// 0.7.0, with a provider installed but defining no key.
+func TestEnvironmentBeatsOptionUnderASilentRelay(t *testing.T) {
+	silentRelayEnv(t)
+	t.Setenv(envMongoTracingEnabled, "1")
+	t.Setenv(envMongoPropagationEnabled, "false")
+	require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain,
+		memprovider.NewInMemoryProvider(map[string]memprovider.InMemoryFlag{})))
+	t.Cleanup(func() {
+		require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, openfeature.NoopProvider{}))
+	})
 
-	on := true
-	_, err := resolveGates(&on, &on)
-	require.ErrorIs(t, err, ErrTracingConfigConflict)
-	require.ErrorIs(t, err, ErrTracePropagationConfigConflict,
-		"both checks must run so a caller violating both rules learns both at once")
+	g, err := resolveGates(boolPtr(false), boolPtr(true))
+	require.NoError(t, err)
+	assert.True(t, g.effectiveTracing(), "the tracing variable beats the option")
+	assert.False(t, g.effectivePropagation(),
+		"the propagation variable beats the option — the operator can stop document writes")
 }
 
 func TestWithTracePropagationEnabledStillCannotBypassRelayTracingOff(t *testing.T) {
@@ -236,7 +263,7 @@ func TestContextFromDocumentIgnoresEveryFlag(t *testing.T) {
 		{name: "relay revoked propagation", global: "1", tracing: "1", prop: "1", relayTracing: true},
 		{name: "relay revoked tracing", global: "1", tracing: "1", prop: "1"},
 		{name: "module switches off", global: "1", tracing: "false", prop: "false", relayTracing: true, relayProp: true},
-		{name: "global kill switch off", global: "false", tracing: "false", prop: "false"},
+		{name: "master veto", global: "false", tracing: "false", prop: "false"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(envGlobalTracingEnabled, tc.global)
@@ -292,9 +319,9 @@ func TestCursorSwitchesImplMidIteration(t *testing.T) {
 func TestNoProviderReproducesEnvOnlyBehavior(t *testing.T) {
 	// No provider installed anywhere: every flag must fall back to its env var,
 	// i.e. behave exactly as the release before dynamic flags.
-	require.NoError(t, openfeature.SetNamedProviderAndWait(flags.FlagDomain, openfeature.NoopProvider{}))
+	silentRelayEnv(t)
+	require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, openfeature.NoopProvider{}))
 
-	t.Setenv(envGlobalTracingEnabled, "1")
 	t.Setenv(envMongoTracingEnabled, "1")
 	t.Setenv(envMongoPropagationEnabled, "1")
 
@@ -303,9 +330,9 @@ func TestNoProviderReproducesEnvOnlyBehavior(t *testing.T) {
 	require.True(t, ok, "env vars on → instrumented")
 	assert.True(t, tc.PropagationEnabled())
 
-	// The module switch is read ONCE, at construction (D7/D8): no environment
-	// variable is touched on a hot path any more, so a later change needs a new
-	// wrapper. Only the relay verdict is observable without reconstructing.
+	// Environment variables are read ONCE, at construction: none is touched on a
+	// hot path, so a later change needs a new wrapper. Only the relay is
+	// observable without reconstructing.
 	t.Setenv(envMongoTracingEnabled, "false")
 	assert.IsType(t, &traced.Collection{}, coll.impl(),
 		"the module env var is fixed at construction; changing it must not affect a live Collection")
@@ -315,18 +342,57 @@ func TestNoProviderReproducesEnvOnlyBehavior(t *testing.T) {
 		"a wrapper built after the change takes the passthrough path")
 }
 
-// TestKillSwitchOffIsUnreachableFromTheRelay is the C6 regression in its
-// current form: with the global kill switch off, nothing the relay serves can
-// reach this process — not tracing, and not the propagation that would write
-// _oteltrace into the caller's documents.
-func TestKillSwitchOffIsUnreachableFromTheRelay(t *testing.T) {
-	t.Setenv(envGlobalTracingEnabled, "false")
-	t.Setenv(envMongoTracingEnabled, "1")
-	t.Setenv(envMongoPropagationEnabled, "1")
-	setRelay(t, true, true)
+// TestNoRelayPossibleAllocatesNothingInstrumented is the zero-cost path: with no
+// endpoint and no provider, a switched-off client must not even build the
+// instrumented implementations, nor register the command monitor.
+func TestNoRelayPossibleAllocatesNothingInstrumented(t *testing.T) {
+	silentRelayEnv(t)
+	require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, openfeature.NoopProvider{}))
 
 	g := envGateState(t)
-	assert.False(t, g.tracedBuilt, "kill switch off → no instrumented impl is constructed")
-	assert.False(t, g.effectiveTracing(), "…so no relay value can produce a span")
-	assert.False(t, g.effectivePropagation(), "…nor a byte of _oteltrace")
+	require.False(t, g.relayPossible)
+	assert.False(t, g.tracedPossible(),
+		"no relay can exist and the local answer is off → no OTel path may be reachable")
+
+	coll := NewCollection(&mongo.Collection{}, noop.NewTracerProvider().Tracer("test"), otel.GetTextMapPropagator())
+	assert.Nil(t, coll.traced)
+}
+
+// TestWrapperBuiltBeforeTheProviderStaysStatic pins the ordering rule an
+// application is most likely to trip over. relayPossible is resolved once, at
+// construction; a wrapper built while no relay could exist resolves from its
+// environment and options for the rest of its life, and installing a provider
+// afterwards never reaches it.
+func TestWrapperBuiltBeforeTheProviderStaysStatic(t *testing.T) {
+	silentRelayEnv(t)
+	require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, openfeature.NoopProvider{}))
+	t.Setenv(envMongoTracingEnabled, "1")
+
+	tracer := noop.NewTracerProvider().Tracer("test")
+	coll := NewCollection(&mongo.Collection{}, tracer, otel.GetTextMapPropagator())
+	require.IsType(t, &traced.Collection{}, coll.impl(), "the environment enabled it")
+
+	setRelay(t, false, false) // installed too late
+
+	assert.IsType(t, &traced.Collection{}, coll.impl(),
+		"a Collection built before any relay existed never consults one")
+	rebuilt := NewCollection(&mongo.Collection{}, tracer, otel.GetTextMapPropagator())
+	assert.IsType(t, &direct.Collection{}, rebuilt.impl(),
+		"one built after the install does observe it — the fix is ordering, not a reset hook")
+}
+
+// TestTwoClientsCanDiffer is what the option is uniquely able to express, and it
+// survives the option moving below the environment variable — on the condition
+// that the deployment leaves that variable unset.
+func TestTwoClientsCanDiffer(t *testing.T) {
+	silentRelayEnv(t)
+	require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, openfeature.NoopProvider{}))
+
+	on, err := resolveGates(boolPtr(true), nil)
+	require.NoError(t, err)
+	off, err := resolveGates(boolPtr(false), nil)
+	require.NoError(t, err)
+
+	assert.True(t, on.effectiveTracing(), "the client built with WithTracingEnabled(true) must trace")
+	assert.False(t, off.effectiveTracing(), "…and the one built with (false) must not")
 }

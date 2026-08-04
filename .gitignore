@@ -28,7 +28,13 @@ profile.cov
 /*/example/examples
 
 # Go workspace file
-go.work
+#
+# go.work IS tracked. It is repo infrastructure, not a personal preference: the
+# four instrumentation modules require the published `otel-flags` module, a
+# published go.mod cannot carry a `replace` directive, and the workspace is what
+# lets the working tree build against itself. CI never uses it — every
+# per-module step sets GOWORK=off so each module is verified as a consumer
+# resolves it. go.work.sum is a churning lockfile with no reader in that setup.
 go.work.sum
 
 # env file

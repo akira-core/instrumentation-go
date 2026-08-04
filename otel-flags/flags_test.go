@@ -1,0 +1,548 @@
+package otelflags
+
+import (
+	"bytes"
+	"errors"
+	"log/slog"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/open-feature/go-sdk/openfeature"
+	"github.com/open-feature/go-sdk/openfeature/memprovider"
+)
+
+// No test in this file may call t.Parallel: the OpenFeature provider registry,
+// the process environment and slog's default logger are all process-global.
+
+const testEnvKey = "OTEL_INSTRUMENTATION_GO_FLAGS_TEST_SWITCH"
+
+// resetInstallState clears the package-level provider-install latch so a test
+// can exercise the install path from scratch.
+//
+// This is a test helper in the same package, not an exported reset hook — the
+// design deliberately has none, because the resolver caches no flag values and a
+// rebound provider is observed on the very next call. The only thing that
+// latches is "did we already install", and that has to be resettable for the
+// auto-install tests to be more than one test long.
+func resetInstallState(t *testing.T) {
+	t.Helper()
+	installMu.Lock()
+	defer installMu.Unlock()
+	installDone = false
+	installEvalCtx = openfeature.EvaluationContext{}
+}
+
+func TestLookup(t *testing.T) {
+	tests := []struct {
+		name      string
+		value     string
+		set       bool
+		wantValue bool
+		wantSet   bool
+		wantErr   bool
+	}{
+		{name: "unset has no opinion"},
+
+		{name: "one", value: "1", set: true, wantValue: true, wantSet: true},
+		{name: "true", value: "true", set: true, wantValue: true, wantSet: true},
+		{name: "yes", value: "yes", set: true, wantValue: true, wantSet: true},
+		{name: "on", value: "on", set: true, wantValue: true, wantSet: true},
+		{name: "upper TRUE", value: "TRUE", set: true, wantValue: true, wantSet: true},
+		{name: "mixed On", value: "On", set: true, wantValue: true, wantSet: true},
+		{name: "padded yes", value: "  yes  ", set: true, wantValue: true, wantSet: true},
+
+		{name: "zero", value: "0", set: true, wantSet: true},
+		{name: "false", value: "false", set: true, wantSet: true},
+		{name: "no", value: "no", set: true, wantSet: true},
+		{name: "off", value: "off", set: true, wantSet: true},
+		{name: "upper FALSE", value: "FALSE", set: true, wantSet: true},
+		{name: "padded off", value: " off ", set: true, wantSet: true},
+
+		// Everything below fails construction rather than being guessed at.
+		{name: "empty string", value: "", set: true, wantSet: true, wantErr: true},
+		{name: "whitespace only", value: "   ", set: true, wantSet: true, wantErr: true},
+		{name: "enabled word", value: "enabled", set: true, wantSet: true, wantErr: true},
+		{name: "two", value: "2", set: true, wantSet: true, wantErr: true},
+		{name: "y", value: "y", set: true, wantSet: true, wantErr: true},
+		{name: "t", value: "t", set: true, wantSet: true, wantErr: true},
+		{name: "arbitrary string", value: "hello", set: true, wantSet: true, wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.set {
+				t.Setenv(testEnvKey, tc.value)
+			}
+			value, set, err := Lookup(testEnvKey)
+
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Lookup(%q=%q) err = %v, wantErr %v", testEnvKey, tc.value, err, tc.wantErr)
+			}
+			if tc.wantErr {
+				if !errors.Is(err, ErrInvalidFlagValue) {
+					t.Errorf("error does not wrap ErrInvalidFlagValue: %v", err)
+				}
+				if !strings.Contains(err.Error(), testEnvKey) {
+					t.Errorf("error does not name the variable: %v", err)
+				}
+				if tc.value != "" && !strings.Contains(err.Error(), tc.value) {
+					t.Errorf("error does not name the observed value: %v", err)
+				}
+				return
+			}
+			if value != tc.wantValue || set != tc.wantSet {
+				t.Fatalf("Lookup(%q=%q) = (%v, %v), want (%v, %v)",
+					testEnvKey, tc.value, value, set, tc.wantValue, tc.wantSet)
+			}
+		})
+	}
+}
+
+func TestMasterLocal(t *testing.T) {
+	t.Run("unset defaults to enabled", func(t *testing.T) {
+		got, err := MasterLocal()
+		if err != nil {
+			t.Fatalf("MasterLocal: %v", err)
+		}
+		if !got {
+			t.Fatalf("MasterLocal() = false with the variable unset; the master is a veto and must default to true")
+		}
+	})
+
+	t.Run("explicitly falsy vetoes", func(t *testing.T) {
+		t.Setenv(EnvGlobalTracing, "0")
+		got, err := MasterLocal()
+		if err != nil {
+			t.Fatalf("MasterLocal: %v", err)
+		}
+		if got {
+			t.Fatalf("MasterLocal() = true for an explicitly falsy value")
+		}
+	})
+
+	t.Run("truthy is inert but legal", func(t *testing.T) {
+		t.Setenv(EnvGlobalTracing, "true")
+		got, err := MasterLocal()
+		if err != nil || !got {
+			t.Fatalf("MasterLocal() = (%v, %v), want (true, nil)", got, err)
+		}
+	})
+
+	t.Run("invalid value is an error", func(t *testing.T) {
+		t.Setenv(EnvGlobalTracing, "maybe")
+		if _, err := MasterLocal(); !errors.Is(err, ErrInvalidFlagValue) {
+			t.Fatalf("MasterLocal() err = %v, want ErrInvalidFlagValue", err)
+		}
+	})
+}
+
+// captureLogs redirects slog's default logger into a buffer for the test.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+// boolFlag builds an in-memory flag that always resolves to v.
+func boolFlag(v bool) memprovider.InMemoryFlag {
+	variant := "off"
+	if v {
+		variant = "on"
+	}
+	return memprovider.InMemoryFlag{
+		State:          memprovider.Enabled,
+		DefaultVariant: variant,
+		Variants:       map[string]any{"on": true, "off": false},
+	}
+}
+
+// setProvider installs an in-memory provider on FlagDomain for the duration of
+// the test.
+//
+// It binds the NAMED domain, not the default provider. A named provider outranks
+// the default for the clients this package creates, so a test that installed a
+// default provider would be silently shadowed the moment anything in the process
+// had auto-installed.
+func setProvider(t *testing.T, flags map[string]memprovider.InMemoryFlag) {
+	t.Helper()
+	if err := openfeature.SetNamedProviderAndWait(FlagDomain, memprovider.NewInMemoryProvider(flags)); err != nil {
+		t.Fatalf("SetNamedProviderAndWait: %v", err)
+	}
+	t.Cleanup(func() { clearProvider(t) })
+}
+
+// clearProvider rebinds FlagDomain to the no-op provider, modelling an
+// application that never wires OpenFeature at all.
+func clearProvider(t *testing.T) {
+	t.Helper()
+	if err := openfeature.SetNamedProviderAndWait(FlagDomain, openfeature.NoopProvider{}); err != nil {
+		t.Fatalf("SetNamedProviderAndWait(Noop): %v", err)
+	}
+}
+
+// --- the precedence ladder -------------------------------------------------
+
+func TestValue_NoProviderReturnsLocal(t *testing.T) {
+	clearProvider(t)
+
+	r := NewResolver(WithFlagKeys("some-key"))
+	for _, local := range []bool{true, false} {
+		if got := r.Value(0, local); got != local {
+			t.Fatalf("Value(0, %v) = %v with no provider installed; the local value must stand", local, got)
+		}
+	}
+}
+
+func TestValue_MissingFlagReturnsLocal(t *testing.T) {
+	setProvider(t, map[string]memprovider.InMemoryFlag{"other-key": boolFlag(false)})
+
+	r := NewResolver(WithFlagKeys("absent-key"))
+	for _, local := range []bool{true, false} {
+		if got := r.Value(0, local); got != local {
+			t.Fatalf("Value(0, %v) = %v for a key absent from the relay; the local value must stand", local, got)
+		}
+	}
+}
+
+func TestValue_RelayOverridesLocalInBothDirections(t *testing.T) {
+	t.Run("relay disables what the deployment enabled", func(t *testing.T) {
+		setProvider(t, map[string]memprovider.InMemoryFlag{"k": boolFlag(false)})
+
+		r := NewResolver(WithFlagKeys("k"))
+		if r.Value(0, true) {
+			t.Fatalf("Value(0, true) = true while the relay serves false")
+		}
+	})
+
+	t.Run("relay enables what the deployment left off", func(t *testing.T) {
+		setProvider(t, map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})
+
+		r := NewResolver(WithFlagKeys("k"))
+		if !r.Value(0, false) {
+			t.Fatalf("Value(0, false) = false while the relay serves true; the relay is authoritative in both directions")
+		}
+	})
+}
+
+func TestValue_ChangeIsVisibleOnTheNextCall(t *testing.T) {
+	setProvider(t, map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})
+
+	r := NewResolver(WithFlagKeys("k"))
+	if !r.Value(0, false) {
+		t.Fatalf("Value = false while the relay serves true")
+	}
+
+	// Re-bind with the flag flipped. No sleep, no clock, no reset hook: the
+	// resolver caches nothing, so the very next call must observe it.
+	if err := openfeature.SetNamedProviderAndWait(FlagDomain,
+		memprovider.NewInMemoryProvider(map[string]memprovider.InMemoryFlag{"k": boolFlag(false)})); err != nil {
+		t.Fatalf("SetNamedProviderAndWait: %v", err)
+	}
+	if r.Value(0, true) {
+		t.Fatalf("Value = true on the call after a change; the value must not be cached")
+	}
+}
+
+func TestValue_OutOfRangeIndexIsDisabled(t *testing.T) {
+	clearProvider(t)
+
+	r := NewResolver(WithFlagKeys("k"))
+	for _, i := range []int{-1, 1, 99} {
+		// local=true so a pass-through implementation would return true; only a
+		// genuine bounds check returns false here.
+		if r.Value(i, true) {
+			t.Errorf("Value(%d, true) = true for an out-of-range index; a mis-wired module must degrade to disabled", i)
+		}
+	}
+}
+
+func TestNewResolver_NilOptionIsSkipped(t *testing.T) {
+	r := NewResolver(nil, WithFlagKeys("k"), nil)
+	if len(r.keys) != 1 {
+		t.Fatalf("keys = %v, want one key; a nil option must be skipped rather than panic", r.keys)
+	}
+}
+
+func TestValue_Concurrent(t *testing.T) {
+	setProvider(t, map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})
+
+	r := NewResolver(WithFlagKeys("k"))
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = r.Value(0, false)
+		}()
+	}
+	wg.Wait()
+}
+
+// --- the master switch -----------------------------------------------------
+
+func TestMasterEnabled(t *testing.T) {
+	t.Run("no relay leaves the local value in charge", func(t *testing.T) {
+		clearProvider(t)
+		if !MasterEnabled(true) {
+			t.Fatalf("MasterEnabled(true) = false with no relay")
+		}
+		if MasterEnabled(false) {
+			t.Fatalf("MasterEnabled(false) = true with no relay")
+		}
+	})
+
+	t.Run("relay false vetoes a locally-enabled master", func(t *testing.T) {
+		setProvider(t, map[string]memprovider.InMemoryFlag{FlagKeyGlobalTracing: boolFlag(false)})
+		if MasterEnabled(true) {
+			t.Fatalf("MasterEnabled(true) = true while the relay vetoes the master")
+		}
+	})
+
+	t.Run("relay true is inert against the default", func(t *testing.T) {
+		setProvider(t, map[string]memprovider.InMemoryFlag{FlagKeyGlobalTracing: boolFlag(true)})
+		if !MasterEnabled(true) {
+			t.Fatalf("MasterEnabled(true) = false while the relay serves true")
+		}
+	})
+}
+
+// --- relayPossible ---------------------------------------------------------
+
+func TestRelayPossible(t *testing.T) {
+	t.Run("false with no endpoint and no provider", func(t *testing.T) {
+		clearProvider(t)
+		if RelayPossible() {
+			t.Fatalf("RelayPossible() = true with no endpoint and no provider bound")
+		}
+	})
+
+	t.Run("true when the endpoint is set", func(t *testing.T) {
+		clearProvider(t)
+		t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+		if !RelayPossible() {
+			t.Fatalf("RelayPossible() = false with an endpoint configured")
+		}
+	})
+
+	t.Run("true when a provider is already bound", func(t *testing.T) {
+		setProvider(t, map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})
+		if !RelayPossible() {
+			t.Fatalf("RelayPossible() = false with a provider bound to the domain")
+		}
+	})
+
+	t.Run("an empty endpoint is not an endpoint", func(t *testing.T) {
+		clearProvider(t)
+		t.Setenv(EnvFlagsEndpoint, "   ")
+		if RelayPossible() {
+			t.Fatalf("RelayPossible() = true for a blank endpoint")
+		}
+	})
+}
+
+// --- provider auto-install -------------------------------------------------
+
+// A syntactically valid endpoint that nothing listens on. Construction performs
+// no I/O, and registration is non-blocking, so the provider's background fetch
+// failing is exactly the "relay down at startup" path — logged, not fatal.
+const unreachableEndpoint = "http://127.0.0.1:1"
+
+func TestAutoInstall_FiresWhenEndpointSetAndNoProvider(t *testing.T) {
+	clearProvider(t)
+	resetInstallState(t)
+	t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+	t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
+
+	r := NewResolver(WithFlagKeys("k"))
+	_ = r.Value(0, false)
+
+	if got := openfeature.NamedProviderMetadata(FlagDomain).Name; got == noopProviderName {
+		t.Fatalf("no provider was installed on %q; want a GO Feature Flag provider", FlagDomain)
+	}
+}
+
+func TestAutoInstall_StandsDownWhenAProviderExists(t *testing.T) {
+	setProvider(t, map[string]memprovider.InMemoryFlag{"k": boolFlag(false)})
+	resetInstallState(t)
+	t.Cleanup(func() { resetInstallState(t) })
+	before := openfeature.NamedProviderMetadata(FlagDomain).Name
+	t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+
+	r := NewResolver(WithFlagKeys("k"))
+	if r.Value(0, true) {
+		t.Fatalf("Value = true; the application's own provider must still decide")
+	}
+	if after := openfeature.NamedProviderMetadata(FlagDomain).Name; after != before {
+		t.Fatalf("provider changed from %q to %q; the auto-install must stand down", before, after)
+	}
+}
+
+func TestAutoInstall_UnsetEndpointInstallsNothing(t *testing.T) {
+	clearProvider(t)
+	resetInstallState(t)
+	t.Cleanup(func() { resetInstallState(t) })
+
+	r := NewResolver(WithFlagKeys("k"))
+	_ = r.Value(0, false)
+
+	if got := openfeature.NamedProviderMetadata(FlagDomain).Name; got != noopProviderName {
+		t.Fatalf("provider = %q with no endpoint configured; want no OpenFeature state written", got)
+	}
+	if len(r.evalCtx.Attributes()) != 0 {
+		t.Fatalf("evaluation context = %v, want empty off the auto-install path", r.evalCtx.Attributes())
+	}
+}
+
+func TestAutoInstall_HappensOnceForEveryResolver(t *testing.T) {
+	clearProvider(t)
+	resetInstallState(t)
+	t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+	t.Setenv(EnvServiceName, "checkout-api")
+	t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
+
+	// Four module resolvers, as a binary linking all four instrumentation
+	// modules would hold, evaluating for the first time concurrently.
+	resolvers := []*Resolver{
+		NewResolver(WithFlagKeys("otel-mongo-tracing")),
+		NewResolver(WithFlagKeys("otel-nats-tracing")),
+		NewResolver(WithFlagKeys("otel-gorilla-ws-tracing")),
+		NewResolver(WithFlagKeys("k")),
+	}
+	var wg sync.WaitGroup
+	for _, r := range resolvers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = r.Value(0, false)
+		}()
+	}
+	wg.Wait()
+
+	if got := openfeature.NamedProviderMetadata(FlagDomain).Name; got == noopProviderName {
+		t.Fatalf("no provider installed")
+	}
+	// The install is remembered, so every resolver — not only the one that won
+	// the race — evaluates with the targeting attribute.
+	for i, r := range resolvers {
+		if got := r.evalCtx.Attributes()["service.name"]; got != "checkout-api" {
+			t.Errorf("resolver %d: service.name = %v, want checkout-api", i, got)
+		}
+	}
+}
+
+func TestAutoInstall_ServiceNameOnlyOnThisPath(t *testing.T) {
+	t.Run("attached when auto-installed", func(t *testing.T) {
+		clearProvider(t)
+		resetInstallState(t)
+		t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+		t.Setenv(EnvServiceName, "checkout-api")
+		t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
+
+		r := NewResolver(WithFlagKeys("k"))
+		_ = r.Value(0, false)
+
+		if got := r.evalCtx.Attributes()["service.name"]; got != "checkout-api" {
+			t.Fatalf("service.name = %v, want checkout-api", got)
+		}
+	})
+
+	t.Run("absent when the application installed the provider", func(t *testing.T) {
+		setProvider(t, map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})
+		resetInstallState(t)
+		t.Cleanup(func() { resetInstallState(t) })
+		t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+		t.Setenv(EnvServiceName, "checkout-api")
+
+		r := NewResolver(WithFlagKeys("k"))
+		_ = r.Value(0, false)
+
+		if len(r.evalCtx.Attributes()) != 0 {
+			t.Fatalf("evaluation context = %v, want empty; the application owns its own context",
+				r.evalCtx.Attributes())
+		}
+	})
+}
+
+func TestPollIntervalFromEnv(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    string
+		set      bool
+		want     time.Duration
+		wantWarn bool
+	}{
+		{name: "unset uses the default", want: defaultPollInterval},
+		{name: "duration string", value: "5s", set: true, want: 5 * time.Second},
+		{name: "minutes", value: "2m", set: true, want: 2 * time.Minute},
+		// A bare integer must NOT be read as milliseconds: misreading a polling
+		// interval that way turns 60 into 60ms.
+		{name: "bare integer is rejected", value: "60", set: true, want: defaultPollInterval, wantWarn: true},
+		{name: "garbage is rejected", value: "soon", set: true, want: defaultPollInterval, wantWarn: true},
+		{name: "zero is rejected", value: "0s", set: true, want: defaultPollInterval, wantWarn: true},
+		{name: "negative is rejected", value: "-5s", set: true, want: defaultPollInterval, wantWarn: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := captureLogs(t)
+			if tc.set {
+				t.Setenv(EnvFlagsPollInterval, tc.value)
+			}
+			if got := pollIntervalFromEnv(); got != tc.want {
+				t.Fatalf("pollIntervalFromEnv() = %v, want %v", got, tc.want)
+			}
+			if warned := strings.Contains(buf.String(), EnvFlagsPollInterval); warned != tc.wantWarn {
+				t.Fatalf("warning emitted = %v, want %v (log: %q)", warned, tc.wantWarn, buf.String())
+			}
+		})
+	}
+}
+
+func TestAutoInstall_MalformedIntervalStillInstalls(t *testing.T) {
+	clearProvider(t)
+	resetInstallState(t)
+	buf := captureLogs(t)
+	t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+	t.Setenv(EnvFlagsPollInterval, "not-a-duration")
+	t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
+
+	r := NewResolver(WithFlagKeys("k"))
+	_ = r.Value(0, false)
+
+	if got := openfeature.NamedProviderMetadata(FlagDomain).Name; got == noopProviderName {
+		t.Fatalf("a malformed poll interval prevented the install; a typo in an optional " +
+			"tuning value must not delete the control plane")
+	}
+	if !strings.Contains(buf.String(), EnvFlagsPollInterval) {
+		t.Errorf("the malformed value was not reported: %q", buf.String())
+	}
+}
+
+func TestAutoInstall_APIKeyIsNeverLogged(t *testing.T) {
+	const secret = "super-secret-relay-key"
+	clearProvider(t)
+	resetInstallState(t)
+	buf := captureLogs(t)
+	t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+	t.Setenv(EnvFlagsAPIKey, secret)
+	t.Setenv(EnvFlagsPollInterval, "also-broken") // force the warning path
+	t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
+
+	r := NewResolver(WithFlagKeys("k"))
+	_ = r.Value(0, false)
+
+	if strings.Contains(buf.String(), secret) {
+		t.Fatalf("the API key appeared in a log line: %q", buf.String())
+	}
+}
+
+func TestVersion(t *testing.T) {
+	if Version() != instrumentationVersion {
+		t.Fatalf("Version() = %q, want %q", Version(), instrumentationVersion)
+	}
+}

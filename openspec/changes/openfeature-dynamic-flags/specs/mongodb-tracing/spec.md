@@ -1,71 +1,87 @@
 ## MODIFIED Requirements
 
 ### Requirement: Three-tier tracing feature-flag gating
-The package SHALL gate all wrapper CLIENT spans and `_oteltrace` document propagation behind a conjunction of tiers, evaluated with short-circuit semantics:
+The package SHALL gate all wrapper CLIENT spans and `_oteltrace` document propagation behind three switches, composed by conjunction with short-circuit semantics:
 
 ```
-tracing     := gate1 && EnvEnabled(OTEL_MONGO_TRACING_ENABLED)     && resolver.Allowed(idxTracing)
-propagation := tracing && gateProp && resolver.Allowed(idxPropagation)
+tracing     := master && mongoTracing
+propagation := tracing && mongoPropagation
 ```
 
-`gate1` SHALL be `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` or the `WithTracingEnabled(v bool)` `ClientOption`, which are mutually exclusive per the shared `shared-feature-flags` rule; supplying both SHALL make `ConnectWithOptions` return an error. `gateProp` SHALL likewise be `OTEL_MONGO_PROPAGATION_ENABLED` or the `WithTracePropagationEnabled(v bool)` `ClientOption`, mutually exclusive on the same terms and reported through a distinct sentinel error.
+Each switch SHALL be resolved down the precedence ladder defined in `shared-feature-flags` — `relay > env > option > default` — implemented as a single `Boolean` call whose evaluation default is the env-or-option-or-default value fixed at construction:
 
-The relay flags `otel-mongo-tracing` and `otel-mongo-propagation` SHALL be resolved with an evaluation default of `true` and SHALL only ever subtract: a `false` on the relay disables a tier the deployment enabled; no relay value SHALL enable a tier the deployment left off. When an environment tier resolves to disabled the module SHALL NOT consult the resolver for that flag.
+| Switch | Relay key | Option | Environment variable | Default |
+|---|---|---|---|---|
+| master | `otel-instrumentation-go-tracing` | — | `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | `true` |
+| tracing | `otel-mongo-tracing` | `WithTracingEnabled` | `OTEL_MONGO_TRACING_ENABLED` | `false` |
+| propagation | `otel-mongo-propagation` | `WithTracePropagationEnabled` | `OTEL_MONGO_PROPAGATION_ENABLED` | `false` |
 
-Environment truthiness SHALL follow the allow-list in `shared-feature-flags`: only `1`, `true`, `yes`, `on` (trimmed, case-insensitive) enable; every other value, including the empty string, disables.
+A relay value SHALL override the local value in **either** direction. Supplying an option and the paired environment variable together SHALL NOT be an error; the **environment variable** wins, and the option decides only when the variable is unset. `WithTracingEnabled` and `WithTracePropagationEnabled` SHALL supply their own module tiers only, never the master.
 
-`WithTracingEnabled` SHALL NOT make a client static. A client constructed with it SHALL still read both environment tiers and both relay verdicts per operation, and SHALL stop tracing when the relay revokes. This applies identically to v1 and v2 (parity rule), which share both flag keys.
+An environment value outside the recognised truthy and falsy lists, including the empty string, SHALL make `ConnectWithOptions` return an error wrapping `otelflags.ErrInvalidFlagValue`, per `shared-feature-flags`.
 
-#### Scenario: First tier disabled disables everything
-- **WHEN** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is unset or falsy and no `WithTracingEnabled` option is passed
-- **THEN** the wrapper uses a noop tracer for CLIENT spans and does not inject or extract `_oteltrace`, regardless of `OTEL_MONGO_TRACING_ENABLED`, `OTEL_MONGO_PROPAGATION_ENABLED`, `WithTracePropagationEnabled`, or any relay value, and no OpenFeature evaluation is performed
+`WithTracingEnabled` SHALL NOT make a client static. A client constructed with it SHALL still resolve the master switch and both relay keys per operation, and SHALL change behaviour when either changes. This applies identically to v1 and v2 (parity rule), which share both flag keys.
+
+#### Scenario: Master off disables everything
+- **WHEN** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is falsy, or the relay resolves `otel-instrumentation-go-tracing` to `false`
+- **THEN** the wrapper uses a noop tracer for CLIENT spans and does not inject or extract `_oteltrace`, regardless of `OTEL_MONGO_TRACING_ENABLED`, `OTEL_MONGO_PROPAGATION_ENABLED`, either option, or either module relay key
+
+#### Scenario: Nothing configured traces nothing
+- **WHEN** no environment variable is set, no option is passed, and no relay flag exists
+- **THEN** the master resolves to `true`, tracing and propagation resolve to their defaults of `false`, and no CLIENT spans or `_oteltrace` fields are produced
 
 #### Scenario: Module tracing disabled forces propagation off
-- **WHEN** `gate1` is enabled but `OTEL_MONGO_TRACING_ENABLED` is unset or falsy
-- **THEN** the wrapper emits no CLIENT spans, `_oteltrace` inject/extract is disabled, `WithTracePropagationEnabled(true)` cannot override this, and no relay evaluation is performed
+- **WHEN** the master is on but the tracing switch resolves to `false`
+- **THEN** the wrapper emits no CLIENT spans, `_oteltrace` inject/extract is disabled, and `WithTracePropagationEnabled(true)` cannot override this
 
-#### Scenario: Relay revokes tracing on a running client
-- **WHEN** a `Client` is tracing under a truthy `OTEL_MONGO_TRACING_ENABLED` and the relay resolves `otel-mongo-tracing` to `false`
+#### Scenario: Relay disables tracing on a running client
+- **WHEN** a `Client` is tracing and the relay resolves `otel-mongo-tracing` to `false`
 - **THEN** the next operation emits no span and injects no `_oteltrace`
 
-#### Scenario: Relay cannot enable tracing the deployment left off
-- **WHEN** `gate1` is enabled, `OTEL_MONGO_TRACING_ENABLED` is unset, and the relay resolves `otel-mongo-tracing` to `true`
-- **THEN** no CLIENT spans are created and no evaluation is performed
+#### Scenario: Relay enables tracing the deployment left off
+- **WHEN** `OTEL_MONGO_TRACING_ENABLED` is unset, `relayPossible` is true, and the relay resolves `otel-mongo-tracing` to `true`
+- **THEN** the next operation emits a CLIENT span
 
-#### Scenario: Relay revokes only propagation
-- **WHEN** both environment tiers are truthy and the relay resolves `otel-mongo-tracing` to `true` and `otel-mongo-propagation` to `false`
+#### Scenario: Relay disables only propagation
+- **WHEN** tracing is on and the relay resolves `otel-mongo-propagation` to `false`
 - **THEN** CLIENT spans continue to be created and `_oteltrace` inject/extract stops
 
-#### Scenario: Relay cannot enable propagation the deployment left off
-- **WHEN** tracing is enabled, `OTEL_MONGO_PROPAGATION_ENABLED` is unset, no `WithTracePropagationEnabled` is passed, and the relay resolves `otel-mongo-propagation` to `true`
-- **THEN** no `_oteltrace` field is written to any document
+#### Scenario: Relay enables propagation the deployment left off
+- **WHEN** tracing is on, `OTEL_MONGO_PROPAGATION_ENABLED` is unset, no `WithTracePropagationEnabled` is passed, and the relay resolves `otel-mongo-propagation` to `true`
+- **THEN** subsequent writes carry an `_oteltrace` field, which is why the relay's ability to enable this tier is called out as a risk in the change's design
 
-#### Scenario: No provider installed reproduces environment-only behavior
-- **WHEN** no OpenFeature provider is installed and the tracing environment variables are set to any combination of allow-list values
-- **THEN** the resolved behavior is identical to the release preceding this change
+#### Scenario: Environment variable beats the option
+- **WHEN** `OTEL_MONGO_TRACING_ENABLED` is truthy and `ConnectWithOptions` is passed `WithTracingEnabled(false)`, with no relay opinion
+- **THEN** the client emits CLIENT spans, because the variable outranks the option
 
-#### Scenario: Option and environment variable together are rejected
-- **WHEN** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is set to any value and `ConnectWithOptions` is passed `WithTracingEnabled(v)` for either value of `v`
-- **THEN** `ConnectWithOptions` returns an error matching the module's tracing-conflict sentinel and no `Client` is created
+#### Scenario: Option decides when the environment is silent
+- **WHEN** no Mongo environment variable is set and `ConnectWithOptions` is passed `WithTracingEnabled(true)`, with no relay opinion
+- **THEN** the client emits CLIENT spans, and a second client built with `WithTracingEnabled(false)` in the same process does not
 
-#### Scenario: Propagation option and environment variable together are rejected
-- **WHEN** `OTEL_MONGO_PROPAGATION_ENABLED` is set to any value and `ConnectWithOptions` is passed `WithTracePropagationEnabled(v)`
-- **THEN** `ConnectWithOptions` returns an error matching the module's propagation-conflict sentinel and no `Client` is created
+#### Scenario: An operator stops document writes the code asked for
+- **WHEN** an application passes `WithTracePropagationEnabled(true)` and the deployment sets `OTEL_MONGO_PROPAGATION_ENABLED=false`, with no relay opinion
+- **THEN** no `_oteltrace` field is written, because the operator's variable outranks the application's option — the reason the option sits below the environment
 
-#### Scenario: Both conflicts are reported in one error
-- **WHEN** both `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` and `OTEL_MONGO_PROPAGATION_ENABLED` are set and `ConnectWithOptions` is passed both `WithTracingEnabled(v)` and `WithTracePropagationEnabled(w)`
-- **THEN** one joined error is returned that satisfies `errors.Is` for both sentinels, with the tracing conflict first, and no `Client` is created
+#### Scenario: Option and environment variable together are legal
+- **WHEN** `OTEL_MONGO_PROPAGATION_ENABLED` is set to any recognised value and `ConnectWithOptions` is passed `WithTracePropagationEnabled(v)`
+- **THEN** construction succeeds and the propagation tier takes the variable's value, whatever the option said
 
-#### Scenario: Option supplies the first tier when the environment is silent
-- **WHEN** `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is unset, `OTEL_MONGO_TRACING_ENABLED` is truthy, and `ConnectWithOptions` is passed `WithTracingEnabled(true)`
-- **THEN** the client creates real CLIENT spans, its Collections are constructed on the traced path, and a subsequent relay revocation still stops them
+#### Scenario: Invalid environment value fails construction
+- **WHEN** `OTEL_MONGO_TRACING_ENABLED` is set to `enabled`, `2` or the empty string
+- **THEN** `ConnectWithOptions` returns an error wrapping `otelflags.ErrInvalidFlagValue` naming the variable and the value, and no `Client` is created
+
+#### Scenario: No relay configured reproduces environment-only behavior
+- **WHEN** no OpenFeature provider is installed, no endpoint variable is set, and the switches are configured through environment variables and options only
+- **THEN** the resolved behaviour is the conjunction of those sources with the hardcoded defaults, and no OpenFeature evaluation is performed
 
 ### Requirement: `_oteltrace` document propagation on write
 When document propagation is enabled and an active span is present in the context, `InsertOne`, `InsertMany`, `ReplaceOne`, `UpdateOne`, `UpdateMany`, `UpdateByID`, and `BulkWrite` (for its `InsertOneModel`, `UpdateOneModel`, and `UpdateManyModel` write models) SHALL inject a reserved `_oteltrace` subdocument (`{ traceparent, tracestate }`) into the written document, or into `$set` for operator-style updates.
 
 The field SHALL NOT be removed by any read path: the module reads `_oteltrace` to restore trace context but never strips it from a decoded document, so once written it is visible to the application on every subsequent read. Disabling propagation SHALL stop further writes but SHALL NOT remove fields already written; removing them is an application-side `$unset` migration.
 
-Because enabling this behavior changes what is persisted — approximately 90 bytes of BSON per document, more when a `tracestate` is present — it SHALL be enablable only by the deployment (`OTEL_MONGO_PROPAGATION_ENABLED` or `WithTracePropagationEnabled`), never by a relay value.
+Because enabling this behaviour changes what is persisted — approximately 90 bytes of BSON per document, more when a `tracestate` is present, with no undo and a hard write failure against a collection using `$jsonSchema` with `additionalProperties: false` — the propagation switch's hardcoded default SHALL be `false`. Something SHALL have to say `true` explicitly: `OTEL_MONGO_PROPAGATION_ENABLED`, `WithTracePropagationEnabled`, or a relay flag the site deliberately created. Absence in every source SHALL never enable it.
+
+The relay SHALL be able to enable this tier, unlike in the superseded revoke-only model. The documentation SHALL state that consequence plainly next to the field's size, its permanence and the `$unset` migration, so a site that cannot accept it knows to withhold the relay key or set the master switch falsy.
 
 **Injection SHALL produce exactly one `_oteltrace` field.** `InjectTraceIntoDocument` currently appends unconditionally, so a document read, modified and written back — the ordinary read-modify-write cycle, since the field is never stripped on read — carries the field twice in the resulting `bson.D`. It SHALL remove any existing `_oteltrace` key before appending.
 
@@ -87,8 +103,12 @@ The read side makes this a correctness defect independent of how the server trea
 - **WHEN** `InsertOne` is called with a context that has no active OTel span
 - **THEN** no `_oteltrace` field is added to the document
 
-#### Scenario: Field survives a revocation
-- **WHEN** documents were written with `_oteltrace` and the relay subsequently resolves `otel-mongo-propagation` to `false`
+#### Scenario: Absence never enables the field
+- **WHEN** `OTEL_MONGO_PROPAGATION_ENABLED` is unset, no option is passed, and the relay defines no `otel-mongo-propagation` flag
+- **THEN** no write carries an `_oteltrace` field, whatever the tracing switch resolves to
+
+#### Scenario: Field survives being disabled
+- **WHEN** documents were written with `_oteltrace` and the propagation switch subsequently resolves to `false`
 - **THEN** new writes carry no `_oteltrace`, and documents written earlier still contain the field and still expose it to the application on read
 
 #### Scenario: Read never strips the field
@@ -96,22 +116,22 @@ The read side makes this a correctness defect independent of how the server trea
 - **THEN** the `_oteltrace` key is present in the decoded map
 
 ### Requirement: Trace context restoration from documents
-`ContextFromDocument(ctx, doc)` and `ContextFromRawDocument(ctx, raw)` SHALL restore a remote span context from a document's `_oteltrace` field and SHALL NOT be gated by any feature flag — not `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`, not the module environment variables, and not the relay verdicts.
+`ContextFromDocument(ctx, doc)` and `ContextFromRawDocument(ctx, raw)` SHALL restore a remote span context from a document's `_oteltrace` field and SHALL NOT be gated by any feature flag — not the master switch, not the module environment variables, not the options, and not the relay values.
 
 The justification is that they emit nothing: they start no span, build no attributes, initialise no part of the OTel SDK, and write to no document. They read a field out of a value the caller already holds and return what it encodes. The feature flags govern work the library performs on the caller's behalf as a side effect of a business operation; these functions do only the thing the caller invoked them for.
 
 `Cursor.DecodeAndTrace` and `ChangeStream.DecodeAndTrace` SHALL remain gated, because they start and end a real `mongo.cursor.decode` span on every call. The two surfaces are not equivalent and SHALL NOT be given the same rule on the grounds that both read `_oteltrace`.
 
-Because they observe no configuration at all, these functions SHALL continue to ignore per-connection options, and SHALL behave identically however `gate1` was supplied.
+Because they observe no configuration at all, these functions SHALL continue to ignore per-connection options, SHALL perform no OpenFeature evaluation, and SHALL behave identically however the switches were supplied.
 
-**A revocation therefore does not stop trace-context extraction, and the documentation SHALL say so in those words.** The gate on `DecodeAndTrace` governs the span it emits, not the linking, and is bypassable by design through `Decode` followed by `ContextFromDocument` — the documented alternative for a caller who wants linking to survive the library being silenced. Left unstated, the operational instruction "to stop a module now, set its relay flag to `false`" reads as though everything stops.
+**Disabling a module therefore does not stop trace-context extraction, and the documentation SHALL say so in those words.** The gate on `DecodeAndTrace` governs the span it emits, not the linking, and is bypassable by design through `Decode` followed by `ContextFromDocument` — the documented alternative for a caller who wants linking to survive the library being silenced.
 
 #### Scenario: Extraction works with every switch off
-- **WHEN** `ContextFromDocument` is called on a document containing a valid `_oteltrace` field while `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` and both module environment variables are unset
-- **THEN** it returns the document's span context and `ok == true`, and no span is created
+- **WHEN** `ContextFromDocument` is called on a document containing a valid `_oteltrace` field while every switch resolves to disabled
+- **THEN** it returns the document's span context and `ok == true`, no span is created, and no `Client.Boolean` call is made
 
-#### Scenario: Extraction is unaffected by a relay revocation
-- **WHEN** a change-stream loop is calling `ContextFromDocument` and the relay revokes `otel-mongo-tracing` and `otel-mongo-propagation`
+#### Scenario: Extraction is unaffected by a relay change
+- **WHEN** a change-stream loop is calling `ContextFromDocument` and the relay disables `otel-mongo-tracing` and `otel-mongo-propagation`
 - **THEN** the calls keep returning the document's span context, while the `Collection` path in the same loop stops emitting spans and stops injecting `_oteltrace`
 
 #### Scenario: Missing or malformed metadata still reports failure
@@ -119,50 +139,56 @@ Because they observe no configuration at all, these functions SHALL continue to 
 - **THEN** `ContextFromDocument` returns a zero `SpanContext` and `ok == false`, and `ContextFromRawDocument` returns the input context unchanged
 
 #### Scenario: The gated sibling keeps its gate
-- **WHEN** `Cursor.DecodeAndTrace` is called on the same document while the relay has revoked `otel-mongo-tracing`
+- **WHEN** `Cursor.DecodeAndTrace` is called on the same document while the tracing switch resolves to `false`
 - **THEN** it decodes through the passthrough implementation, returns `ctx` unchanged, and emits no `mongo.cursor.decode` span
 
 #### Scenario: Configuration spelling does not matter
-- **WHEN** a deployment supplies `gate1` through `WithTracingEnabled` and leaves `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` unset
+- **WHEN** a deployment supplies the tracing switch through `WithTracingEnabled` and leaves the environment variables unset
 - **THEN** both functions behave exactly as they would under the environment-variable spelling, because neither reads it
 
 ### Requirement: Disabled-mode invariant via strategy split
 `Collection`, `Cursor`, and `ChangeStream` SHALL hold both an `internal/direct` (passthrough) and an `internal/traced` (instrumented) implementation, and SHALL select between them per operation according to the wrapper's effective tracing state, such that `internal/direct` imports no `go.opentelemetry.io/otel` package of any kind (API, SDK, or exporters) and `internal/traced` contains no feature-flag gating of its own.
 
-Implementation selection at construction SHALL key on the whole static part of the decision, `gate1 && EnvEnabled(OTEL_MONGO_TRACING_ENABLED)` — the same expression `otel-gorilla-ws` uses for its negotiation capability. When it is false, only the `internal/direct` implementation SHALL be constructed and no OTel SDK code path SHALL be reachable, because the relay can only revoke and therefore can never make the instrumented path reachable. When it is true, both implementations SHALL be constructed and the per-operation relay verdict SHALL select between them. No wrapper SHALL be pinned to one implementation because a `WithTracingEnabled` option was supplied.
+Implementation selection at construction SHALL key on whether a relay can exist at all:
 
-For a single public operation, the tracing boolean used to select the implementation SHALL also be the tracing input to document-propagation resolution for that operation — the propagation path SHALL NOT independently re-resolve module tracing via a second resolver read. Fail-safe composition remains: when that tracing value is false, propagation SHALL be false.
+```
+useTracedImpl = relayPossible || (masterLocal && tracingLocal)
+```
+
+When it is false the relay is structurally incapable of returning anything but the value passed to it, so only the `internal/direct` implementation SHALL be constructed, no OTel SDK code path SHALL be reachable, no OpenFeature client SHALL be created, and `shared.NewCommandMonitor` SHALL NOT be registered. When it is true both implementations SHALL be constructed and the per-operation resolution SHALL select between them, because the relay may enable a tier the environment left off. No wrapper SHALL be pinned to one implementation because a `WithTracingEnabled` option was supplied.
+
+For a single public operation, the tracing boolean used to select the implementation SHALL also be the tracing input to document-propagation resolution for that operation — the propagation path SHALL NOT independently re-resolve the master or the tracing switch via additional resolver reads. Fail-safe composition remains: when that tracing value is false, propagation SHALL be false.
 
 The unexported `collectionImpl` methods `Find`, `Aggregate`, and `Watch` SHALL return only the raw driver cursor/change-stream plus error; the facade SHALL construct dual direct/traced wrappers. Those methods SHALL NOT return a throwaway `shared.CursorImpl` / `shared.ChangeStreamImpl` that the facade discards. `FindOne` continues to return `shared.SingleResultImpl` for the live-span exception below.
 
-`SingleResult` is the documented exception: its implementation SHALL be fixed by whichever path executed the originating `FindOne`. `internal/traced.SingleResult` holds the live `FindOne` span and ends it exactly once on the first of `Decode`/`TraceContext`/`Raw`, so no instrumented implementation can be constructed for a `FindOne` that ran through the passthrough path — there is no span to hold. Selecting per call would also be incoherent: a revocation between `FindOne` and `Decode` would leave an already-started span that the passthrough path would never end.
+`SingleResult` is the documented exception: its implementation SHALL be fixed by whichever path executed the originating `FindOne`. `internal/traced.SingleResult` holds the live `FindOne` span and ends it exactly once on the first of `Decode`/`TraceContext`/`Raw`, so no instrumented implementation can be constructed for a `FindOne` that ran through the passthrough path — there is no span to hold. Selecting per call would also be incoherent: a change between `FindOne` and `Decode` would leave an already-started span that the passthrough path would never end.
 
-#### Scenario: First tier off constructs only the passthrough implementation
-- **WHEN** `gate1` is disabled at the time a `Collection` is constructed
-- **THEN** only an `internal/direct` implementation is constructed and no OTel SDK code path can execute for that collection's lifetime
+#### Scenario: No relay possible and switches off constructs only the passthrough implementation
+- **WHEN** no endpoint variable is set, no provider is installed, and the master and tracing switches resolve locally to disabled at the time a `Collection` is constructed
+- **THEN** only an `internal/direct` implementation is constructed, no OTel SDK code path can execute for that collection's lifetime, no evaluation is ever performed, and no command monitor is registered
 
-#### Scenario: Module switch off also constructs only the passthrough implementation
-- **WHEN** `gate1` is enabled and `OTEL_MONGO_TRACING_ENABLED` is unset or falsy at the time a `Collection` is constructed
-- **THEN** only an `internal/direct` implementation is constructed, no OTel SDK code path can execute, and no relay evaluation is ever performed for that collection — because no relay value could reach the instrumented path
+#### Scenario: Relay possible constructs both implementations regardless of the environment
+- **WHEN** the endpoint variable is set and `OTEL_MONGO_TRACING_ENABLED` is unset at the time a `Collection` is constructed
+- **THEN** both implementations are constructed, so a later relay `true` takes effect without reconstruction
 
-#### Scenario: Revocation selects the implementation per operation
-- **WHEN** `gate1` and `OTEL_MONGO_TRACING_ENABLED` are enabled, a `Collection` has been constructed, and the relay revokes `otel-mongo-tracing` between two operations
-- **THEN** the first operation runs through the instrumented implementation and the second through the passthrough implementation, without the `Collection` being reconstructed
+#### Scenario: A flag change selects the implementation per operation
+- **WHEN** a `Collection` was constructed with `relayPossible` true and the relay changes `otel-mongo-tracing` between two operations
+- **THEN** the two operations run through different implementations, without the `Collection` being reconstructed
 
-#### Scenario: Long-lived change stream follows the revocation
-- **WHEN** a `ChangeStream` opened while tracing was enabled outlives a relay revocation of `otel-mongo-tracing`
+#### Scenario: Long-lived change stream follows the change
+- **WHEN** a `ChangeStream` opened while tracing was enabled outlives a relay change of `otel-mongo-tracing` to `false`
 - **THEN** subsequent iterations run through the `internal/direct` implementation and emit no spans
 
 #### Scenario: Option does not pin the implementation
-- **WHEN** a `Client` is constructed with `WithTracingEnabled(true)` while `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is unset, and the relay later revokes `otel-mongo-tracing`
+- **WHEN** a `Client` is constructed with `WithTracingEnabled(true)` and the relay later resolves `otel-mongo-tracing` to `false`
 - **THEN** its Collections switch to `internal/direct` and stop emitting spans
 
 #### Scenario: SingleResult keeps the implementation its FindOne ran through
-- **WHEN** `FindOne` executes through the instrumented path and the relay revokes `otel-mongo-tracing` before the caller calls `Decode`
+- **WHEN** `FindOne` executes through the instrumented path and the relay disables `otel-mongo-tracing` before the caller calls `Decode`
 - **THEN** `Decode` still runs through `internal/traced.SingleResult` and ends the span that `FindOne` started, because leaving it unended would leak an open span
 
 #### Scenario: SingleResult from a passthrough FindOne never becomes instrumented
-- **WHEN** `FindOne` executes through the passthrough path and the relay verdict changes before the caller calls `Decode`
+- **WHEN** `FindOne` executes through the passthrough path and the relay value changes before the caller calls `Decode`
 - **THEN** `Decode` runs through `internal/direct.SingleResult` and emits no span, because no `FindOne` span exists to end
 
 #### Scenario: CI enforcement of the direct package boundary

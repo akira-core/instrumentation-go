@@ -1,0 +1,41 @@
+# Changelog
+
+All notable changes to the `otel-flags` module are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). See `VERSIONING.md` at the repo root for the tagging scheme and the pre-1.0 semver policy.
+
+> **Release ordering**: this module is tagged **before** the instrumentation modules that require it. A published `go.mod` cannot carry a `replace` directive — consumers ignore it — so `otel-mongo`, `otel-mongo/v2`, `otel-nats` and `otel-gorilla-ws` can only name a version that already exists. Local development and the repo-root `go.work` cover the gap; CI builds every module with `GOWORK=off` so each is verified exactly as a consumer resolves it.
+
+## [0.1.0] - unreleased
+
+First release. Extracted from the four vendored `internal/flags` copies that
+`otel-mongo`, `otel-mongo/v2`, `otel-nats` and `otel-gorilla-ws` each carried.
+
+### Why this module exists
+
+A single OpenFeature provider per binary. Four `internal/` packages in four
+modules share no state, so two of them can observe "no provider installed"
+concurrently and both register one — the SDK replaces the loser and shuts it
+down, leaving one live provider *eventually* but two briefly, plus a duplicated
+relay fetch. Go resolves one module path to one version per build, so one shared
+module means one package instance, one install mutex, and exactly one provider.
+
+Deleted along the way: the byte-identical vendoring rule, its "maintained by code
+review, not by a check" caveat, the drift table, and three redundant copies of
+`flags_test.go`.
+
+### Added
+
+- **The precedence ladder.** Every switch resolves `relay > env > option > default`, first source with an opinion winning. It is one `client.Boolean(ctx, key, local, evalCtx)` call: `local` is the already-resolved env-or-option-or-default value, and the SDK returns it on every path where the relay has no usable answer. Relay silence and relay failure are deliberately indistinguishable — both mean "the next rung down decides".
+- `Lookup(name) (value, set bool, err error)` — the environment read, as a strict tri-state. Unset means this source has no opinion. `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off` (trimmed, case-insensitive) decide. **Everything else, including the empty string, is an error** wrapping `ErrInvalidFlagValue` and naming the variable and the value.
+- `ErrInvalidFlagValue` — one sentinel for every module, matchable with `errors.Is`. Possible only because this module is published rather than `internal/`.
+- `MasterLocal()` / `MasterEnabled(local)` — the process-wide master switch, `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` and the relay key `otel-instrumentation-go-tracing`. It defaults to **enabled**, which makes it a veto rather than an enabler: setting it truthy changes nothing, and setting it falsy stops every module in the process, including connections whose Go code passed an option. It takes no option parameter, and must not: a per-connection value cannot express a process-wide switch.
+- `RelayPossible()` — endpoint configured, or a provider already bound to `FlagDomain`. When false the relay is structurally incapable of returning anything but the value passed to it, so callers resolve statically, allocate no instrumented implementation unless the local answer is on, and never touch the OpenFeature SDK. **Resolve it once per construction; do not memoize it process-wide.**
+- `Resolver` / `NewResolver` / `WithFlagKeys` / `Value(i, local)` — per-module flag resolution. Caches nothing: no snapshot, no TTL, no clock, no refresh. An out-of-range index returns `false` rather than panicking.
+- Environment-driven provider auto-install. Setting `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` (plus `_API_KEY` and `_POLL_INTERVAL`) gives an application relay control with no Go code and no import. It fires only when the application has installed no provider of its own, registers a **named** provider on `otel-instrumentation-go`, and hardcodes `DataCollectorDisabled: true` and in-process evaluation so the zero-code path cannot be misconfigured into a stall. A malformed poll interval warns, falls back to `60s` and still installs.
+- `Version()` and the `instrumentationVersion` constant, for the release-tag CI guard.
+
+### Notes for callers
+
+- **Install your own provider before constructing any wrapper.** `RelayPossible` is resolved at construction, so a wrapper built earlier resolves statically for the rest of its life.
+- **A flag change is not immediate.** End-to-end latency is the provider's poll interval — 60 s by default. This module adds none of its own.
+- **Two or three evaluations per instrumented operation**, at roughly 2 µs and 7 allocations each. That is the SDK's evaluation pipeline, not the flag lookup; an in-memory provider does not make it cheaper. Caching is a permitted future optimisation and fits inside `Resolver` without changing `Value`'s signature.
+- This module never calls `SetProvider`, `SetEvaluationContext`, `AddHooks` or `Shutdown`. Nothing it does can change how the application's own feature flags resolve.

@@ -63,10 +63,11 @@ func TestConnectWithOptions_TracingEnabledOption_True_SuppliesGate1(t *testing.T
 // direct impl, and WithTracePropagationEnabled(true) cannot enable
 // propagation despite tracing being force-disabled by the option.
 func TestConnectWithOptions_TracingEnabledOption_False_BuildsPassthrough(t *testing.T) {
-	// Both env variables that have an option counterpart are left UNSET: since
-	// D3 each pair is two spellings of one switch, and supplying both is a
-	// configuration error.
-	t.Setenv(envMongoTracingEnabled, "1")
+	// Every variable is left UNSET so the options are the deciding rung. Setting
+	// OTEL_MONGO_TRACING_ENABLED here would BEAT WithTracingEnabled(false) — the
+	// option sits below its variable — and this test would assert the wrong
+	// thing while still passing for the wrong reason.
+	clearMongoTracingEnv(t)
 	uri := requireMongoDB(t)
 
 	c, err := ConnectWithOptions([]ClientOption{
@@ -76,7 +77,7 @@ func TestConnectWithOptions_TracingEnabledOption_False_BuildsPassthrough(t *test
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Disconnect(context.Background()) })
 
-	assert.False(t, c.effectiveTracing(), "gate1 off → no instrumented impl, whichever spelling supplied it")
+	assert.False(t, c.effectiveTracing(), "the option decides with the environment silent")
 	assert.False(t, c.effectivePropagation(), "propagation cannot be enabled when effective tracing is off, even via WithTracePropagationEnabled")
 
 	coll := c.Database("otelmongo_test").Collection("option_false_overrides_env")

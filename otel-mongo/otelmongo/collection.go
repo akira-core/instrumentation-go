@@ -92,13 +92,14 @@ var (
 
 // NewCollection wraps an existing *mongo.Collection with trace propagation.
 //
-// It resolves the static tiers from the environment, since it accepts no
-// options: OTEL_INSTRUMENTATION_GO_TRACING_ENABLED **and**
-// OTEL_MONGO_TRACING_ENABLED must both be on for the instrumented
-// implementation to be built at all, and OTEL_MONGO_PROPAGATION_ENABLED is a
-// further tier below that for _oteltrace writes. When the first two are off the
-// returned wrapper is a pure passthrough — no spans, no _oteltrace, no
-// propagator extract, and no OpenFeature evaluation.
+// It resolves the switches from the environment alone, since it accepts no
+// options. The instrumented implementation is built when a relay could ever
+// enable this module, or when the environment already does; the effective
+// per-operation answer is the master switch AND OTEL_MONGO_TRACING_ENABLED, each
+// resolved down the full ladder. OTEL_MONGO_PROPAGATION_ENABLED is a further
+// switch below tracing for _oteltrace writes. With no relay configured and the
+// environment silent, the returned wrapper is a pure passthrough — no spans, no
+// _oteltrace, no propagator extract, and no OpenFeature evaluation.
 func NewCollection(coll *mongo.Collection, tracer trace.Tracer, propagator propagation.TextMapPropagator) *Collection {
 	gate := envGates()
 	c := &Collection{
@@ -106,7 +107,7 @@ func NewCollection(coll *mongo.Collection, tracer trace.Tracer, propagator propa
 		direct:     direct.NewCollection(coll),
 		tracing:    gate.effectiveTracing,
 	}
-	if !gate.tracedBuilt {
+	if !gate.tracedPossible() {
 		return c
 	}
 	c.traced = &traced.Collection{
@@ -127,7 +128,7 @@ func newCollectionForDatabase(d *Database, raw *mongo.Collection) *Collection {
 		direct:     direct.NewCollection(raw),
 		tracing:    d.effectiveTracing,
 	}
-	if !d.gate.tracedBuilt {
+	if !d.gate.tracedPossible() {
 		return c
 	}
 	c.traced = &traced.Collection{

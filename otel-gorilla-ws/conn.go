@@ -94,29 +94,34 @@ type Conn struct {
 	// writes the envelope, because the peer committed to it at the handshake.
 	tracingEnabled bool
 
-	// capable records whether this connection could EVER trace: both
-	// environment-derived tiers ANDed at construction (gate1, spelled either as
-	// OTEL_INSTRUMENTATION_GO_TRACING_ENABLED or WithTracingEnabled, AND
-	// OTEL_GORILLA_WS_TRACING_ENABLED). False ⇒ no spans and no OpenFeature
-	// evaluation, exactly the pre-dynamic disabled behavior. Distinct from
-	// enveloped (the wire fact) and from featureEnabled() (the per-call gate).
+	// capable records whether any OTel SDK path could EVER run on this
+	// connection: gate.tracedPossible(), fixed at construction. False ⇒ a noop
+	// tracer, no spans and no OpenFeature evaluation, exactly the pre-dynamic
+	// disabled behavior. Distinct from enveloped (the wire fact) and from
+	// featureEnabled() (the per-call gate).
 	capable bool
+
+	// gate holds the connection's switch state fixed at construction — the
+	// master and module local values, and whether a relay can exist at all.
+	gate gateState
 }
 
 // featureEnabled reports whether this call should create spans and inject or
 // extract trace context.
 //
-// It is the per-call gate: the static capability AND the relay verdict, which
-// is resolved fresh every time so a revocation reaches this live connection on
-// its next operation. There is no option branch — WithTracingEnabled supplies
-// gate1, which capability already folded in at construction.
+// It is the per-call gate: the whole ladder, master switch included, resolved
+// fresh every time so a relay change reaches this live connection on its next
+// operation. There is no option branch — WithTracingEnabled supplied one rung of
+// the ladder at construction.
 //
 // Distinct from enveloped and tracingEnabled, which describe the wire. A
 // connection can be enveloped with featureEnabled false: it keeps writing
 // envelopes because the peer expects them, but injects nothing and creates no
-// span.
+// span. And it can have featureEnabled true while not enveloped — a connection
+// opened before the relay enabled this module emits local spans but cannot
+// inject or extract, because negotiation cannot be revisited.
 func (c *Conn) featureEnabled() bool {
-	return c.capable && wsRelayAllows()
+	return c.gate.tracing()
 }
 
 // Subprotocol returns the application protocol negotiated for this connection.
@@ -147,22 +152,22 @@ func NewConn(conn *websocket.Conn, opts ...Option) (*Conn, error) {
 // newConn wraps conn with the given negotiation outcome, resolving opts.
 func newConn(conn *websocket.Conn, enveloped bool, opts ...Option) (*Conn, error) {
 	cfg := resolveConnOptions(opts)
-	capable, err := effectiveCapability(cfg)
+	gate, err := resolveGates(cfg)
 	if err != nil {
 		return nil, err
 	}
-	return newConnFromConfig(conn, enveloped, cfg, capable), nil
+	return newConnFromConfig(conn, enveloped, cfg, gate), nil
 }
 
 // newConnFromConfig is the constructor core shared by NewConn, Dial and
-// Upgrader.Upgrade — the latter two resolve their options and capability before
+// Upgrader.Upgrade — the latter two resolve their options and gate state before
 // the handshake (to gate otel-ws negotiation) and pass both here.
-func newConnFromConfig(conn *websocket.Conn, enveloped bool, cfg connOptions, capable bool) *Conn {
+func newConnFromConfig(conn *websocket.Conn, enveloped bool, cfg connOptions, gate gateState) *Conn {
 	c := &Conn{
 		Conn:      conn,
 		enveloped: enveloped,
 	}
-	configureConn(c, cfg, capable)
+	configureConn(c, cfg, gate)
 	return c
 }
 
@@ -309,10 +314,14 @@ func (c *Conn) ReadMessage(ctx context.Context) (context.Context, int, []byte, e
 // gorilla sees it — see stripOTelSubprotocol.
 func Dial(ctx context.Context, urlStr string, requestHeader http.Header, subprotocols []string, opts ...Option) (*Conn, *http.Response, error) {
 	cfg := resolveConnOptions(opts)
-	featureOn, err := effectiveCapability(cfg)
+	gate, err := resolveGates(cfg)
 	if err != nil {
 		return nil, nil, err
 	}
+	// Resolved ONCE, here, from the whole ladder including the relay. A handshake
+	// cannot be revisited, so this is the only moment the wire decision can be
+	// made — and it is why enabling this module reaches new connections only.
+	featureOn := gate.tracing()
 
 	var otelInjected bool
 	dialProtos := subprotocols
@@ -352,7 +361,7 @@ func Dial(ctx context.Context, urlStr string, requestHeader http.Header, subprot
 	}
 	// Scenario E: otelInjected=false → enveloped=false (passthrough).
 
-	return newConnFromConfig(raw, enveloped, cfg, featureOn), resp, nil
+	return newConnFromConfig(raw, enveloped, cfg, gate), resp, nil
 }
 
 func appProtocolFromRaw(rawProto string) string {

@@ -4,12 +4,14 @@ import (
 	nats "github.com/nats-io/nats.go"
 )
 
-// checkConnOptions rejects a contradictory configuration BEFORE any connection
-// is opened, so a caller that supplied both WithTracingEnabled and
-// OTEL_INSTRUMENTATION_GO_TRACING_ENABLED does not leave a live NATS connection
-// behind an error return.
+// checkConnOptions rejects an unreadable configuration BEFORE any connection is
+// opened, so a deployment carrying an OTEL_*_ENABLED value this package cannot
+// interpret does not leave a live NATS connection behind an error return.
+//
+// Both switches are read, and both failures are reported together, so one run
+// names every bad value rather than making the caller rediscover the next one.
 func checkConnOptions(traceOpts []Option) error {
-	_, err := tracedPossible(newConnConfig(traceOpts...).TracingEnabled)
+	_, err := resolveGates(newConnConfig(traceOpts...).TracingEnabled)
 	return err
 }
 

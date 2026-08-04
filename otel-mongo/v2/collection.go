@@ -103,7 +103,7 @@ func NewCollection(coll *mongo.Collection, tracer trace.Tracer, propagator propa
 		direct:     direct.NewCollection(coll),
 		tracing:    gate.effectiveTracing,
 	}
-	if !gate.tracedBuilt {
+	if !gate.tracedPossible() {
 		return c
 	}
 	c.traced = &traced.Collection{
@@ -124,7 +124,7 @@ func newCollectionForDatabase(d *Database, raw *mongo.Collection) *Collection {
 		direct:     direct.NewCollection(raw),
 		tracing:    d.effectiveTracing,
 	}
-	if !d.gate.tracedBuilt {
+	if !d.gate.tracedPossible() {
 		return c
 	}
 	c.traced = &traced.Collection{

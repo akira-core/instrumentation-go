@@ -1,8 +1,21 @@
-> **Sections 1–8 record the first implementation** (commits `f9f363d`, `1d124f1`), built against the
-> earlier model in which the relay decided in both directions and `WithTracingEnabled` pinned a
-> connection static. That model was replaced during design review; see `design.md` §
-> "Superseded decisions". Those sections are kept as the historical record of what shipped —
-> **section 9 revises it** and is the work that remains. Where the two disagree, section 9 wins.
+> **Read this file back to front.** It records three passes over the same change, and only the
+> last one describes the intended end state.
+>
+> - **Sections 1–8** — the first implementation (commits `f9f363d`, `1d124f1`), built against a model
+>   in which the relay decided in both directions and `WithTracingEnabled` pinned a connection static.
+> - **Section 9** — the kill-switch rework (implemented, unreleased): the relay became revoke-only,
+>   the option became a mutually exclusive spelling of the global switch, and `EnvEnabled` gained a
+>   truthy allow-list.
+> - **Section 10** — the feature-toggle rework, and **the work that remains**. Each switch resolves
+>   down `relay > env > option > default`; the relay is authoritative in both directions again, but
+>   the defaults (master `true` as a veto, everything else `false`) keep a zero-configuration process
+>   silent. The shared flag logic moves out of four vendored copies into a published `otel-flags`
+>   module so exactly one OpenFeature provider serves the binary.
+>
+> Where any two sections disagree, the later one wins. Sections 1–9 are kept as the record of what
+> was built and why it was replaced; see `design.md` § "Superseded decisions" for the point-by-point
+> mapping. **No version carrying section 9's model has been released**, so the external migration
+> story runs from `0.7.0` straight to section 10.
 
 ## 1. Shared `internal/flags` foundation
 
@@ -205,4 +218,100 @@
 
 ### 9.9 Downstream follow-up (not blocking this change)
 
-- [ ] 9.9.1 `instrumentation-demo`: its NATS demo runs with `OTEL_NATS_TRACING_ENABLED=false` and flips the flag **on** at the relay, which this model forbids. The deployment must set `OTEL_NATS_TRACING_ENABLED=true` and the demo must invert to revoke-then-restore. File it as an issue on that project; nothing in this repository blocks on it.
+- [x] 9.9.1 **Withdrawn by section 10.** `instrumentation-demo`'s NATS demo runs with `OTEL_NATS_TRACING_ENABLED=false` and flips the flag **on** at the relay. Section 9's model forbade that and the demo would have had to invert to revoke-then-restore; under section 10 the relay can enable, so the demo works as written. No downstream change is required. Verify once before release that the demo's `OTEL_NATS_TRACING_ENABLED=false` is a recognised falsy value rather than an empty string, which section 10 turns into a construction error.
+
+## 10. Feature-toggle rework
+
+> Locked in `design.md` D1–D17 (revision 2) and the five delta specs. Do not start code until those
+> artifacts are reviewed. `otel-flags` is tagged first; the four instrumentation modules land together
+> in one commit afterwards.
+
+### 10.1 The `otel-flags` module
+
+- [x] 10.1.1 Create `otel-flags/` with `go.mod` (`module github.com/akira-core/instrumentation-go/otel-flags`), requiring `github.com/open-feature/go-sdk` and the GO Feature Flag provider. Nothing in this repository may depend on the four instrumentation modules from here.
+- [x] 10.1.2 Move the surviving contents of `otel-nats/otelnats/internal/flags/flags.go` into `otel-flags/flags.go` and adapt: the package name, the exported surface below, and the doc comment (which loses the byte-identical rule and its drift table, and gains the single-provider guarantee).
+- [x] 10.1.3 Replace `EnvEnabled`/`EnvSet` with the tri-state `Lookup(name string) (value bool, set bool, err error)`: unset ⇒ `(false, false, nil)`; `1`/`true`/`yes`/`on` ⇒ `(true, true, nil)`; `0`/`false`/`no`/`off` ⇒ `(false, true, nil)`; anything else, **including the empty string** ⇒ a non-nil error wrapping `ErrInvalidFlagValue` and naming the variable and the observed value. Delete the `slog.Warn` path — an error replaces it.
+- [x] 10.1.4 Export `ErrInvalidFlagValue`. One sentinel serves all four modules, because `otel-flags` is a published module rather than an `internal/` package; do not add per-module sentinels.
+- [x] 10.1.5 Add the master switch: `EnvGlobalTracing`, `FlagKeyGlobalTracing = "otel-instrumentation-go-tracing"`, `MasterLocal() (bool, error)` (env, else `true`) and `MasterEnabled(local bool) bool` (the relay, defaulting to `local`). Document that the default `true` makes the switch a veto and that setting either spelling to `true` is inert.
+- [x] 10.1.6 Change `Resolver.Allowed(i int) bool` to `Value(i int, local bool) bool`, evaluating `client.Boolean(ctx, r.keys[i], local, r.evalCtx)`. Keep the bounds check returning `false`, the lazy `clientOnce`, and the absence of any cache. Do **not** use `BooleanValueDetails`: relay silence and relay failure both fall through to `local`, so the distinction has no reader.
+- [x] 10.1.7 Add `RelayPossible() bool` — `EnvFlagsEndpoint` non-empty **or** `openfeature.NamedProviderMetadata(FlagDomain).Name != "NoopProvider"`. Document that it is resolved per construction and deliberately not memoized, and why (a process-wide `sync.Once` would freeze the answer at whichever wrapper was built first, which in a test binary makes every relay test unreachable).
+- [x] 10.1.8 Keep the D17 auto-install unchanged in behaviour, and delete the paragraph about two modules racing to register — one package means one `clientOnce` means one install. Keep `DataCollectorDisabled: true` and `EvaluationTypeInProcess` hardcoded, the `time.ParseDuration`-only poll interval with its `60s` fallback and warn-but-still-install rule, and the prohibition on logging `EnvFlagsAPIKey`. Keep the D12 `service.name` evaluation context on this path only.
+- [x] 10.1.9 Write `otel-flags/flags_test.go` — one copy, not four. `Lookup` golden table covering every truthy and falsy spelling, the empty string, `enabled`, `2`, and unset; `Value` returning `local` with no provider installed and the relay's value with one; `Value` returning `false` for an out-of-range index; `MasterEnabled` defaulting to `true`; `RelayPossible` in all three states (endpoint set, provider bound, neither); a provider mutation observed on the very next call with no sleep; the auto-install's fire and stand-down conditions. Install in-memory providers with `SetNamedProviderAndWait(FlagDomain, …)`. No `t.Parallel` where a provider or `t.Setenv` is involved.
+- [x] 10.1.10 Add `otel-flags/version.go` with `instrumentationVersion = "0.1.0"`, `otel-flags/CHANGELOG.md`, and `otel-flags/README.md` describing the ladder, the three switches and the provider variables, and pointing at `feature-flags.md` for the operator-facing reference.
+- [x] 10.1.11 Delete `otel-nats/otelnats/internal/flags/`, `otel-gorilla-ws/internal/flags/`, `otel-mongo/otelmongo/internal/flags/` and `otel-mongo/v2/internal/flags/`.
+- [x] 10.1.12 Add a repository-root `go.work` listing all seven modules plus the examples and integration sub-modules, so local development resolves `otel-flags` from the working tree. It must not be accompanied by any `replace` directive in a published `go.mod`.
+- [x] 10.1.13 Run `go build ./...`, `go test -v -race ./...` and `golangci-lint run ./...` in `otel-flags/` until all three pass with zero issues.
+
+### 10.2 Per-module composition
+
+- [x] 10.2.1 In each module's `env_flags.go`, add the tier's hardcoded default (`false` for every module tracing switch and for `OTEL_MONGO_PROPAGATION_ENABLED`) and a `resolveLocal(option *bool, envName string, def bool) (bool, error)` helper implementing `env > option > default`: start from `def`, apply the option if present, then let a recognised environment value overwrite it. The `Lookup` error propagates **even when an option was supplied** — the option does not excuse an unreadable variable that outranks it.
+- [x] 10.2.2 Replace the three-tier conjunction with `master && moduleTracing`, both resolved through `Value`/`MasterEnabled` per operation, and `propagation = tracing && Value(idxPropagation, propLocal)` for `otel-mongo`. Delete every `EnvEnabled(moduleEnv)` read outside construction.
+- [x] 10.2.3 Delete `ErrTracingConfigConflict` and `ErrTracePropagationConfigConflict` and the presence-based mutual-exclusion check from all seven option-accepting constructors. Supplying an option and its paired environment variable is now legal, with the option winning.
+- [x] 10.2.4 Make `WithTracingEnabled` supply the **module** tier rather than `gate1` in all four modules, and confirm `WithTracePropagationEnabled` still supplies only the propagation tier. No option may reach the master switch.
+- [x] 10.2.5 Every constructor collects all of its `Lookup` errors before returning and joins them with `errors.Join` in a fixed order (master, module tracing, propagation). It must not return on the first failure.
+- [x] 10.2.6 Update `otel-testkit/harness/flags.go` to import `otel-flags` and to expose helpers for both directions of the ladder, not just revocation.
+
+### 10.3 Implementation selection on `relayPossible`
+
+- [x] 10.3.1 Add `relayPossible`, `masterLocal`, `tracingLocal` and (Mongo only) `propLocal` to `gateState`, resolved once at construction. `gateState.tracing()` short-circuits to `masterLocal && tracingLocal` when `relayPossible` is false, so a no-relay process performs no evaluation.
+- [x] 10.3.2 `otel-mongo` v1 and v2: replace `tracedBuilt = gate1 && EnvEnabled(envMongoTracingEnabled)` with `relayPossible || (masterLocal && tracingLocal)`, and register `shared.NewCommandMonitor` on that same condition.
+- [x] 10.3.3 `otel-nats`: same expression decides whether `tracedConn` / `tracedJSImpl` are built. Keep the lockstep comment tying `impl`/`msgHandler`/`traceEventMsgHandler` together.
+- [x] 10.3.4 `otel-gorilla-ws`: same expression decides whether any OTel SDK path is reachable; `featureEnabled()` becomes `master && wsTracing` resolved per call.
+- [x] 10.3.5 Confirm every derived wrapper — `oteljetstream.New(conn)`, `Client.Database()`, `Database.Collection()`, cursors, change streams, consumers, batch forwarders — inherits its source's `gateState` rather than re-resolving `relayPossible`.
+- [x] 10.3.6 Confirm `ContextFromDocument`/`ContextFromRawDocument` remain entirely ungated and perform no evaluation (unchanged from 9.3.4; re-verify after the gateState rewrite).
+
+### 10.4 otel-gorilla-ws negotiation
+
+- [x] 10.4.1 Replace the static negotiation capability with the connection's effective tracing value — `master && wsTracing`, relay included — resolved **once, immediately before** the handshake, in `Dial` and `Upgrader.Upgrade`.
+- [x] 10.4.2 Keep the write-path clamp on the negotiated wire fact and the read-path unwrap keyed on that same unclamped fact (9.4.5 stands). Keep the byte-transparent probe (9.4.6 stands) and the exported `SubprotocolOTelWS` / `IsOTelNegotiated` (9.4.4 stands).
+- [x] 10.4.3 Keep `NewConn`'s `(*Conn, error)` signature; its reason changes from a configuration conflict to an invalid environment value.
+- [x] 10.4.4 Update `otel-ws.md` §5: negotiation now follows the handshake-time effective value including the relay, so a relay enable reaches only connections opened afterwards and a relay disable leaves the envelope in place. State both halves of the asymmetry. The reserved-`{"header":…,"data":…}` section stands.
+
+### 10.5 Tests
+
+- [x] 10.5.1 Rewrite the ~89 call sites that set an environment variable and pass the matching option: they no longer fail, and must now assert that the **environment variable wins**. This is the opposite of released `0.7.0`, so read each one rather than editing mechanically — a test that passes for the wrong reason is the likely failure here. Where the intent was per-connection differentiation, drop the environment variable and let the option decide.
+- [x] 10.5.1b Add an operator-override test per module: the option says on, the environment variable says off, no relay ⇒ off. For `otel-mongo`, add the propagation form (`WithTracePropagationEnabled(true)` + `OTEL_MONGO_PROPAGATION_ENABLED=false` ⇒ no `_oteltrace` written), which is the case the ordering exists for.
+- [x] 10.5.1c Add a differentiation test per module: with the module's environment variable unset, two wrappers built with `WithTracingEnabled(true)` and `WithTracingEnabled(false)` behave differently in one process.
+- [x] 10.5.1d Add an invalid-value-with-option test: an unrecognised environment value fails construction even when an option was supplied.
+- [x] 10.5.2 Replace every "the relay cannot enable" assertion with its inverse: relay `true` against an unset environment variable enables the module, provided the provider was installed before the wrapper was constructed.
+- [x] 10.5.3 Delete the constructor-conflict tests added in 9.5.3 and replace them with invalid-value tests: every module, every option-accepting constructor, `enabled` / `2` / the empty string, asserting `errors.Is(err, otelflags.ErrInvalidFlagValue)` and that all bad values are named in one joined error.
+- [x] 10.5.4 Add master-veto tests per module: `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=false` and a relay `otel-instrumentation-go-tracing: false` each stop a module whose own switch is on, including a connection carrying `WithTracingEnabled(true)`.
+- [x] 10.5.5 Add `relayPossible` tests per module: with neither an endpoint nor a provider, no OpenFeature client is created, only the passthrough implementation is allocated and (Mongo) no command monitor is registered; with an endpoint set, both implementations are allocated even though the environment says off; a wrapper constructed **before** the provider is installed stays static.
+- [x] 10.5.6 Add a defaults test per module: nothing configured ⇒ nothing traces; the module environment variable alone ⇒ that module traces (the master defaults to `true`); `OTEL_MONGO_PROPAGATION_ENABLED` unset ⇒ no `_oteltrace` regardless of tracing.
+- [x] 10.5.7 `otel-gorilla-ws`: negotiation follows the handshake-time value including the relay; a connection opened while the module was off does not gain the envelope when the relay enables it, though it may emit local spans; a relay disable stops spans while the envelope continues.
+- [x] 10.5.8 Update the relay integration test to assert **both** directions — enable from an environment that says nothing, then disable — and to install its provider before constructing the wrapper.
+- [x] 10.5.9 Confirm no test leaves `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` set outside the auto-install tests, that every in-memory provider is installed with `SetNamedProviderAndWait(FlagDomain, …)`, and that every relay test constructs its wrapper after the install.
+- [x] 10.5.10 Run `go build`, `go test -race` and `golangci-lint` with `GOWORK=off` in all seven modules until clean.
+
+### 10.6 CI and release plumbing
+
+- [x] 10.6.1 Add `otel-flags` as a seventh entry in `.github/workflows/ci.yml`'s `test-and-lint` matrix.
+- [x] 10.6.2 Set `GOWORK=off` on every per-module build, test and lint step so each module is verified exactly as a consumer resolves it, not through the workspace.
+- [x] 10.6.3 Add an `otel-flags/v[0-9]*` trigger pattern to `.github/workflows/release-guard.yml`, validated against `otel-flags/version.go`.
+- [x] 10.6.3b **Guard the development-time `replace`.** Until `otel-flags/v0.1.0` is tagged, each of the four modules carries `replace github.com/akira-core/instrumentation-go/otel-flags => ../otel-flags` so `go mod tidy` and `GOWORK=off` builds work. A `replace` that reaches a published tag breaks every consumer silently, so `release-guard.yml` SHALL fail any module tag whose `go.mod` contains a `replace` directive pointing at another module in this repository. Human discipline is not sufficient here: the failure is invisible until a consumer tries to build.
+- [ ] 10.6.3c Remove the four `replace` directives immediately after `otel-flags/v0.1.0` is pushed, and re-run `GOWORK=off go mod tidy` in each module so the requirement resolves from the proxy.
+- [x] 10.6.4 Update `VERSIONING.md` with `otel-flags`, its tag shape, and the two-stage release ordering (`otel-flags` first, then the four modules requiring a published version — never a `replace`).
+
+### 10.7 Documentation
+
+- [x] 10.7.1 Rewrite `feature-flags.md` for the ladder: the four sources and their order, the three switches with their defaults, the master's inert `true`, the per-switch resolution tables, and the worked examples for the combinations most likely to surprise (module variable alone now works; the empty string is now an error; the option no longer beats its environment variable, reversing `0.7.0`).
+- [x] 10.7.1b Add § "Which setting wins" to `feature-flags.md`: the ladder is ordered by how late each source is decided (compile → construct → deploy → run), the environment variable is the operator's per-module control that application code cannot override, and the option decides only when that variable is unset — which is also the condition for differentiating two connections in one process.
+- [x] 10.7.2 In `feature-flags.md`, replace § "the relay can only revoke" with the risk it becomes: the relay can enable, including `otel-mongo` propagation, which writes ~90 bytes of permanent `_oteltrace` into application documents. State the four things that bound it — the master veto, the per-module environment variable (which application code cannot override), the propagation default of `false`, and `relayPossible` — and how a site that cannot accept it opts out.
+- [x] 10.7.3 Add § "Install your provider before constructing wrappers" to `feature-flags.md`, explaining `relayPossible` and what a wrapper built too early loses. Update the § on the non-blocking startup window: it now falls back to the locally-resolved value, so it can only delay an enable, never introduce one.
+- [x] 10.7.4 Add the pre-upgrade audit to `feature-flags.md` and to every CHANGELOG: grep the deployment configuration for `OTEL_*_ENABLED` and confirm every value is in one of the two accepted lists, because anything else — including an empty string from an unexpanded template variable — now fails construction.
+- [x] 10.7.5 In `feature-flags.md` § otel-gorilla-ws, state the negotiation asymmetry in both directions (an enable reaches only new connections; a disable leaves the envelope). § What is not gated stands unchanged: extraction is never stopped.
+- [x] 10.7.6 Update § Revocation latency — rename it to cover both directions and keep the 60 s poll interval as the number that matters.
+- [x] 10.7.7 Regenerate `feature-flags.zh-TW.md` from the rewritten English file, keeping the cross-links.
+- [x] 10.7.8 Rewrite `CLAUDE.md`'s feature-flag sections: the ladder replaces the conjunctive-tier model, `otel-flags` replaces the byte-identical `internal/flags` (delete that rule and its enforcement note), `relayPossible` replaces `gate1 && EnvEnabled(moduleEnv)` as the allocation key, `WithTracingEnabled` supplies the module tier, the mutual-exclusion rule and both sentinels are gone, and the WS negotiation paragraph follows 10.4.1. Add the master switch's relay key and its inert `true`.
+- [x] 10.7.9 Update `README.md`, `README.zh-TW.md` and the six module READMEs: the defaults table, the master switch described as "set to `false` to stop everything", and the note that a module variable alone is now sufficient.
+- [x] 10.7.10 Rewrite each module's unreleased `CHANGELOG.md` entry against `0.7.0` rather than against section 9's unreleased model. BREAKING: an invalid or empty `OTEL_*_ENABLED` value fails construction; a module variable set without the global one now takes effect; `NewConn` returns an error; `ContextFromDocument`/`ContextFromRawDocument` are ungated; the module now requires `otel-flags`, which brings the GO Feature Flag provider's dependency tree. Removed: both configuration-conflict sentinels. Note that no release ever carried the revoke-only model, so no migration from it is described.
+- [x] 10.7.11 Add `otel-flags/CHANGELOG.md`'s `0.1.0` entry describing the module's purpose and its exported surface.
+
+### 10.8 Explicit non-work
+
+- **Caching relay values.** Still deferred (D4), and still invisible behind `Value(i, local) bool`. The case is stronger now that an instrumented operation makes two or three evaluations instead of one, but it is not in this change.
+- **`BooleanValueDetails`.** Not used; relay silence and relay failure both fall through to `local`.
+- **Per-module OpenFeature domains.** Not reintroduced — one domain is what makes one provider serve every module.
+- **Negotiating `otel-ws` whenever a relay is configured.** Rejected in D9; it would charge every relay-configured deployment for the envelope permanently.
+- **Per-request targeting and dynamic sampling rates.** Unchanged Non-Goals.
+- **A CI check for `internal/flags` byte-identity.** Moot — there are no copies left to compare.

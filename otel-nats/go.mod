@@ -14,6 +14,7 @@ require (
 )
 
 require (
+	github.com/akira-core/instrumentation-go/otel-flags v0.1.0
 	github.com/antithesishq/antithesis-sdk-go v0.7.0-default-no-op // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.0 // indirect
 	github.com/blang/semver v3.5.1+incompatible // indirect
@@ -43,3 +44,5 @@ require (
 	golang.org/x/time v0.15.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/akira-core/instrumentation-go/otel-flags => ../otel-flags

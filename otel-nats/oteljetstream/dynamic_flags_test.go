@@ -17,6 +17,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
+	otelflags "github.com/akira-core/instrumentation-go/otel-flags"
 	"github.com/akira-core/instrumentation-go/otel-nats/oteljetstream"
 	"github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 )
@@ -26,10 +27,12 @@ import (
 // captured when New returns. This test proves that end to end: spans stop and
 // start on a handle that is never recreated.
 //
-// It waits out the resolver's one-second TTL rather than reaching into
-// otelnats' unexported reset hook — the TTL boundary itself is unit-tested with
-// a fake clock in internal/flags, so the only thing left to prove here is that
-// the wrapper re-reads at all.
+// Nothing is cached and there is no reset hook: a rebound provider is observed
+// on the very next operation, so these tests flip the relay and assert directly.
+//
+// Every test binds the provider BEFORE connecting. relayPossible is resolved at
+// construction, so a Conn built while no relay could exist resolves statically
+// for its whole life.
 //
 // Not parallel-safe: the OpenFeature provider and the process environment are
 // global. No t.Parallel in this file.
@@ -50,18 +53,9 @@ func relayFlag(v bool) memprovider.InMemoryFlag {
 	}
 }
 
-// flagDomain is the OpenFeature domain every instrumentation module resolves
-// through. It is declared in otel-nats/otelnats/internal/flags, which this
-// package cannot import (a different internal/ subtree), so the literal is
-// repeated here; it must stay in step with flags.FlagDomain.
-const flagDomain = "otel-instrumentation-go"
-
-// clearGlobalSwitch removes OTEL_INSTRUMENTATION_GO_TRACING_ENABLED for the
-// duration of the test, so WithTracingEnabled can supply gate1 without
-// colliding with it.
-func clearGlobalSwitch(t *testing.T) {
+// clearEnv removes a switch for the duration of the test.
+func clearEnv(t *testing.T, name string) {
 	t.Helper()
-	const name = "OTEL_INSTRUMENTATION_GO_TRACING_ENABLED"
 	prev, existed := os.LookupEnv(name)
 	_ = os.Unsetenv(name)
 	t.Cleanup(func() {
@@ -78,12 +72,12 @@ func setJSRelay(t *testing.T, tracing bool) {
 	// Bind the NAMED domain: that is what the resolver reads, and a default
 	// provider would be shadowed by any named binding left behind elsewhere in
 	// this binary.
-	require.NoError(t, openfeature.SetNamedProviderAndWait(flagDomain,
+	require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain,
 		memprovider.NewInMemoryProvider(
 			map[string]memprovider.InMemoryFlag{jsTracingFlagKey: relayFlag(tracing)},
 		)))
 	t.Cleanup(func() {
-		require.NoError(t, openfeature.SetNamedProviderAndWait(flagDomain, openfeature.NoopProvider{}))
+		require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, openfeature.NoopProvider{}))
 	})
 }
 
@@ -133,19 +127,19 @@ func TestJetStreamPublishFollowsTheRelayWithoutRecreatingTheHandle(t *testing.T)
 		"relay flipped back off → no further publish spans")
 }
 
-func TestGate1OffKeepsJetStreamPassthrough(t *testing.T) {
+// TestMasterVetoStopsEveryJetStreamWrapper: the master switch is ANDed above
+// the whole ladder, so a JetStream wrapper derived from a Conn stops with it —
+// even though the module's own key and its environment variable both say on.
+func TestMasterVetoStopsEveryJetStreamWrapper(t *testing.T) {
 	url := startJetStreamServer(t)
-	// startJetStreamServer sets both tracing variables; clear the global one so
-	// WithTracingEnabled is the only spelling of gate1 in play. Setting both is
-	// a configuration error since D3.
-	clearGlobalSwitch(t)
+	t.Setenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED", "false")
 	t.Setenv("OTEL_NATS_TRACING_ENABLED", "true")
 	setJSRelay(t, true)
 
 	sr := tracetest.NewSpanRecorder()
 	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr)))
 
-	conn, err := otelnats.ConnectWithOptions(url, nil, otelnats.WithTracingEnabled(false))
+	conn, err := otelnats.ConnectWithOptions(url, nil, otelnats.WithTracingEnabled(true))
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -154,17 +148,55 @@ func TestGate1OffKeepsJetStreamPassthrough(t *testing.T) {
 
 	ctx := context.Background()
 	_, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:     "PINNED",
-		Subjects: []string{"pinned.>"},
+		Name:     "VETOED",
+		Subjects: []string{"vetoed.>"},
 	})
 	require.NoError(t, err)
 
-	setJSRelay(t, true)
-	_, err = js.Publish(ctx, "pinned.a", []byte("one"))
+	_, err = js.Publish(ctx, "vetoed.a", []byte("one"))
 	require.NoError(t, err)
 
 	assert.Empty(t, publishSpans(sr),
-		"gate1 off builds only the passthrough, so no JetStream wrapper derived from the Conn can trace")
+		"the master veto must stop every wrapper derived from the Conn, whatever enabled the module")
+}
+
+// TestEnvironmentBeatsOptionForDerivedWrappers pins the ordering change at the
+// level a JetStream user sees: a deployment can disable the module even though
+// the application's Go code passed WithTracingEnabled(true).
+func TestEnvironmentBeatsOptionForDerivedWrappers(t *testing.T) {
+	url := startJetStreamServer(t)
+	clearEnv(t, "OTEL_INSTRUMENTATION_GO_TRACING_ENABLED")
+	t.Setenv("OTEL_NATS_TRACING_ENABLED", "false")
+	// A provider exists but defines no key, so the relay is silent and the local
+	// ladder decides.
+	require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain,
+		memprovider.NewInMemoryProvider(map[string]memprovider.InMemoryFlag{})))
+	t.Cleanup(func() {
+		require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, openfeature.NoopProvider{}))
+	})
+
+	sr := tracetest.NewSpanRecorder()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr)))
+
+	conn, err := otelnats.ConnectWithOptions(url, nil, otelnats.WithTracingEnabled(true))
+	require.NoError(t, err)
+	defer conn.Close()
+
+	js, err := oteljetstream.New(conn)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	_, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:     "ENVWINS",
+		Subjects: []string{"envwins.>"},
+	})
+	require.NoError(t, err)
+
+	_, err = js.Publish(ctx, "envwins.a", []byte("one"))
+	require.NoError(t, err)
+
+	assert.Empty(t, publishSpans(sr),
+		"OTEL_NATS_TRACING_ENABLED=false must beat WithTracingEnabled(true) for derived wrappers too")
 }
 
 // publishSpans returns the recorded spans produced by JetStream publishes.

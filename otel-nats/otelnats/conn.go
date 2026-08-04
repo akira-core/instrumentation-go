@@ -44,26 +44,33 @@ type MsgHandler func(m Msg)
 // Selection happens per operation, not once at construction, so a relay flag
 // change reaches a long-lived connection without it being re-established. NO
 // connection is ever static — not even one carrying WithTracingEnabled, which
-// supplies the first tier and says nothing about the relay.
+// supplies one rung of the ladder and says nothing about the relay or the
+// master switch.
 //
-// What construction does fix is the ceiling: traced is nil when the two
-// environment-derived tiers say this connection could never trace, and then no
-// OTel SDK code path is reachable for its lifetime and the resolver is never
-// consulted.
+// What construction does fix is whether an instrumented implementation exists at
+// all. traced is nil only when no relay can exist in this process AND the local
+// answer is off; then no OTel SDK code path is reachable for the connection's
+// lifetime and no evaluation is ever performed.
 type Conn struct {
 	nc *nats.Conn
 
-	// direct is always non-nil. traced is non-nil only when the static tiers
-	// allow tracing, and is then selected per operation by the relay verdict.
+	// gate holds everything about this connection's switches that was fixed at
+	// construction. Everything derived from the Conn copies it, so a derived
+	// wrapper inherits the decision rather than re-resolving it.
+	gate gateState
+
+	// direct is always non-nil. traced is non-nil only when gate.tracedPossible
+	// said an instrumented path could ever be reached, and is then selected per
+	// operation.
 	direct connImpl
 	traced connImpl
 }
 
 // impl returns the implementation this operation runs through.
 // The condition must stay lockstep with msgHandler and traceEventMsgHandler
-// (traced == nil? / natsRelayAllows?) — do not change one alone.
+// (traced == nil? / gate.tracing()?) — do not change one alone.
 func (c *Conn) impl() connImpl {
-	if c.traced != nil && natsRelayAllows() {
+	if c.traced != nil && c.gate.tracing() {
 		return c.traced
 	}
 	return c.direct
@@ -81,7 +88,7 @@ func (c *Conn) msgHandler(subject, queue string, handler MsgHandler) nats.MsgHan
 	th := c.traced.wrapMsgHandler(subject, queue, handler)
 	dh := c.direct.wrapMsgHandler(subject, queue, handler)
 	return func(m *nats.Msg) {
-		if natsRelayAllows() {
+		if c.gate.tracing() {
 			th(m)
 		} else {
 			dh(m)
@@ -99,7 +106,7 @@ func (c *Conn) traceEventMsgHandler() nats.MsgHandler {
 	th := c.traced.traceEventHandler()
 	dh := c.direct.traceEventHandler()
 	return func(m *nats.Msg) {
-		if natsRelayAllows() {
+		if c.gate.tracing() {
 			th(m)
 		} else {
 			dh(m)
@@ -178,21 +185,32 @@ func WithTraceDestination(subject string) Option {
 	})
 }
 
-// WithTracingEnabled supplies the process-wide first-tier switch for this Conn
-// only. It is an alternative SPELLING of OTEL_INSTRUMENTATION_GO_TRACING_ENABLED,
-// not an override of it: supplying both is a configuration error reported by the
-// constructor (ErrTracingConfigConflict), even when the two agree.
+// WithTracingEnabled supplies this module's tracing switch for this Conn only.
 //
-// It is one tier of three and says nothing about the other two. A Conn carrying
-// it — and everything derived from it, such as oteljetstream wrappers — still
-// reads OTEL_NATS_TRACING_ENABLED at construction and still resolves the relay
-// verdict on EVERY operation, so it still stops when the relay revokes. There
-// is no way to opt a connection out of a revocation.
+// It is the THIRD rung of a four-rung ladder — relay > env > option > default —
+// so it is a per-connection default, not an override of anything above it:
 //
-// It exists for callers who cannot set a process environment variable: tests,
-// or several independently configured connections in one binary. With the
-// environment variable unset, the option is the only source of the first tier,
-// so both a tracing and a non-tracing Conn can be built in one process.
+//   - OTEL_NATS_TRACING_ENABLED wins over it. That is deliberate, and it is what
+//     lets a deployment disable this module without silencing the process and
+//     without a relay, even when the application's Go code asked for tracing.
+//   - The relay wins over both, in either direction.
+//   - The master switch (OTEL_INSTRUMENTATION_GO_TRACING_ENABLED, or its relay
+//     key) is ANDed above the whole ladder and accepts no option at all. It
+//     stops a Conn carrying WithTracingEnabled(true) like any other.
+//
+// Supplying it alongside OTEL_NATS_TRACING_ENABLED is legal and no longer an
+// error; the variable simply wins. An unreadable value in that variable is still
+// a construction error, because the option does not excuse a variable that
+// outranks it.
+//
+// It exists for callers who cannot set a process environment variable: tests, or
+// several independently configured connections in one binary. With the variable
+// unset the option is the deciding rung, so a tracing and a non-tracing Conn can
+// be built in the same process.
+//
+// It does not make a Conn static. A Conn carrying it — and everything derived
+// from it, such as oteljetstream wrappers — resolves the master switch and the
+// relay on EVERY operation.
 func WithTracingEnabled(v bool) Option {
 	return optionFunc(func(c *connConfig) {
 		c.TracingEnabled = &v
@@ -208,17 +226,19 @@ func newConn(nc *nats.Conn, opts ...Option) (*Conn, error) {
 	cfg := newConnConfig(opts...)
 	direct := &directConn{nc: nc}
 
-	// Both environment-derived tiers, ANDed and fixed here. When they say no,
-	// only the passthrough is built: no OTel code path is reachable and the
-	// resolver is never consulted. Including the module env var is safe because
-	// the relay can only revoke — with it off, no relay value could raise the
-	// answer, so the instrumented implementation could never be reached.
-	possible, err := tracedPossible(cfg.TracingEnabled)
+	// Everything the relay cannot change, fixed here: the master switch's local
+	// value, this module's local value, and whether a relay can exist at all.
+	gate, err := resolveGates(cfg.TracingEnabled)
 	if err != nil {
 		return nil, err
 	}
-	if !possible {
-		return &Conn{nc: nc, direct: direct}, nil
+	// No relay possible and the local answer is off ⇒ only the passthrough is
+	// built, no OTel code path is reachable, and no evaluation is ever performed.
+	// When a relay IS possible the instrumented implementation must exist even
+	// though the environment says off, because the relay can enable it later and
+	// construction happens once.
+	if !gate.tracedPossible() {
+		return &Conn{nc: nc, gate: gate, direct: direct}, nil
 	}
 
 	if cfg.Propagators == nil {
@@ -237,9 +257,9 @@ func newConn(nc *nats.Conn, opts ...Option) (*Conn, error) {
 		traceDest:   cfg.TraceDest,
 	}
 
-	// Both implementations exist; the relay verdict selects between them per
-	// operation. The option supplied gate1 and does not pin anything.
-	return &Conn{nc: nc, direct: direct, traced: traced}, nil
+	// Both implementations exist; the per-operation resolution selects between
+	// them. The option supplied one rung of the ladder and pins nothing.
+	return &Conn{nc: nc, gate: gate, direct: direct, traced: traced}, nil
 }
 
 // serverAttrsFromConn parses the connected NATS server address into server.address / server.port attributes.
