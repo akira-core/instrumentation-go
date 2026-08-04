@@ -6,7 +6,7 @@ Every instrumentation module can be switched on or off. This document is the sin
 how that decision is made — what each switch does, who owns it, which ones can change while a
 process is running, and which cannot.
 
-Applies to `otel-flags` 0.1.0, `otel-mongo` 0.9.0, `otel-mongo/v2` 2.9.0, `otel-nats` 0.8.0 and
+Applies to `otel-flags` 0.1.0, `otel-mongo` 0.8.0, `otel-mongo/v2` 2.8.0, `otel-nats` 0.8.0 and
 `otel-gorilla-ws` 0.8.0 and later. Design record:
 `openspec/changes/openfeature-dynamic-flags/design.md`.
 

@@ -209,7 +209,7 @@ keys, module env var names and module defaults stay in each module's own `env_fl
 shared module through `WithFlagKeys` and `Value`'s `local` parameter. Adding an instrumentation module
 must not require a change to `otel-flags`.
 
-`Gate`/`NewGate`/`ResetForTest` were removed in 0.8.0/0.9.0 — a process-lifetime cache is incompatible
+`Gate`/`NewGate`/`ResetForTest` were removed in 0.8.0 — a process-lifetime cache is incompatible
 with runtime flag changes. So were the module-level reset hooks: with nothing cached there is nothing
 to re-arm, and tests drive the real path by rebinding the provider.
 
@@ -219,7 +219,7 @@ version with **no `replace`** (consumers ignore a replace in a dependency's `go.
 consumer resolves it. The release guard fails any module tag whose `go.mod` still carries an in-repo
 `replace`. See `VERSIONING.md`.
 
-### Dynamic feature flags (0.8.0/0.9.0+)
+### Dynamic feature flags (0.8.0+)
 
 Tracing and Mongo propagation are resolved at **runtime** through [OpenFeature](https://openfeature.dev),
 so an operator can flip them via a GO Feature Flag relay proxy without restarting the application —
@@ -338,7 +338,7 @@ otelmongo/
 
 Key rules:
 - `internal/shared/impls.go` declares the polymorphic interfaces (`CursorImpl`, `SingleResultImpl`, `ChangeStreamImpl`) satisfied by both `internal/direct.X` and `internal/traced.X`.
-- **Dual implementation (0.9.0+).** Facade `Collection`, `Cursor` and `ChangeStream` hold **both** a `direct` and a `traced` field plus a `tracing func() bool`, and select per operation via `impl()`. `traced` is nil when `gate.tracedPossible()` was false at construction — no relay possible and the local answer off — so no OTel path is reachable. `SingleResult` is the **documented exception**: `traced.SingleResult` holds the live `FindOne` span (ended once on the first `Decode`/`TraceContext`/`Raw`), so a passthrough `FindOne` leaves nothing to wrap and a mid-flight flip would strand an unended span — its implementation stays fixed by the path that ran the `FindOne`.
+- **Dual implementation (0.8.0+).** Facade `Collection`, `Cursor` and `ChangeStream` hold **both** a `direct` and a `traced` field plus a `tracing func() bool`, and select per operation via `impl()`. `traced` is nil when `gate.tracedPossible()` was false at construction — no relay possible and the local answer off — so no OTel path is reachable. `SingleResult` is the **documented exception**: `traced.SingleResult` holds the live `FindOne` span (ended once on the first `Decode`/`TraceContext`/`Raw`), so a passthrough `FindOne` leaves nothing to wrap and a mid-flight flip would strand an unended span — its implementation stays fixed by the path that ran the `FindOne`.
 - `traced.Collection.PropagationEnabled` is a `func() bool` (not a `bool`), read per call via the nil-safe `t.propagationOn()`. Same for `traced.Cursor` / `traced.ChangeStream`'s `propagationEnabled`.
 - Facade `collectionImpl` interface returns raw driver types (`*mongo.Cursor`, `*mongo.SingleResult`, `*mongo.ChangeStream`) + `shared.XImpl` — the impl packages never need to import the facade, preventing any facade ↔ internal cycle. Facade methods wrap raw types into facade wrappers (`&Cursor{Cursor: raw, impl: cImpl}`).
 - `internal/traced.Collection` has **exported fields** (`Coll`, `Tracer`, `Propagator`, `PropagationEnabled`, `ServerAddr`, `ServerPort`) so facade-package tests can build literals and call them directly.
@@ -349,7 +349,7 @@ Key rules:
 
 `ContextFromDocument` / `ContextFromRawDocument` (`tracing.go`, both v1 and v2) carry **no feature-flag gate at all** — not the master switch, not the module env vars, not the options, not the relay. They start no span, build no attributes, initialise no part of the OTel SDK, write nothing, and perform no OpenFeature evaluation: they read `_oteltrace` out of a value the caller already holds and return what it encodes, and you only call them when you want extraction.
 
-`Cursor.DecodeAndTrace` / `ChangeStream.DecodeAndTrace` look similar and **are** gated, because each starts and ends a real `mongo.cursor.decode` span. So **turning a module off stops those but does not stop extraction here** — this pair is the supported way to keep trace linking while the library is silenced, and `feature-flags.md` says so in those words. **BREAKING in 0.9.0:** a fully-disabled process now gets a valid span context from them where it previously got nothing.
+`Cursor.DecodeAndTrace` / `ChangeStream.DecodeAndTrace` look similar and **are** gated, because each starts and ends a real `mongo.cursor.decode` span. So **turning a module off stops those but does not stop extraction here** — this pair is the supported way to keep trace linking while the library is silenced, and `feature-flags.md` says so in those words. **BREAKING in 0.8.0:** a fully-disabled process now gets a valid span context from them where it previously got nothing.
 
 Consequences worth knowing: they cost no relay evaluation, so a per-document change-stream loop pays none of the 2–3 evaluations an instrumented operation does; and there is nothing for them to misread when a deployment configures tracing through `WithTracingEnabled` rather than the environment variable.
 

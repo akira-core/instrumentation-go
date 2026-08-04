@@ -19,7 +19,7 @@ The OpenFeature Go SDK is at v1.17.2. Its relevant surface:
 - `Client.evaluate` merges evaluation contexts in the order *API (global) → transaction → client → invocation* (`client.go:695`), so an attribute passed at the invocation site composes with — and wins over — the application's global context without the library ever calling `SetEvaluationContext`.
 - `openfeature/memprovider` provides an in-memory provider suitable for tests.
 
-**This document has been revised twice.** Revision 1 replaced a relay that decided in both directions with a revoke-only kill switch, and was implemented and merged before this second review. Revision 2 restores bidirectional control, but as a per-switch **precedence ladder** rather than the conjunction of revision 1 — and pairs it with defaults that keep a zero-configuration process fully off. Neither shape has ever been released: `otel-mongo 0.9.0`, `otel-mongo/v2 2.9.0`, `otel-nats 0.8.0` and `otel-gorilla-ws 0.8.0` are all still in their CHANGELOGs' unreleased sections, so **the external migration story is `0.7.0` → this change**, not kill-switch → toggle. See § "Superseded decisions" for both rounds and `tasks.md` § 10 for the remaining work.
+**This document has been revised twice.** Revision 1 replaced a relay that decided in both directions with a revoke-only kill switch, and was implemented and merged before this second review. Revision 2 restores bidirectional control, but as a per-switch **precedence ladder** rather than the conjunction of revision 1 — and pairs it with defaults that keep a zero-configuration process fully off. Neither shape has ever been released: `otel-mongo 0.8.0`, `otel-mongo/v2 2.8.0`, `otel-nats 0.8.0` and `otel-gorilla-ws 0.8.0` are all still in their CHANGELOGs' unreleased sections, so **the external migration story is `0.7.0` → this change**, not kill-switch → toggle. See § "Superseded decisions" for both rounds and `tasks.md` § 10 for the remaining work.
 
 ## Goals / Non-Goals
 
@@ -640,7 +640,7 @@ The check is written against the **named** domain because `NamedProviderMetadata
 
 1. **Release `otel-flags` first.** Tag `otel-flags/v0.1.0`. It depends on nothing in this repo, so it can be tagged from the same commit that introduces it.
 2. **Bump the four modules** to `require github.com/akira-core/instrumentation-go/otel-flags v0.1.0`, with no `replace` directive — a `replace` in a published module is ignored by consumers. Local development and CI use the root `go.work`; CI's per-module steps set `GOWORK=off` so each module is verified exactly as a consumer resolves it.
-3. **Tag the four modules**: `otel-mongo/v0.9.0`, `otel-mongo/v2.9.0`, `otel-nats/v0.8.0`, `otel-gorilla-ws/v0.8.0`. Tags may be pushed sequentially; the release guard validates each against its version constant, and gains a fifth pattern for `otel-flags`.
+3. **Tag the four modules**: `otel-mongo/v0.8.0`, `otel-mongo/v2.8.0`, `otel-nats/v0.8.0`, `otel-gorilla-ws/v0.8.0`. Tags may be pushed sequentially; the release guard validates each against its version constant, and gains a fifth pattern for `otel-flags`.
 4. **Before upgrading, audit every `OTEL_*_ENABLED` value in the deployment configuration.** D14 makes any value outside `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off` — including the empty string — a construction error. This is the one change that can stop a process from starting, and the check is a grep.
 5. **Re-read what the defaults now mean.** Against released `0.7.0`:
 

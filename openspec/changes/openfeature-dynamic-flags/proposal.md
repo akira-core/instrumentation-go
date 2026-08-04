@@ -100,8 +100,8 @@ The defaults are what keep that safe. Every per-module switch defaults to **off*
 | Module | Version |
 |---|---|
 | `otel-flags` | **new** — `0.1.0` |
-| `otel-mongo` | 0.8.0 → 0.9.0 |
-| `otel-mongo/v2` | 2.8.0 → 2.9.0 |
+| `otel-mongo` | 0.7.0 → 0.8.0 |
+| `otel-mongo/v2` | 2.7.0 → 2.8.0 |
 | `otel-nats` | 0.7.0 → 0.8.0 |
 | `otel-gorilla-ws` | 0.7.0 → 0.8.0 |
 

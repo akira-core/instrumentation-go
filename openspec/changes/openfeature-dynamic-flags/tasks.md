@@ -85,7 +85,7 @@
 
 ## 7. Documentation and release
 
-- [x] 7.1 Bump version constants: `otel-mongo/otelmongo/version.go` → `0.9.0`, `otel-mongo/v2/version.go` → `2.9.0`, `otel-nats/otelnats/conn.go` → `0.8.0`, `otel-gorilla-ws/version.go` → `0.8.0`.
+- [x] 7.1 Bump version constants: `otel-mongo/otelmongo/version.go` → `0.8.0`, `otel-mongo/v2/version.go` → `2.8.0`, `otel-nats/otelnats/conn.go` → `0.8.0`, `otel-gorilla-ws/version.go` → `0.8.0`.
 - [x] 7.2 Write each module's `CHANGELOG.md` entry, marking BREAKING for the demoted module env vars, the global-switch-only strategy selection, the otel-ws negotiation change (otel-gorilla-ws), and the `ContextFromDocument` behavior change (otel-mongo).
 - [x] 7.3 Update `CLAUDE.md`: the feature-flag sections, the precedence table, the flag key table, the `internal/flags` description (Gate removed, Resolver added), the disabled-mode invariant restated on the global switch, and the dual-implementation strategy-split layout.
 - [x] 7.4 Update `README.md` and `README.zh-TW.md` with the flag key reference and the application-side wiring snippet (`openfeature.SetProviderAndWait(gofeatureflag.NewProvider(...))` next to `otelsetup.Init()`), stating that the GO Feature Flag provider is an application dependency, not a library one.

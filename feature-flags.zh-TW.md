@@ -5,7 +5,7 @@
 每一個 instrumentation 模組都可以被打開或關掉。本文件是這個決策的**唯一參考**:每個開關做什麼、由誰擁有、
 哪些能在 process 執行期間改變、哪些不能。
 
-適用於 `otel-flags` 0.1.0、`otel-mongo` 0.9.0、`otel-mongo/v2` 2.9.0、`otel-nats` 0.8.0、
+適用於 `otel-flags` 0.1.0、`otel-mongo` 0.8.0、`otel-mongo/v2` 2.8.0、`otel-nats` 0.8.0、
 `otel-gorilla-ws` 0.8.0 以後的版本。設計記錄:`openspec/changes/openfeature-dynamic-flags/design.md`。
 
 ## 一段話講完這個模型

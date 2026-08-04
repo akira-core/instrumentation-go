@@ -4,7 +4,7 @@ All notable changes to the `otel-mongo` module (v1, `go.mongodb.org/mongo-driver
 
 > **Coverage note**: this file starts at `0.6.0`. Earlier history lives only in git tags (`otel-mongo/vX.Y.Z`) — see the repo root `VERSIONING.md` for the root cause and the release-tag CI guard that now keeps the version constant and tag in sync going forward.
 
-## [0.9.0] - unreleased
+## [0.8.0] - unreleased
 
 ### Changed
 
@@ -24,6 +24,7 @@ All notable changes to the `otel-mongo` module (v1, `go.mongodb.org/mongo-driver
 - The relay **can** now start `_oteltrace` writes, which the revoke-only model could not. Four things bound that: the master veto, `OTEL_MONGO_PROPAGATION_ENABLED=false` (which code cannot override), the tier's hardcoded default of `false` so absence never enables it, and the fact that a process with no relay configured cannot be reached at all.
 - `InjectTraceIntoDocument` removes any existing `_oteltrace` before appending. It appended unconditionally, so an ordinary read-modify-write produced two copies — and because extraction resolves the field with `bson.Raw.LookupErr`, which returns the **first** match, such a loop pinned the trace linkage to the original write permanently.
 - `shared.NewCommandMonitor` — which runs on every MongoDB command — is registered on the same condition that allocates the instrumented implementation, so a process with no relay and tracing off does not pay for it.
+- **BREAKING** Renamed the exported method `DecodeWithContext(ctx, val) (context.Context, error)` to `DecodeAndTrace(ctx, val) (context.Context, error)` on both `Cursor` and `ChangeStream`. Signature and behavior are unchanged — the new name states the trace side effect (emit a `mongo.cursor.decode` span, extract `_oteltrace`) that plain `Decode` does not have. **Migration**: replace `cursor.DecodeWithContext(...)` / `changeStream.DecodeWithContext(...)` with `DecodeAndTrace(...)`; arguments and returns are identical. This was staged on 2026-07-21 as its own `0.8.0`, but no tag was ever pushed, so it reaches consumers for the first time here.
 
 ### Removed
 
@@ -35,12 +36,6 @@ All notable changes to the `otel-mongo` module (v1, `go.mongodb.org/mongo-driver
 - **Flag changes are not immediate.** End-to-end latency is the provider's poll interval — 60 s by default — in **both** directions. This module adds none of its own.
 - The library still never touches the **default** OpenFeature provider, the global evaluation context, hooks or shutdown. The one piece of state it may write is a **named** provider on `otel-instrumentation-go`, and only when the environment asks for one and the application installed none. `DataCollectorDisabled: true` and in-process evaluation are hardcoded on that path.
 - Full reference: [`feature-flags.md`](../feature-flags.md) ([繁體中文](../feature-flags.zh-TW.md)).
-
-## [0.8.0] - 2026-07-21
-
-### Changed — BREAKING
-
-- Renamed the exported method `DecodeWithContext(ctx, val) (context.Context, error)` to `DecodeAndTrace(ctx, val) (context.Context, error)` on both `Cursor` and `ChangeStream`. Signature and behavior are unchanged — the new name states the trace side effect (emit a `mongo.cursor.decode` span, extract `_oteltrace`) that plain `Decode` does not have. **Migration**: replace `cursor.DecodeWithContext(...)` / `changeStream.DecodeWithContext(...)` with `DecodeAndTrace(...)`; arguments and returns are identical.
 
 ## [0.7.0] - 2026-07-15
 
