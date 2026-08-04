@@ -1,15 +1,37 @@
 package sampling
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
+	otelflags "github.com/akira-core/instrumentation-go/otel-flags"
 	otelnats "github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 	"github.com/akira-core/instrumentation-go/otel-testkit/harness"
 )
+
+// envNATSTracingEnabled is this module's tracing variable. otel-flags names only
+// process-scoped things, so the module variable is spelled out here rather than
+// imported.
+const envNATSTracingEnabled = "OTEL_NATS_TRACING_ENABLED"
+
+// unsetEnv removes name for the duration of the test and restores it afterwards.
+// t.Setenv cannot express absence, and absence is the state the option tier needs.
+func unsetEnv(t *testing.T, name string) {
+	t.Helper()
+	prev, existed := os.LookupEnv(name)
+	if err := os.Unsetenv(name); err != nil {
+		t.Fatalf("unset %s: %v", name, err)
+	}
+	t.Cleanup(func() {
+		if existed {
+			_ = os.Setenv(name, prev)
+		}
+	})
+}
 
 // rvLadder spans the decision space for the suite's {0.9, 0.5} rates:
 // 0 → nobody sampled; 1<<53 → only rate 0.9; 1<<55 → both; max → both.
@@ -378,16 +400,26 @@ func TestNatsFullSpanShape(t *testing.T) {
 }
 
 // TestNatsTracingToggleInProcess exercises the per-connection
-// WithTracingEnabled override in both directions within a single process —
-// independent of (and authoritative over) the env matrix, so it runs in every
-// row: an "on" pair must behave exactly like the all-on suite, and an "off"
-// pair must emit no wrapper spans and propagate nothing, side by side.
+// WithTracingEnabled option in both directions within a single process: an "on"
+// pair must behave exactly like the all-on suite, and an "off" pair must emit no
+// wrapper spans and propagate nothing, side by side.
+//
+// Since 0.8.0 the option is the ladder's third rung — below both the master and
+// the module environment variable — so it decides only when neither has an
+// opinion. The test clears both for its duration, which is also what makes it
+// meaningful in every row of the matrix: the row's values are precisely what the
+// option is no longer allowed to override, so leaving them set would test the
+// row, not the option. Nothing in this package runs in parallel, so mutating the
+// process environment here is safe.
 func TestNatsTracingToggleInProcess(t *testing.T) {
+	unsetEnv(t, otelflags.EnvGlobalTracing)
+	unsetEnv(t, envNATSTracingEnabled)
+
 	sink, endpoint, url := setup(t)
 	rates := []float64{1.0, 1.0}
 	rv := uint64(1) << 55
 
-	// Forced-on pair: full consistent-sampling behavior regardless of env.
+	// Option-on pair: full consistent-sampling behavior.
 	onSvcs, _ := buildServices(t, url, endpoint, "on", rates, otelnats.WithTracingEnabled(true))
 	onRunID, onRun := driveChain(t, sink, onSvcs, rates, scenario{"toggle-on", coreSubscribe}, rv)
 	require.Len(t, onRun, 2)
@@ -397,7 +429,7 @@ func TestNatsTracingToggleInProcess(t *testing.T) {
 	require.NotEmpty(t, harness.SpansByScope(onFull, otelnats.ScopeName),
 		"forced-on pair must emit wrapper spans")
 
-	// Forced-off pair: app spans flow, but no wrapper spans and no propagation.
+	// Option-off pair: app spans flow, but no wrapper spans and no propagation.
 	offSvcs, _ := buildServices(t, url, endpoint, "off", rates, otelnats.WithTracingEnabled(false))
 	_, offRun := driveChain(t, sink, offSvcs, rates, scenario{"toggle-off", coreSubscribe}, rv)
 	require.Len(t, offRun, 2)

@@ -94,6 +94,8 @@ For the four wrapper modules this constant is what the package reports as its `T
 
 **No in-repo `replace`.** It greps the tagged module's `go.mod` for a `replace` pointing at another module in this repository and fails if it finds one. Same reasoning: a `replace` that reaches a tag is silently ignored by consumers, leaving the module requiring a version that may not exist, and the failure is invisible until someone outside this repository tries to build. See [the two-stage release above](#otel-flags-is-released-before-the-modules-that-require-it).
 
+**Push release tags one at a time.** GitHub Actions does not run workflows for a push that creates more than three tags, so a single `git push origin tagA tagB tagC tagD` publishes all four tags with **no guard run at all** — not three of four, zero. This has already happened once: `otel-mongo/v0.8.0-rc.1`, `otel-mongo/v2.8.0-rc.1`, `otel-nats/v0.8.0-rc.1` and `otel-gorilla-ws/v0.8.0-rc.1` were pushed together and none was checked. The failure mode is silent — the tags land, `proxy.golang.org` caches them within seconds, and nothing reports that the guard was skipped. Push each tag in its own `git push`, and check that a Release Tag Guard run appeared for it before pushing the next.
+
 Two `otel-mongo` routing details:
 
 - `otel-mongo/v2.*` tags (the [v2 exception](#exception-otel-mongov2-is-tagged-otel-mongov2xy) shape) validate against `otel-mongo/v2/version.go`; other `otel-mongo/v*` tags validate against the v1 module's constant.
