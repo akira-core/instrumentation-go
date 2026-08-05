@@ -14,7 +14,7 @@ require (
 require github.com/open-feature/go-sdk-contrib/providers/go-feature-flag v1.1.1 // indirect
 
 require (
-	github.com/akira-core/instrumentation-go/otel-flags v0.1.0
+	github.com/akira-core/instrumentation-go/otel-flags v0.2.0
 	github.com/antlr4-go/antlr/v4 v4.13.0 // indirect
 	github.com/blang/semver v3.5.1+incompatible // indirect
 	github.com/bluele/gcache v0.0.2 // indirect

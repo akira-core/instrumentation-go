@@ -3,7 +3,7 @@ module github.com/akira-core/instrumentation-go/otel-nats/tests/integration
 go 1.25.0
 
 require (
-	github.com/akira-core/instrumentation-go/otel-flags v0.1.0
+	github.com/akira-core/instrumentation-go/otel-flags v0.2.0
 	github.com/akira-core/instrumentation-go/otel-nats v0.0.0
 	github.com/akira-core/instrumentation-go/otel-testkit v0.0.0
 	github.com/google/uuid v1.6.0

@@ -18,7 +18,7 @@ import (
 const (
 	// ScopeName is the instrumentation scope name for Tracer creation (OTel contrib guideline).
 	ScopeName              = "instrumentation-go/otel-nats/otelnats"
-	instrumentationVersion = "0.8.0-rc.1"
+	instrumentationVersion = "0.8.0-rc.3"
 	messagingSystem        = "nats"
 )
 

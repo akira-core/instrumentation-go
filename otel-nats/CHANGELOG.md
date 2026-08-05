@@ -6,6 +6,18 @@ All notable changes to the `otel-nats` module (`otelnats` + `oteljetstream`) are
 
 ## [0.8.0] - unreleased
 
+> **Release candidates.** `v0.8.0-rc.3` is the first one that carries the `otel-flags` 0.2.0 flag
+> layer, and the first that builds for a consumer at all: `rc.1` and `rc.2` predate it and both
+> `require otel-flags v0.1.0`, whose API this module's code no longer matches. `rc.2` also carries a
+> version constant reading `0.8.0-rc.1`. Test the relay against `rc.3` or later.
+>
+> What `rc.3` adds over `rc.2`: flag keys passed by name rather than by index; the OpenFeature
+> provider installed at construction through `otelflags.ValidateAndInstall`; an unreadable
+> `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` or `_POLL_INTERVAL` failing construction rather than
+> warning and falling back; evaluation error codes logged once per transition, two-tier, so relay
+> silence is distinguishable from relay failure in the log even though it is not in the value; and a
+> failed provider install that is retried rather than latched.
+
 ### Changed
 
 - **BREAKING** Feature switches now resolve down a **four-step ladder** — `relay > env > option > default`, first source with an opinion winning — and the relay proxy is **authoritative in both directions**: it can turn this module off, and it can turn it on when the deployment left it off. This replaces the revoke-only model that was developed but never released. Safety now comes from the defaults rather than from a restriction on the relay: every per-module switch defaults to **off**, and the process-wide master switch defaults to **on** only because it is a veto rather than an enabler.

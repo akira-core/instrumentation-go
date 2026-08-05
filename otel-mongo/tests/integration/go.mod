@@ -16,7 +16,7 @@ require (
 	dario.cat/mergo v1.0.2 // indirect
 	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
-	github.com/akira-core/instrumentation-go/otel-flags v0.1.0 // indirect
+	github.com/akira-core/instrumentation-go/otel-flags v0.2.0 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.0 // indirect
 	github.com/blang/semver v3.5.1+incompatible // indirect
 	github.com/bluele/gcache v0.0.2 // indirect
