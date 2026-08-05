@@ -247,7 +247,11 @@ Three further **process-scoped** variables configure the relay connection rather
 `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` (unset ⇒ no provider is installed **and** `RelayPossible()`
 is false), `_API_KEY`, and `_POLL_INTERVAL` (Go duration strings only, default `60s`, and the centre
 of the period rather than an exact one — see `jitterInterval` below).
-`OTEL_SERVICE_NAME` supplies a `service.name` targeting attribute, on the auto-install path only.
+`OTEL_SERVICE_NAME` supplies `serviceName` and `service.name` targeting attributes, on the auto-install
+path only — relay rules must key on the dot-free spelling, because a dot is a nested-path separator in
+both query languages the relay supports. A targeting key of `<hostname>-<pid>` is supplied on every
+path, without which every `percentage`/`progressiveRollout` rule fails with `TARGETING_KEY_MISSING`
+and silently resolves to the local value.
 
 **Flag-change latency is the provider's poll interval — 60 s by default, up to 66 s — in both
 directions.** The resolver adds nothing beyond `jitterInterval` (`otel-flags/flags.go`), which

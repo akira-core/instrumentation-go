@@ -215,7 +215,7 @@ master、模組、含 relay——在**交握前的那一刻**為開。交握無�
 | `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` | relay proxy URL。未設 ⇒ 不安裝任何東西、不寫入任何 OpenFeature 狀態、永遠不做評估 |
 | `OTEL_INSTRUMENTATION_GO_FLAGS_API_KEY` | 選用;永遠不會被記進 log |
 | `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` | 選用;只接受 Go duration 字串(`30s`、`2m`),預設 `60s`。格式錯誤會警告、退回預設值,並**仍然安裝**。這個值設定的是輪詢週期的中心,不是精確值:每個 process 會抽一次、偏移最多 ±10% |
-| `OTEL_SERVICE_NAME` | 選用;提供 `service.name` targeting 屬性,僅限這條路徑 |
+| `OTEL_SERVICE_NAME` | 選用;提供 `serviceName` 與 `service.name` 兩個 targeting 屬性,僅限這條路徑。規則要寫不含點的那個 |
 
 函式庫會把 GO Feature Flag provider 以**具名(named)**provider 的身分註冊在 `otel-instrumentation-go`
 domain 上,而且只在你的應用程式沒有安裝自己的 provider 時才會這麼做。它寫死了
@@ -268,7 +268,7 @@ instrumented 實作被建構,也永遠不會有 instrumentation key 拿去對它
 
 - **初始化、logger、輪詢週期與 shutdown 都是你的。** 本 library 什麼都不安裝,也永遠不會對一個不是自己
   安裝的 provider 呼叫 `Shutdown`。
-- **evaluation context 是你的。** 本 library 只在零程式碼的自動安裝路徑上附加 `service.name` targeting
+- **evaluation context 幾乎完全是你的。** 本 library 只在零程式碼的自動安裝路徑上附加 `serviceName` 與 `service.name` targeting
   屬性;當 provider 由你擁有時,它傳入的是空的 invocation context,所以你用
   `openfeature.SetEvaluationContext` 設的 API 級全域 context 會原封不動地進入每一次評估。見
   [只針對單一服務而非整個艦隊](#只針對單一服務而非整個艦隊)。
@@ -339,19 +339,37 @@ provider 的 in-process 模式——背景輪詢、本地查表——是唯一�
 
 ### 只針對單一服務而非整個艦隊
 
-設 `OTEL_SERVICE_NAME`,並在 relay 規則裡對 `service.name` 撰寫條件:
+設 `OTEL_SERVICE_NAME`,並在 relay 規則裡對 `serviceName` 撰寫條件:
 
 ```yaml
 otel-mongo-tracing:
   variations: { enabled: true, disabled: false }
   targeting:
-    - query: service.name eq "checkout-api"
+    - query: serviceName eq "checkout-api"
       variation: enabled
   defaultRule: { variation: disabled }
 ```
 
-沒有它的話,一個 relay flag 會套用到**該 relay 服務的每一個 process**——在 flag 能夠啟用之後,這件事更
+**要寫 `serviceName`,不是 `service.name`。** 本 library 兩種拼法都提供、值相同,但只有不含點的那個
+匹配得到:relay 支援的兩種查詢語言都把點當作巢狀路徑分隔符,所以 `service.name eq "checkout-api"` 是去
+找屬性 `service` 底下的 `name` 欄位,找不到,然後靜默落到 defaultRule。保留 `service.name` 是因為那是
+讀 evaluation context 的人預期看到的名字。
+
+沒有規則的話,一個 relay flag 會套用到**該 relay 服務的每一個 process**——在 flag 能夠啟用之後,這件事更
 重要了。
+
+分桶規則也可用。本 library 在每條路徑上都提供 `<hostname>-<pid>` 形式的 targeting key,所以
+`percentage` 與 `progressiveRollout` 是**以 process 為單位**灰度:
+
+```yaml
+otel-mongo-tracing:
+  variations: { enabled: true, disabled: false }
+  defaultRule:
+    percentage: { enabled: 10, disabled: 90 }
+```
+
+是 per process 而不是 per service——用服務名衍生的 key 會讓每個百分比變成整個艦隊全有全無。這個 key 在
+容器生命週期內穩定,所以落在灰度組的 process 重啟後仍留在該組,不會每次重新抽。
 
 **如果你是用程式碼而非環境變數設定 `service.name`**,那個值靠它自己到不了本 library。OpenTelemetry 的
 Resource 由環境建構、從不回寫環境,而且 `TracerProvider` 介面與 SDK 的具體型別都沒有提供讀回 Resource 的
@@ -374,7 +392,9 @@ Resource 由環境建構、從不回寫環境,而且 `TracerProvider` 介面與 
   }
   ```
 
-本 library 只在零程式碼路徑上提供這個屬性。
+服務名這兩個屬性,本 library 只在零程式碼路徑上提供。targeting key 則在每條路徑上都提供,包含你自己安裝
+provider 的情況:它只作用於本 library 自己 domain 上的自己那幾個 key,而少了它,每一條分桶規則都會以
+`TARGETING_KEY_MISSING` 失敗、退回 local 值,而且不會留下任何診斷訊息。
 
 不支援 per-request targeting。resolver 不持有任何 request 狀態。
 
@@ -487,7 +507,7 @@ inject/extract 但不會停掉 envelope。見
 **要在單一部署停掉單一模組、且不用 relay:** 設 `OTEL_<MODULE>_TRACING_ENABLED=false`。
 應用程式碼無法覆寫它。
 
-**要只停掉單一服務而非整個艦隊:** 設 `OTEL_SERVICE_NAME`,並在 relay 規則裡對 `service.name` 下條件。
+**要只停掉單一服務而非整個艦隊:** 設 `OTEL_SERVICE_NAME`,並在 relay 規則裡對 `serviceName` 下條件。
 
 **要讓一個模組可被 relay 控制:** 設 `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT`,並在 relay 上建立它的
 flag。不需要應用程式碼。部署成你想要的靜止狀態即可——relay 之後可以往任一方向移動它。

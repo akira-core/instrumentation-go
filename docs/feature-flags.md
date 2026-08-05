@@ -245,7 +245,7 @@ Set environment variables. No import, no Go code, nothing else to remember.
 | `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` | relay proxy URL. Unset ⇒ nothing is installed, no OpenFeature state is written, and no evaluation ever happens |
 | `OTEL_INSTRUMENTATION_GO_FLAGS_API_KEY` | optional; never logged |
 | `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` | optional; Go duration strings only (`30s`, `2m`), default `60s`. A malformed value warns, falls back and still installs. The value sets the centre of the polling period, not an exact one: it is deviated by at most ±10%, drawn once per process |
-| `OTEL_SERVICE_NAME` | optional; supplies a `service.name` targeting attribute, on this path only |
+| `OTEL_SERVICE_NAME` | optional; supplies `serviceName` and `service.name` targeting attributes, on this path only. Rules must key on the dot-free spelling |
 
 The library installs a GO Feature Flag provider as a **named** provider on the domain
 `otel-instrumentation-go`, and only when your application has installed no provider of its own. It
@@ -302,10 +302,12 @@ your own initialisation, before you construct any wrapper. From then on:
 
 - **Initialisation, logger, poll interval and shutdown are yours.** This library installs nothing,
   and it never calls `Shutdown` on a provider it did not install.
-- **The evaluation context is yours.** The library attaches a `service.name` targeting attribute
-  *only* on the zero-code auto-install path; when you own the provider it passes an empty invocation
-  context, so an API-level global context you set with `openfeature.SetEvaluationContext` reaches
-  every evaluation unaltered. See [Targeting](#targeting-one-service-instead-of-the-fleet).
+- **The evaluation context is almost entirely yours.** The library attaches the `serviceName` and
+  `service.name` attributes *only* on the zero-code auto-install path, so an API-level global context
+  you set with `openfeature.SetEvaluationContext` reaches every evaluation unaltered. The one thing it
+  always supplies is a targeting key of `<hostname>-<pid>`, on its own domain and its own keys, because
+  without one every bucketing rule fails outright. See
+  [Targeting](#targeting-one-service-instead-of-the-fleet).
 - **The default provider is untouched, in both directions.** Your application's own flags keep
   resolving through whatever you bound to the default slot, and that provider is never asked about an
   instrumentation key.
@@ -385,19 +387,39 @@ publish.
 
 ### Targeting one service instead of the fleet
 
-Set `OTEL_SERVICE_NAME` and write the relay rule against `service.name`:
+Set `OTEL_SERVICE_NAME` and write the relay rule against `serviceName`:
 
 ```yaml
 otel-mongo-tracing:
   variations: { enabled: true, disabled: false }
   targeting:
-    - query: service.name eq "checkout-api"
+    - query: serviceName eq "checkout-api"
       variation: enabled
   defaultRule: { variation: disabled }
 ```
 
-Without it, a relay flag applies to **every process the relay serves** — which matters more now that
-a flag can enable.
+**Write `serviceName`, not `service.name`.** The library supplies both spellings and they carry the
+same value, but only the dot-free one can be matched: a dot is a nested-path separator in both query
+languages the relay supports, so `service.name eq "checkout-api"` looks for a field `name` inside an
+attribute `service`, finds nothing, and silently falls through to the default rule. `service.name` is
+kept because it is the name a reader expects to see in an evaluation context.
+
+Without a rule, a relay flag applies to **every process the relay serves** — which matters more now
+that a flag can enable.
+
+Bucketing rules work too. The library supplies a targeting key of `<hostname>-<pid>` on every path,
+so `percentage` and `progressiveRollout` canary per process:
+
+```yaml
+otel-mongo-tracing:
+  variations: { enabled: true, disabled: false }
+  defaultRule:
+    percentage: { enabled: 10, disabled: 90 }
+```
+
+Per process, not per service — a key derived from the service name would make every percentage
+all-or-nothing across the fleet. The key is stable for the life of a container, so a process that
+lands in the canary stays there across a restart rather than re-drawing its verdict.
 
 **If you set `service.name` programmatically rather than through the environment**, that value cannot
 reach this library on its own. OpenTelemetry's Resource is built from the environment, never written
@@ -424,7 +446,10 @@ Two ways to close the gap:
   }
   ```
 
-The attribute is supplied by this library only on the zero-code path.
+The service-name attributes are supplied by this library only on the zero-code path. The targeting
+key is supplied on every path, including one where you installed the provider yourself: it applies
+only to this library's own keys on its own domain, and without it every bucketing rule fails with
+`TARGETING_KEY_MISSING` and resolves to the local value with no diagnostic anywhere.
 
 Per-request targeting is not supported. The resolver holds no request state.
 
@@ -556,7 +581,7 @@ can escape that, including connections whose Go code passed an option.
 **To stop one module in one deployment, without a relay:** set `OTEL_<MODULE>_TRACING_ENABLED=false`.
 Application code cannot override it.
 
-**To stop one service rather than the fleet:** set `OTEL_SERVICE_NAME` and target `service.name` in
+**To stop one service rather than the fleet:** set `OTEL_SERVICE_NAME` and target `serviceName` in
 the relay rule.
 
 **To make a module relay-controllable:** set `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` and create its

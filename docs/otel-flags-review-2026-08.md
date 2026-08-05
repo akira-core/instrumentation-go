@@ -11,17 +11,17 @@ that silently stops being a switch outranks a race that needs two goroutines and
 |---|---|---|---|
 | 1 | High | A relay unreachable at process start leaves the provider permanently inert | Fixed |
 | 2 | High | `InstallProvider` does not serialise against the environment auto-install | Fixed |
-| 3 | Medium | `ResolveLocal` — the ladder's central rule — has no test in this module | Open |
+| 3 | Medium | `ResolveLocal` — the ladder's central rule — has no test in this module | Fixed |
 | 4 | Low | Package doc cites a symbol, `installOnce`, that does not exist | Fixed |
 | 5 | Low | `installProviderFromEnv`'s doc recommends `SetProviderAndWait`, which no longer stands the install down | Fixed |
-| 6 | High | The `service.name` targeting attribute cannot be matched by any relay rule | Open — needs a decision |
-| 7 | High | No targeting key is supplied, so percentage and progressive rollouts never apply | Open — needs a decision |
-| 8 | High | With `FlagDomain` unbound, evaluation falls back to the application's default provider | Open — needs a decision |
-| 9 | Medium | `Value` hardcodes `context.Background()` on the instrumented hot path | Open — needs a decision |
-| 10 | Medium | `providerBound` compares two independently-locked SDK reads | Open |
-| 11 | Medium | `captureLogs` shares a `bytes.Buffer` with the provider's async init goroutine | Open |
-| 12 | Medium | `clearProvider` binds a no-op provider, so the domain-unbound state is untested | Open |
-| 13 | Medium | The "do not evaluate when no relay is possible" guard lives in the consumers, not here | Open |
+| 6 | High | The `service.name` targeting attribute cannot be matched by any relay rule | Fixed |
+| 7 | High | No targeting key is supplied, so percentage and progressive rollouts never apply | Fixed |
+| 8 | High | With `FlagDomain` unbound, evaluation falls back to the application's default provider | Fixed |
+| 9 | Medium | `Value` hardcodes `context.Background()` on the instrumented hot path | Fixed |
+| 10 | Medium | `providerBound` compares two independently-locked SDK reads | Fixed |
+| 11 | Medium | `captureLogs` shares a `bytes.Buffer` with the provider's async init goroutine | Fixed |
+| 12 | Medium | `clearProvider` binds a no-op provider, so the domain-unbound state is untested | Mitigated — see below |
+| 13 | Medium | The "do not evaluate when no relay is possible" guard lives in the consumers, not here | Fixed |
 | 14 | Low | `Value` reads `r.evalCtx` as an operand of the call that initialises it | Fixed |
 
 ## Fixed in this pass
@@ -110,67 +110,56 @@ is microseconds, not an HTTP timeout.
   plain field load unordered against them, so the zero evaluation context could reach the first
   evaluation of a `Resolver`. The client is now bound to a local before the call.
 
-## Open — mechanical, no decision needed
+## Also fixed in a second pass
 
-**3. `ResolveLocal` has no test here.** The symbol does not appear in `flags_test.go` at all. The
-behaviours it uniquely owns are unpinned in this module: env outranks the option — the ordering the
-package doc calls the case that forces the order, and the one thing standing between
-`WithTracePropagationEnabled(true)` and permanent `_oteltrace` fields in an operator's documents —
-the option outranks the default, and a `Lookup` error is returned even when a non-nil option was
-supplied. The only coverage is indirect, in four modules that are versioned and released separately.
+**3. `ResolveLocal` now has a test here.** `TestResolveLocal` pins the three rungs it owns: env
+outranks the option — the ordering the package doc calls the case that forces the order, and the one
+thing standing between `WithTracePropagationEnabled(true)` and permanent `_oteltrace` fields in an
+operator's documents — the option outranks the default, and a `Lookup` error is returned, with no
+usable value, even when a non-nil option was supplied.
 
-**10. `providerBound` compares two independently-locked reads.** `NamedProviderMetadata(FlagDomain)`
-takes and releases the SDK's lock, then `ProviderMetadata()` takes it again. With the domain
-unbound, the first returns the current default's metadata through the SDK's fallback; if the
-application swaps its default provider between the two calls, the two names differ and neither is
-`NoopProvider`, so the function reports a domain binding that does not exist. `RelayPossible()` then
-returns true with nothing bound, and the auto-install stands down over an endpoint the operator
-configured — the exact silent failure the fallback check was written to eliminate.
+**6 and 7. Targeting works now, and the choice was per process.** A targeting key of
+`<hostname>-<pid>` is supplied on every path, so `percentage` and `progressiveRollout` bucket per
+process. The alternative — deriving the key from the service name — would have made every percentage
+rollout all-or-nothing across a service, which is not what "enable tracing on 10% of the fleet"
+means. Host plus PID rather than a random value so the verdict is stable across a restart of the
+same container instead of being re-drawn each time.
 
-**11. `captureLogs` races the provider's init goroutine.** It swaps `slog.Default()` for a handler
-writing into a local `bytes.Buffer`; `gofeatureflag.NewProvider` captures that logger permanently,
-and initialisation runs on a goroutine that outlives the test's `Value` call. The test then reads
-`buf.String()` from the test goroutine with no synchronisation. CI runs `go test -race`.
+Separately, `serviceName` is now supplied alongside `service.name`, both carrying `OTEL_SERVICE_NAME`
+and both still confined to the auto-install path. Only the dot-free spelling is matchable: nikunjy's
+parser splits `service.name` into attribute `service` with sub-attribute `name` and finds nothing,
+and JSONLogic resolves `{"var": "service.name"}` as a path too. `service.name` stays because it is
+the name a reader expects in an evaluation context. Both documents and the README now tell operators
+to write the rule against `serviceName`.
 
-**12. `clearProvider` makes the dangerous state untestable.** It binds `NoopProvider` to
-`FlagDomain`, and the SDK offers no unbind, so after the first call every test in the binary
-evaluates against a bound no-op provider. The state that actually matters — `FlagDomain` absent from
-the map, evaluation silently routed to the application's own provider — is unreachable from this
-suite. `TestValue_NoProviderReturnsLocal` and `TestValue_MissingFlagReturnsLocal` both read as
-covering it and cover neither, which is why finding 8 is invisible to CI.
+**8 and 13. The guard moved behind `Value`.** `Value` short-circuits to the local value unless a
+provider is bound to `FlagDomain`, so an unbound domain can no longer route an instrumentation key to
+the application's own flag backend. The four wrappers keep their `relayPossible` short-circuits —
+those also decide which implementation to allocate, which is a different question — but the module
+that owns the ladder now enforces the rule for the wrapper that forgets and for direct callers of the
+exported `MasterEnabled`.
 
-## Open — needs a decision before any code changes
+**9. Evaluations against an application-installed provider are bounded at 250 ms.** The auto-installed
+provider evaluates in process, so it skips the deadline entirely and the zero-code path pays nothing.
+The caller's context is still deliberately not threaded through: cancelling a Mongo operation must not
+change what an instrumentation switch resolves to, and a caller's deadline is about their work. If
+propagating the caller's context is wanted later, it is an API change across four modules, not a
+tweak here.
 
-These four are not bugs in the sense of a wrong line; each asks what the module is supposed to
-promise.
+**10. `providerBound` validates its reads.** The default provider is read twice, around the named
+read, and the answer is trusted only when it did not move — the trick a seqlock plays, for the same
+reason. Three attempts; a process swapping its default provider faster than that gets the
+conservative answer "bound", which leaves an endpoint inert rather than replacing a provider the
+application may have just bound.
 
-**6 and 7 together: targeting does not work, and there are two ways to fix it that mean different
-things.** The evaluation context is either zero or `NewTargetlessEvaluationContext`, so there is
-never a targeting key: a relay flag using `percentage` or `progressiveRollout` — the canonical way
-to canary a kill switch — fails with `TARGETING_KEY_MISSING`, and `Client.Boolean` swallows that and
-returns the local value. Separately, the one attribute the module does supply is unusable: the SDK
-flattens it to the literal key `service.name`, but both supported query languages read a dot as a
-nested-path separator, so the documented rule `service.name eq "checkout-api"` matches nothing.
-Supplying the service name as the targeting key would fix both at once, at the cost of making every
-process of a service bucket identically — a percentage rollout would become all-or-nothing per
-service. A per-process identifier buckets properly but re-buckets on every restart. Which one is
-right depends on what a rollout is supposed to mean here, and that is a product decision.
+**11. `captureLogs` returns a mutex-guarded buffer.** Writes and reads now take the same lock, which
+is what the provider's initialisation goroutine and the test goroutine needed between them.
 
-**8. Where an evaluation goes when `FlagDomain` is unbound.** `ForEvaluation` falls back to the
-default provider, so `MasterEnabled` and `Resolver.Value` — both exported, neither checking
-`RelayPossible` — evaluate instrumentation keys against whatever the application installed for its
-own flags. Narrowing `providerBound` fixed detection, not routing. The four consumers hand-roll the
-short-circuit that hides this; the module that owns the ladder does not enforce it (finding 13).
+## Mitigated, not fixed
 
-**9. `Value` hardcodes `context.Background()`.** `InstallProvider` accepts any provider, and the
-README recommends it. With a remote-evaluation provider, every evaluation becomes an HTTP request on
-the hot path of `InsertOne` or `Publish` — two per operation, three on a Mongo write — carrying no
-deadline and no cancellation. The hardcoded `DataCollectorDisabled` and in-process settings that
-prevent this stall apply only to the auto-install path.
-
-**13. The guard belongs behind `Value`.** `if !g.relayPossible { return masterLocal && tracingLocal }`
-is duplicated in `otel-nats/otelnats/env_flags.go`, both Mongo `gate_state.go` files, and
-`otel-gorilla-ws/env_flags.go`. `NewResolver`'s doc asserts the property as though it were
-guaranteed. A fifth instrumentation module that omits it — and the repository rule is explicitly
-that adding one must not require changing `otel-flags` — pays full SDK evaluation cost per operation
-and inherits finding 8.
+**12. The domain-unbound state stays untestable.** The SDK offers no way to unbind a domain, so once
+anything in the process binds `FlagDomain` — as `clearProvider` does — the state where evaluation
+falls back to the application's default provider is unreachable for the rest of the test binary. The
+`Value` guard is what makes that state harmless in production; no test in this package can enter it
+to prove the guard fires. `clearProvider` now says so in its doc comment, so the next reader does not
+mistake `TestValue_NoProviderReturnsLocal` for coverage of it.

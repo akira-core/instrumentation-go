@@ -301,6 +301,7 @@ func InstallProvider(provider openfeature.FeatureProvider) error {
 		return fmt.Errorf("otel-flags: binding a provider to %q: %w", FlagDomain, err)
 	}
 	explicitBind.Store(true)
+	autoInstalled.Store(false)
 	installDone = true
 
 	return nil
@@ -333,12 +334,36 @@ var explicitBind atomic.Bool
 // is not a binding. What survives is one false negative — an application that
 // binds the SAME provider to both slots reads equal and is treated as unbound —
 // which InstallProvider closes for anyone who wants it closed.
+// The two SDK reads take the same lock separately, so they can straddle a
+// SetProvider call: the named read would return the OLD default through the
+// fallback and the default read the NEW one, two different names, neither of
+// them NoopProvider — a binding that does not exist. So the default is read
+// twice around the named read and the answer is only trusted when it did not
+// move, which is the same trick a seqlock plays for the same reason.
 func providerBound() bool {
 	if explicitBind.Load() {
 		return true
 	}
-	return boundToDomain(openfeature.NamedProviderMetadata(FlagDomain), openfeature.ProviderMetadata())
+	for range providerReadAttempts {
+		before := openfeature.ProviderMetadata()
+		named := openfeature.NamedProviderMetadata(FlagDomain)
+		after := openfeature.ProviderMetadata()
+		if before.Name == after.Name {
+			return boundToDomain(named, after)
+		}
+	}
+	// The application is replacing its default provider faster than three reads.
+	// Answer "bound", which stands the auto-install down: leaving an operator's
+	// endpoint inert is recoverable by a restart, and replacing a provider the
+	// application may have just bound to this domain is not.
+	return true
 }
+
+// providerReadAttempts is how many times providerBound re-reads before giving
+// up. Three is one more than the number needed to survive a single concurrent
+// swap; a process that fails all three is swapping its default provider in a
+// loop, which is not a state this package can usefully wait out.
+const providerReadAttempts = 3
 
 // boundToDomain holds the comparison itself, separately from the two SDK calls
 // that feed it, because the case that matters most cannot be built through the
@@ -446,6 +471,17 @@ func NewResolver(opts ...ResolverOption) *Resolver {
 //
 // An out-of-range index returns false rather than panicking, so a mis-wired
 // module degrades to the disabled path instead of taking the process down.
+//
+// Nothing is evaluated unless a provider is bound to FlagDomain. That guard
+// belongs here rather than in each wrapper, and it is not an optimisation: the
+// SDK's ForEvaluation falls back to the DEFAULT provider when a domain is
+// unbound, so evaluating regardless would resolve instrumentation keys against
+// whatever the application installed for its own feature flags — a network call
+// per instrumented operation if that provider evaluates remotely, and a wrong
+// answer outright if it happens to define a key by the same name. Every wrapper
+// in this repository hand-rolls an equivalent short-circuit before calling here;
+// this makes the module that owns the ladder enforce it too, for the wrapper
+// that forgets and for the callers of the exported MasterEnabled.
 func (r *Resolver) Value(i int, local bool) bool {
 	if i < 0 || i >= len(r.keys) {
 		return false
@@ -456,18 +492,89 @@ func (r *Resolver) Value(i int, local bool) bool {
 	// the argument list unordered against them. Inlined, the zero evaluation
 	// context could reach the first evaluation of a Resolver.
 	client := r.evaluator()
-	return client.Boolean(context.Background(), r.keys[i], local, r.evalCtx)
+	if !providerBound() {
+		return local
+	}
+
+	ctx, cancel := evaluationContext()
+	defer cancel()
+	return client.Boolean(ctx, r.keys[i], local, r.evalCtx)
 }
+
+// evaluationContext bounds one evaluation.
+//
+// The auto-installed provider evaluates in process, so it cannot block and the
+// deadline is pure overhead — hence the fast path that skips building one. A
+// provider the application installed through InstallProvider can be anything,
+// including one that evaluates over HTTP, and that one sits on the hot path of
+// every instrumented Mongo command and NATS publish: two evaluations per
+// operation, three on a Mongo write. A stalled flag backend must cost a bounded
+// amount and then fall through to the local value, which is what a timeout here
+// produces — Boolean returns the passed-in default on a context error like any
+// other failure.
+//
+// The caller's context is deliberately NOT threaded through. Cancelling a Mongo
+// operation should not change what the instrumentation switch resolves to, and a
+// caller's deadline is about their work, not about the control plane.
+func evaluationContext() (context.Context, context.CancelFunc) {
+	if autoInstalled.Load() {
+		return context.Background(), func() {}
+	}
+	return context.WithTimeout(context.Background(), evaluationTimeout)
+}
+
+// evaluationTimeout is how long an evaluation may take before the local value
+// decides. It is generous for a same-datacentre round trip and small next to any
+// database or messaging operation this library instruments, which is the budget
+// it is really spending.
+const evaluationTimeout = 250 * time.Millisecond
+
+// autoInstalled records that the provider bound to FlagDomain is the one this
+// package built: in-process evaluation, no network on the evaluation path.
+var autoInstalled atomic.Bool
 
 // evaluator lazily installs the environment-configured provider, if any, and
 // creates the domain-scoped OpenFeature client.
 func (r *Resolver) evaluator() openfeature.IClient {
 	r.clientOnce.Do(func() {
-		r.evalCtx = installProvider()
+		r.evalCtx = withTargetingKey(installProvider())
 		r.client = openfeature.NewClient(FlagDomain)
 	})
 	return r.client
 }
+
+// withTargetingKey adds this process's targeting key to an evaluation context.
+//
+// Without one, every relay rule that buckets — percentage and progressiveRollout,
+// which is how a kill switch is canaried or ramped — fails with
+// TARGETING_KEY_MISSING, and Client.Boolean turns that into the local value like
+// any other failure. The rollout then appears to do nothing at all, on every
+// process, with no diagnostic anywhere. So the key is supplied on every path,
+// including the one where the application installed the provider itself: it
+// applies to this package's own keys on its own domain, and an application that
+// binds FlagDomain has opted into these switches.
+//
+// Unlike the service.name attribute, which stays confined to the auto-install
+// path so it can never override one the application set.
+func withTargetingKey(ctx openfeature.EvaluationContext) openfeature.EvaluationContext {
+	return openfeature.NewEvaluationContext(processTargetingKey, ctx.Attributes())
+}
+
+// processTargetingKey identifies this process to the relay.
+//
+// Host plus PID rather than a random value, for two reasons. It buckets per
+// process, which is what an operator canarying "enable tracing on 10% of the
+// fleet" means — a key derived from the service name alone would make every
+// percentage rollout all-or-nothing per service. And it is stable across a
+// restart of the same container, so a process that lands in the canary stays
+// there instead of re-drawing its verdict every time it restarts.
+var processTargetingKey = func() string {
+	host, err := os.Hostname()
+	if err != nil || strings.TrimSpace(host) == "" {
+		host = "unknown-host"
+	}
+	return fmt.Sprintf("%s-%d", host, os.Getpid())
+}()
 
 // Provider-install state, guarded by installMu.
 //
@@ -594,15 +701,27 @@ func installProviderFromEnv() openfeature.EvaluationContext {
 		return empty
 	}
 
+	autoInstalled.Store(true)
 	go watchProviderInit(provider.Metadata().Name, endpoint, interval, installGen.Load())
 
-	// Targeting attribute, supplied only here. Passed at the invocation site
+	// Targeting attributes, supplied only here. Passed at the invocation site
 	// rather than through SetEvaluationContext, so it composes with an
 	// application's global context instead of replacing it — and confined to this
 	// path, so it can never override a service.name the application set.
+	//
+	// Both spellings, and the dot-free one is the one a rule can actually use.
+	// The SDK flattens an attribute key literally, so the semconv name arrives at
+	// the relay as "service.name", but both supported query languages read a dot
+	// as a nested-path separator: nikunjy's parser splits it into attribute
+	// "service" with sub-attribute "name" and finds nothing, and JSONLogic's
+	// {"var": "service.name"} resolves it as a path too. A rule written the
+	// obvious way therefore matched no process at all. service.name stays because
+	// it is the name a reader expects to see in an evaluation context, and
+	// serviceName is what targeting rules key on.
 	if svc := strings.TrimSpace(os.Getenv(EnvServiceName)); svc != "" {
 		return openfeature.NewTargetlessEvaluationContext(map[string]any{
 			"service.name": svc,
+			"serviceName":  svc,
 		})
 	}
 	return empty

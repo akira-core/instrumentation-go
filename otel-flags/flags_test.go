@@ -161,14 +161,38 @@ func TestMasterLocal(t *testing.T) {
 	})
 }
 
+// syncBuffer is a bytes.Buffer safe to read while something else writes it.
+//
+// slog's TextHandler serialises writers against each other but not against a
+// reader, and the loggers these tests capture are shared with goroutines the
+// test does not own: the provider's initialisation runs on one, and
+// gofeatureflag.NewProvider captures slog.Default() permanently. Reading a bare
+// buffer from the test goroutine is a data race under -race, and CI runs -race.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // captureLogs redirects slog's default logger into a buffer for the test.
-func captureLogs(t *testing.T) *bytes.Buffer {
+func captureLogs(t *testing.T) *syncBuffer {
 	t.Helper()
-	var buf bytes.Buffer
+	buf := &syncBuffer{}
 	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
-	return &buf
+	return buf
 }
 
 // boolFlag builds an in-memory flag that always resolves to v.
@@ -201,6 +225,14 @@ func setProvider(t *testing.T, flags map[string]memprovider.InMemoryFlag) {
 
 // clearProvider rebinds FlagDomain to the no-op provider, modelling an
 // application that never wires OpenFeature at all.
+//
+// It is the closest this suite can get to the real thing, and the gap is worth
+// knowing about: the SDK offers no way to UNBIND a domain, so once anything in
+// the process binds FlagDomain — as this does — the state where the domain is
+// absent from the SDK's map, and ForEvaluation falls back to the application's
+// default provider, is unreachable for the rest of the binary. Value's
+// providerBound guard is what makes that state harmless in production; no test
+// here can enter it to prove the guard fires.
 func clearProvider(t *testing.T) {
 	t.Helper()
 	if err := openfeature.SetNamedProviderAndWait(FlagDomain, openfeature.NoopProvider{}); err != nil {
@@ -743,6 +775,150 @@ func TestJitterInterval_NonPositiveAndTinyIntervalsPassThrough(t *testing.T) {
 		if got := jitterInterval(d); got != d {
 			t.Errorf("jitterInterval(%v) = %v, want it returned unchanged", d, got)
 		}
+	}
+}
+
+func TestResolveLocal(t *testing.T) {
+	ptr := func(v bool) *bool { return &v }
+
+	tests := []struct {
+		name    string
+		option  *bool
+		env     string
+		envSet  bool
+		def     bool
+		want    bool
+		wantErr bool
+	}{
+		{name: "nothing set falls to the default", def: true, want: true},
+		{name: "nothing set falls to a false default"},
+
+		{name: "the option beats the default", option: ptr(true), def: false, want: true},
+		{name: "the option beats a true default", option: ptr(false), def: true},
+
+		// The ordering the whole ladder is built around: an operator's variable
+		// must survive application code that asked for the opposite.
+		{name: "the env beats the option", option: ptr(true), env: "false", envSet: true, def: false},
+		{name: "the env beats the option the other way", option: ptr(false), env: "true", envSet: true, def: false, want: true},
+		{name: "the env beats the default", env: "true", envSet: true, def: false, want: true},
+
+		// An unreadable variable is an error even when an option supplied a
+		// perfectly good value: the operator's intent is unknown, not absent.
+		{name: "an invalid env is an error", env: "maybe", envSet: true, def: false, wantErr: true},
+		{name: "an invalid env is an error despite an option", option: ptr(true), env: "maybe", envSet: true, def: false, wantErr: true},
+		{name: "an empty env is an error", env: "", envSet: true, def: true, wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.envSet {
+				t.Setenv(testEnvKey, tc.env)
+			}
+			got, err := ResolveLocal(tc.option, testEnvKey, tc.def)
+
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("ResolveLocal err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if tc.wantErr {
+				if !errors.Is(err, ErrInvalidFlagValue) {
+					t.Errorf("error does not wrap ErrInvalidFlagValue: %v", err)
+				}
+				if got {
+					t.Errorf("ResolveLocal = true alongside an error; the caller must not be handed a usable value")
+				}
+				return
+			}
+			if got != tc.want {
+				t.Fatalf("ResolveLocal = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestValue_SuppliesATargetingKey(t *testing.T) {
+	setProvider(t, map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})
+	resetInstallState(t)
+	t.Cleanup(func() { resetInstallState(t) })
+
+	r := NewResolver(WithFlagKeys("k"))
+	_ = r.Value(0, false)
+
+	// Without one, every percentage and progressiveRollout rule fails with
+	// TARGETING_KEY_MISSING and silently resolves to the local value.
+	if r.evalCtx.TargetingKey() == "" {
+		t.Fatalf("no targeting key; bucketing rules on the relay cannot apply to this process")
+	}
+	if got := r.evalCtx.TargetingKey(); got != processTargetingKey {
+		t.Errorf("targeting key = %q, want the process key %q", got, processTargetingKey)
+	}
+}
+
+func TestAutoInstall_ServiceNameIsMatchableByARule(t *testing.T) {
+	clearProvider(t)
+	resetInstallState(t)
+	t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+	t.Setenv(EnvServiceName, "checkout-api")
+	t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
+
+	r := NewResolver(WithFlagKeys("k"))
+	_ = r.Value(0, false)
+
+	// A dot is a nested-path separator in both query languages the relay
+	// supports, so service.name alone is unmatchable however it is written.
+	if got := r.evalCtx.Attributes()["serviceName"]; got != "checkout-api" {
+		t.Fatalf("serviceName = %v, want checkout-api; no relay rule can target this process", got)
+	}
+	if got := r.evalCtx.Attributes()["service.name"]; got != "checkout-api" {
+		t.Errorf("service.name = %v, want it kept alongside the matchable spelling", got)
+	}
+}
+
+func TestProviderBound(t *testing.T) {
+	t.Run("a no-op provider on the domain is not a binding", func(t *testing.T) {
+		clearProvider(t)
+		resetInstallState(t)
+		t.Cleanup(func() { resetInstallState(t) })
+
+		if providerBound() {
+			t.Fatalf("providerBound() = true for NoopProvider")
+		}
+	})
+
+	t.Run("an application's default provider is not a binding", func(t *testing.T) {
+		clearProvider(t)
+		resetInstallState(t)
+		setDefaultProvider(t, "business-flag")
+		t.Cleanup(func() { resetInstallState(t) })
+
+		if providerBound() {
+			t.Fatalf("providerBound() = true for a provider in the DEFAULT slot; " +
+				"instrumentation keys would be evaluated against the application's own flags")
+		}
+	})
+
+	t.Run("a provider on the domain is a binding", func(t *testing.T) {
+		setProvider(t, map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})
+		resetInstallState(t)
+		t.Cleanup(func() { resetInstallState(t) })
+
+		if !providerBound() {
+			t.Fatalf("providerBound() = false for a provider bound to %q", FlagDomain)
+		}
+	})
+}
+
+func TestValue_DoesNotReachTheDefaultProvider(t *testing.T) {
+	clearProvider(t)
+	resetInstallState(t)
+	// The application's own flag backend, which happens to define a key by the
+	// same name as one of ours.
+	setDefaultProvider(t, "k")
+	t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
+
+	r := NewResolver(WithFlagKeys("k"))
+	if r.Value(0, false) {
+		t.Fatalf("Value consulted the application's default provider; the local value must decide "+
+			"when nothing is bound to %q", FlagDomain)
 	}
 }
 
