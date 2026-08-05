@@ -4,12 +4,13 @@ All notable changes to the `otel-flags` module are documented here. Format loose
 
 > **Release ordering**: this module is tagged **before** the instrumentation modules that require it. A published `go.mod` cannot carry a `replace` directive — consumers ignore it — so `otel-mongo`, `otel-mongo/v2`, `otel-nats` and `otel-gorilla-ws` can only name a version that already exists. Local development and the repo-root `go.work` cover the gap; CI builds every module with `GOWORK=off` so each is verified exactly as a consumer resolves it.
 
-## [0.2.0] - unreleased
+## [0.2.0] - 2026-08-05
 
-> The consumers' `require` lines still name `v0.1.0` and move at release time. A `require` on a
-> version that has no tag fails module-graph loading for the entire workspace — `go.work` does not
-> cover it, contrary to what the design document originally assumed — so the two-stage release in
-> `VERSIONING.md` is not merely tidy, it is the only order that builds.
+> Tagged before the consumers, as `VERSIONING.md` requires. Their `require` lines named `v0.1.0`
+> until this tag existed, because a `require` on a version that has no tag fails module-graph
+> loading for the entire workspace — `go.work` does not cover it, contrary to what the design
+> document originally assumed — so the two-stage release is not merely tidy, it is the only order
+> that builds.
 
 Follows the August 2026 review (`docs/otel-flags-review-2026-08.md`). It fixes
 the design that review exposed rather than the defects themselves; the reasoning
