@@ -1,9 +1,11 @@
 # `otel-flags` error handling and evaluation fallback — decisions
 
-**Status: decided, not implemented.** Nothing in this document has been written into the code yet.
-It records thirteen decisions taken on 2026-08-05, the reasoning behind each, and the options that
-were rejected, so the work can be picked up in a different session, on a different machine, or by a
-different person.
+**Status: implemented in `otel-flags` 0.2.0** (unreleased at the time of writing; the four wrapper
+modules require it from their own `0.8.0`/`2.8.0`). It records thirteen decisions taken on
+2026-08-05, the reasoning behind each, and the options that were rejected. The reasoning is why it
+stays: the code carries the rules, not the alternatives that were weighed against them.
+
+Where the implementation differs from the letter of a decision below, it is noted inline.
 
 It follows `docs/otel-flags-review-2026-08.md`, which found and fixed fourteen defects. This document
 is about the design those fixes exposed rather than about the defects themselves.
@@ -52,6 +54,14 @@ operator's intent be read" is decidable by looking at the value.
 validated whether or not a relay is configured — making the failure conditional on another variable
 reintroduces exactly the unpredictability this removes. `_API_KEY` is not validated: any string can
 be a legitimate key.
+
+*As implemented*, two details the decision did not spell out. The endpoint must have a **host** as
+well as a scheme, because `relay:1031` parses cleanly — scheme `relay`, opaque `1031` — and would
+otherwise pass while producing a provider that reaches nothing. And a **blank** value for either
+variable means "not configured" rather than being an error: unlike a boolean, a duration and a URL
+have no second reading for `export VAR=` to be mistaken for, which is the entire reason `Lookup`
+rejects it. Which schemes the relay actually speaks is left to the provider; a well-formed but
+exotic one fails at the transport, where the retry loop logs it.
 
 ### 2. The error surfaces through a process-level validation function
 
@@ -225,12 +235,22 @@ readable exist.
 - `CLAUDE.md`, `docs/feature-flags.md`, `docs/feature-flags.zh-TW.md`,
   `docs/otel-flags-review-2026-08.md`
 
-## Known consequence: CI goes red until the tag lands
+## The `require` bump waits for the tag
 
-The consumers' `require` lines move to `otel-flags v0.2.0` in the same change set, so between the
-commit and `git tag otel-flags/v0.2.0` their CI jobs fail to resolve the dependency under
-`GOWORK=off`. Local development is unaffected — the repo-root `go.work` covers exactly this window,
-which `VERSIONING.md` already describes as the two-stage release.
+**Corrected during implementation.** The plan was to move the consumers' `require` lines to
+`otel-flags v0.2.0` in the same change set and accept red CI until `git tag otel-flags/v0.2.0`, on
+the assumption that the repo-root `go.work` covers the window locally. It does not: a `require` on a
+version that does not exist fails module-graph loading for the whole workspace, so **every module
+stops building locally too**, including `otel-flags` itself.
 
-Leaving the `require` lines at `v0.1.0` instead would turn the same window into compile errors
-against a published API that no longer matches, which is harder to read and no shorter.
+```
+flags.go:81:2: github.com/akira-core/instrumentation-go/otel-flags@v0.2.0:
+  reading .../otel-flags/go.mod at revision otel-flags/v0.2.0: unknown revision
+```
+
+So the `require` lines stay at `v0.1.0` in this change set, and the bump happens at release, which is
+the two-stage procedure `VERSIONING.md` and `CLAUDE.md` already describe: tag `otel-flags/v0.2.0`,
+then bump the four `require` lines, `GOWORK=off go mod tidy`, then tag the wrappers. Local
+development keeps working against the working tree the whole time; the API mismatch the original
+reasoning worried about does not arise, because the workspace resolves `otel-flags` from source
+rather than from the version named in `require`.

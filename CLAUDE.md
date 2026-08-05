@@ -196,11 +196,21 @@ Exported surface:
   construction; never memoize process-wide** (a `sync.Once` would freeze the answer at whichever
   wrapper was built first, which in a test binary makes every relay test unreachable). A provider the
   application installed as the **default** does not count — see below.
-- `InstallProvider(p) error` — the recommended way for an application to install its own provider:
-  `SetNamedProviderAndWait(FlagDomain, p)` plus a record that this process did so. Waiting means no
-  startup window. Raw `SetNamedProviderAndWait` stays supported.
-- `Resolver` / `NewResolver` / `WithFlagKeys` / `Value(i int, local bool) bool` — per-module
-  resolution. Caches nothing. Out-of-range index returns `false` rather than panicking.
+- `ValidateAndInstall() error` (0.2.0+) — the process-level entry point every wrapper constructor
+  calls and joins into its own error. It validates `_POLL_INTERVAL` (positive Go duration) and
+  `_ENDPOINT` (URL with a scheme **and** a host), reports every bad value at once, and performs the
+  one-time provider install. Both are validated whether or not a relay is configured; blank means
+  "not configured" for both; the API key is never validated. It does **not** wait for initialisation.
+- `SetNamedProvider(p) error` (0.2.0+, was `InstallProvider`) — the recommended way for an
+  application to install its own provider: `SetNamedProviderAndWait(FlagDomain, p)` plus a record
+  that this process did so. Waiting means no startup window. Raw `SetNamedProviderAndWait` stays
+  supported. Warns when wrappers were already constructed. Set-or-replace, not an idempotent
+  install — hence the SDK's verb, and **not** `SetProvider`, which is the default slot.
+- `Resolver` / `NewResolver()` / `Value(key string, local bool) bool` — per-module resolution.
+  Caches nothing. The key is a **parameter**: `WithFlagKeys` and the per-resolver key list were
+  removed in 0.2.0 because an index couples two modules' flags by position with nothing checking it
+  (swapping two lines in otel-mongo's registration compiled, passed, and made the propagation flag
+  control tracing).
 - `EnvGlobalTracing`, `FlagKeyGlobalTracing`, `FlagDomain`, `EnvFlagsEndpoint`, `EnvFlagsAPIKey`,
   `EnvFlagsPollInterval`, `EnvServiceName`.
 
@@ -210,8 +220,8 @@ leaks N−1 unstoppable pollers.
 
 **The module-vocabulary rule survives.** `otel-flags` names only process-scoped things. Module flag
 keys, module env var names and module defaults stay in each module's own `env_flags.go` and reach the
-shared module through `WithFlagKeys` and `Value`'s `local` parameter. Adding an instrumentation module
-must not require a change to `otel-flags`.
+shared module as `Value`'s `key` and `local` arguments. Adding an instrumentation module must not
+require a change to `otel-flags`.
 
 `Gate`/`NewGate`/`ResetForTest` were removed in 0.8.0 — a process-lifetime cache is incompatible
 with runtime flag changes. So were the module-level reset hooks: with nothing cached there is nothing
@@ -237,16 +247,27 @@ so an operator can flip them via a GO Feature Flag relay proxy without restartin
 | `otel-nats-tracing` | `OTEL_NATS_TRACING_ENABLED` | `false` | `otel-nats` |
 | `otel-gorilla-ws-tracing` | `OTEL_GORILLA_WS_TRACING_ENABLED` | `false` | `otel-gorilla-ws` |
 
-The whole ladder is **one call**: `client.Boolean(ctx, key, local, evalCtx)`, where `local` is the
-option-or-env-or-default value fixed at construction. `Client.Boolean` returns that default on every
-path where the relay has no usable answer — no provider, not ready, key absent, evaluation error, type
-mismatch — so relay silence and relay failure are deliberately indistinguishable, and both mean "the
-next rung down decides". Do **not** use `BooleanValueDetails`: the distinction has no reader.
+The whole ladder is **one call**: `client.BooleanValueDetails(ctx, key, local, evalCtx)`, where
+`local` is the option-or-env-or-default value fixed at construction. The SDK returns that default on
+every path where the relay has no usable answer — no provider, not ready, key absent, evaluation
+error, type mismatch — so relay silence and relay failure stay deliberately indistinguishable **in
+the returned value**, and both mean "the next rung down decides".
+
+**The details variant is used for its error code, not its value** (0.2.0+; before that it was
+`client.Boolean` and the code was thrown away). `Value` logs a key's error code when it *changes* —
+never per evaluation, since an instrumented operation evaluates two flags. `FLAG_NOT_FOUND` and
+`PROVIDER_NOT_READY` mean the relay has no opinion and log at **debug**; `TARGETING_KEY_MISSING`,
+`TYPE_MISMATCH`, `PARSE_ERROR`, `INVALID_CONTEXT`, `PROVIDER_FATAL`, `GENERAL` log at **warn**; a
+code that clears logs the recovery at **info**. The classification lives in `quietErrorCodes` and
+`recordEvaluation`, not at call sites. The error is never propagated: spec 1.4.10 makes evaluation
+non-throwing, and the ladder is built on `Value` having no failure mode.
 
 Three further **process-scoped** variables configure the relay connection rather than any module:
 `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` (unset ⇒ no provider is installed **and** `RelayPossible()`
 is false), `_API_KEY`, and `_POLL_INTERVAL` (Go duration strings only, default `60s`, and the centre
-of the period rather than an exact one — see `jitterInterval` below).
+of the period rather than an exact one — see `jitterInterval` below). Since 0.2.0 the endpoint and
+the interval are **validated at construction** and an unreadable one fails it — no warn-and-fall-back
+carve-out for the "less severe" variable.
 `OTEL_SERVICE_NAME` supplies `serviceName` and `service.name` targeting attributes, on the auto-install
 path only — relay rules must key on the dot-free spelling, because a dot is a nested-path separator in
 both query languages the relay supports. A targeting key of `<hostname>-<pid>` is supplied on every
@@ -286,21 +307,28 @@ provider, _ := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{
     DataCollectorDisabled: true, // required — see feature-flags.md
 })
 // Blocking install; on error log and continue rather than failing startup.
-_ = otelflags.InstallProvider(provider)
+_ = otelflags.SetNamedProvider(provider)
 ```
+
+An application that wants to alarm on a dead relay reads
+`openfeature.NewClient(otelflags.FlagDomain).State()` — there is no health API here, and startup must
+**not** be gated on that state.
 
 **"A provider is bound" means bound to `FlagDomain`, not to the default slot.** `NamedProviderMetadata`
 falls back to the default provider's metadata when the domain is unbound, so reading it alone made an
 application's own business provider look like a relay: wrappers allocated the instrumented
 implementation and evaluated instrumentation keys against it, and — worse — the auto-install stood
 down, leaving an operator's configured endpoint silently inert. `providerBound()` therefore rejects an
-answer that merely echoes the default, and `InstallProvider` records the fact exactly. Do **not** reach
+answer that merely echoes the default, and `SetNamedProvider` records the fact exactly. Do **not** reach
 for `GetNamedProviders()`: it returns the live map without copying, so reading it races
 `SetNamedProvider` and can crash the process.
 
 **They must do it BEFORE constructing any wrapper.** `RelayPossible()` is resolved at construction, so
 a wrapper built earlier resolves statically for its whole life and never consults the relay. This is a
-documented ordering requirement, and the same rule binds the tests.
+documented ordering requirement, and the same rule binds the tests. `SetNamedProvider` warns when it
+detects that wrappers already exist; a raw `openfeature.SetNamedProviderAndWait` leaves no trace and is
+an accepted blind spot. The rule only bites when `_ENDPOINT` is unset — with it set, `RelayPossible()`
+is true from the start.
 
 The startup window is **fail-safe for enabling**: until the provider's first fetch, every switch
 resolves to its local value, so the window can delay a relay-driven enable but can never introduce one

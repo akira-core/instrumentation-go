@@ -4,6 +4,94 @@ All notable changes to the `otel-flags` module are documented here. Format loose
 
 > **Release ordering**: this module is tagged **before** the instrumentation modules that require it. A published `go.mod` cannot carry a `replace` directive — consumers ignore it — so `otel-mongo`, `otel-mongo/v2`, `otel-nats` and `otel-gorilla-ws` can only name a version that already exists. Local development and the repo-root `go.work` cover the gap; CI builds every module with `GOWORK=off` so each is verified exactly as a consumer resolves it.
 
+## [0.2.0] - unreleased
+
+> The consumers' `require` lines still name `v0.1.0` and move at release time. A `require` on a
+> version that has no tag fails module-graph loading for the entire workspace — `go.work` does not
+> cover it, contrary to what the design document originally assumed — so the two-stage release in
+> `VERSIONING.md` is not merely tidy, it is the only order that builds.
+
+Follows the August 2026 review (`docs/otel-flags-review-2026-08.md`). It fixes
+the design that review exposed rather than the defects themselves; the reasoning
+and the rejected alternatives are recorded in
+`docs/otel-flags-error-handling-decisions.md`.
+
+### BREAKING
+
+- **`Value` takes a flag key, not an index**: `Value(key string, local bool) bool`.
+  `WithFlagKeys`, `ResolverOption` and the per-resolver key list are gone, and
+  `NewResolver()` takes no arguments. The index bought nothing — `client.Boolean`
+  takes a key string, so `Value` converted it straight back — while coupling two
+  modules' flags by position with nothing checking it: swapping the two lines in
+  `otel-mongo`'s `WithFlagKeys` call compiled, passed the tests, and silently made
+  the propagation flag control tracing. Out-of-range was the least dangerous
+  member of that family; this deletes the family rather than deciding what
+  out-of-range should return.
+- **`InstallProvider` is now `SetNamedProvider`.** "Install" implies a one-time
+  idempotent operation; the semantics are set-or-replace, which matters more now
+  that sharing one provider between the application and this library is an
+  explicitly supported story. Not `SetProvider`: that name is taken by
+  `openfeature.SetProvider`, which writes the opposite slot.
+- **An unreadable provider variable now fails construction.**
+  `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` must be a positive Go duration and
+  `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` a URL with a scheme and a host, both
+  validated whether or not a relay is configured. The interval previously warned
+  and fell back to `60s`. That was a carve-out keyed to how bad the consequence
+  is, which has to be re-argued for every variable anyone adds; what decides now
+  is whether the operator's intent can be read. Blank still means "not
+  configured" for both — unlike a boolean, neither has a second reading. The API
+  key is not validated: any string can be a legitimate key.
+- **`ErrInvalidFlagValue`'s message is now "invalid configuration value"** and it
+  covers all four variable shapes. One sentinel still serves every module.
+
+### Added
+
+- **`ValidateAndInstall() error`** — the process-level entry point every wrapper
+  constructor calls. It validates this package's environment, reports every bad
+  value at once, and performs the one-time provider install. It does **not** wait
+  for the provider to initialise; an application that wants the startup window
+  closed calls `SetNamedProvider`.
+- **Evaluation diagnostics.** `Value` reads `BooleanValueDetails` and logs a flag
+  key's error code when it *changes* — never per evaluation, so the steady state
+  is silent. `FLAG_NOT_FOUND` and `PROVIDER_NOT_READY` mean the relay has no
+  opinion and log at debug; `TARGETING_KEY_MISSING`, `TYPE_MISMATCH`,
+  `PARSE_ERROR`, `INVALID_CONTEXT`, `PROVIDER_FATAL` and `GENERAL` log at warn; a
+  code that clears logs the recovery at info. The two highest-severity findings of
+  the review were both invisible because this code was populated the whole time
+  and nothing read it. The returned value is unchanged — relay silence and relay
+  failure stay indistinguishable to a caller, which is what makes the ladder
+  total.
+- **`SetNamedProvider` warns when wrappers already exist.** `RelayPossible` is a
+  construction-time snapshot, so a wrapper built before the provider was bound
+  can never consult the relay. Nothing can repair that from here, which is why the
+  warning is the remedy. A raw `openfeature.SetNamedProviderAndWait` cannot be
+  detected and remains an accepted blind spot.
+
+### Changed
+
+- The install no longer runs inside the first evaluation. It held `installMu` —
+  the mutex `SetNamedProvider` holds across a blocking provider initialisation —
+  so a first evaluation concurrent with an application's own install could park an
+  instrumented operation for the length of that provider's HTTP timeout.
+- The evaluation context moved from per-`Resolver` to package level. A resolver
+  created before the install used to cache an empty one for the life of the
+  process, so one module would carry the `serviceName` targeting attributes and
+  another would not.
+
+### Unchanged, deliberately
+
+- **The startup window still resolves to the local value.** `PROVIDER_NOT_READY`
+  keeps passing `local` as the evaluation default, so a relay *disable* does not
+  survive a restart while a relay *enable* can never appear during the window.
+  Durable state belongs in the environment variable; persisting the last-known-good
+  verdict to disk is the only design that changes this, and it stays on the shelf.
+- **No health API.** An application that wants to alarm on a dead relay reads
+  `openfeature.NewClient(otelflags.FlagDomain).State()`. It must not gate startup
+  on it — that is the availability dependency this module refuses to become.
+- **The 250 ms evaluation timeout stays hardcoded.** It applies only to a provider
+  the application installed; the auto-installed one evaluates in process and skips
+  the deadline entirely.
+
 ## [0.1.0] - unreleased
 
 First release. Extracted from the four vendored `internal/flags` copies that

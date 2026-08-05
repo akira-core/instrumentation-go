@@ -126,12 +126,30 @@ exceptions: **set it to a recognised value, or do not set it.**
 The error names the variable and the observed value. A constructor that reads several switches
 reports **all** of the bad ones in one joined error, so one run tells you everything to fix.
 
+**The relay-connection variables follow the same principle with their own shapes.** They are
+validated at construction whether or not a relay is configured, and an unreadable one fails the
+constructor with the same sentinel:
+
+| Variable | Accepted | Rejected |
+|---|---|---|
+| `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` | unset, blank, or a URL with a scheme **and** a host | `relay:1031`, `relay`, `http://` |
+| `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` | unset, blank, or a positive Go duration | `60`, `soon`, `0s`, `-5s` |
+| `OTEL_INSTRUMENTATION_GO_FLAGS_API_KEY` | anything | — (never validated, never logged) |
+
+Blank means "not configured" for those two rather than being an error, and that is not a carve-out: a
+duration and a URL have no second reading for `export VAR=` to be mistaken for, which is the whole
+reason a **boolean** rejects it.
+
 ## Before you upgrade
 
 **Grep your deployment configuration for `OTEL_*_ENABLED` and confirm every value is in one of the
 two accepted lists.** This is the one change in this release that can stop a process from starting:
 `=enabled`, `=2`, `=y` and `=` (empty) were previously tolerated and now fail at the first
 constructor. An unexpanded `${SOMETHING}` in a Kubernetes manifest reaches exactly the empty case.
+
+**Then grep for `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL`.** A malformed value used to warn and
+fall back to `60s`; it now fails the same constructor. `=60` is the case to look for — it was never
+read as seconds, and it is now rejected rather than silently ignored.
 
 Then re-read what the defaults mean. Against `0.7.0`:
 
@@ -242,9 +260,9 @@ Set environment variables. No import, no Go code, nothing else to remember.
 
 | Variable | Meaning |
 |---|---|
-| `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` | relay proxy URL. Unset ⇒ nothing is installed, no OpenFeature state is written, and no evaluation ever happens |
+| `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` | relay proxy URL, with a scheme and a host (`http://relay:1031`). Unset ⇒ nothing is installed, no OpenFeature state is written, and no evaluation ever happens. A value that is set but is not such a URL **fails construction** |
 | `OTEL_INSTRUMENTATION_GO_FLAGS_API_KEY` | optional; never logged |
-| `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` | optional; Go duration strings only (`30s`, `2m`), default `60s`. A malformed value warns, falls back and still installs. The value sets the centre of the polling period, not an exact one: it is deviated by at most ±10%, drawn once per process |
+| `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` | optional; a positive Go duration (`30s`, `2m`), default `60s`. A value that is set and cannot be read **fails construction** (0.2.0+; it used to warn and fall back). The value sets the centre of the polling period, not an exact one: it is deviated by at most ±10%, drawn once per process |
 | `OTEL_SERVICE_NAME` | optional; supplies `serviceName` and `service.name` targeting attributes, on this path only. Rules must key on the dot-free spelling |
 
 The library installs a GO Feature Flag provider as a **named** provider on the domain
@@ -269,13 +287,13 @@ provider, err := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{
 })
 if err != nil {
     slog.Warn("feature flag provider unavailable; switches are environment-only", "error", err)
-} else if err := otelflags.InstallProvider(provider); err != nil {
+} else if err := otelflags.SetNamedProvider(provider); err != nil {
     // Log and continue: the relay is a control plane, not a prerequisite.
     slog.Warn("feature flag provider registration failed", "error", err)
 }
 ```
 
-`otelflags.InstallProvider` binds the **named** domain `otel-instrumentation-go`
+`otelflags.SetNamedProvider` binds the **named** domain `otel-instrumentation-go`
 (`otelflags.FlagDomain`), waits for the provider to finish initialising, and records that this
 process deliberately gave the instrumentation switches a relay. When you call it, the zero-code
 install stands down and you own the provider's lifecycle.
@@ -285,9 +303,11 @@ an embedding SDK uses to own initialisation, evaluation context, logger and shut
 [Embedding SDKs](#embedding-sdks-owning-the-provider-yourself).
 
 `openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, provider)` still works and is still
-detected. `InstallProvider` is preferred for one reason: detecting a raw binding means asking the
+detected. `SetNamedProvider` is preferred for one reason: detecting a raw binding means asking the
 OpenFeature SDK which provider is bound to a domain, and that question has no exact answer (see
-below), whereas the record `InstallProvider` keeps is exact.
+below), whereas the record `SetNamedProvider` keeps is exact. If you want ONE provider instance to
+serve both your own flags and these switches, this function is the only way: bound to both slots, a
+provider reads back identical either way and the heuristic sees an unbound domain.
 
 **Never bind the default provider for this purpose.** A provider you installed with
 `openfeature.SetProvider` — your application's own flags — is deliberately **not** treated as a relay
@@ -297,7 +317,7 @@ instrumented implementation to be built, and it never has instrumentation keys e
 ### Embedding SDKs: owning the provider yourself
 
 If you ship an SDK that wraps these modules and want to own the OpenFeature lifecycle rather than
-inherit the zero-code path, install any provider you like with `otelflags.InstallProvider` during
+inherit the zero-code path, install any provider you like with `otelflags.SetNamedProvider` during
 your own initialisation, before you construct any wrapper. From then on:
 
 - **Initialisation, logger, poll interval and shutdown are yours.** This library installs nothing,
@@ -348,6 +368,30 @@ successfully.
 Once a fetch has succeeded, an outage changes nothing: the in-process evaluator serves its last
 fetched configuration, and no evaluation performs network I/O.
 
+### Knowing that the relay is dead
+
+There is no health API in `otel-flags`. Read the state the OpenFeature SDK already keeps:
+
+```go
+state := openfeature.NewClient(otelflags.FlagDomain).State()
+```
+
+**Do not gate startup on it.** A process that refuses to come up until the relay answers has turned a
+telemetry control plane into an availability dependency — the outcome the whole design refuses.
+
+What a running process reports on its own is a log line, emitted when a flag key's evaluation
+outcome **changes** and never per evaluation:
+
+| Error code | Level | What it means |
+|---|---|---|
+| `FLAG_NOT_FOUND`, `PROVIDER_NOT_READY` | debug | the relay has no opinion. Ordinary — and the only signal you get if you mistyped a key name on the relay |
+| `TARGETING_KEY_MISSING`, `TYPE_MISMATCH`, `PARSE_ERROR`, `INVALID_CONTEXT`, `PROVIDER_FATAL`, `GENERAL` | warn | something is broken; the local value stands and the relay cannot change this switch |
+| the code clears | info | the relay decides this switch again |
+
+The **returned value** stays the same on every one of those paths — that is what makes the ladder
+total — but the silence is gone. Both of the highest-severity findings in the August 2026 review were
+invisible for exactly this reason: the code was populated the whole time and nothing read it.
+
 ### The startup window
 
 The zero-code install is non-blocking, so between it and the provider's first successful fetch every
@@ -375,7 +419,7 @@ incident-brake procedure is two steps, in this order:
    agree, the window is harmless.
 
 If you want the relay's answer before the first operation, install your own provider with
-`otelflags.InstallProvider`, which waits for initialisation and also makes the zero-code install
+`otelflags.SetNamedProvider`, which waits for initialisation and also makes the zero-code install
 stand down.
 
 ### In-process evaluation only
@@ -504,6 +548,9 @@ operation, and only a process where no relay is possible skips the pipeline enti
 
 **A process with no relay configured pays none of it**, and allocates no instrumented implementation
 it cannot reach.
+
+The diagnostic above costs nothing in the steady state: one map lookup per evaluation, and a log line
+only when a key's outcome changes.
 
 Nothing is cached, deliberately: a cache would make a flag change take effect later than the poll
 interval already implies. It sits behind an unchanged internal signature, so it can be added without

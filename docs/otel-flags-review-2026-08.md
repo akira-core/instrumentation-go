@@ -7,6 +7,14 @@ four consumer modules that carry the `relayPossible` short-circuit.
 Fourteen findings. Severity is about what an operator loses, not about how hard the fix is: a switch
 that silently stops being a switch outranks a race that needs two goroutines and bad luck.
 
+> **Follow-up.** The *design* these fixes exposed — how an unreadable value should be reported, where
+> the install belongs, what a failing evaluation should say — is recorded and decided in
+> [`otel-flags-error-handling-decisions.md`](otel-flags-error-handling-decisions.md), and landed in
+> `otel-flags` 0.2.0. Two things below have been renamed or reversed since: `InstallProvider` is now
+> `SetNamedProvider`, and finding 9's evaluation timeout survives while the poll interval's
+> warn-and-fall-back does not — a malformed interval now fails construction. The text is kept as
+> written, as the record of what was found in `8ac2112`.
+
 | # | Severity | Finding | Status |
 |---|---|---|---|
 | 1 | High | A relay unreachable at process start leaves the provider permanently inert | Fixed |
