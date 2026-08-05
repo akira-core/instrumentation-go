@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,6 +40,7 @@ func resetInstallState(t *testing.T) {
 	installedEvalCtx.Store(nil)
 	explicitBind.Store(false)
 	relayPossibleRead.Store(false)
+	autoInstalled.Store(false)
 	installGen.Add(1)
 }
 
@@ -795,6 +797,105 @@ func TestValue_QuietWhenTheRelaySimplyHasNoOpinion(t *testing.T) {
 				t.Errorf("%s was not reported at all; a mistyped key name would have no signal: %q", code, log)
 			}
 		})
+	}
+}
+
+// TestValue_EveryErrorCodeLeavesLocalInCharge closes the fallback contract over
+// the full error-code vocabulary: whatever way an evaluation fails, and in
+// whichever direction the local value points, the local value stands.
+//
+// The per-code tests above assert the logging; this one asserts the VALUE, so a
+// future code path that handled one code specially — returning false on
+// PROVIDER_FATAL, say — is caught even if its logging looks right.
+func TestValue_EveryErrorCodeLeavesLocalInCharge(t *testing.T) {
+	codes := []openfeature.ErrorCode{
+		openfeature.FlagNotFoundCode,
+		openfeature.ProviderNotReadyCode,
+		openfeature.ProviderFatalCode,
+		openfeature.TargetingKeyMissingCode,
+		openfeature.GeneralCode,
+	}
+	for _, code := range codes {
+		t.Run(string(code), func(t *testing.T) {
+			setCodeProvider(t, code)
+
+			r := NewResolver()
+			key := freshKey(t, "fallback-"+string(code))
+			for _, local := range []bool{true, false} {
+				if got := r.Value(key, local); got != local {
+					t.Errorf("Value(%v) = %v under %s; the local value must stand", local, got, code)
+				}
+			}
+		})
+	}
+}
+
+// TestValue_TypeMismatchLeavesLocalInCharge covers the one failure the
+// codeProvider cannot model faithfully: a relay that serves the key with the
+// WRONG TYPE. The SDK detects the mismatch after the provider resolves, so this
+// drives it through a real in-memory flag whose variants are strings.
+func TestValue_TypeMismatchLeavesLocalInCharge(t *testing.T) {
+	setProvider(t, map[string]memprovider.InMemoryFlag{
+		"string-typed-flag": {
+			State:          memprovider.Enabled,
+			DefaultVariant: "on",
+			Variants:       map[string]any{"on": "definitely", "off": "nope"},
+		},
+	})
+
+	r := NewResolver()
+	key := freshKey(t, "string-typed-flag")
+	for _, local := range []bool{true, false} {
+		if got := r.Value(key, local); got != local {
+			t.Errorf("Value(%v) = %v for a string-typed flag; the local value must stand", local, got)
+		}
+	}
+}
+
+// deadlineProbe records whether the evaluation context carried a deadline.
+type deadlineProbe struct {
+	openfeature.NoopProvider
+	sawDeadline atomic.Bool
+}
+
+func (*deadlineProbe) Metadata() openfeature.Metadata {
+	return openfeature.Metadata{Name: "DeadlineProbe"}
+}
+
+func (p *deadlineProbe) BooleanEvaluation(ctx context.Context, _ string, defaultValue bool,
+	_ openfeature.FlattenedContext,
+) openfeature.BoolResolutionDetail {
+	_, ok := ctx.Deadline()
+	p.sawDeadline.Store(ok)
+	return openfeature.BoolResolutionDetail{Value: defaultValue}
+}
+
+// TestValue_DeadlineOnlyForApplicationProviders pins where the 250 ms bound
+// applies. A provider the application installed can be anything, including one
+// that evaluates over HTTP, so its evaluations carry a deadline and a stall
+// falls through to the local value. The auto-installed provider evaluates in
+// process and cannot block, so the deadline — pure overhead there — is skipped.
+func TestValue_DeadlineOnlyForApplicationProviders(t *testing.T) {
+	resetInstallState(t)
+	probe := &deadlineProbe{}
+	if err := openfeature.SetNamedProviderAndWait(FlagDomain, probe); err != nil {
+		t.Fatalf("SetNamedProviderAndWait: %v", err)
+	}
+	t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
+
+	r := NewResolver()
+	key := freshKey(t, "deadline-probe")
+
+	_ = r.Value(key, false)
+	if !probe.sawDeadline.Load() {
+		t.Errorf("no deadline on an application-installed provider's evaluation; " +
+			"a stalled flag backend would block the instrumented operation indefinitely")
+	}
+
+	autoInstalled.Store(true)
+	_ = r.Value(key, false)
+	if probe.sawDeadline.Load() {
+		t.Errorf("a deadline was built for the auto-installed provider, which evaluates in process and cannot block")
 	}
 }
 
