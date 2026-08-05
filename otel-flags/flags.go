@@ -440,10 +440,25 @@ func (r *Resolver) evaluator() openfeature.IClient {
 //
 // This is package-level rather than per-Resolver, and that is the whole point of
 // the module. A process holds one Resolver for the master switch and one per
-// instrumentation module; with the check-then-register sequence inside each
-// Resolver's own sync.Once, two of them could observe NoopProvider concurrently
-// and both register. One mutex here serialises the sequence across all of them,
-// so "one shared module" becomes "exactly one install".
+// instrumentation module, each with its own sync.Once, which orders nothing
+// between them. The sequence installProviderFromEnv performs — read whether a
+// provider is bound, then bind one — is two separate critical sections inside the
+// OpenFeature SDK: a read lock behind NamedProviderMetadata, a write lock in the
+// named-provider setter, with no conditional setter offered that would fuse them.
+// So two Resolvers can both observe NoopProvider and both register. One mutex
+// here serialises the whole sequence across all of them, so "one shared module"
+// becomes "exactly one install".
+//
+// What that race costs is not what it first appears. The SDK does shut the loser
+// down — setNamedProviderWithContext hands the replaced provider to shutdownOld
+// (go-sdk v1.17.2, openfeature_api.go). What it does not do is order that against
+// the winner's initialisation: Init and Shutdown are dispatched to separate
+// goroutines, and the in-process evaluator is not idempotent across that pair.
+// Its Shutdown returns immediately when Init has not run yet, pollingDone being
+// pre-closed for exactly that case, after which Init installs a fresh
+// stopPolling channel and resets the shutdownOnce that just fired. The polling
+// goroutine it then starts has no reachable handle and outlives every attempt to
+// stop it, fetching from the relay for the life of the process.
 //
 // installEvalCtx is remembered rather than recomputed because a Resolver that
 // initialises after the install would otherwise see a provider already bound,
