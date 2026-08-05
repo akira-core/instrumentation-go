@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -415,6 +416,20 @@ func TestRelayPossible(t *testing.T) {
 		}
 	})
 
+	// One reading of the variable, shared with ValidateAndInstall. "relay:1031"
+	// is non-blank but fails validation, so a hand-rolled non-blank check here
+	// would call a relay possible that can never be built.
+	t.Run("an endpoint that fails validation is not an endpoint", func(t *testing.T) {
+		clearProvider(t)
+		resetInstallState(t)
+		t.Cleanup(func() { resetInstallState(t) })
+		t.Setenv(EnvFlagsEndpoint, "relay:1031")
+
+		if RelayPossible() {
+			t.Fatalf("RelayPossible() = true for an endpoint ValidateAndInstall rejects")
+		}
+	})
+
 	t.Run("a provider the application installed for its own flags does not count", func(t *testing.T) {
 		clearProvider(t)
 		resetInstallState(t)
@@ -461,7 +476,7 @@ func TestBoundToDomain(t *testing.T) {
 		{name: "we auto-installed", named: ours, def: noop, want: true},
 
 		// The one surviving false negative: the same provider in both slots is
-		// indistinguishable from the fallback. InstallProvider closes it.
+		// indistinguishable from the fallback. SetNamedProvider closes it.
 		{name: "same provider in both slots reads as unbound", named: business, def: business},
 	}
 
@@ -517,6 +532,37 @@ func TestSetNamedProvider(t *testing.T) {
 	t.Run("a nil provider is an error, not a panic", func(t *testing.T) {
 		if err := SetNamedProvider(nil); err == nil {
 			t.Fatalf("SetNamedProvider(nil) = nil, want an error")
+		}
+	})
+
+	// The auto-install's targeting attributes are confined to the auto-install
+	// path so they can never override a context the application owns. Leaving
+	// them published after the application takes the domain over sends them to
+	// ITS provider on every evaluation — the same override by a slower route.
+	t.Run("the auto-install's service attributes go with its provider", func(t *testing.T) {
+		clearProvider(t)
+		resetInstallState(t)
+		t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+		t.Setenv(EnvServiceName, "checkout-api")
+		t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
+
+		mustValidate(t)
+		if got := currentEvalCtx().Attributes()["serviceName"]; got != "checkout-api" {
+			t.Fatalf("serviceName = %v before the takeover, want checkout-api", got)
+		}
+
+		if err := SetNamedProvider(memprovider.NewInMemoryProvider(
+			map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})); err != nil {
+			t.Fatalf("SetNamedProvider: %v", err)
+		}
+
+		if attrs := currentEvalCtx().Attributes(); len(attrs) != 0 {
+			t.Fatalf("evaluation context = %v after the application took the domain over; "+
+				"the auto-install's attributes must not reach its provider", attrs)
+		}
+		if got := currentEvalCtx().TargetingKey(); got != processTargetingKey {
+			t.Errorf("targeting key = %q, want the process key %q; bucketing rules must still apply",
+				got, processTargetingKey)
 		}
 	})
 }
@@ -798,6 +844,70 @@ func TestValue_QuietWhenTheRelaySimplyHasNoOpinion(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCodeFromError covers the failures the SDK reports with NO error code.
+//
+// Client.evaluate short-circuits a domain in NOT_READY or FATAL state before it
+// builds any resolution detail, so BooleanValueDetails hands back an empty
+// ErrorCode next to a sentinel error. NOT_READY that way is not an exotic case:
+// it is the whole startup window between a non-blocking install and the
+// provider's first fetch, in every relay-configured process. Folding it into
+// GENERAL reported that window at warn, as a fault — the exact noise
+// quietErrorCodes exists to prevent.
+func TestCodeFromError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want openfeature.ErrorCode
+	}{
+		{name: "the not-ready short circuit", err: openfeature.ProviderNotReadyError,
+			want: openfeature.ProviderNotReadyCode},
+		{name: "the fatal short circuit", err: openfeature.ProviderFatalError,
+			want: openfeature.ProviderFatalCode},
+		{name: "wrapped, as a hook error arrives",
+			err:  fmt.Errorf("before hook: %w", openfeature.ProviderNotReadyError),
+			want: openfeature.ProviderNotReadyCode},
+		{name: "anything else", err: errors.New("boom"), want: openfeature.GeneralCode},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := codeFromError(tc.err); got != tc.want {
+				t.Fatalf("codeFromError(%v) = %q, want %q", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRecordEvaluation_ClassifiesTheCodelessShortCircuits is the same defect one
+// level up: the tier the log lands in, not the code it derives.
+func TestRecordEvaluation_ClassifiesTheCodelessShortCircuits(t *testing.T) {
+	t.Run("a not-ready short circuit is quiet", func(t *testing.T) {
+		buf := captureLogs(t)
+		key := freshKey(t, "codeless-not-ready")
+
+		recordEvaluation(key, "", openfeature.ProviderNotReadyError)
+
+		log := buf.String()
+		if strings.Contains(log, "level=WARN") {
+			t.Fatalf("the startup window was reported at warn: %q", log)
+		}
+		if !strings.Contains(log, string(openfeature.ProviderNotReadyCode)) {
+			t.Errorf("the log does not name PROVIDER_NOT_READY: %q", log)
+		}
+	})
+
+	t.Run("an unrecognised error is still a fault", func(t *testing.T) {
+		buf := captureLogs(t)
+		key := freshKey(t, "codeless-general")
+
+		recordEvaluation(key, "", errors.New("boom"))
+
+		if !strings.Contains(buf.String(), "level=WARN") {
+			t.Fatalf("an unexplained failure was not reported at warn: %q", buf.String())
+		}
+	})
 }
 
 // TestValue_EveryErrorCodeLeavesLocalInCharge closes the fallback contract over
@@ -1510,14 +1620,14 @@ func TestRebindRelayProvider_StandsDown(t *testing.T) {
 
 	// The domain is held by a provider that is not the auto-installed one. A
 	// watchdog must never replace it — an application can bind FlagDomain
-	// directly, without going through InstallProvider, and leaves no record.
+	// directly, without going through SetNamedProvider, and leaves no record.
 	if rebindRelayProvider("GO Feature Flag Provider", unreachableEndpoint, defaultPollInterval, gen) {
 		t.Errorf("rebindRelayProvider was willing to steal a domain owned by %q", bound)
 	}
 
 	explicitBind.Store(true)
 	if rebindRelayProvider(bound, unreachableEndpoint, defaultPollInterval, gen) {
-		t.Errorf("rebindRelayProvider ran after an explicit InstallProvider call")
+		t.Errorf("rebindRelayProvider ran after an explicit SetNamedProvider call")
 	}
 	explicitBind.Store(false)
 

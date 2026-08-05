@@ -334,6 +334,13 @@ func SetNamedProvider(provider openfeature.FeatureProvider) error {
 	}
 	explicitBind.Store(true)
 	autoInstalled.Store(false)
+	// The auto-install's evaluation context goes with its provider. Its
+	// service.name attributes are confined to that path precisely so they can
+	// never override one the application set; leaving them published would send
+	// them to THIS provider on every evaluation, which is the same override by a
+	// slower route. Clearing it falls back to baseEvalCtx, which carries the
+	// targeting key and nothing else.
+	installedEvalCtx.Store(nil)
 	installDone = true
 
 	return nil
@@ -373,7 +380,12 @@ var explicitBind atomic.Bool
 // twice around the named read and the answer is only trusted when it did not
 // move, which is the same trick a seqlock plays for the same reason.
 func providerBound() bool {
-	if explicitBind.Load() {
+	// Either latch means THIS package bound a provider to FlagDomain, and the SDK
+	// offers no way to unbind a domain, so the answer is final. The reads below
+	// each take the SDK's registry lock, and Value performs this check on every
+	// instrumented operation, so skipping them when the answer is already known is
+	// worth the two atomic loads.
+	if explicitBind.Load() || autoInstalled.Load() {
 		return true
 	}
 	for range providerReadAttempts {
@@ -437,7 +449,12 @@ func boundToDomain(named, def openfeature.Metadata) bool {
 // from the process's first instruction, and ordering stops mattering.
 func RelayPossible() bool {
 	relayPossibleRead.Store(true)
-	if strings.TrimSpace(os.Getenv(EnvFlagsEndpoint)) != "" {
+	// Read through endpointFromEnv rather than re-deriving "is an endpoint set"
+	// here. A second reading of the variable would drift from the one
+	// ValidateAndInstall enforces — an endpoint of "relay:1031" fails validation
+	// but is non-blank, so a hand-rolled check calls a relay possible that can
+	// never be built.
+	if endpoint, err := endpointFromEnv(); err == nil && endpoint != "" {
 		return true
 	}
 	return providerBound()
@@ -559,14 +576,23 @@ var quietErrorCodes = map[openfeature.ErrorCode]bool{
 // say produced identical behaviour and identical silence, for the life of the
 // process. This is the one place that distinction is made.
 func recordEvaluation(key string, code openfeature.ErrorCode, err error) {
-	// The SDK populates the code on every documented failure path, but an error
-	// with no code would otherwise read as a recovery.
+	// The SDK populates the code on the paths that reach a provider, but not on
+	// its own short circuits, and an error with no code would otherwise read as a
+	// recovery.
 	if code == "" && err != nil {
-		code = openfeature.GeneralCode
+		code = codeFromError(err)
+	}
+
+	// Loaded before it is swapped. The steady state is every evaluation reporting
+	// what the last one did, and Swap boxes the code into an interface there — one
+	// heap allocation and one atomic store per evaluation, two or three per
+	// instrumented operation — only to discover that nothing changed.
+	if prev, seen := evaluationErrorCodes.Load(key); seen && errorCodeOf(prev) == code {
+		return
 	}
 
 	prev, seen := evaluationErrorCodes.Swap(key, code)
-	if seen && prev.(openfeature.ErrorCode) == code {
+	if seen && errorCodeOf(prev) == code {
 		return
 	}
 
@@ -587,11 +613,41 @@ func recordEvaluation(key string, code openfeature.ErrorCode, err error) {
 	}
 }
 
+// errorCodeOf reads a remembered code back out of the sync.Map.
+//
+// Comma-ok rather than a bare assertion: nothing else writes this map today, but
+// a panic on the hot path of every instrumented operation is not the way to
+// discover that something started to.
+func errorCodeOf(v any) openfeature.ErrorCode {
+	code, _ := v.(openfeature.ErrorCode)
+	return code
+}
+
+// codeFromError recovers the code the SDK left unset.
+//
+// Client.evaluate short-circuits on a domain in NOT_READY or FATAL state before
+// it builds any resolution detail, so BooleanValueDetails returns an empty
+// ErrorCode next to a sentinel error — and NOT_READY is the commonest state this
+// package has, being the whole startup window between a non-blocking install and
+// the provider's first fetch. Reading GENERAL onto it reported that window at
+// warn, as a fault, in every process the relay serves, which is exactly the
+// noise quietErrorCodes exists to prevent.
+func codeFromError(err error) openfeature.ErrorCode {
+	switch {
+	case errors.Is(err, openfeature.ProviderNotReadyError):
+		return openfeature.ProviderNotReadyCode
+	case errors.Is(err, openfeature.ProviderFatalError):
+		return openfeature.ProviderFatalCode
+	default:
+		return openfeature.GeneralCode
+	}
+}
+
 // evaluationContext bounds one evaluation.
 //
 // The auto-installed provider evaluates in process, so it cannot block and the
 // deadline is pure overhead — hence the fast path that skips building one. A
-// provider the application installed through InstallProvider can be anything,
+// provider the application installed through SetNamedProvider can be anything,
 // including one that evaluates over HTTP, and that one sits on the hot path of
 // every instrumented Mongo command and NATS publish: two evaluations per
 // operation, three on a Mongo write. A stalled flag backend must cost a bounded
@@ -778,20 +834,35 @@ func ValidateAndInstall() error {
 
 // installOnce performs the environment auto-install exactly once per process and
 // publishes the evaluation context it produced.
+//
+// The latch closes on an install that DECIDED — one that bound a provider, or
+// stood down because there was nothing to do or somebody else owned the domain.
+// It stays open when building or registering the provider failed, because
+// nothing is bound, no watchProviderInit goroutine is running, and there is
+// therefore nothing in the process that would ever try again: latching there
+// would pin a process to a dead relay for its whole life over one transient
+// failure, with a single warn as the evidence. The next constructor retries
+// instead.
 func installOnce(endpoint string, interval time.Duration) {
 	installMu.Lock()
 	defer installMu.Unlock()
 	if installDone {
 		return
 	}
-	ctx := withTargetingKey(installProviderFromEnv(endpoint, interval))
+	evalCtx, decided := installProviderFromEnv(endpoint, interval)
+	if !decided {
+		return
+	}
+	ctx := withTargetingKey(evalCtx)
 	installedEvalCtx.Store(&ctx)
 	installDone = true
 }
 
 // installProviderFromEnv registers a GO Feature Flag provider on FlagDomain when
 // the environment asks for one and the application installed none, and returns
-// the evaluation context to use with it.
+// the evaluation context to use with it plus whether the attempt reached a
+// decision. A false decision means the provider could not be built or could not
+// be registered — see installOnce for why that must not latch.
 //
 // Two conditions, both necessary. EnvFlagsEndpoint is the operator's expression
 // of intent. The NoopProvider check is what makes this an allowance rather than
@@ -819,11 +890,11 @@ func installOnce(endpoint string, interval time.Duration) {
 // that was merely slow to come up during a rollout would leave the process with
 // a bound provider that can never answer anything — the kill switch dead, with
 // silence as the only signal. watchProviderInit is what closes that.
-func installProviderFromEnv(endpoint string, interval time.Duration) openfeature.EvaluationContext {
+func installProviderFromEnv(endpoint string, interval time.Duration) (openfeature.EvaluationContext, bool) {
 	var empty openfeature.EvaluationContext
 
 	if endpoint == "" {
-		return empty
+		return empty, true
 	}
 	// Stand down for a provider the application bound to THIS domain, and only
 	// for that. A provider it installed as the default is its own business and
@@ -832,7 +903,7 @@ func installProviderFromEnv(endpoint string, interval time.Duration) openfeature
 	// every instrumentation key was evaluated against the application's business
 	// provider. See providerBound.
 	if providerBound() {
-		return empty
+		return empty, true
 	}
 
 	// Jittered once, here, on the constructing goroutine, and passed down from
@@ -845,13 +916,13 @@ func installProviderFromEnv(endpoint string, interval time.Duration) openfeature
 	if err != nil {
 		slog.Warn("feature flag provider unavailable; instrumentation switches cannot be changed remotely",
 			"var", EnvFlagsEndpoint, "error", err)
-		return empty
+		return empty, false
 	}
 
 	if err := openfeature.SetNamedProvider(FlagDomain, provider); err != nil {
 		slog.Warn("feature flag provider registration failed; instrumentation switches cannot be changed remotely",
 			"domain", FlagDomain, "error", err)
-		return empty
+		return empty, false
 	}
 
 	autoInstalled.Store(true)
@@ -875,9 +946,9 @@ func installProviderFromEnv(endpoint string, interval time.Duration) openfeature
 		return openfeature.NewTargetlessEvaluationContext(map[string]any{
 			"service.name": svc,
 			"serviceName":  svc,
-		})
+		}), true
 	}
-	return empty
+	return empty, true
 }
 
 // newRelayProvider builds the GO Feature Flag provider the auto-install binds.
@@ -922,8 +993,8 @@ func newRelayProvider(endpoint string, interval time.Duration) (openfeature.Feat
 //
 // So this watches the domain's state and rebinds a fresh provider whenever it
 // reads ERROR, backing off from providerRetryInitialDelay to the poll interval.
-// It ends on the first success, or when something else takes the domain over: an
-// InstallProvider call, or a provider bound directly by the application. It logs
+// It ends on the first success, or when something else takes the domain over: a
+// SetNamedProvider call, or a provider bound directly by the application. It logs
 // the first failure at warn with the endpoint, keeps subsequent ones at debug so
 // a long outage cannot flood, and reports the eventual recovery at info.
 func watchProviderInit(providerName, endpoint string, interval time.Duration, gen uint64) {
@@ -970,10 +1041,10 @@ func watchProviderInit(providerName, endpoint string, interval time.Duration, ge
 // rebindRelayProvider replaces a failed auto-installed provider with a fresh
 // one. It reports whether the caller should keep watching.
 //
-// It runs under installMu, so it cannot interleave with an InstallProvider call
+// It runs under installMu, so it cannot interleave with a SetNamedProvider call
 // or with the auto-install itself. The provider-name check is what keeps it from
 // stealing a domain somebody else now owns: an application that bound its own
-// provider directly, without going through InstallProvider, sets no explicitBind
+// provider directly, without going through SetNamedProvider, sets no explicitBind
 // record, and its provider must not be replaced by this one.
 func rebindRelayProvider(providerName, endpoint string, interval time.Duration, gen uint64) bool {
 	installMu.Lock()

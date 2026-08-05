@@ -78,6 +78,44 @@ and the rejected alternatives are recorded in
   process, so one module would carry the `serviceName` targeting attributes and
   another would not.
 
+### Fixed
+
+- **The startup window is no longer reported as a fault.** `Client.evaluate`
+  short-circuits a domain in `NOT_READY` or `FATAL` state *before* it builds any
+  resolution detail, so `BooleanValueDetails` returns an empty `ErrorCode` next to
+  a sentinel error — and `recordEvaluation` folded every codeless error into
+  `GENERAL`, which is a warn tier. The commonest state this module has, the window
+  between a non-blocking install and the provider's first fetch, therefore warned
+  in every relay-configured process. `codeFromError` reads the sentinel back, so
+  `PROVIDER_NOT_READY` lands at debug where the design says it does. The
+  `codeProvider` tests could not see this: they resolve *through* a provider, which
+  is the one path the SDK populates the code on.
+- **A failed auto-install no longer latches.** `installOnce` marked the install
+  done even when building or registering the provider had failed, and neither a
+  later constructor nor `watchProviderInit` — which is started only on success —
+  would try again. One transient failure pinned the process to a dead relay for
+  its whole life, with a single warn as the evidence. The latch now closes only on
+  an install that reached a decision.
+- **`SetNamedProvider` drops the auto-install's evaluation context** along with its
+  provider. The `service.name`/`serviceName` attributes are confined to the
+  auto-install path precisely so they can never override a context the application
+  owns; leaving them published sent them to the application's own provider on every
+  evaluation.
+- **`RelayPossible` reads the endpoint through `endpointFromEnv`** instead of
+  re-deriving "is it non-blank", so it cannot disagree with the validation
+  `ValidateAndInstall` enforces — `relay:1031` is non-blank but unbuildable.
+
+### Performance
+
+- `recordEvaluation` loads the remembered code before swapping it. `sync.Map.Swap`
+  boxes the code into an interface — a heap allocation and an atomic store on the
+  hot path of every instrumented operation, two or three per operation — only to
+  discover that nothing had changed.
+- `providerBound` short-circuits on `explicitBind`/`autoInstalled`. Either latch
+  means this module bound `FlagDomain` itself and the SDK offers no way to unbind a
+  domain, so the three metadata reads — each taking the SDK's registry lock, on
+  every evaluation — were answering a question already settled.
+
 ### Unchanged, deliberately
 
 - **The startup window still resolves to the local value.** `PROVIDER_NOT_READY`
