@@ -27,6 +27,10 @@ const testEnvKey = "OTEL_INSTRUMENTATION_GO_FLAGS_TEST_SWITCH"
 // rebound provider is observed on the very next call. The only thing that
 // latches is "did we already install", and that has to be resettable for the
 // auto-install tests to be more than one test long.
+// It also bumps installGen, which retires any watchProviderInit goroutine an
+// earlier test left running against an unreachable endpoint. Without that, one
+// of them could wake up mid-test and rebind FlagDomain underneath the in-memory
+// provider the current test installed.
 func resetInstallState(t *testing.T) {
 	t.Helper()
 	installMu.Lock()
@@ -34,6 +38,7 @@ func resetInstallState(t *testing.T) {
 	installDone = false
 	installEvalCtx = openfeature.EvaluationContext{}
 	explicitBind.Store(false)
+	installGen.Add(1)
 }
 
 // setDefaultProvider installs a provider in the DEFAULT slot — an application's
@@ -738,6 +743,59 @@ func TestJitterInterval_NonPositiveAndTinyIntervalsPassThrough(t *testing.T) {
 		if got := jitterInterval(d); got != d {
 			t.Errorf("jitterInterval(%v) = %v, want it returned unchanged", d, got)
 		}
+	}
+}
+
+func TestInstallProvider_LatchesTheAutoInstallShut(t *testing.T) {
+	clearProvider(t)
+	resetInstallState(t)
+	t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+	t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
+
+	own := memprovider.NewInMemoryProvider(map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})
+	if err := InstallProvider(own); err != nil {
+		t.Fatalf("InstallProvider: %v", err)
+	}
+
+	r := NewResolver(WithFlagKeys("k"))
+	if !r.Value(0, false) {
+		t.Fatalf("the application's own provider was not consulted")
+	}
+	if got, want := openfeature.NamedProviderMetadata(FlagDomain).Name, own.Metadata().Name; got != want {
+		t.Fatalf("provider bound to %q, want the application's own %q; the auto-install fired behind it", got, want)
+	}
+
+	installMu.Lock()
+	done := installDone
+	installMu.Unlock()
+	if !done {
+		t.Errorf("InstallProvider did not latch installDone, so a later auto-install can still replace the application's provider")
+	}
+}
+
+func TestRebindRelayProvider_StandsDown(t *testing.T) {
+	clearProvider(t)
+	resetInstallState(t)
+	t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
+
+	gen := installGen.Load()
+	bound := openfeature.NamedProviderMetadata(FlagDomain).Name
+
+	// The domain is held by a provider that is not the auto-installed one. A
+	// watchdog must never replace it — an application can bind FlagDomain
+	// directly, without going through InstallProvider, and leaves no record.
+	if rebindRelayProvider("GO Feature Flag Provider", unreachableEndpoint, defaultPollInterval, gen) {
+		t.Errorf("rebindRelayProvider was willing to steal a domain owned by %q", bound)
+	}
+
+	explicitBind.Store(true)
+	if rebindRelayProvider(bound, unreachableEndpoint, defaultPollInterval, gen) {
+		t.Errorf("rebindRelayProvider ran after an explicit InstallProvider call")
+	}
+	explicitBind.Store(false)
+
+	if rebindRelayProvider(bound, unreachableEndpoint, defaultPollInterval, gen-1) {
+		t.Errorf("a retired watchProviderInit goroutine kept rebinding")
 	}
 }
 

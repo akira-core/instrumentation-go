@@ -39,7 +39,9 @@
 // because four packages sharing no state cannot guarantee a single provider:
 // two of them can observe "nothing installed" concurrently and both register
 // one. Go resolves one module path to one version per build, so there is one
-// instance of installOnce below, and therefore exactly one install.
+// instance of the installMu/installDone latch below, which every path that binds
+// FlagDomain goes through — the auto-install, its retries, and an application's
+// own InstallProvider — and therefore exactly one install.
 //
 // # What this package will not touch
 //
@@ -274,14 +276,33 @@ var masterResolver = NewResolver(WithFlagKeys(FlagKeyGlobalTracing))
 // It writes nothing but the named binding on FlagDomain. The default provider,
 // the global evaluation context, hooks and shutdown all remain the
 // application's.
+// It takes installMu, which is what makes it safe to call concurrently with the
+// first instrumented operation: without it, this and the environment
+// auto-install were two unsynchronised read-then-bind sequences on the same
+// domain — the very race installMu exists to prevent, reachable through the one
+// entry point that skipped it. It also latches installDone, so an application
+// that installs its own provider is never followed by an auto-install, whichever
+// of the two the process reaches first.
+//
+// Holding installMu across the wait does block a wrapper being constructed
+// concurrently on another goroutine, for as long as the provider takes to
+// initialise. That is the correct outcome and not merely an acceptable one: the
+// wrapper would otherwise resolve its first operations against a provider this
+// call is in the middle of replacing.
 func InstallProvider(provider openfeature.FeatureProvider) error {
 	if provider == nil {
 		return errors.New("otel-flags: InstallProvider: provider is nil")
 	}
+
+	installMu.Lock()
+	defer installMu.Unlock()
+
 	if err := openfeature.SetNamedProviderAndWait(FlagDomain, provider); err != nil {
 		return fmt.Errorf("otel-flags: binding a provider to %q: %w", FlagDomain, err)
 	}
 	explicitBind.Store(true)
+	installDone = true
+
 	return nil
 }
 
@@ -429,7 +450,13 @@ func (r *Resolver) Value(i int, local bool) bool {
 	if i < 0 || i >= len(r.keys) {
 		return false
 	}
-	return r.evaluator().Boolean(context.Background(), r.keys[i], local, r.evalCtx)
+	// The client is bound to a local before the call rather than inlined as its
+	// receiver: evaluator() is what initialises r.evalCtx, and Go orders function
+	// calls left to right only against each other, leaving a plain field load in
+	// the argument list unordered against them. Inlined, the zero evaluation
+	// context could reach the first evaluation of a Resolver.
+	client := r.evaluator()
+	return client.Boolean(context.Background(), r.keys[i], local, r.evalCtx)
 }
 
 // evaluator lazily installs the environment-configured provider, if any, and
@@ -477,6 +504,20 @@ var (
 	installEvalCtx openfeature.EvaluationContext
 )
 
+// installGen retires the retry goroutine below. It exists for the tests, which
+// reset the install latch and rebind providers many times inside one process: a
+// goroutine left over from an earlier test would otherwise wake up and rebind
+// FlagDomain underneath a later one. Production bumps it never, so the goroutine
+// runs until it succeeds or stands down.
+var installGen atomic.Uint64
+
+// providerRetryInitialDelay is how soon after a failed first fetch the retry
+// below looks again, doubling to the poll interval from there. A relay that is
+// briefly unavailable during a rollout is the common case and deserves a fast
+// recovery; a relay that is down for an hour deserves one attempt per poll
+// interval and no more.
+const providerRetryInitialDelay = time.Second
+
 func installProvider() openfeature.EvaluationContext {
 	installMu.Lock()
 	defer installMu.Unlock()
@@ -503,7 +544,19 @@ func installProvider() openfeature.EvaluationContext {
 // relay-driven enable but can never introduce one, and for otel-mongo it can
 // never write an _oteltrace field the deployment did not configure. An
 // application that wants the relay's answer before its first operation installs
-// its own provider with SetProviderAndWait, which also makes this stand down.
+// its own provider with InstallProvider (or the raw
+// SetNamedProviderAndWait(FlagDomain, p)), which also makes this stand down.
+// SetProviderAndWait does NOT: it binds the default slot, which says nothing
+// about the instrumentation switches — see providerBound.
+//
+// Because registration does not wait, it also cannot see whether initialisation
+// succeeded, and a failure there is permanent rather than transient: the SDK
+// discards the init result on the asynchronous path, and the provider's
+// in-process evaluator returns from Init before it starts its ticker when the
+// first fetch fails, so it never polls again and nothing retries it. A relay
+// that was merely slow to come up during a rollout would leave the process with
+// a bound provider that can never answer anything — the kill switch dead, with
+// silence as the only signal. watchProviderInit is what closes that.
 func installProviderFromEnv() openfeature.EvaluationContext {
 	var empty openfeature.EvaluationContext
 
@@ -521,21 +574,14 @@ func installProviderFromEnv() openfeature.EvaluationContext {
 		return empty
 	}
 
-	provider, err := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{
-		Endpoint:                  endpoint,
-		APIKey:                    os.Getenv(EnvFlagsAPIKey),
-		FlagChangePollingInterval: jitterInterval(pollIntervalFromEnv()),
+	// Read once, here, on the constructing goroutine. Passing the interval down
+	// rather than re-reading it keeps the malformed-value warning to a single
+	// line, and keeps every log this path emits on a goroutine the caller can
+	// reason about — a retry goroutine that warned on its own would be writing to
+	// whatever logger happened to be installed minutes later.
+	interval := jitterInterval(pollIntervalFromEnv())
 
-		// Both hardcoded, and deliberately not exposed as environment variables,
-		// so the zero-code path cannot be misconfigured into either failure. The
-		// data collector appends one event per evaluation to a bounded buffer
-		// that a failed flush never drains; once full, every append flushes
-		// synchronously on the evaluating goroutine, turning a relay outage into
-		// stalled Mongo queries and NATS publishes. Remote evaluation would put
-		// an HTTP request on that same path.
-		DataCollectorDisabled: true,
-		EvaluationType:        gofeatureflag.EvaluationTypeInProcess,
-	})
+	provider, err := newRelayProvider(endpoint, interval)
 	if err != nil {
 		slog.Warn("feature flag provider unavailable; instrumentation switches cannot be changed remotely",
 			"var", EnvFlagsEndpoint, "error", err)
@@ -548,6 +594,8 @@ func installProviderFromEnv() openfeature.EvaluationContext {
 		return empty
 	}
 
+	go watchProviderInit(provider.Metadata().Name, endpoint, interval, installGen.Load())
+
 	// Targeting attribute, supplied only here. Passed at the invocation site
 	// rather than through SetEvaluationContext, so it composes with an
 	// application's global context instead of replacing it — and confined to this
@@ -558,6 +606,123 @@ func installProviderFromEnv() openfeature.EvaluationContext {
 		})
 	}
 	return empty
+}
+
+// newRelayProvider builds the GO Feature Flag provider the auto-install binds.
+//
+// It is a function rather than an inline literal because a failed initialisation
+// cannot be repaired in place: the in-process evaluator that returned an error
+// from Init has no ticker and no way to be told to try again, so recovery means
+// building a fresh provider. See watchProviderInit.
+func newRelayProvider(endpoint string, interval time.Duration) (openfeature.FeatureProvider, error) {
+	provider, err := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{
+		Endpoint:                  endpoint,
+		APIKey:                    os.Getenv(EnvFlagsAPIKey),
+		FlagChangePollingInterval: interval,
+
+		// Both hardcoded, and deliberately not exposed as environment variables,
+		// so the zero-code path cannot be misconfigured into either failure. The
+		// data collector appends one event per evaluation to a bounded buffer
+		// that a failed flush never drains; once full, every append flushes
+		// synchronously on the evaluating goroutine, turning a relay outage into
+		// stalled Mongo queries and NATS publishes. Remote evaluation would put
+		// an HTTP request on that same path.
+		DataCollectorDisabled: true,
+		EvaluationType:        gofeatureflag.EvaluationTypeInProcess,
+	})
+	if err != nil {
+		// Returned explicitly rather than as the pair, so a nil *Provider never
+		// reaches a caller wrapped in a non-nil interface.
+		return nil, err
+	}
+	return provider, nil
+}
+
+// watchProviderInit repairs an auto-installed provider whose first fetch failed.
+//
+// The failure it exists for is not transient. The asynchronous bind discards the
+// SDK's init result, and the provider's in-process evaluator returns from Init
+// before creating its ticker when the configuration fetch fails, so it polls
+// nothing, recovers from nothing, and reports ERROR for the life of the process.
+// A relay that is briefly unreachable while a fleet rolls out therefore used to
+// produce processes in which the relay could never take effect again — every
+// switch pinned to its local value, the kill switch dead, and nothing logged.
+//
+// So this watches the domain's state and rebinds a fresh provider whenever it
+// reads ERROR, backing off from providerRetryInitialDelay to the poll interval.
+// It ends on the first success, or when something else takes the domain over: an
+// InstallProvider call, or a provider bound directly by the application. It logs
+// the first failure at warn with the endpoint, keeps subsequent ones at debug so
+// a long outage cannot flood, and reports the eventual recovery at info.
+func watchProviderInit(providerName, endpoint string, interval time.Duration, gen uint64) {
+	client := openfeature.NewClient(FlagDomain)
+	ceiling := interval
+	delay := min(providerRetryInitialDelay, ceiling)
+	var warned bool
+
+	for {
+		time.Sleep(delay)
+		if delay < ceiling {
+			delay = min(2*delay, ceiling)
+		}
+		if installGen.Load() != gen || explicitBind.Load() {
+			return
+		}
+
+		switch client.State() {
+		case openfeature.ReadyState:
+			if warned {
+				slog.Info("feature flag provider reached the relay; instrumentation switches can be changed remotely again",
+					"var", EnvFlagsEndpoint, "endpoint", endpoint)
+			}
+			return
+		case openfeature.NotReadyState:
+			// Still initialising. Nothing to repair yet.
+			continue
+		}
+
+		if !warned {
+			slog.Warn("feature flag provider could not reach the relay; retrying, and instrumentation switches cannot be changed remotely until it does",
+				"var", EnvFlagsEndpoint, "endpoint", endpoint)
+			warned = true
+		} else {
+			slog.Debug("feature flag provider still cannot reach the relay",
+				"var", EnvFlagsEndpoint, "endpoint", endpoint, "retry", delay)
+		}
+		if !rebindRelayProvider(providerName, endpoint, interval, gen) {
+			return
+		}
+	}
+}
+
+// rebindRelayProvider replaces a failed auto-installed provider with a fresh
+// one. It reports whether the caller should keep watching.
+//
+// It runs under installMu, so it cannot interleave with an InstallProvider call
+// or with the auto-install itself. The provider-name check is what keeps it from
+// stealing a domain somebody else now owns: an application that bound its own
+// provider directly, without going through InstallProvider, sets no explicitBind
+// record, and its provider must not be replaced by this one.
+func rebindRelayProvider(providerName, endpoint string, interval time.Duration, gen uint64) bool {
+	installMu.Lock()
+	defer installMu.Unlock()
+
+	if installGen.Load() != gen || explicitBind.Load() {
+		return false
+	}
+	if openfeature.NamedProviderMetadata(FlagDomain).Name != providerName {
+		return false
+	}
+
+	provider, err := newRelayProvider(endpoint, interval)
+	if err != nil {
+		slog.Debug("feature flag provider could not be rebuilt", "var", EnvFlagsEndpoint, "error", err)
+		return true
+	}
+	if err := openfeature.SetNamedProvider(FlagDomain, provider); err != nil {
+		slog.Debug("feature flag provider could not be rebound", "domain", FlagDomain, "error", err)
+	}
+	return true
 }
 
 // pollIntervalFromEnv reads EnvFlagsPollInterval, falling back to
