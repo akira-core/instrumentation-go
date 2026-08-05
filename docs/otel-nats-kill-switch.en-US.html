@@ -313,7 +313,7 @@
 
       <h1>otel-nats × kill-switch relay-proxy tutorial</h1>
       <p class="lead">
-        Step-by-step guide to wire <code>otel-nats</code> (v0.8.0+) to a
+        Step-by-step guide to wire <code>otel-nats</code> (<code>v0.8.0-rc.3</code>+) to a
         <a href="https://gofeatureflag.org">GO Feature Flag</a> relay proxy via
         <a href="https://openfeature.dev">OpenFeature</a>, so operators can toggle
         NATS tracing <strong>on or off at runtime</strong> — no redeploy.
@@ -916,6 +916,26 @@ defaultRule:
         <li>
           <strong>Assuming option beats env</strong> → reversed vs 0.7.0; env wins.
         </li>
+        <li>
+          <strong>Testing against <code>v0.8.0-rc.1</code> or <code>rc.2</code></strong> → they
+          <code>require otel-flags v0.1.0</code>, whose API this module's code no longer matches, so
+          they do not build for a consumer at all. Use <code>v0.8.0-rc.3</code> or later.
+        </li>
+        <li>
+          <strong>Binding your provider with <code>openfeature.SetProvider</code></strong> → that is
+          the <em>default</em> slot, and it is deliberately not treated as a relay for these
+          switches. Use <code>otelflags.SetNamedProvider</code>.
+        </li>
+        <li>
+          <strong>Assuming a relay that was down at startup stays dead</strong> → it does not.
+          The provider is rebound until it reaches the relay: one <code>warn</code> line when it
+          first fails, <code>debug</code> for later attempts, one <code>info</code> on recovery.
+        </li>
+        <li>
+          <strong>Reading <code>PROVIDER_NOT_READY</code> at debug as a problem</strong> → that is
+          the ordinary startup window, before the provider's first fetch. Only the <code>warn</code>
+          tier means the relay cannot change a switch.
+        </li>
       </ol>
 
       <footer>
@@ -925,7 +945,8 @@ defaultRule:
           <a href="../otel-nats/README.md">otel-nats/README.md</a>
         </p>
         <p>
-          Applies to <code>otel-nats</code> 0.8.0+ with the bidirectional ladder model.
+          Applies to <code>otel-nats</code> <code>v0.8.0-rc.3</code>+ with the bidirectional ladder
+          model, on <code>otel-flags</code> 0.2.0.
           zh-TW: <a href="otel-nats-kill-switch.zh-TW.html">otel-nats-kill-switch.zh-TW.html</a>
         </p>
       </footer>

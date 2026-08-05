@@ -7,6 +7,10 @@ four consumer modules that carry the `relayPossible` short-circuit.
 Fourteen findings. Severity is about what an operator loses, not about how hard the fix is: a switch
 that silently stops being a switch outranks a race that needs two goroutines and bad luck.
 
+This document holds **two** passes. The first, below, is the review of `8ac2112`. The second —
+[a review of the 0.2.0 rework itself](#second-pass--the-020-diagnostics-and-install-paths) — is at
+the end, and is where the currently open findings are.
+
 > **Follow-up.** The *design* these fixes exposed — how an unreadable value should be reported, where
 > the install belongs, what a failing evaluation should say — is recorded and decided in
 > [`otel-flags-error-handling-decisions.md`](otel-flags-error-handling-decisions.md), and landed in
@@ -171,3 +175,93 @@ falls back to the application's default provider is unreachable for the rest of 
 `Value` guard is what makes that state harmless in production; no test in this package can enter it
 to prove the guard fires. `clearProvider` now says so in its doc comment, so the next reader does not
 mistake `TestValue_NoProviderReturnsLocal` for coverage of it.
+
+---
+
+# Second pass — the 0.2.0 diagnostics and install paths
+
+Scope: `otel-flags` after the 0.2.0 rework above had landed — the `ValidateAndInstall` entry point,
+the `BooleanValueDetails` diagnostics, the retry watch added by finding 1, and the install latch they
+all share. Cross-checked against the same `go-sdk@v1.17.2` and GO Feature Flag provider `v1.1.1`.
+
+Fourteen findings. Seven fixed in the same pass and released in `otel-flags` 0.2.0; the rest are
+recorded here and summarised for operators under **Known limitations** in
+[`feature-flags.md`](feature-flags.md).
+
+| # | Finding | Status |
+|---|---|---|
+| 1 | Every codeless SDK error folded into `GENERAL`, so the ordinary startup window logged at **warn** as a fault | Fixed |
+| 2 | `watchProviderInit` polls `client.State()`, which falls back to the **default** domain's state while `FlagDomain` has no entry | Open |
+| 3 | `providerBound()`'s seqlock give-up path returns `true` — safe for `RelayPossible`, unsafe for `Value` | Open |
+| 4 | `rebindRelayProvider`'s provider-name check cannot distinguish our provider from an application's own GO Feature Flag provider | Open |
+| 5 | `installOnce` latched `installDone` even when the install **failed**, permanently disabling the relay | Fixed |
+| 6 | `recordEvaluation` called `sync.Map.Swap` on every evaluation — one boxing allocation and one atomic store per evaluation, on the hot path | Fixed |
+| 7 | `Value` called `providerBound()` on every evaluation, taking 2–3 SDK registry `RLock`s to re-derive a settled fact | Fixed |
+| 8 | `providerBound()` → `NamedProviderMetadata` on an unbound domain re-enters the SDK's own `RWMutex` for reading — a documented Go deadlock hazard | Mitigated |
+| 9 | `SetNamedProvider` cleared `autoInstalled` but left the auto-install's `service.name` attributes published | Fixed |
+| 10 | `evaluationContext()` keys the 250 ms bound on `autoInstalled`, which says nothing about which provider is bound now | Open |
+| 11 | `RelayPossible` re-implemented the endpoint read as a non-blank check, disagreeing with `endpointFromEnv` | Fixed |
+| 12 | `watchProviderInit` has no exit when the domain never leaves `NOT_READY` | Open |
+| 13 | Unchecked type assertion `prev.(openfeature.ErrorCode)` on the hot path | Fixed |
+| 14 | `flags.go` is 1155 lines against the 800-line convention | Open |
+
+## The one that mattered most
+
+**1. The startup window was reported as a fault.** `Client.evaluate` short-circuits a domain in
+`NOT_READY` or `FATAL` state **before** it builds any resolution detail
+(`go-sdk@v1.17.2`, `client.go`), so `BooleanValueDetails` returns an empty `ErrorCode` next to a
+sentinel error. `recordEvaluation` folded every codeless error into `GENERAL`, which the
+classification puts at **warn**.
+
+The commonest state this module has is exactly that window — between the non-blocking auto-install
+and the provider's first fetch — so every relay-configured process warned, on every flag key, about
+its own ordinary startup. That is precisely the noise the two tiers were introduced to prevent, one
+release earlier.
+
+What hid it is worth recording: the tests that cover the classification resolve **through** a
+provider, and that is the one path on which the SDK does populate the code. `codeFromError` now reads
+the sentinel back, and `TestCodeFromError` plus
+`TestRecordEvaluation_ClassifiesTheCodelessShortCircuits` pin both directions.
+
+## The rest of the fixes
+
+- **5.** `installOnce` now closes the latch only on an install that *decided* — bound a provider, or
+  stood down deliberately. A build or registration failure leaves it open, because nothing is bound
+  on that path, no watch goroutine exists, and latching pinned the process to a dead relay for life
+  over one transient failure.
+- **9.** `SetNamedProvider` clears `installedEvalCtx` along with `autoInstalled`, so the
+  auto-install's `service.name`/`serviceName` attributes do not ride on to a provider the application
+  owns — the same override the "confined to the auto-install path" rule exists to prevent, by a
+  slower route.
+- **11.** `RelayPossible` reads through `endpointFromEnv`, so `relay:1031` cannot be non-blank enough
+  to declare a relay possible while being unbuildable by the code that validates it.
+- **6, 7, 13.** `recordEvaluation` loads before it swaps and reads the map through a comma-ok helper;
+  `providerBound` short-circuits on `explicitBind || autoInstalled`, either of which means this
+  package bound the domain itself and the SDK offers no way to unbind one.
+
+## Open, and why they were not fixed here
+
+None is reachable from the zero-code path — each needs the application to bind an OpenFeature
+provider of its own — which is what made it right to report them rather than widen the diff.
+
+- **2** needs the asynchronous bind restructured to observe the real initialisation result rather
+  than inferring it from a domain state the SDK will happily answer from a different domain.
+  Measured, for the record: on a pristine SDK both `FlagDomain` and the default domain report
+  `NOT_READY`, so a process with no provider of its own takes the watch's `continue` branch and the
+  defect does not fire.
+- **3** needs a two-valued `(bound, certain)` result threaded through three callers that want
+  opposite defaults — `RelayPossible` and the install want "assume bound", `Value` wants "assume
+  not".
+- **4** needs provider *identity*, which the SDK exposes only through `GetNamedProviders()` — and
+  that returns the live map without copying, so reading it races `SetNamedProvider` and can crash the
+  process. `SetNamedProvider` is the documented way around it, and it records the binding exactly.
+- **10** and **12** have no detection mechanism available in the SDK: nothing reports which provider
+  is bound now, and nothing reports that a domain will never emit an initialisation event.
+- **14** would churn the whole module. The seams are real — `env.go`, `resolver.go`, `install.go`,
+  `diagnostics.go` — and worth taking when something else opens the file.
+
+**8** is mitigated rather than fixed. The nested `RLock` — `GetNamedProviderMetadata` holds
+`api.mu.RLock()` and, on the unbound-domain fallback, calls `ProviderMetadata()`, which takes it
+again — remains reachable at construction time. What finding 7's fast path removed is the
+per-operation exposure, which is where a hang would have been a stalled Mongo command or NATS
+publish rather than a stalled constructor.

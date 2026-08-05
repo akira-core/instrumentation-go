@@ -254,3 +254,29 @@ then bump the four `require` lines, `GOWORK=off go mod tidy`, then tag the wrapp
 development keeps working against the working tree the whole time; the API mismatch the original
 reasoning worried about does not arise, because the workspace resolves `otel-flags` from source
 rather than from the version named in `require`.
+
+**Done.** `otel-flags/v0.2.0` is tagged, and **thirteen** `require` lines moved with it — not four.
+The count is the part worth carrying forward: each wrapper's `examples/` and `tests/integration/`
+sub-module has its own `go.mod` naming `otel-flags` as an indirect requirement, and so does
+`otel-testkit` and both of its `examples/httpdirect*` templates.
+
+What the window cost while it was open is the reason this is not a footnote. Four modules —
+`otel-mongo`, `otel-mongo/v2`, `otel-nats`, `otel-gorilla-ws` — carried code written against the
+0.2.0 API against a `require` on `0.1.0`, so **none of them built the way a consumer resolves them**,
+and CI's `test-and-lint` matrix, which sets `GOWORK=off` for exactly this reason, was red for each.
+The workspace hid it locally: `go build ./...` inside a module directory resolves through `go.work`
+and passes.
+
+## After the release: a second review pass
+
+`otel-flags` 0.2.0 shipped with seven fixes that a review of the code implementing these decisions
+found — including one that inverted decision 10's whole purpose, the SDK's codeless `NOT_READY`
+short-circuit being reported at **warn** as a fault on every flag key of every relay-configured
+process. Both passes are recorded in
+[`otel-flags-review-2026-08.md`](otel-flags-review-2026-08.md); the findings still open are
+summarised for operators under **Known limitations** in [`feature-flags.md`](feature-flags.md).
+
+The lesson for decision 10 specifically: the tier classification is only as good as the code the SDK
+hands you, and the SDK does not populate one on the paths where it answers without consulting a
+provider. A rule that maps "no code" onto the most severe tier will therefore fire hardest in the
+most ordinary state.

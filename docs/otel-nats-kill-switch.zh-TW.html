@@ -313,7 +313,7 @@
 
       <h1>otel-nats × kill-switch relay-proxy 使用指南</h1>
       <p class="lead">
-        逐步說明如何把 <code>otel-nats</code>（v0.8.0+）接到
+        逐步說明如何把 <code>otel-nats</code>（<code>v0.8.0-rc.3</code>+）接到
         <a href="https://gofeatureflag.org">GO Feature Flag</a> relay proxy，
         透過 <a href="https://openfeature.dev">OpenFeature</a> 在執行期
         <strong>雙向切換</strong> NATS tracing——不必 redeploy。
@@ -914,6 +914,24 @@ defaultRule:
         <li>
           <strong>以為 option 贏過 env</strong> → 相對 0.7.0 已反轉；env 贏。
         </li>
+        <li>
+          <strong>拿 <code>v0.8.0-rc.1</code> 或 <code>rc.2</code> 來測</strong> → 它們
+          <code>require otel-flags v0.1.0</code>，而模組程式碼早已不符合那個 API，consumer 根本編不起來。
+          請用 <code>v0.8.0-rc.3</code> 以後的版本。
+        </li>
+        <li>
+          <strong>用 <code>openfeature.SetProvider</code> 綁自己的 provider</strong> → 那是<em>預設</em>
+          槽位，本函式庫刻意不把它當成這些開關的 relay。請用 <code>otelflags.SetNamedProvider</code>。
+        </li>
+        <li>
+          <strong>以為啟動時連不上的 relay 就永遠死了</strong> → 不會。provider 會被持續重新綁定直到連上
+          relay：第一次失敗一行 <code>warn</code>、之後的嘗試走 <code>debug</code>、恢復時一行
+          <code>info</code>。
+        </li>
+        <li>
+          <strong>把 debug 等級的 <code>PROVIDER_NOT_READY</code> 當成問題</strong> → 那是正常的啟動視窗，
+          在 provider 第一次抓取之前。只有 <code>warn</code> 那一層才代表 relay 改不動某個開關。
+        </li>
       </ol>
 
       <footer>
@@ -924,7 +942,8 @@ defaultRule:
           <a href="../otel-nats/README.zh-TW.md">otel-nats/README.zh-TW.md</a>
         </p>
         <p>
-          適用 <code>otel-nats</code> 0.8.0+（雙向 ladder 模型）。
+          適用 <code>otel-nats</code> <code>v0.8.0-rc.3</code>+（雙向 ladder 模型），搭配
+          <code>otel-flags</code> 0.2.0。
           en-US: <a href="otel-nats-kill-switch.en-US.html">otel-nats-kill-switch.en-US.html</a>
         </p>
       </footer>

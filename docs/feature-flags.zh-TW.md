@@ -7,8 +7,15 @@
 每一個 instrumentation 模組都可以被打開或關掉。本文件是這個決策的**唯一參考**:每個開關做什麼、由誰擁有、
 哪些能在 process 執行期間改變、哪些不能。
 
-適用於 `otel-flags` 0.1.0、`otel-mongo` 0.8.0、`otel-mongo/v2` 2.8.0、`otel-nats` 0.8.0、
-`otel-gorilla-ws` 0.8.0 以後的版本。設計記錄:`openspec/changes/openfeature-dynamic-flags/design.md`。
+適用於 `otel-flags` 0.2.0、`otel-mongo` 0.8.0、`otel-mongo/v2` 2.8.0、`otel-nats` 0.8.0、
+`otel-gorilla-ws` 0.8.0 以後的版本。設計記錄:`openspec/changes/openfeature-dynamic-flags/design.md`;
+`otel-flags` 0.2.0 背後的錯誤處理決策在
+[`otel-flags-error-handling-decisions.md`](otel-flags-error-handling-decisions.md),形塑它的兩輪
+code review 在 [`otel-flags-review-2026-08.md`](otel-flags-review-2026-08.md)。
+
+> **Release candidate。**第一個帶有 `otel-flags` 0.2.0 flag layer 的 `otel-nats` candidate 是
+> **`v0.8.0-rc.3`**,它同時也是第一個 consumer 編譯得起來的版本 —— `rc.1` 與 `rc.2` require 的是
+> `otel-flags v0.1.0`,而模組的程式碼早已不符合那個 API。要測 relay 請用 `rc.3` 以後的版本。
 
 ## 一段話講完這個模型
 
@@ -236,6 +243,14 @@ master、模組、含 relay——在**交握前的那一刻**為開。交握無�
 domain 上,而且只在你的應用程式沒有安裝自己的 provider 時才會這麼做。它寫死了
 `DataCollectorDisabled: true` 與 in-process 評估,所以這條路徑不可能被設定成下面描述的那兩種失敗。
 
+**安裝發生在你建構第一個 wrapper 的時候**,不是第一次被instrument的操作。每個建構子都會呼叫
+`otelflags.ValidateAndInstall`:驗證上面那三個 process 範圍的變數、把**所有**讀不懂的值一次報成同一個
+錯誤,並執行那一次性的安裝。建構回傳錯誤時什麼都不會被安裝 —— endpoint 打錯字正是最不該去猜對方原意的
+情況。
+
+`ValidateAndInstall` **不會**等 provider 初始化完成。它回傳時,relay 可能離第一次抓取還有好幾秒,在那之前
+每個開關都解析成本地值 —— 見[啟動視窗](#啟動視窗)。
+
 不論 binary 連結了幾個模組,**每個 process 只會安裝一個 provider**:共享的 `otel-flags` module 用單一
 一把鎖守住那次安裝。
 
@@ -289,6 +304,11 @@ instrumented 實作被建構,也永遠不會有 instrumentation key 拿去對它
   屬性;當 provider 由你擁有時,它傳入的是空的 invocation context,所以你用
   `openfeature.SetEvaluationContext` 設的 API 級全域 context 會原封不動地進入每一次評估。見
   [只針對單一服務而非整個艦隊](#只針對單一服務而非整個艦隊)。
+
+  即使自動安裝先跑過也一樣 —— endpoint 有設、wrapper 已經建好,你**之後**才呼叫 `SetNamedProvider`。
+  那些屬性是跟著自動安裝的 provider 一起發布的,會跟著它一起被丟掉,不會延續到你的 provider 上。
+  (`otel-flags` 0.2.0 之前它們會留著,結果是把一個你從未設定過的 `service.name` 送進你自己的 provider,
+  每一次評估都送。)
 - **預設 provider 兩個方向都不受影響。** 你應用程式自己的旗標繼續由你綁在預設槽位上的東西解析,而那個
   provider 永遠不會被問到任何一個 instrumentation key。
 
@@ -297,6 +317,9 @@ instrumented 實作被建構,也永遠不會有 instrumentation key 拿去對它
 「relay 是否可能存在」是在**建構 wrapper 時解析一次**的——endpoint 有設,或已經有 provider 綁定到
 `otelflags.FlagDomain`。在這兩件事都還不成立時建構的 wrapper,終其一生都從自己的環境變數與選項解析,
 **永遠不會去問 relay**,即使你下一刻就安裝了 provider。
+
+這裡的「有設」和其他地方是同一件事:一個帶 scheme **且**帶 host 的 URL,由驗證它的同一段程式碼讀取。
+格式錯誤的 endpoint 會讓建構失敗,而不是產生一個「以為 relay 可能存在、卻永遠建不出來」的 process。
 
 所以:先安裝 provider,**再**建構你的 client 與連線。`SetNamedProvider` 偵測得到「wrapper 已經存在」時會
 發出警告;原生的 `openfeature.SetNamedProviderAndWait` 不會留下痕跡,所以那條路徑不會有警告。走零程式碼
@@ -325,6 +348,31 @@ provider 的 data collector 預設開啟。它每次評估都往一個有上限�
 一旦成功抓取過一次,之後的中斷不會改變任何事:in-process 評估器會服務它最後一次成功抓取的設定,
 而且任何評估都不會產生網路 I/O。
 
+**process 啟動時 relay 是掛的,會被重試。** 這件事值得寫出來,因為底層的函式庫並不會做:綁定是非同步的、
+會直接丟掉 SDK 的初始化結果,而 GO Feature Flag provider 的 in-process 評估器在第一次抓取設定失敗時,
+會**在建立輪詢 ticker 之前**就從 `Init` 回傳。這種 provider 什麼都不輪詢、也不會從任何事情中恢復 ——
+放著不管,它會在整個 process 生命週期回報 `ERROR`,每個開關被釘死在本地值上,kill switch 形同失效。
+
+所以 `otel-flags` 會盯著這個 domain 的狀態,**每次讀到 `ERROR` 就重新綁定一個全新建立的 provider**,
+退避時間從一秒逐步拉長到輪詢週期。壞掉的 in-process 評估器無法原地修復 —— 沒有 ticker 可以重啟、
+也沒有重試的進入點 —— 所以恢復的意思就是換一個新的 provider 實例。這個監看在第一次成功時結束,
+或是在期間有別人接管了這個 domain 時退場。
+
+兩種不同的失敗,現在都會恢復:
+
+| 什麼壞了 | 會發生什麼 |
+|---|---|
+| provider 綁上去了,但第一次抓取失敗 | 上述的監看會重新綁定新的 provider,直到有一個連得上 relay |
+| provider 根本**建不出來、或註冊不上去** | 安裝的門閂不會關上,你下一次建構 wrapper 時會再試一次 |
+
+第二種是延遲建構 wrapper 的人要知道的:那條路徑上什麼都沒綁定,所以沒有監看的 goroutine 會去重試;而在
+`otel-flags` 0.2.0 之前門閂照樣會關上 —— 一次短暫的失敗就把 process 釘在一個死掉的 relay 上、直到它結束,
+證據只有一行 `warn`。
+
+這些都不改變啟動視窗本身。綁定仍然是非同步且立即的,所以你的第一個 instrumented 操作前面不會卡一次
+relay 往返;在抓取成功之前,每個開關都解析成本地值。要**關掉**這個視窗而不只是縮短它,就用
+`otelflags.SetNamedProvider` 安裝你自己的 provider,它會等。
+
 ### 怎麼知道 relay 死了
 
 `otel-flags` 沒有健康檢查 API。直接讀 OpenFeature SDK 本來就維護的狀態:
@@ -346,6 +394,24 @@ state := openfeature.NewClient(otelflags.FlagDomain).State()
 
 上面每一條路徑的**回傳值**都一樣 —— 那正是階梯模型完整的原因 —— 但沉默結束了。2026 年 8 月那份 review 中
 兩個最高嚴重度的發現,都正是因為這個原因而不可見:error code 一直都有值,只是沒有人去讀。
+
+**正常的啟動視窗記在 debug,不是 warn。** 這不是免費的:OpenFeature SDK 對處於 `NOT_READY` 或 `FATAL`
+狀態的 domain,會在建立任何 resolution detail **之前**就短路,所以它回傳的是一個**空的** error code
+配上一個 sentinel error —— 而本函式庫最常見的狀態,正好就是那個視窗。把沒有 code 的錯誤讀成 `GENERAL`,
+等於把每一個設定了 relay 的 process 自己的啟動過程,在每一個 flag key 上都報成故障 —— 正是兩層分級要
+避免的噪音。`otel-flags` 0.2.0 會從 sentinel 把真正的 code 還原回來,所以 `PROVIDER_NOT_READY` 落在
+上表寫的位置。
+
+[relay 不是啟動的前置條件](#relay-不是啟動的前置條件)裡描述的那個 relay 監看,會自己寫 log,與任何
+flag key 無關:
+
+| 什麼時候 | 等級 | 內容 |
+|---|---|---|
+| 第一次抓取失敗 | warn | 「連不上 relay;重試中,在連上之前 instrumentation 開關無法遠端改變」,附上 endpoint |
+| 之後每一次失敗 | debug | 這樣一小時的中斷也不會洗版 |
+| relay 回來了 | info | 「instrumentation 開關又能遠端改變了」 |
+
+所以一個從 process 啟動就掛掉的 relay,不論中斷多久,就只產生**一行** warn,恢復時也只有一行 info。
 
 ### 啟動視窗
 
@@ -482,7 +548,13 @@ flag 儲存那段。
 
 **沒有配置 relay 的 process 一毛都不用付**,也不會配置它搆不到的 instrumented 實作。
 
-上面那個診斷在穩定狀態下不花成本:每次評估一次 map 查詢,只有某個 key 的結果改變時才寫一行 log。
+上面那個診斷在穩定狀態下不花成本:每次評估**一次 map load** —— 沒有寫入、沒有配置,因為穩定狀態就是
+每次評估都回報上一次回報過的東西 —— 只有某個 key 的結果改變時才寫一行 log。
+
+`otel-flags` 0.2.0 之前有兩筆成本壓在這條路徑上,而且兩筆都從來不會反映在回傳值裡,現在都沒了:診斷會在
+**每一次**評估都把 code 寫回去,為此把它裝箱成 interface,等於每次評估一次 heap 配置加一次 atomic store,
+結果只是發現什麼都沒變;以及每次評估都要重新推導「這個 domain 上是否綁了 provider」,那是三次帶 registry
+鎖的 SDK metadata 讀取,而這個問題在本 library 自己綁定該 domain 的那一刻就已經有答案了。
 
 刻意不做快取:快取會讓一次 flag 改動比輪詢間隔所暗示的更晚生效。它藏在一個不會變的內部簽名後面,所以
 若某天真實工作負載的 benchmark 顯示有必要,可以在不影響任何 API 的情況下加上去。理由記錄在設計文件裡。
@@ -527,6 +599,23 @@ inject/extract 但不會停掉 envelope。見
 
 變數未設定時,選項就是決定性的那一層,所以一條追蹤與一條不追蹤的連線可以共存於同一個 process。
 
+## 已知限制
+
+以 `otel-flags` 0.2.0 為準仍未修的項目,寫在這裡而不是留給你自己踩到。**沒有任何一條從零程式碼路徑構得到**
+—— 每一條都需要你的應用程式自己綁定一個 OpenFeature provider —— 但那是在描述觸發條件,不是保證,而
+embedding SDK 正好就是會踩到的那種形狀。
+
+| 是什麼 | 什麼時候會咬人 | 你會失去什麼 |
+|---|---|---|
+| relay 監看讀到錯的 domain 狀態 | 你的應用程式在**預設**槽位綁了一個 provider,而且它在我們的 relay provider 初始化完成之前就到達 `READY`(或 `ERROR`) | 我們的 domain 還沒有狀態條目時,SDK 會退回讀預設 domain 的狀態,所以監看可能判定「已恢復」而停止 —— 之後第一次抓取才失敗的 relay provider 就再也不會被修復,而且什麼都不會記進 log。反向的情況:預設 provider 處於 `ERROR` 會讓監看去重綁一個其實還在初始化中的 provider |
+| relay 監看可能換掉你綁的 provider | 你用原生的 `openfeature.SetNamedProviderAndWait` 把**自己的** GO Feature Flag provider 綁在 `otel-instrumentation-go` 上,而我們的 provider 失敗了 | 監看是用 `Metadata().Name` 辨識「我們的」provider,而每一個 GO Feature Flag provider 回報的名字都一樣 —— 所以它可能把你的重綁到 `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` 上。**請用 `otelflags.SetNamedProvider`**,它會精確記下這次綁定,並讓監看退場 |
+| 「是否已綁定 provider」的檢查放棄時傾向回答「是」 | 你的應用程式反覆抽換自己的**預設** provider,而且與被 instrument 的操作並行 | 這個檢查會讀三次 SDK metadata,只在答案沒有移動時才採信;若始終無法穩定下來,它會回答「已綁定」。對「判斷 relay 是否可能存在」而言那是安全的方向,對「評估」而言則不是 —— 它可能把一個 instrumentation key 導向你應用程式自己的 flag 後端 |
+| 評估的逾時界線可能消失 | 你用原生的 `openfeature.SetNamedProviderAndWait` 取代了自動安裝的 provider | 那 250 ms 的界線是看「我們有沒有自動安裝過」,而不是看現在綁的是哪個 provider,所以對你那個走 HTTP 評估的 provider 會變成無上限,一個卡住的 flag 後端可以擋住被 instrument 的操作 |
+| domain 若始終停在 `NOT_READY`,relay 監看不會退出 | provider 綁上去了,但從未發出初始化事件 | 一個 goroutine 以輪詢週期為節奏睡到 process 結束。沒有功能影響 |
+
+一步就避開前四條的規則,就是本文件已經講過兩次的那條:**用 `otelflags.SetNamedProvider` 綁你的
+provider,而且在建構任何 wrapper 之前。**
+
 ## 維運速查
 
 **要立刻打開一個模組:** 把它的 relay flag 設成 `true`,在輪詢間隔內生效。對 `otel-gorilla-ws` 而言,
@@ -553,5 +642,12 @@ inject/extract 但不會停掉 envelope。見
 
 **要讓一個模組可被 relay 控制:** 設 `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT`,並在 relay 上建立它的
 flag。不需要應用程式碼。部署成你想要的靜止狀態即可——relay 之後可以往任一方向移動它。
+
+**如果 process 啟動時 relay 是掛的:** 什麼都不用做。process 以它環境變數的狀態啟動,寫了一行 `warn`,
+之後會持續重試到連上 relay,再寫一行 `info`。見*relay 不是啟動的前置條件*。
+
+**要知道 relay 到底有沒有在回應:** 讀 `openfeature.NewClient(otelflags.FlagDomain).State()`,而且
+**不要**用它擋啟動。在 log 裡,某個 key 的 error code 出現在 `warn` 代表 relay 改不動那個開關;出現在
+`debug` 代表 relay 對它沒有意見。見*怎麼知道 relay 死了*。
 
 **如果你完全沒有 relay:** 由環境變數與選項決定,跟動態 flag 出現之前一模一樣,成本也一模一樣。
