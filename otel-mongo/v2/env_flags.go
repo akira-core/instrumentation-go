@@ -41,36 +41,38 @@ const (
 	defaultMongoPropagation = false
 )
 
-// Indices into mongoResolver's flag keys.
-const (
-	idxTracing = iota
-	idxPropagation
-)
-
 // mongoResolver resolves this module's relay values through the process-global
 // OpenFeature client. It caches nothing, so a relay change reaches a live client
 // on its very next operation.
-var mongoResolver = otelflags.NewResolver(
-	otelflags.WithFlagKeys(
-		flagKeyMongoTracing,
-		flagKeyMongoPropagation,
-	),
-)
+//
+// One resolver serves both keys, which are passed to Value by name: an index
+// into a per-resolver key list would couple this module's two flags by position,
+// and swapping the two lines that registered them compiled, passed, and made the
+// propagation flag control tracing.
+var mongoResolver = otelflags.NewResolver()
 
 // resolveGates resolves every static tier for one client, collecting ALL
 // configuration errors before returning any of them.
 //
 // A deployment can carry more than one unreadable value — one configuration file
-// setting every OTEL_*_ENABLED variable — so all three reads run and the
-// failures are joined in a fixed order (master, tracing, propagation). Returning
-// only the first would make the caller fix one and rediscover the next on the
-// following run, which is the failure mode configuration errors are worst at.
+// setting every OTEL_* variable — so every read runs and the failures are joined
+// in a fixed order (provider configuration, master, tracing, propagation).
+// Returning only the first would make the caller fix one and rediscover the next
+// on the following run, which is the failure mode configuration errors are worst
+// at.
+//
+// otelflags.ValidateAndInstall is part of the same read: it validates the
+// process-scoped provider variables this module never names, and performs the
+// one-time provider install. Doing it here rather than inside the first
+// evaluation keeps a provider initialisation off the hot path of a Mongo
+// command.
 func resolveGates(tracingOption, propagationOption *bool) (gateState, error) {
+	providerErr := otelflags.ValidateAndInstall()
 	masterLocal, masterErr := otelflags.MasterLocal()
 	tracingLocal, tracingErr := otelflags.ResolveLocal(tracingOption, envMongoTracingEnabled, defaultMongoTracing)
 	propLocal, propErr := otelflags.ResolveLocal(propagationOption, envMongoPropagationEnabled, defaultMongoPropagation)
 
-	if err := errors.Join(masterErr, tracingErr, propErr); err != nil {
+	if err := errors.Join(providerErr, masterErr, tracingErr, propErr); err != nil {
 		return gateState{}, err
 	}
 

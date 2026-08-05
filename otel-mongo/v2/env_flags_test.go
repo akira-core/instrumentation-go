@@ -50,6 +50,7 @@ func silentFlagEnv(t *testing.T) {
 		envMongoTracingEnabled,
 		envMongoPropagationEnabled,
 		otelflags.EnvFlagsEndpoint,
+		otelflags.EnvFlagsPollInterval,
 	} {
 		setOrUnset(t, name, false, "")
 	}
@@ -183,6 +184,34 @@ func TestResolveGates_ReportsEveryBadValueAtOnce(t *testing.T) {
 	require.ErrorIs(t, err, otelflags.ErrInvalidFlagValue)
 	for _, name := range []string{envGlobalTracingEnabled, envMongoTracingEnabled, envMongoPropagationEnabled} {
 		assert.Contains(t, err.Error(), name, "the joined error must name every bad variable")
+	}
+}
+
+// TestResolveGates_InvalidProviderConfigFailsConstruction extends the same rule
+// to the variables otel-flags owns.
+//
+// They are process-scoped and this module never names them, but they are read
+// during construction, so a value nobody can interpret must stop the constructor
+// here as surely as one of this module's own does.
+func TestResolveGates_InvalidProviderConfigFailsConstruction(t *testing.T) {
+	tests := []struct {
+		name  string
+		env   string
+		value string
+	}{
+		{name: "a bare integer poll interval", env: otelflags.EnvFlagsPollInterval, value: "60"},
+		{name: "an endpoint with no scheme", env: otelflags.EnvFlagsEndpoint, value: "relay:1031"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			silentFlagEnv(t)
+			t.Setenv(tc.env, tc.value)
+
+			_, err := resolveGates(nil, nil)
+			require.ErrorIs(t, err, otelflags.ErrInvalidFlagValue)
+			assert.Contains(t, err.Error(), tc.env)
+		})
 	}
 }
 

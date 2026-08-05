@@ -26,6 +26,7 @@ func unsetFlagEnv(t *testing.T) {
 		otelflags.EnvGlobalTracing,
 		envNATSTracingEnabled,
 		otelflags.EnvFlagsEndpoint,
+		otelflags.EnvFlagsPollInterval,
 	} {
 		prev, existed := os.LookupEnv(name)
 		if err := os.Unsetenv(name); err != nil {
@@ -195,6 +196,38 @@ func TestResolveGates_ReportsEveryBadValueAtOnce(t *testing.T) {
 		if !strings.Contains(err.Error(), name) {
 			t.Errorf("joined error does not name %s: %v", name, err)
 		}
+	}
+}
+
+// TestResolveGates_InvalidProviderConfigFailsConstruction extends the same rule
+// to the variables otel-flags owns.
+//
+// They are process-scoped and this module never names them, but they are read
+// during construction, so a value nobody can interpret must stop the constructor
+// here as surely as one of this module's own does.
+func TestResolveGates_InvalidProviderConfigFailsConstruction(t *testing.T) {
+	tests := []struct {
+		name  string
+		env   string
+		value string
+	}{
+		{name: "a bare integer poll interval", env: otelflags.EnvFlagsPollInterval, value: "60"},
+		{name: "an endpoint with no scheme", env: otelflags.EnvFlagsEndpoint, value: "relay:1031"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			unsetFlagEnv(t)
+			t.Setenv(tc.env, tc.value)
+
+			_, err := resolveGates(nil)
+			if !errors.Is(err, otelflags.ErrInvalidFlagValue) {
+				t.Fatalf("resolveGates err = %v, want ErrInvalidFlagValue", err)
+			}
+			if !strings.Contains(err.Error(), tc.env) {
+				t.Errorf("error does not name the variable: %v", err)
+			}
+		})
 	}
 }
 

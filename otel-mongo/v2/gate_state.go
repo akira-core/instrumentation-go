@@ -49,7 +49,7 @@ func (g gateState) effectiveTracing() bool {
 		return g.masterLocal && g.tracingLocal
 	}
 	return otelflags.MasterEnabled(g.masterLocal) &&
-		mongoResolver.Value(idxTracing, g.tracingLocal)
+		mongoResolver.Value(flagKeyMongoTracing, g.tracingLocal)
 }
 
 // effectivePropagation resolves _oteltrace for a call that has not already
@@ -76,7 +76,7 @@ func (g gateState) propagationGiven(tracing bool) bool {
 	if !g.relayPossible {
 		return g.propLocal
 	}
-	return mongoResolver.Value(idxPropagation, g.propLocal)
+	return mongoResolver.Value(flagKeyMongoPropagation, g.propLocal)
 }
 
 // propagationWhenTracing is propagationGiven(true), for the instrumented

@@ -24,15 +24,10 @@ const flagKeyNATSTracing = "otel-nats-tracing"
 // that configures nothing traces nothing.
 const defaultNATSTracing = false
 
-// Index into natsResolver's flag keys.
-const idxTracing = 0
-
 // natsResolver resolves this module's relay value through the process-global
 // OpenFeature client. It caches nothing, so a relay change reaches a live
 // connection on its very next operation.
-var natsResolver = otelflags.NewResolver(
-	otelflags.WithFlagKeys(flagKeyNATSTracing),
-)
+var natsResolver = otelflags.NewResolver()
 
 // gateState carries everything about a connection's switches that is fixed at
 // construction, so no hot path reads an environment variable.
@@ -56,14 +51,21 @@ type gateState struct {
 // resolveGates resolves every static tier for one connection, collecting BOTH
 // configuration errors before returning either.
 //
-// One configuration file can carry every OTEL_*_ENABLED variable, and each is
-// read independently, so returning the first failure alone would make the caller
-// fix one and rediscover the next on the following run.
+// One configuration file can carry every OTEL_* variable, and each is read
+// independently, so returning the first failure alone would make the caller fix
+// one and rediscover the next on the following run.
+//
+// otelflags.ValidateAndInstall is part of the same read: it validates the
+// process-scoped provider variables this module never names, and performs the
+// one-time provider install. Doing it here rather than inside the first
+// evaluation keeps a provider initialisation off the hot path of an instrumented
+// operation.
 func resolveGates(tracingOption *bool) (gateState, error) {
+	providerErr := otelflags.ValidateAndInstall()
 	masterLocal, masterErr := otelflags.MasterLocal()
 	tracingLocal, tracingErr := otelflags.ResolveLocal(tracingOption, envNATSTracingEnabled, defaultNATSTracing)
 
-	if err := errors.Join(masterErr, tracingErr); err != nil {
+	if err := errors.Join(providerErr, masterErr, tracingErr); err != nil {
 		return gateState{}, err
 	}
 
@@ -97,5 +99,5 @@ func (g gateState) tracing() bool {
 		return g.masterLocal && g.tracingLocal
 	}
 	return otelflags.MasterEnabled(g.masterLocal) &&
-		natsResolver.Value(idxTracing, g.tracingLocal)
+		natsResolver.Value(flagKeyNATSTracing, g.tracingLocal)
 }

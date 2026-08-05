@@ -29,9 +29,16 @@
 // Every name this file defines is PROCESS-scoped: the master switch, the three
 // provider variables, the service-name attribute, the OpenFeature domain. Module
 // flag keys, module environment variable names and module defaults belong to the
-// module that owns them and reach this package only through WithFlagKeys and the
-// local parameter of Value. Adding an instrumentation module must not require a
-// change here.
+// module that owns them and reach this package only as the arguments of Value.
+// Adding an instrumentation module must not require a change here.
+//
+// # The two entry points
+//
+// ValidateAndInstall runs at construction: it validates this package's own
+// environment, fails the constructor on anything it cannot read, and performs
+// the one-time provider install. Value runs per operation and only evaluates.
+// Keeping the install off the evaluation path is what stops an instrumented
+// operation from parking on a provider initialisation somebody else started.
 //
 // # The single-provider guarantee
 //
@@ -41,7 +48,7 @@
 // one. Go resolves one module path to one version per build, so there is one
 // instance of the installMu/installDone latch below, which every path that binds
 // FlagDomain goes through — the auto-install, its retries, and an application's
-// own InstallProvider — and therefore exactly one install.
+// own SetNamedProvider — and therefore exactly one install.
 //
 // # What this package will not touch
 //
@@ -64,6 +71,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -147,12 +155,15 @@ const noopProviderName = "NoopProvider"
 const defaultMasterTracing = true
 
 // ErrInvalidFlagValue reports an environment variable set to something this
-// package cannot interpret as a boolean.
+// package cannot interpret: a switch that is neither truthy nor falsy, a poll
+// interval that is not a positive Go duration, an endpoint that is not a URL.
 //
-// One sentinel serves every module. That is possible only because this package
-// is published rather than internal/, and it is why the per-module
-// configuration-conflict sentinels an earlier design needed are gone.
-var ErrInvalidFlagValue = errors.New("otel-flags: invalid boolean value")
+// One sentinel serves every variable and every module. That is possible only
+// because this package is published rather than internal/, and it is why the
+// per-module configuration-conflict sentinels an earlier design needed are gone.
+// A caller that needs to know WHICH variable failed reads the message: it always
+// names the variable and the observed value, and never the API key.
+var ErrInvalidFlagValue = errors.New("otel-flags: invalid configuration value")
 
 // truthy and falsy are the complete accepted vocabularies, mirrored one for one
 // so the documented rule stays symmetric and short.
@@ -253,21 +264,30 @@ func MasterLocal() (bool, error) {
 // It is resolved per operation like every other relay-backed switch. Resolving
 // it once at construction would mean a relay veto reached only connections
 // created afterwards, which is the opposite of what a veto is for.
-func MasterEnabled(local bool) bool { return masterResolver.Value(0, local) }
+func MasterEnabled(local bool) bool { return masterResolver.Value(FlagKeyGlobalTracing, local) }
 
 // masterResolver resolves the master switch's relay key. It shares the
 // process-wide provider install with every module resolver.
-var masterResolver = NewResolver(WithFlagKeys(FlagKeyGlobalTracing))
+var masterResolver = NewResolver()
 
-// InstallProvider binds provider to FlagDomain and records that this process
+// SetNamedProvider binds provider to FlagDomain and records that this process
 // deliberately gave the instrumentation switches a relay.
+//
+// The name mirrors the SDK verb for what actually happens. This is set-or-
+// replace, not a one-time idempotent install, and the difference matters now
+// that sharing one provider between the application and this library is a
+// supported story. It is deliberately not called SetProvider: that name is taken
+// by openfeature.SetProvider, which writes the DEFAULT slot — the opposite one.
 //
 // It is the recommended way for an application to install its own provider. The
 // raw openfeature.SetNamedProviderAndWait(FlagDomain, p) still works and is
 // still detected, but only through the heuristic in providerBound, which cannot
 // tell an explicit binding from a fallback when the same provider is bound to
 // both the default slot and this domain. Going through here removes that one
-// blind spot: the record is exact.
+// blind spot: the record is exact. An application that wants ONE provider
+// instance serving both its own flags and these switches must use this
+// function — with the heuristic alone, the two slots read equal and the domain
+// reads as unbound.
 //
 // It installs with SetNamedProviderAndWait rather than the asynchronous form, so
 // when it returns the provider has finished initialising and no startup window
@@ -289,13 +309,25 @@ var masterResolver = NewResolver(WithFlagKeys(FlagKeyGlobalTracing))
 // initialise. That is the correct outcome and not merely an acceptable one: the
 // wrapper would otherwise resolve its first operations against a provider this
 // call is in the middle of replacing.
-func InstallProvider(provider openfeature.FeatureProvider) error {
+func SetNamedProvider(provider openfeature.FeatureProvider) error {
 	if provider == nil {
-		return errors.New("otel-flags: InstallProvider: provider is nil")
+		return errors.New("otel-flags: SetNamedProvider: provider is nil")
 	}
 
 	installMu.Lock()
 	defer installMu.Unlock()
+
+	// A wrapper constructed before this call resolved RelayPossible as false and
+	// allocated no instrumented implementation, so nothing this provider ever says
+	// can reach it. There is no repair from here — deferring the allocation across
+	// four modules is what it would take, and otel-mongo's command monitor cannot
+	// be registered after Connect at all — so the warning IS the remedy.
+	if relayPossibleRead.Load() {
+		slog.Warn("a feature flag provider was bound after wrappers were constructed; "+
+			"any wrapper built earlier resolved its relay snapshot without one and will never consult the relay — "+
+			"bind the provider before constructing any wrapper",
+			"domain", FlagDomain)
+	}
 
 	if err := openfeature.SetNamedProviderAndWait(FlagDomain, provider); err != nil {
 		return fmt.Errorf("otel-flags: binding a provider to %q: %w", FlagDomain, err)
@@ -307,7 +339,7 @@ func InstallProvider(provider openfeature.FeatureProvider) error {
 	return nil
 }
 
-// explicitBind records an InstallProvider call. It is never cleared outside
+// explicitBind records a SetNamedProvider call. It is never cleared outside
 // tests: an application that installs a provider and later rebinds still has one
 // bound, and unbinding a domain is not something the OpenFeature SDK offers.
 var explicitBind atomic.Bool
@@ -333,7 +365,7 @@ var explicitBind atomic.Bool
 // So the fallback is stripped: an answer that merely echoes the default provider
 // is not a binding. What survives is one false negative — an application that
 // binds the SAME provider to both slots reads equal and is treated as unbound —
-// which InstallProvider closes for anyone who wants it closed.
+// which SetNamedProvider closes for anyone who wants it closed.
 // The two SDK reads take the same lock separately, so they can straddle a
 // SetProvider call: the named read would return the OLD default through the
 // fallback and the default read the NEW one, two different names, neither of
@@ -397,13 +429,24 @@ func boundToDomain(named, def openfeature.Metadata) bool {
 //
 // The consequence for applications is an ordering rule: install your own
 // provider BEFORE constructing any wrapper. One built earlier resolves
-// statically for the rest of its life.
+// statically for the rest of its life. SetNamedProvider warns when it can see
+// that this happened; a raw openfeature.SetNamedProviderAndWait cannot be
+// detected and is an accepted blind spot.
+//
+// The rule only bites when EnvFlagsEndpoint is unset. With it set this is true
+// from the process's first instruction, and ordering stops mattering.
 func RelayPossible() bool {
+	relayPossibleRead.Store(true)
 	if strings.TrimSpace(os.Getenv(EnvFlagsEndpoint)) != "" {
 		return true
 	}
 	return providerBound()
 }
+
+// relayPossibleRead records that at least one construction-time snapshot exists.
+// It is what lets SetNamedProvider tell an application that its provider arrived
+// too late for wrappers already built.
+var relayPossibleRead atomic.Bool
 
 // Resolver resolves one module's flag keys through the OpenFeature client.
 //
@@ -420,57 +463,35 @@ func RelayPossible() bool {
 // fits entirely inside this type without changing Value's signature or any call
 // site.
 type Resolver struct {
-	// keys are OpenFeature flag keys in Value-index order.
-	keys []string
-
 	clientOnce sync.Once
 	client     openfeature.IClient
-
-	// evalCtx is populated only when this process auto-installed the provider.
-	// An application that installs its own owns its evaluation context outright,
-	// and this stays zero so nothing it set can be overridden.
-	evalCtx openfeature.EvaluationContext
-}
-
-// ResolverOption configures a Resolver at construction.
-type ResolverOption func(*Resolver)
-
-// WithFlagKeys sets the OpenFeature flag keys this Resolver resolves. Each key's
-// index is the index callers pass to Value.
-func WithFlagKeys(keys ...string) ResolverOption {
-	return func(r *Resolver) { r.keys = keys }
 }
 
 // NewResolver returns a Resolver for one module.
 //
 // There is no domain parameter: the domain is process-scoped, so making it a
 // parameter would only create a string that has to agree across every module
-// with nothing checking it.
+// with nothing checking it. There is no key list either — keys are passed to
+// Value, so nothing positional can be mis-wired.
 //
-// No OpenFeature client is created here and no provider is installed. Both
-// happen lazily on the first Value call, which a wrapper only reaches when a
-// relay could exist — so a process without one never touches the OpenFeature SDK
-// at all.
-func NewResolver(opts ...ResolverOption) *Resolver {
-	r := &Resolver{}
-	for _, opt := range opts {
-		if opt == nil {
-			continue
-		}
-		opt(r)
-	}
-	return r
-}
+// No OpenFeature client is created here. One is created lazily on the first
+// Value call that finds a provider bound, so a process with no relay never
+// touches the OpenFeature SDK at all. The provider install is not here either:
+// it belongs to ValidateAndInstall, which a wrapper's constructor calls.
+func NewResolver() *Resolver { return &Resolver{} }
 
-// Value returns the effective value of the key at index i, given the local value
-// resolved from the option, the environment variable and the hardcoded default.
+// Value returns the effective value of key, given the local value resolved from
+// the option, the environment variable and the hardcoded default.
 //
 // This single call is the whole precedence ladder. local is passed as the
 // evaluation default, so the relay's value wins when it has one and local stands
 // on every other path.
 //
-// An out-of-range index returns false rather than panicking, so a mis-wired
-// module degrades to the disabled path instead of taking the process down.
+// The key is a parameter rather than an index into a per-resolver list, and that
+// is a correctness property rather than a taste one: an index couples two
+// modules' flags by position with nothing checking it, so swapping two lines in
+// a WithFlagKeys call used to compile, pass, and silently make otel-mongo's
+// propagation flag control its tracing.
 //
 // Nothing is evaluated unless a provider is bound to FlagDomain. That guard
 // belongs here rather than in each wrapper, and it is not an optimisation: the
@@ -482,23 +503,14 @@ func NewResolver(opts ...ResolverOption) *Resolver {
 // in this repository hand-rolls an equivalent short-circuit before calling here;
 // this makes the module that owns the ladder enforce it too, for the wrapper
 // that forgets and for the callers of the exported MasterEnabled.
-func (r *Resolver) Value(i int, local bool) bool {
-	if i < 0 || i >= len(r.keys) {
-		return false
-	}
-	// The client is bound to a local before the call rather than inlined as its
-	// receiver: evaluator() is what initialises r.evalCtx, and Go orders function
-	// calls left to right only against each other, leaving a plain field load in
-	// the argument list unordered against them. Inlined, the zero evaluation
-	// context could reach the first evaluation of a Resolver.
-	client := r.evaluator()
+func (r *Resolver) Value(key string, local bool) bool {
 	if !providerBound() {
 		return local
 	}
 
 	ctx, cancel := evaluationContext()
 	defer cancel()
-	return client.Boolean(ctx, r.keys[i], local, r.evalCtx)
+	return r.evaluator().Boolean(ctx, key, local, currentEvalCtx())
 }
 
 // evaluationContext bounds one evaluation.
@@ -533,14 +545,41 @@ const evaluationTimeout = 250 * time.Millisecond
 // package built: in-process evaluation, no network on the evaluation path.
 var autoInstalled atomic.Bool
 
-// evaluator lazily installs the environment-configured provider, if any, and
-// creates the domain-scoped OpenFeature client.
+// evaluator lazily creates this Resolver's domain-scoped OpenFeature client.
+//
+// It installs nothing: since the install moved to ValidateAndInstall, the first
+// evaluation on a hot path can no longer be the call that blocks behind another
+// goroutine's provider initialisation.
 func (r *Resolver) evaluator() openfeature.IClient {
-	r.clientOnce.Do(func() {
-		r.evalCtx = withTargetingKey(installProvider())
-		r.client = openfeature.NewClient(FlagDomain)
-	})
+	r.clientOnce.Do(func() { r.client = openfeature.NewClient(FlagDomain) })
 	return r.client
+}
+
+// installedEvalCtx is the evaluation context the install produced, published
+// once and read by every evaluation in the process.
+//
+// It is package-level rather than per-Resolver because the install is: a
+// Resolver that happened to be created before the install would otherwise cache
+// an empty context and lose the service-name attributes for the life of the
+// process, so one module would be targetable and another not.
+var installedEvalCtx atomic.Pointer[openfeature.EvaluationContext]
+
+// baseEvalCtx is what an evaluation carries when no install ran — an
+// application that bound FlagDomain itself, or one whose provider arrived
+// through SetNamedProvider.
+//
+// It carries the targeting key and nothing else. The key is unconditional
+// because percentage and progressiveRollout rules are unusable without one; the
+// attributes are not, because they would override an evaluation context the
+// application owns.
+var baseEvalCtx = openfeature.NewEvaluationContext(processTargetingKey, nil)
+
+// currentEvalCtx returns the evaluation context for one evaluation.
+func currentEvalCtx() openfeature.EvaluationContext {
+	if ctx := installedEvalCtx.Load(); ctx != nil {
+		return *ctx
+	}
+	return baseEvalCtx
 }
 
 // withTargetingKey adds this process's targeting key to an evaluation context.
@@ -600,15 +639,14 @@ var processTargetingKey = func() string {
 // goroutine it then starts has no reachable handle and outlives every attempt to
 // stop it, fetching from the relay for the life of the process.
 //
-// installEvalCtx is remembered rather than recomputed because a Resolver that
-// initialises after the install would otherwise see a provider already bound,
-// take the stand-down path, and evaluate with an empty evaluation context — so
-// the service.name targeting attribute would reach one module and not the
-// others.
+// The context the install produces is published in installedEvalCtx rather than
+// recomputed, because a module that resolves after the install would otherwise
+// see a provider already bound, take the stand-down path, and evaluate with an
+// empty evaluation context — so the service.name targeting attribute would reach
+// one module and not the others.
 var (
-	installMu      sync.Mutex
-	installDone    bool
-	installEvalCtx openfeature.EvaluationContext
+	installMu   sync.Mutex
+	installDone bool
 )
 
 // installGen retires the retry goroutine below. It exists for the tests, which
@@ -625,14 +663,56 @@ var installGen atomic.Uint64
 // interval and no more.
 const providerRetryInitialDelay = time.Second
 
-func installProvider() openfeature.EvaluationContext {
+// ValidateAndInstall validates this package's process-scoped environment and
+// performs the one-time provider install. Every wrapper constructor calls it and
+// joins its error with the module's own.
+//
+// It reports every value it cannot read, together, as one error wrapping
+// ErrInvalidFlagValue — a deployment carrying two typos must not have to fix one
+// to discover the other. Nothing is installed when validation fails: a typo in
+// the endpoint is exactly the case where guessing at what was meant is worst.
+//
+// Both variables are validated whether or not a relay is configured. Making the
+// poll interval's validity conditional on the endpoint being set would put back
+// the unpredictability this removes — the same typo failing one deployment and
+// passing another. The API key is deliberately not validated: any string can be
+// a legitimate key.
+//
+// The install itself does not block; see installProviderFromEnv. What moving it
+// here buys is that it no longer runs inside an evaluation, where it held
+// installMu — the same mutex SetNamedProvider holds across a blocking provider
+// initialisation — and could park an instrumented operation for the length of
+// somebody else's HTTP timeout.
+//
+// Calling it a second time re-validates (cheap, and the environment can change
+// between two constructions) and installs nothing.
+//
+// The name says what it guarantees. It does NOT wait for the provider to
+// initialise: when it returns, the relay may still be minutes from its first
+// fetch, and every switch resolves locally until then. An application that wants
+// that window closed installs its own provider with SetNamedProvider.
+func ValidateAndInstall() error {
+	endpoint, endpointErr := endpointFromEnv()
+	interval, intervalErr := pollIntervalFromEnv()
+	if err := errors.Join(endpointErr, intervalErr); err != nil {
+		return err
+	}
+
+	installOnce(endpoint, interval)
+	return nil
+}
+
+// installOnce performs the environment auto-install exactly once per process and
+// publishes the evaluation context it produced.
+func installOnce(endpoint string, interval time.Duration) {
 	installMu.Lock()
 	defer installMu.Unlock()
-	if !installDone {
-		installEvalCtx = installProviderFromEnv()
-		installDone = true
+	if installDone {
+		return
 	}
-	return installEvalCtx
+	ctx := withTargetingKey(installProviderFromEnv(endpoint, interval))
+	installedEvalCtx.Store(&ctx)
+	installDone = true
 }
 
 // installProviderFromEnv registers a GO Feature Flag provider on FlagDomain when
@@ -651,8 +731,9 @@ func installProvider() openfeature.EvaluationContext {
 // relay-driven enable but can never introduce one, and for otel-mongo it can
 // never write an _oteltrace field the deployment did not configure. An
 // application that wants the relay's answer before its first operation installs
-// its own provider with InstallProvider (or the raw
-// SetNamedProviderAndWait(FlagDomain, p)), which also makes this stand down.
+// its own provider with SetNamedProvider (or the raw
+// openfeature.SetNamedProviderAndWait(FlagDomain, p)), which also makes this
+// stand down.
 // SetProviderAndWait does NOT: it binds the default slot, which says nothing
 // about the instrumentation switches — see providerBound.
 //
@@ -664,10 +745,9 @@ func installProvider() openfeature.EvaluationContext {
 // that was merely slow to come up during a rollout would leave the process with
 // a bound provider that can never answer anything — the kill switch dead, with
 // silence as the only signal. watchProviderInit is what closes that.
-func installProviderFromEnv() openfeature.EvaluationContext {
+func installProviderFromEnv(endpoint string, interval time.Duration) openfeature.EvaluationContext {
 	var empty openfeature.EvaluationContext
 
-	endpoint := strings.TrimSpace(os.Getenv(EnvFlagsEndpoint))
 	if endpoint == "" {
 		return empty
 	}
@@ -681,12 +761,11 @@ func installProviderFromEnv() openfeature.EvaluationContext {
 		return empty
 	}
 
-	// Read once, here, on the constructing goroutine. Passing the interval down
-	// rather than re-reading it keeps the malformed-value warning to a single
-	// line, and keeps every log this path emits on a goroutine the caller can
-	// reason about — a retry goroutine that warned on its own would be writing to
-	// whatever logger happened to be installed minutes later.
-	interval := jitterInterval(pollIntervalFromEnv())
+	// Jittered once, here, on the constructing goroutine, and passed down from
+	// there: every log this path emits then belongs to a goroutine the caller can
+	// reason about, and the retry below reuses the same deviation instead of
+	// re-drawing one.
+	interval = jitterInterval(interval)
 
 	provider, err := newRelayProvider(endpoint, interval)
 	if err != nil {
@@ -845,35 +924,68 @@ func rebindRelayProvider(providerName, endpoint string, interval time.Duration, 
 }
 
 // pollIntervalFromEnv reads EnvFlagsPollInterval, falling back to
-// defaultPollInterval.
+// defaultPollInterval when it is not set.
 //
-// A malformed value warns and falls back rather than aborting the install. Note
-// the deliberate asymmetry with Lookup, which fails construction on a value it
-// cannot read: the interval has a safe fallback and a switch does not. Refusing
-// to install over a typo in an optional tuning knob would delete the entire
-// control plane — the highest-severity outcome reachable from the
-// lowest-severity mistake — whereas guessing at an unreadable switch picks a
-// behaviour nobody asked for.
-func pollIntervalFromEnv() time.Duration {
+// A value that is set and unreadable fails construction, on the same rule as
+// Lookup: what decides is whether the operator's intent can be read, not how
+// severe the consequence of getting it wrong would be. The earlier design warned
+// and fell back here — a severity carve-out that has to be re-argued for every
+// variable anyone adds, and that leaves a process polling on an interval nobody
+// configured with a log line as the only evidence.
+//
+// Blank is treated as unset rather than as an error, and that is not a
+// carve-out: `export VAR=` for a duration has exactly one reading, "no interval
+// configured", whereas for a boolean it has two — which is the whole reason
+// Lookup rejects it.
+//
+// A bare integer is rejected rather than read as milliseconds or seconds:
+// misreading a polling interval that way turns 60 into 60ms, and a fleet
+// hammering the relay sixty times a second is worse than a failed startup.
+func pollIntervalFromEnv() (time.Duration, error) {
 	v := strings.TrimSpace(os.Getenv(EnvFlagsPollInterval))
 	if v == "" {
-		return defaultPollInterval
+		return defaultPollInterval, nil
 	}
 	d, err := time.ParseDuration(v)
 	switch {
 	case err != nil:
-		slog.Warn("invalid poll interval; falling back to the default",
-			"var", EnvFlagsPollInterval, "value", v,
-			"default", defaultPollInterval, "error", err)
-		return defaultPollInterval
+		return 0, fmt.Errorf("%w: %s=%q is not a Go duration (want e.g. 30s or 2m; a bare integer is rejected)",
+			ErrInvalidFlagValue, EnvFlagsPollInterval, v)
 	case d <= 0:
-		slog.Warn("non-positive poll interval; falling back to the default",
-			"var", EnvFlagsPollInterval, "value", v,
-			"default", defaultPollInterval)
-		return defaultPollInterval
-	default:
-		return d
+		return 0, fmt.Errorf("%w: %s=%q must be a positive duration",
+			ErrInvalidFlagValue, EnvFlagsPollInterval, v)
 	}
+	return d, nil
+}
+
+// endpointFromEnv reads EnvFlagsEndpoint, returning "" when no relay is
+// configured.
+//
+// A value that is set must be a URL with both a scheme and a host, because the
+// two ways of getting that wrong are silent. "relay:1031" parses cleanly — as
+// scheme "relay" with opaque "1031" — and produces a provider that can never
+// reach anything, which is why the host is checked as well as the scheme.
+//
+// The check stops at the shape. Which schemes the relay actually speaks is the
+// provider's business, and an exotic but well-formed one fails at the transport
+// with an error the retry loop logs; enumerating them here would be this
+// package deciding something it does not own.
+//
+// Blank is "no relay", for the same reason as in pollIntervalFromEnv.
+func endpointFromEnv() (string, error) {
+	raw := strings.TrimSpace(os.Getenv(EnvFlagsEndpoint))
+	if raw == "" {
+		return "", nil
+	}
+	u, err := url.Parse(raw)
+	switch {
+	case err != nil:
+		return "", fmt.Errorf("%w: %s=%q is not a URL: %w", ErrInvalidFlagValue, EnvFlagsEndpoint, raw, err)
+	case u.Scheme == "" || u.Host == "":
+		return "", fmt.Errorf("%w: %s=%q needs a scheme and a host (want e.g. http://relay:1031)",
+			ErrInvalidFlagValue, EnvFlagsEndpoint, raw)
+	}
+	return raw, nil
 }
 
 // pollJitterFraction is the maximum deviation jitterInterval applies, as a

@@ -36,9 +36,22 @@ func resetInstallState(t *testing.T) {
 	installMu.Lock()
 	defer installMu.Unlock()
 	installDone = false
-	installEvalCtx = openfeature.EvaluationContext{}
+	installedEvalCtx.Store(nil)
 	explicitBind.Store(false)
+	relayPossibleRead.Store(false)
 	installGen.Add(1)
+}
+
+// mustValidate runs the process-level entry point every wrapper constructor
+// calls, and fails the test if the environment it reads is unreadable.
+//
+// Tests call it wherever a wrapper's construction would: the provider install
+// happens here, not on the first evaluation.
+func mustValidate(t *testing.T) {
+	t.Helper()
+	if err := ValidateAndInstall(); err != nil {
+		t.Fatalf("ValidateAndInstall: %v", err)
+	}
 }
 
 // setDefaultProvider installs a provider in the DEFAULT slot — an application's
@@ -245,10 +258,10 @@ func clearProvider(t *testing.T) {
 func TestValue_NoProviderReturnsLocal(t *testing.T) {
 	clearProvider(t)
 
-	r := NewResolver(WithFlagKeys("some-key"))
+	r := NewResolver()
 	for _, local := range []bool{true, false} {
-		if got := r.Value(0, local); got != local {
-			t.Fatalf("Value(0, %v) = %v with no provider installed; the local value must stand", local, got)
+		if got := r.Value("some-key", local); got != local {
+			t.Fatalf("Value(%v) = %v with no provider installed; the local value must stand", local, got)
 		}
 	}
 }
@@ -256,10 +269,10 @@ func TestValue_NoProviderReturnsLocal(t *testing.T) {
 func TestValue_MissingFlagReturnsLocal(t *testing.T) {
 	setProvider(t, map[string]memprovider.InMemoryFlag{"other-key": boolFlag(false)})
 
-	r := NewResolver(WithFlagKeys("absent-key"))
+	r := NewResolver()
 	for _, local := range []bool{true, false} {
-		if got := r.Value(0, local); got != local {
-			t.Fatalf("Value(0, %v) = %v for a key absent from the relay; the local value must stand", local, got)
+		if got := r.Value("absent-key", local); got != local {
+			t.Fatalf("Value(%v) = %v for a key absent from the relay; the local value must stand", local, got)
 		}
 	}
 }
@@ -268,18 +281,18 @@ func TestValue_RelayOverridesLocalInBothDirections(t *testing.T) {
 	t.Run("relay disables what the deployment enabled", func(t *testing.T) {
 		setProvider(t, map[string]memprovider.InMemoryFlag{"k": boolFlag(false)})
 
-		r := NewResolver(WithFlagKeys("k"))
-		if r.Value(0, true) {
-			t.Fatalf("Value(0, true) = true while the relay serves false")
+		r := NewResolver()
+		if r.Value("k", true) {
+			t.Fatalf("Value(true) = true while the relay serves false")
 		}
 	})
 
 	t.Run("relay enables what the deployment left off", func(t *testing.T) {
 		setProvider(t, map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})
 
-		r := NewResolver(WithFlagKeys("k"))
-		if !r.Value(0, false) {
-			t.Fatalf("Value(0, false) = false while the relay serves true; the relay is authoritative in both directions")
+		r := NewResolver()
+		if !r.Value("k", false) {
+			t.Fatalf("Value(false) = false while the relay serves true; the relay is authoritative in both directions")
 		}
 	})
 }
@@ -287,8 +300,8 @@ func TestValue_RelayOverridesLocalInBothDirections(t *testing.T) {
 func TestValue_ChangeIsVisibleOnTheNextCall(t *testing.T) {
 	setProvider(t, map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})
 
-	r := NewResolver(WithFlagKeys("k"))
-	if !r.Value(0, false) {
+	r := NewResolver()
+	if !r.Value("k", false) {
 		t.Fatalf("Value = false while the relay serves true")
 	}
 
@@ -298,41 +311,42 @@ func TestValue_ChangeIsVisibleOnTheNextCall(t *testing.T) {
 		memprovider.NewInMemoryProvider(map[string]memprovider.InMemoryFlag{"k": boolFlag(false)})); err != nil {
 		t.Fatalf("SetNamedProviderAndWait: %v", err)
 	}
-	if r.Value(0, true) {
+	if r.Value("k", true) {
 		t.Fatalf("Value = true on the call after a change; the value must not be cached")
 	}
 }
 
-func TestValue_OutOfRangeIndexIsDisabled(t *testing.T) {
-	clearProvider(t)
+// TestValue_ResolvesTheKeyItIsGiven is what the key parameter buys over the
+// index it replaced.
+//
+// A resolver holds no key list, so there is no positional coupling left to get
+// wrong: two modules sharing one resolver cannot swap each other's flags by
+// listing them in the wrong order.
+func TestValue_ResolvesTheKeyItIsGiven(t *testing.T) {
+	setProvider(t, map[string]memprovider.InMemoryFlag{
+		"otel-mongo-tracing":     boolFlag(true),
+		"otel-mongo-propagation": boolFlag(false),
+	})
 
-	r := NewResolver(WithFlagKeys("k"))
-	for _, i := range []int{-1, 1, 99} {
-		// local=true so a pass-through implementation would return true; only a
-		// genuine bounds check returns false here.
-		if r.Value(i, true) {
-			t.Errorf("Value(%d, true) = true for an out-of-range index; a mis-wired module must degrade to disabled", i)
-		}
+	r := NewResolver()
+	if !r.Value("otel-mongo-tracing", false) {
+		t.Errorf("otel-mongo-tracing resolved false while the relay serves true")
 	}
-}
-
-func TestNewResolver_NilOptionIsSkipped(t *testing.T) {
-	r := NewResolver(nil, WithFlagKeys("k"), nil)
-	if len(r.keys) != 1 {
-		t.Fatalf("keys = %v, want one key; a nil option must be skipped rather than panic", r.keys)
+	if r.Value("otel-mongo-propagation", true) {
+		t.Errorf("otel-mongo-propagation resolved true while the relay serves false")
 	}
 }
 
 func TestValue_Concurrent(t *testing.T) {
 	setProvider(t, map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})
 
-	r := NewResolver(WithFlagKeys("k"))
+	r := NewResolver()
 	var wg sync.WaitGroup
 	for range 32 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = r.Value(0, false)
+			_ = r.Value("k", false)
 		}()
 	}
 	wg.Wait()
@@ -459,23 +473,23 @@ func TestBoundToDomain(t *testing.T) {
 	}
 }
 
-func TestInstallProvider(t *testing.T) {
+func TestSetNamedProvider(t *testing.T) {
 	t.Run("binds the domain and records the choice", func(t *testing.T) {
 		clearProvider(t)
 		resetInstallState(t)
 		t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
 
-		if err := InstallProvider(memprovider.NewInMemoryProvider(
+		if err := SetNamedProvider(memprovider.NewInMemoryProvider(
 			map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})); err != nil {
-			t.Fatalf("InstallProvider: %v", err)
+			t.Fatalf("SetNamedProvider: %v", err)
 		}
 
 		if !RelayPossible() {
-			t.Fatalf("RelayPossible() = false after InstallProvider")
+			t.Fatalf("RelayPossible() = false after SetNamedProvider")
 		}
-		r := NewResolver(WithFlagKeys("k"))
-		if !r.Value(0, false) {
-			t.Fatalf("Value(0, false) = false; the installed provider must decide")
+		r := NewResolver()
+		if !r.Value("k", false) {
+			t.Fatalf("Value(false) = false; the installed provider must decide")
 		}
 	})
 
@@ -486,10 +500,12 @@ func TestInstallProvider(t *testing.T) {
 		t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
 
 		// Same provider type in both slots — the heuristic alone reads this as
-		// unbound. The explicit record is what makes it exact.
-		if err := InstallProvider(memprovider.NewInMemoryProvider(
+		// unbound. The explicit record is what makes it exact, and it is the only
+		// way to share ONE provider instance between the application and this
+		// library.
+		if err := SetNamedProvider(memprovider.NewInMemoryProvider(
 			map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})); err != nil {
-			t.Fatalf("InstallProvider: %v", err)
+			t.Fatalf("SetNamedProvider: %v", err)
 		}
 		if !RelayPossible() {
 			t.Fatalf("RelayPossible() = false after an explicit install; the record must outrank the heuristic")
@@ -497,8 +513,51 @@ func TestInstallProvider(t *testing.T) {
 	})
 
 	t.Run("a nil provider is an error, not a panic", func(t *testing.T) {
-		if err := InstallProvider(nil); err == nil {
-			t.Fatalf("InstallProvider(nil) = nil, want an error")
+		if err := SetNamedProvider(nil); err == nil {
+			t.Fatalf("SetNamedProvider(nil) = nil, want an error")
+		}
+	})
+}
+
+// TestSetNamedProvider_WarnsWhenWrappersAlreadyExist covers the ordering rule
+// that RelayPossible's construction-time snapshot creates.
+//
+// A wrapper built before the provider was bound resolved relayPossible as false
+// and allocated no instrumented implementation, so a relay bound afterwards can
+// never reach it. Nothing can repair that from here — the warning is the whole
+// remedy, and it is why the install belongs before the first constructor.
+func TestSetNamedProvider_WarnsWhenWrappersAlreadyExist(t *testing.T) {
+	provider := func() openfeature.FeatureProvider {
+		return memprovider.NewInMemoryProvider(map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})
+	}
+
+	t.Run("warns after a wrapper has resolved its snapshot", func(t *testing.T) {
+		clearProvider(t)
+		resetInstallState(t)
+		buf := captureLogs(t)
+		t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
+
+		_ = RelayPossible() // a wrapper being constructed
+
+		if err := SetNamedProvider(provider()); err != nil {
+			t.Fatalf("SetNamedProvider: %v", err)
+		}
+		if !strings.Contains(buf.String(), "wrapper") {
+			t.Fatalf("no warning about wrappers constructed before the install: %q", buf.String())
+		}
+	})
+
+	t.Run("silent when installed first", func(t *testing.T) {
+		clearProvider(t)
+		resetInstallState(t)
+		buf := captureLogs(t)
+		t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
+
+		if err := SetNamedProvider(provider()); err != nil {
+			t.Fatalf("SetNamedProvider: %v", err)
+		}
+		if strings.Contains(buf.String(), "wrapper") {
+			t.Fatalf("warned about wrappers that do not exist yet: %q", buf.String())
 		}
 	})
 }
@@ -510,8 +569,7 @@ func TestAutoInstall_ProceedsWhenOnlyADefaultProviderExists(t *testing.T) {
 	t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
 	t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
 
-	r := NewResolver(WithFlagKeys("k"))
-	_ = r.Value(0, false)
+	mustValidate(t)
 
 	// The operator set the endpoint. Standing down for a provider the application
 	// installed for its own flags would leave that endpoint with nothing behind
@@ -562,10 +620,10 @@ func TestValue_NotReadyProviderLeavesLocalInCharge(t *testing.T) {
 	}
 	t.Cleanup(func() { clearProvider(t) })
 
-	r := NewResolver(WithFlagKeys("k"))
+	r := NewResolver()
 	for _, local := range []bool{true, false} {
-		if got := r.Value(0, local); got != local {
-			t.Fatalf("Value(0, %v) = %v before the provider's first fetch; the local value must stand", local, got)
+		if got := r.Value("k", local); got != local {
+			t.Fatalf("Value(%v) = %v before the provider's first fetch; the local value must stand", local, got)
 		}
 	}
 
@@ -588,11 +646,34 @@ func TestAutoInstall_FiresWhenEndpointSetAndNoProvider(t *testing.T) {
 	t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
 	t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
 
-	r := NewResolver(WithFlagKeys("k"))
-	_ = r.Value(0, false)
+	mustValidate(t)
 
 	if got := openfeature.NamedProviderMetadata(FlagDomain).Name; got == noopProviderName {
 		t.Fatalf("no provider was installed on %q; want a GO Feature Flag provider", FlagDomain)
+	}
+}
+
+// TestValue_DoesNotInstallAProvider pins where the install happens.
+//
+// It used to run inside the first evaluation, under installMu — the same mutex
+// SetNamedProvider holds across a blocking provider initialisation. An
+// application installing its own provider concurrently with the first
+// instrumented operation could therefore park that operation for as long as the
+// provider's HTTP timeout. Construction is where a wrapper is allowed to block;
+// the hot path is not.
+func TestValue_DoesNotInstallAProvider(t *testing.T) {
+	clearProvider(t)
+	resetInstallState(t)
+	t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+	t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
+
+	r := NewResolver()
+	if got := r.Value("k", true); !got {
+		t.Errorf("Value(true) = false with nothing bound; the local value must stand")
+	}
+
+	if got := openfeature.NamedProviderMetadata(FlagDomain).Name; got != noopProviderName {
+		t.Fatalf("evaluating installed %q; the install belongs to ValidateAndInstall, off the hot path", got)
 	}
 }
 
@@ -603,8 +684,10 @@ func TestAutoInstall_StandsDownWhenAProviderExists(t *testing.T) {
 	before := openfeature.NamedProviderMetadata(FlagDomain).Name
 	t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
 
-	r := NewResolver(WithFlagKeys("k"))
-	if r.Value(0, true) {
+	mustValidate(t)
+
+	r := NewResolver()
+	if r.Value("k", true) {
 		t.Fatalf("Value = true; the application's own provider must still decide")
 	}
 	if after := openfeature.NamedProviderMetadata(FlagDomain).Name; after != before {
@@ -617,38 +700,33 @@ func TestAutoInstall_UnsetEndpointInstallsNothing(t *testing.T) {
 	resetInstallState(t)
 	t.Cleanup(func() { resetInstallState(t) })
 
-	r := NewResolver(WithFlagKeys("k"))
-	_ = r.Value(0, false)
+	mustValidate(t)
 
 	if got := openfeature.NamedProviderMetadata(FlagDomain).Name; got != noopProviderName {
 		t.Fatalf("provider = %q with no endpoint configured; want no OpenFeature state written", got)
 	}
-	if len(r.evalCtx.Attributes()) != 0 {
-		t.Fatalf("evaluation context = %v, want empty off the auto-install path", r.evalCtx.Attributes())
+	if attrs := currentEvalCtx().Attributes(); len(attrs) != 0 {
+		t.Fatalf("evaluation context = %v, want no attributes off the auto-install path", attrs)
 	}
 }
 
-func TestAutoInstall_HappensOnceForEveryResolver(t *testing.T) {
+func TestAutoInstall_HappensOnceForEveryConstructor(t *testing.T) {
 	clearProvider(t)
 	resetInstallState(t)
 	t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
 	t.Setenv(EnvServiceName, "checkout-api")
 	t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
 
-	// Four module resolvers, as a binary linking all four instrumentation
-	// modules would hold, evaluating for the first time concurrently.
-	resolvers := []*Resolver{
-		NewResolver(WithFlagKeys("otel-mongo-tracing")),
-		NewResolver(WithFlagKeys("otel-nats-tracing")),
-		NewResolver(WithFlagKeys("otel-gorilla-ws-tracing")),
-		NewResolver(WithFlagKeys("k")),
-	}
+	// Four wrappers, as a binary linking all four instrumentation modules would
+	// hold, constructed concurrently. Each construction validates and installs.
 	var wg sync.WaitGroup
-	for _, r := range resolvers {
+	for range 4 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = r.Value(0, false)
+			if err := ValidateAndInstall(); err != nil {
+				t.Errorf("ValidateAndInstall: %v", err)
+			}
 		}()
 	}
 	wg.Wait()
@@ -656,12 +734,10 @@ func TestAutoInstall_HappensOnceForEveryResolver(t *testing.T) {
 	if got := openfeature.NamedProviderMetadata(FlagDomain).Name; got == noopProviderName {
 		t.Fatalf("no provider installed")
 	}
-	// The install is remembered, so every resolver — not only the one that won
-	// the race — evaluates with the targeting attribute.
-	for i, r := range resolvers {
-		if got := r.evalCtx.Attributes()["service.name"]; got != "checkout-api" {
-			t.Errorf("resolver %d: service.name = %v, want checkout-api", i, got)
-		}
+	// The install is remembered process-wide, so every module — not only the one
+	// that won the race — evaluates with the targeting attribute.
+	if got := currentEvalCtx().Attributes()["service.name"]; got != "checkout-api" {
+		t.Errorf("service.name = %v, want checkout-api", got)
 	}
 }
 
@@ -673,10 +749,9 @@ func TestAutoInstall_ServiceNameOnlyOnThisPath(t *testing.T) {
 		t.Setenv(EnvServiceName, "checkout-api")
 		t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
 
-		r := NewResolver(WithFlagKeys("k"))
-		_ = r.Value(0, false)
+		mustValidate(t)
 
-		if got := r.evalCtx.Attributes()["service.name"]; got != "checkout-api" {
+		if got := currentEvalCtx().Attributes()["service.name"]; got != "checkout-api" {
 			t.Fatalf("service.name = %v, want checkout-api", got)
 		}
 	})
@@ -688,48 +763,229 @@ func TestAutoInstall_ServiceNameOnlyOnThisPath(t *testing.T) {
 		t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
 		t.Setenv(EnvServiceName, "checkout-api")
 
-		r := NewResolver(WithFlagKeys("k"))
-		_ = r.Value(0, false)
+		mustValidate(t)
 
-		if len(r.evalCtx.Attributes()) != 0 {
-			t.Fatalf("evaluation context = %v, want empty; the application owns its own context",
-				r.evalCtx.Attributes())
+		if attrs := currentEvalCtx().Attributes(); len(attrs) != 0 {
+			t.Fatalf("evaluation context = %v, want no attributes; the application owns its own context", attrs)
 		}
 	})
 }
 
+// TestPollIntervalFromEnv pins the reversal decision 1 makes: a tuning value
+// whose intent cannot be read now fails construction instead of warning and
+// falling back.
+//
+// The old rule was keyed to how bad the consequence is — a switch is severe, an
+// interval is not — and that has to be re-argued for every variable added. "Can
+// the operator's intent be read" is decidable by looking at the value.
 func TestPollIntervalFromEnv(t *testing.T) {
 	tests := []struct {
-		name     string
-		value    string
-		set      bool
-		want     time.Duration
-		wantWarn bool
+		name    string
+		value   string
+		set     bool
+		want    time.Duration
+		wantErr bool
 	}{
 		{name: "unset uses the default", want: defaultPollInterval},
 		{name: "duration string", value: "5s", set: true, want: 5 * time.Second},
 		{name: "minutes", value: "2m", set: true, want: 2 * time.Minute},
+		// Blank is the absence of a value, not an unreadable one: a duration has
+		// no second reading the way a boolean does, so there is nothing to guess
+		// between. Contrast Lookup, where `export VAR=` is an error.
+		{name: "blank is the same as unset", value: "  ", set: true, want: defaultPollInterval},
 		// A bare integer must NOT be read as milliseconds: misreading a polling
 		// interval that way turns 60 into 60ms.
-		{name: "bare integer is rejected", value: "60", set: true, want: defaultPollInterval, wantWarn: true},
-		{name: "garbage is rejected", value: "soon", set: true, want: defaultPollInterval, wantWarn: true},
-		{name: "zero is rejected", value: "0s", set: true, want: defaultPollInterval, wantWarn: true},
-		{name: "negative is rejected", value: "-5s", set: true, want: defaultPollInterval, wantWarn: true},
+		{name: "bare integer is rejected", value: "60", set: true, wantErr: true},
+		{name: "garbage is rejected", value: "soon", set: true, wantErr: true},
+		{name: "zero is rejected", value: "0s", set: true, wantErr: true},
+		{name: "negative is rejected", value: "-5s", set: true, wantErr: true},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := captureLogs(t)
 			if tc.set {
 				t.Setenv(EnvFlagsPollInterval, tc.value)
 			}
-			if got := pollIntervalFromEnv(); got != tc.want {
+			got, err := pollIntervalFromEnv()
+
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("pollIntervalFromEnv() err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if tc.wantErr {
+				if !errors.Is(err, ErrInvalidFlagValue) {
+					t.Errorf("error does not wrap ErrInvalidFlagValue: %v", err)
+				}
+				if !strings.Contains(err.Error(), EnvFlagsPollInterval) {
+					t.Errorf("error does not name the variable: %v", err)
+				}
+				if !strings.Contains(err.Error(), tc.value) {
+					t.Errorf("error does not name the observed value: %v", err)
+				}
+				return
+			}
+			if got != tc.want {
 				t.Fatalf("pollIntervalFromEnv() = %v, want %v", got, tc.want)
 			}
-			if warned := strings.Contains(buf.String(), EnvFlagsPollInterval); warned != tc.wantWarn {
-				t.Fatalf("warning emitted = %v, want %v (log: %q)", warned, tc.wantWarn, buf.String())
+		})
+	}
+}
+
+func TestEndpointFromEnv(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		set     bool
+		want    string
+		wantErr bool
+	}{
+		{name: "unset means no relay"},
+		{name: "blank means no relay", value: "   ", set: true},
+		{name: "http", value: "http://relay:1031", set: true, want: "http://relay:1031"},
+		{name: "https with a path", value: "https://flags.example.com/gofeatureflag", set: true,
+			want: "https://flags.example.com/gofeatureflag"},
+		{name: "surrounding whitespace is trimmed", value: "  http://relay:1031  ", set: true, want: "http://relay:1031"},
+
+		// url.Parse accepts these; the provider cannot use them. A host:port with
+		// no scheme parses as scheme "relay" with opaque "1031", which is why the
+		// host is checked too.
+		{name: "no scheme", value: "relay:1031", set: true, wantErr: true},
+		{name: "bare host", value: "relay", set: true, wantErr: true},
+		{name: "scheme with no host", value: "http://", set: true, wantErr: true},
+		{name: "unparseable", value: "http://[::1", set: true, wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.set {
+				t.Setenv(EnvFlagsEndpoint, tc.value)
+			}
+			got, err := endpointFromEnv()
+
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("endpointFromEnv() err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if tc.wantErr {
+				if !errors.Is(err, ErrInvalidFlagValue) {
+					t.Errorf("error does not wrap ErrInvalidFlagValue: %v", err)
+				}
+				if !strings.Contains(err.Error(), EnvFlagsEndpoint) {
+					t.Errorf("error does not name the variable: %v", err)
+				}
+				return
+			}
+			if got != tc.want {
+				t.Fatalf("endpointFromEnv() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestValidateAndInstall_RejectsUnreadableConfiguration is decision 1 at the
+// entry point: every provider variable is validated whether or not a relay is
+// configured, and an unreadable one fails construction rather than installing
+// something the operator did not ask for.
+func TestValidateAndInstall_RejectsUnreadableConfiguration(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		interval string
+		wantVars []string
+	}{
+		{name: "a bare integer poll interval, with no relay configured",
+			interval: "60", wantVars: []string{EnvFlagsPollInterval}},
+		{name: "a garbage poll interval alongside a good endpoint",
+			endpoint: unreachableEndpoint, interval: "soon", wantVars: []string{EnvFlagsPollInterval}},
+		{name: "a non-positive poll interval",
+			endpoint: unreachableEndpoint, interval: "0s", wantVars: []string{EnvFlagsPollInterval}},
+		{name: "an endpoint with no scheme",
+			endpoint: "relay:1031", wantVars: []string{EnvFlagsEndpoint}},
+
+		// Both are read before either is reported: a deployment carrying two bad
+		// values must not have to fix one to discover the other.
+		{name: "both unreadable are reported together",
+			endpoint: "relay:1031", interval: "60",
+			wantVars: []string{EnvFlagsEndpoint, EnvFlagsPollInterval}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			clearProvider(t)
+			resetInstallState(t)
+			t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
+			if tc.endpoint != "" {
+				t.Setenv(EnvFlagsEndpoint, tc.endpoint)
+			}
+			if tc.interval != "" {
+				t.Setenv(EnvFlagsPollInterval, tc.interval)
+			}
+
+			err := ValidateAndInstall()
+			if !errors.Is(err, ErrInvalidFlagValue) {
+				t.Fatalf("ValidateAndInstall() err = %v, want ErrInvalidFlagValue", err)
+			}
+			for _, v := range tc.wantVars {
+				if !strings.Contains(err.Error(), v) {
+					t.Errorf("error does not name %s: %v", v, err)
+				}
+			}
+			if got := openfeature.NamedProviderMetadata(FlagDomain).Name; got != noopProviderName {
+				t.Errorf("provider %q was installed despite unreadable configuration", got)
+			}
+		})
+	}
+}
+
+func TestValidateAndInstall_AcceptsWhatItCanRead(t *testing.T) {
+	t.Run("nothing configured installs nothing", func(t *testing.T) {
+		clearProvider(t)
+		resetInstallState(t)
+		t.Cleanup(func() { resetInstallState(t) })
+
+		mustValidate(t)
+
+		if got := openfeature.NamedProviderMetadata(FlagDomain).Name; got != noopProviderName {
+			t.Fatalf("provider = %q with nothing configured; want no OpenFeature state written", got)
+		}
+	})
+
+	t.Run("an endpoint installs the provider before any evaluation", func(t *testing.T) {
+		clearProvider(t)
+		resetInstallState(t)
+		t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+		t.Setenv(EnvFlagsPollInterval, "5s")
+		// Any string is a legitimate API key, so it is never validated.
+		t.Setenv(EnvFlagsAPIKey, "%%not-a-url%%")
+		t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
+
+		mustValidate(t)
+
+		if got := openfeature.NamedProviderMetadata(FlagDomain).Name; got == noopProviderName {
+			t.Fatalf("no provider installed on %q", FlagDomain)
+		}
+	})
+}
+
+// TestValidateAndInstall_IsIdempotent pins the latch: a wrapper constructed
+// second must not rebind the domain underneath the first.
+func TestValidateAndInstall_IsIdempotent(t *testing.T) {
+	clearProvider(t)
+	resetInstallState(t)
+	t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+	t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
+
+	mustValidate(t)
+	installed := openfeature.NamedProviderMetadata(FlagDomain).Name
+
+	// The application takes the domain over afterwards, as it may.
+	if err := openfeature.SetNamedProviderAndWait(FlagDomain, memprovider.NewInMemoryProvider(
+		map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})); err != nil {
+		t.Fatalf("SetNamedProviderAndWait: %v", err)
+	}
+
+	mustValidate(t)
+
+	if got := openfeature.NamedProviderMetadata(FlagDomain).Name; got == installed {
+		t.Fatalf("the second ValidateAndInstall rebound %q over the application's provider", got)
 	}
 }
 
@@ -836,21 +1092,32 @@ func TestResolveLocal(t *testing.T) {
 }
 
 func TestValue_SuppliesATargetingKey(t *testing.T) {
-	setProvider(t, map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})
-	resetInstallState(t)
-	t.Cleanup(func() { resetInstallState(t) })
+	t.Run("after the install", func(t *testing.T) {
+		setProvider(t, map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})
+		resetInstallState(t)
+		t.Cleanup(func() { resetInstallState(t) })
 
-	r := NewResolver(WithFlagKeys("k"))
-	_ = r.Value(0, false)
+		mustValidate(t)
 
-	// Without one, every percentage and progressiveRollout rule fails with
-	// TARGETING_KEY_MISSING and silently resolves to the local value.
-	if r.evalCtx.TargetingKey() == "" {
-		t.Fatalf("no targeting key; bucketing rules on the relay cannot apply to this process")
-	}
-	if got := r.evalCtx.TargetingKey(); got != processTargetingKey {
-		t.Errorf("targeting key = %q, want the process key %q", got, processTargetingKey)
-	}
+		// Without one, every percentage and progressiveRollout rule fails with
+		// TARGETING_KEY_MISSING and silently resolves to the local value.
+		if got := currentEvalCtx().TargetingKey(); got != processTargetingKey {
+			t.Fatalf("targeting key = %q, want the process key %q; bucketing rules on the relay "+
+				"cannot apply to this process", got, processTargetingKey)
+		}
+	})
+
+	t.Run("even with no install at all", func(t *testing.T) {
+		clearProvider(t)
+		resetInstallState(t)
+		t.Cleanup(func() { resetInstallState(t) })
+
+		// An application that binds FlagDomain directly never reaches the install
+		// path, and its evaluations must still bucket.
+		if got := currentEvalCtx().TargetingKey(); got != processTargetingKey {
+			t.Fatalf("targeting key = %q, want the process key %q", got, processTargetingKey)
+		}
+	})
 }
 
 func TestAutoInstall_ServiceNameIsMatchableByARule(t *testing.T) {
@@ -860,15 +1127,14 @@ func TestAutoInstall_ServiceNameIsMatchableByARule(t *testing.T) {
 	t.Setenv(EnvServiceName, "checkout-api")
 	t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
 
-	r := NewResolver(WithFlagKeys("k"))
-	_ = r.Value(0, false)
+	mustValidate(t)
 
 	// A dot is a nested-path separator in both query languages the relay
 	// supports, so service.name alone is unmatchable however it is written.
-	if got := r.evalCtx.Attributes()["serviceName"]; got != "checkout-api" {
+	if got := currentEvalCtx().Attributes()["serviceName"]; got != "checkout-api" {
 		t.Fatalf("serviceName = %v, want checkout-api; no relay rule can target this process", got)
 	}
-	if got := r.evalCtx.Attributes()["service.name"]; got != "checkout-api" {
+	if got := currentEvalCtx().Attributes()["service.name"]; got != "checkout-api" {
 		t.Errorf("service.name = %v, want it kept alongside the matchable spelling", got)
 	}
 }
@@ -915,26 +1181,30 @@ func TestValue_DoesNotReachTheDefaultProvider(t *testing.T) {
 	setDefaultProvider(t, "k")
 	t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
 
-	r := NewResolver(WithFlagKeys("k"))
-	if r.Value(0, false) {
+	r := NewResolver()
+	if r.Value("k", false) {
 		t.Fatalf("Value consulted the application's default provider; the local value must decide "+
 			"when nothing is bound to %q", FlagDomain)
 	}
 }
 
-func TestInstallProvider_LatchesTheAutoInstallShut(t *testing.T) {
+func TestSetNamedProvider_LatchesTheAutoInstallShut(t *testing.T) {
 	clearProvider(t)
 	resetInstallState(t)
 	t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
 	t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
 
 	own := memprovider.NewInMemoryProvider(map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})
-	if err := InstallProvider(own); err != nil {
-		t.Fatalf("InstallProvider: %v", err)
+	if err := SetNamedProvider(own); err != nil {
+		t.Fatalf("SetNamedProvider: %v", err)
 	}
 
-	r := NewResolver(WithFlagKeys("k"))
-	if !r.Value(0, false) {
+	// A wrapper constructed afterwards validates and would auto-install, the
+	// endpoint being set.
+	mustValidate(t)
+
+	r := NewResolver()
+	if !r.Value("k", false) {
 		t.Fatalf("the application's own provider was not consulted")
 	}
 	if got, want := openfeature.NamedProviderMetadata(FlagDomain).Name, own.Metadata().Name; got != want {
@@ -945,7 +1215,7 @@ func TestInstallProvider_LatchesTheAutoInstallShut(t *testing.T) {
 	done := installDone
 	installMu.Unlock()
 	if !done {
-		t.Errorf("InstallProvider did not latch installDone, so a later auto-install can still replace the application's provider")
+		t.Errorf("SetNamedProvider did not latch installDone, so a later auto-install can still replace the application's provider")
 	}
 }
 
@@ -975,42 +1245,43 @@ func TestRebindRelayProvider_StandsDown(t *testing.T) {
 	}
 }
 
-func TestAutoInstall_MalformedIntervalStillInstalls(t *testing.T) {
-	clearProvider(t)
-	resetInstallState(t)
-	buf := captureLogs(t)
-	t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
-	t.Setenv(EnvFlagsPollInterval, "not-a-duration")
-	t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
-
-	r := NewResolver(WithFlagKeys("k"))
-	_ = r.Value(0, false)
-
-	if got := openfeature.NamedProviderMetadata(FlagDomain).Name; got == noopProviderName {
-		t.Fatalf("a malformed poll interval prevented the install; a typo in an optional " +
-			"tuning value must not delete the control plane")
-	}
-	if !strings.Contains(buf.String(), EnvFlagsPollInterval) {
-		t.Errorf("the malformed value was not reported: %q", buf.String())
-	}
-}
-
-func TestAutoInstall_APIKeyIsNeverLogged(t *testing.T) {
+func TestValidateAndInstall_APIKeyIsNeverReported(t *testing.T) {
 	const secret = "super-secret-relay-key"
-	clearProvider(t)
-	resetInstallState(t)
-	buf := captureLogs(t)
-	t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
-	t.Setenv(EnvFlagsAPIKey, secret)
-	t.Setenv(EnvFlagsPollInterval, "also-broken") // force the warning path
-	t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
 
-	r := NewResolver(WithFlagKeys("k"))
-	_ = r.Value(0, false)
+	t.Run("not in the error from a neighbouring bad value", func(t *testing.T) {
+		clearProvider(t)
+		resetInstallState(t)
+		buf := captureLogs(t)
+		t.Setenv(EnvFlagsEndpoint, "relay:1031") // fails validation, and names itself
+		t.Setenv(EnvFlagsAPIKey, secret)
+		t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
 
-	if strings.Contains(buf.String(), secret) {
-		t.Fatalf("the API key appeared in a log line: %q", buf.String())
-	}
+		err := ValidateAndInstall()
+		if err == nil {
+			t.Fatalf("ValidateAndInstall() = nil for an endpoint with no scheme")
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("the API key appeared in an error: %v", err)
+		}
+		if strings.Contains(buf.String(), secret) {
+			t.Fatalf("the API key appeared in a log line: %q", buf.String())
+		}
+	})
+
+	t.Run("not on the install path", func(t *testing.T) {
+		clearProvider(t)
+		resetInstallState(t)
+		buf := captureLogs(t)
+		t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+		t.Setenv(EnvFlagsAPIKey, secret)
+		t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
+
+		mustValidate(t)
+
+		if strings.Contains(buf.String(), secret) {
+			t.Fatalf("the API key appeared in a log line: %q", buf.String())
+		}
+	})
 }
 
 func TestVersion(t *testing.T) {

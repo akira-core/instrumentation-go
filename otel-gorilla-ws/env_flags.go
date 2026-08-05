@@ -26,15 +26,10 @@ const flagKeyWSTracing = "otel-gorilla-ws-tracing"
 // that configures nothing traces nothing and negotiates nothing.
 const defaultWSTracing = false
 
-// Index into wsResolver's flag keys.
-const idxTracing = 0
-
 // wsResolver resolves this module's relay value through the process-global
 // OpenFeature client. It caches nothing, so a relay change reaches a live
 // connection on its very next operation.
-var wsResolver = otelflags.NewResolver(
-	otelflags.WithFlagKeys(flagKeyWSTracing),
-)
+var wsResolver = otelflags.NewResolver()
 
 // gateState carries everything about a connection's switches that is fixed at
 // construction, so no hot path reads an environment variable.
@@ -50,13 +45,20 @@ type gateState struct {
 	tracingLocal bool
 }
 
-// resolveGates resolves every static tier for one connection, collecting BOTH
-// configuration errors before returning either.
+// resolveGates resolves every static tier for one connection, collecting EVERY
+// configuration error before returning any of them.
+//
+// otelflags.ValidateAndInstall is part of the same read: it validates the
+// process-scoped provider variables this module never names, and performs the
+// one-time provider install. Doing it here rather than inside the first
+// evaluation keeps a provider initialisation off the hot path of a read or a
+// write.
 func resolveGates(cfg connOptions) (gateState, error) {
+	providerErr := otelflags.ValidateAndInstall()
 	masterLocal, masterErr := otelflags.MasterLocal()
 	tracingLocal, tracingErr := otelflags.ResolveLocal(cfg.featureEnabled, envWSTracingEnabled, defaultWSTracing)
 
-	if err := errors.Join(masterErr, tracingErr); err != nil {
+	if err := errors.Join(providerErr, masterErr, tracingErr); err != nil {
 		return gateState{}, err
 	}
 
@@ -90,5 +92,5 @@ func (g gateState) tracing() bool {
 		return g.masterLocal && g.tracingLocal
 	}
 	return otelflags.MasterEnabled(g.masterLocal) &&
-		wsResolver.Value(idxTracing, g.tracingLocal)
+		wsResolver.Value(flagKeyWSTracing, g.tracingLocal)
 }
