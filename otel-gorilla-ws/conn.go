@@ -138,10 +138,10 @@ func (c *Conn) Subprotocol() string {
 // the connection — offer or echo SubprotocolOTelWS. For handshake-side
 // negotiation, use Dial or Upgrader.Upgrade.
 //
-// It returns an error when the configuration is contradictory: supplying both
-// WithTracingEnabled and OTEL_INSTRUMENTATION_GO_TRACING_ENABLED yields
-// ErrTracingConfigConflict. NewConn is the entry point most likely to be
-// misconfigured, since it is the path for callers running their own handshake.
+// It returns an error when an OTEL_*_ENABLED variable this connection reads is
+// set to a value that is neither truthy nor falsy — including the empty string.
+// Supplying WithTracingEnabled alongside its paired variable is legal; the
+// variable wins.
 //
 // When capable and the relay verdict are on but otel-ws was not proven, local
 // send/receive spans may still be created without inject/extract.

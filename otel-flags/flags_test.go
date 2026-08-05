@@ -2,6 +2,7 @@ package otelflags
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
 	"strings"
@@ -32,6 +33,23 @@ func resetInstallState(t *testing.T) {
 	defer installMu.Unlock()
 	installDone = false
 	installEvalCtx = openfeature.EvaluationContext{}
+	explicitBind.Store(false)
+}
+
+// setDefaultProvider installs a provider in the DEFAULT slot — an application's
+// own feature flags, with no relation to this library — and restores the no-op
+// provider afterwards.
+func setDefaultProvider(t *testing.T, name string) {
+	t.Helper()
+	if err := openfeature.SetProviderAndWait(memprovider.NewInMemoryProvider(
+		map[string]memprovider.InMemoryFlag{name: boolFlag(true)})); err != nil {
+		t.Fatalf("SetProviderAndWait: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := openfeature.SetProviderAndWait(openfeature.NoopProvider{}); err != nil {
+			t.Fatalf("SetProviderAndWait(Noop): %v", err)
+		}
+	})
 }
 
 func TestLookup(t *testing.T) {
@@ -343,6 +361,181 @@ func TestRelayPossible(t *testing.T) {
 			t.Fatalf("RelayPossible() = true for a blank endpoint")
 		}
 	})
+
+	t.Run("a provider the application installed for its own flags does not count", func(t *testing.T) {
+		clearProvider(t)
+		resetInstallState(t)
+		setDefaultProvider(t, "checkout-experiment")
+
+		if RelayPossible() {
+			t.Fatalf("RelayPossible() = true with only a default provider installed; " +
+				"an application's own feature flags say nothing about the instrumentation switches")
+		}
+	})
+}
+
+// TestBoundToDomain is where the default-provider fallback is actually pinned.
+//
+// It tests the comparison rather than the two SDK calls that feed it, because
+// the row that matters most cannot be built through the SDK: the fallback fires
+// only while FlagDomain is unbound, and once any test binds it there is no way
+// to unbind it again. The rows are the full truth table of what
+// NamedProviderMetadata can return.
+func TestBoundToDomain(t *testing.T) {
+	const (
+		noop     = noopProviderName
+		business = "BusinessProvider"
+		ours     = "GO Feature Flag"
+	)
+	meta := func(name string) openfeature.Metadata { return openfeature.Metadata{Name: name} }
+
+	tests := []struct {
+		name  string
+		named string
+		def   string
+		want  bool
+	}{
+		{name: "nothing installed anywhere", named: noop, def: noop},
+		{name: "domain explicitly bound to the no-op provider", named: noop, def: business},
+
+		// The regression. With nothing bound to FlagDomain, NamedProviderMetadata
+		// returns the DEFAULT provider's metadata, so the application's business
+		// provider used to read back as a binding on our domain.
+		{name: "default provider only, echoed by the fallback", named: business, def: business},
+
+		{name: "application bound its own provider to the domain", named: business, def: noop, want: true},
+		{name: "application bound one to each slot", named: ours, def: business, want: true},
+		{name: "we auto-installed", named: ours, def: noop, want: true},
+
+		// The one surviving false negative: the same provider in both slots is
+		// indistinguishable from the fallback. InstallProvider closes it.
+		{name: "same provider in both slots reads as unbound", named: business, def: business},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := boundToDomain(meta(tc.named), meta(tc.def)); got != tc.want {
+				t.Fatalf("boundToDomain(named=%q, default=%q) = %v, want %v",
+					tc.named, tc.def, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestInstallProvider(t *testing.T) {
+	t.Run("binds the domain and records the choice", func(t *testing.T) {
+		clearProvider(t)
+		resetInstallState(t)
+		t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
+
+		if err := InstallProvider(memprovider.NewInMemoryProvider(
+			map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})); err != nil {
+			t.Fatalf("InstallProvider: %v", err)
+		}
+
+		if !RelayPossible() {
+			t.Fatalf("RelayPossible() = false after InstallProvider")
+		}
+		r := NewResolver(WithFlagKeys("k"))
+		if !r.Value(0, false) {
+			t.Fatalf("Value(0, false) = false; the installed provider must decide")
+		}
+	})
+
+	t.Run("the record survives a provider that reads back as the default", func(t *testing.T) {
+		clearProvider(t)
+		resetInstallState(t)
+		setDefaultProvider(t, "checkout-experiment")
+		t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
+
+		// Same provider type in both slots — the heuristic alone reads this as
+		// unbound. The explicit record is what makes it exact.
+		if err := InstallProvider(memprovider.NewInMemoryProvider(
+			map[string]memprovider.InMemoryFlag{"k": boolFlag(true)})); err != nil {
+			t.Fatalf("InstallProvider: %v", err)
+		}
+		if !RelayPossible() {
+			t.Fatalf("RelayPossible() = false after an explicit install; the record must outrank the heuristic")
+		}
+	})
+
+	t.Run("a nil provider is an error, not a panic", func(t *testing.T) {
+		if err := InstallProvider(nil); err == nil {
+			t.Fatalf("InstallProvider(nil) = nil, want an error")
+		}
+	})
+}
+
+func TestAutoInstall_ProceedsWhenOnlyADefaultProviderExists(t *testing.T) {
+	clearProvider(t)
+	resetInstallState(t)
+	setDefaultProvider(t, "checkout-experiment")
+	t.Setenv(EnvFlagsEndpoint, unreachableEndpoint)
+	t.Cleanup(func() { clearProvider(t); resetInstallState(t) })
+
+	r := NewResolver(WithFlagKeys("k"))
+	_ = r.Value(0, false)
+
+	// The operator set the endpoint. Standing down for a provider the application
+	// installed for its own flags would leave that endpoint with nothing behind
+	// it, and every instrumentation key evaluated against the business provider.
+	if got := openfeature.NamedProviderMetadata(FlagDomain).Name; got == noopProviderName {
+		t.Fatalf("no provider installed on %q; an unrelated default provider must not "+
+			"stand the auto-install down", FlagDomain)
+	}
+}
+
+// --- the startup window ----------------------------------------------------
+
+// notReadyProvider models a provider between registration and its first
+// successful fetch: bound, but with nothing to say.
+type notReadyProvider struct{ openfeature.NoopProvider }
+
+func (notReadyProvider) Metadata() openfeature.Metadata {
+	return openfeature.Metadata{Name: "NotReadyProvider"}
+}
+
+func (notReadyProvider) BooleanEvaluation(_ context.Context, _ string, defaultValue bool,
+	_ openfeature.FlattenedContext,
+) openfeature.BoolResolutionDetail {
+	return openfeature.BoolResolutionDetail{
+		Value: defaultValue,
+		ProviderResolutionDetail: openfeature.ProviderResolutionDetail{
+			ResolutionError: openfeature.NewProviderNotReadyResolutionError("first fetch has not completed"),
+			Reason:          openfeature.ErrorReason,
+		},
+	}
+}
+
+// TestValue_NotReadyProviderLeavesLocalInCharge pins the startup window's
+// contract in BOTH directions.
+//
+// Between a non-blocking install and the provider's first successful fetch,
+// every switch resolves to its local value. That is fail-safe for enabling — the
+// window can delay a relay-driven enable but never introduce one — and it is
+// deliberately NOT fail-safe for disabling: a relay value of false does not
+// survive a restart, because a provider with nothing to say must not be able to
+// veto. Reading not-ready as "disabled" would apply to the master key too, whose
+// local default is true, so every restart of every relay-configured process
+// would be fully vetoed until its first fetch, and indefinitely while the relay
+// is down. Durable state belongs in the environment variable.
+func TestValue_NotReadyProviderLeavesLocalInCharge(t *testing.T) {
+	if err := openfeature.SetNamedProviderAndWait(FlagDomain, notReadyProvider{}); err != nil {
+		t.Fatalf("SetNamedProviderAndWait: %v", err)
+	}
+	t.Cleanup(func() { clearProvider(t) })
+
+	r := NewResolver(WithFlagKeys("k"))
+	for _, local := range []bool{true, false} {
+		if got := r.Value(0, local); got != local {
+			t.Fatalf("Value(0, %v) = %v before the provider's first fetch; the local value must stand", local, got)
+		}
+	}
+
+	if got := MasterEnabled(true); !got {
+		t.Fatalf("MasterEnabled(true) = false before the provider's first fetch; "+
+			"a provider with nothing to say must not veto the master (got %v)", got)
+	}
 }
 
 // --- provider auto-install -------------------------------------------------

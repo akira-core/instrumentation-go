@@ -59,13 +59,27 @@ Set three environment variables and nothing else:
 | `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` | optional; Go duration strings only, default `60s`. A malformed value warns, falls back and still installs |
 | `OTEL_SERVICE_NAME` | optional; supplies a `service.name` targeting attribute, on this path only |
 
-The install fires only when the application has installed no provider of its own, and registers a **named** provider on `otel-instrumentation-go`. `DataCollectorDisabled: true` and in-process evaluation are hardcoded, so the zero-code path cannot be misconfigured into the stall those two settings otherwise cause during a relay outage.
+The install fires only when the application has bound no provider to `otel-instrumentation-go`, and registers a **named** provider on that domain. `DataCollectorDisabled: true` and in-process evaluation are hardcoded, so the zero-code path cannot be misconfigured into the stall those two settings otherwise cause during a relay outage.
 
-An application that installs its own provider keeps it, and must do so **before constructing any wrapper** — `RelayPossible` is resolved at construction, and a wrapper built earlier resolves statically for the rest of its life.
+A provider the application installed in the **default** slot — its own feature flags — is not treated as a relay for these switches: it does not make `RelayPossible()` true, it never has an instrumentation key evaluated against it, and it does not stand this install down.
+
+## Installing your own provider
+
+```go
+if err := otelflags.InstallProvider(provider); err != nil {
+    slog.Warn("feature flag provider registration failed", "error", err)
+}
+```
+
+`InstallProvider` binds any OpenFeature provider to `FlagDomain`, waits for it to initialise — so there is no startup window — and records that this process installed one. That record is what makes detection exact: `openfeature.NamedProviderMetadata` falls back to the default provider's metadata when the domain is unbound, so a heuristic alone cannot distinguish an application that bound the same provider to both slots.
+
+Raw `openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, p)` remains supported and is still detected.
+
+Install **before constructing any wrapper** — `RelayPossible` is resolved at construction, and a wrapper built earlier resolves statically for the rest of its life.
 
 ## Things worth knowing
 
 - **A flag change is not immediate.** End-to-end latency is the provider's poll interval, 60 s by default. This module adds none of its own.
-- **An instrumented operation makes two evaluations** (three on a Mongo write), at roughly 2 µs and 7 allocations each. Nothing is cached; a cache would fit inside `Resolver` without changing `Value`'s signature.
+- **An instrumented operation makes two evaluations** (three on a Mongo write), and pays for them whatever the flag's value — only a process where no relay is possible skips the pipeline. Order of magnitude on developer hardware: single-digit microseconds each; this repository ships no benchmark, so measure on your own workload. Nothing is cached; a cache would fit inside `Resolver` without changing `Value`'s signature.
 - **This module never touches the default provider**, the global evaluation context, hooks or shutdown — the same rule the instrumentation packages follow for `TracerProvider`.
 - **Nothing shuts the auto-installed provider down.** One poller goroutine per process, ending with the process. An application needing lifecycle control installs its own provider.

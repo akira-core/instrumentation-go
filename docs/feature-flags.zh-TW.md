@@ -159,8 +159,10 @@ propagation 開啟時,`InsertOne`、`InsertMany`、`ReplaceOne`、`UpdateOne`、
    選項排在它之下的原因。
 3. **預設值 `false`。** 所有來源都沉默時,永遠不會啟用它。必須有東西明確說 `true`:一個選項、一個變數,
    或某人建立的 relay flag——而 relay 設定是由你自己的站台撰寫的。
-4. **沒有 relay 就搆不到。** 一個既沒設 `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT`、應用程式也沒安裝
-   provider 的 process,relay 根本觸及不到——見[先安裝 provider,再建構 wrapper](#先安裝-provider再建構-wrapper)。
+4. **沒有 relay 就搆不到。** 一個既沒設 `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT`、也沒有任何 provider
+   綁定到 `otelflags.FlagDomain` 的 process,relay 根本觸及不到——見
+   [先安裝 provider,再建構 wrapper](#先安裝-provider再建構-wrapper)。你為應用程式自己的旗標安裝的
+   provider 不算數。
 
 ## otel-gorilla-ws:negotiation 是交握時的既成事實
 
@@ -236,20 +238,48 @@ provider, err := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{
 })
 if err != nil {
     slog.Warn("feature flag provider unavailable; switches are environment-only", "error", err)
-} else if err := openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, provider); err != nil {
+} else if err := otelflags.InstallProvider(provider); err != nil {
     // 記 log 後繼續:relay 是控制平面,不是前置條件。
     slog.Warn("feature flag provider registration failed", "error", err)
 }
 ```
 
-要綁**具名** domain `otel-instrumentation-go`(`otelflags.FlagDomain`),不是預設 provider。這麼做之後,
+`otelflags.InstallProvider` 會綁定**具名** domain `otel-instrumentation-go`(`otelflags.FlagDomain`)、
+等待 provider 完成初始化,並記錄「這個 process 刻意給了 instrumentation 開關一個 relay」。呼叫它之後,
 零程式碼安裝會自動讓位,provider 的生命週期由你擁有。
+
+provider **不必是 GO Feature Flag** —— 任何 OpenFeature provider 都可以。這就是 embedding SDK 用來完整
+掌管初始化、evaluation context、logger 與 shutdown 的接縫;見
+[Embedding SDK:自己擁有 provider](#embedding-sdk自己擁有-provider)。
+
+`openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, provider)` 仍然可用,也仍然偵測得到。優先用
+`InstallProvider` 只有一個理由:要偵測一個原生綁定,就得問 OpenFeature SDK「哪個 provider 綁在這個 domain
+上」,而那個問題沒有精確答案(見下);`InstallProvider` 記下的東西則是精確的。
+
+**永遠不要為了這個目的去綁預設 provider。** 你用 `openfeature.SetProvider` 安裝的 provider —— 你應用程式
+自己的旗標 —— 刻意**不會**被當成 instrumentation 開關的 relay:它不會讓 `RelayPossible()` 為真、不會導致
+instrumented 實作被建構,也永遠不會有 instrumentation key 拿去對它評估。
+
+### Embedding SDK:自己擁有 provider
+
+如果你發布的 SDK 包住這些模組,而且想自己擁有 OpenFeature 的生命週期、而非繼承零程式碼路徑,就在你自己的
+初始化流程裡用 `otelflags.InstallProvider` 安裝任何你想要的 provider,並在建構任何 wrapper 之前完成。
+從那一刻起:
+
+- **初始化、logger、輪詢週期與 shutdown 都是你的。** 本 library 什麼都不安裝,也永遠不會對一個不是自己
+  安裝的 provider 呼叫 `Shutdown`。
+- **evaluation context 是你的。** 本 library 只在零程式碼的自動安裝路徑上附加 `service.name` targeting
+  屬性;當 provider 由你擁有時,它傳入的是空的 invocation context,所以你用
+  `openfeature.SetEvaluationContext` 設的 API 級全域 context 會原封不動地進入每一次評估。見
+  [只針對單一服務而非整個艦隊](#只針對單一服務而非整個艦隊)。
+- **預設 provider 兩個方向都不受影響。** 你應用程式自己的旗標繼續由你綁在預設槽位上的東西解析,而那個
+  provider 永遠不會被問到任何一個 instrumentation key。
 
 ### 先安裝 provider,再建構 wrapper
 
-「relay 是否可能存在」是在**建構 wrapper 時解析一次**的——endpoint 有設,或已經有 provider 綁定。在這兩件
-事都還不成立時建構的 wrapper,終其一生都從自己的環境變數與選項解析,**永遠不會去問 relay**,即使你下一刻
-就安裝了 provider。
+「relay 是否可能存在」是在**建構 wrapper 時解析一次**的——endpoint 有設,或已經有 provider 綁定到
+`otelflags.FlagDomain`。在這兩件事都還不成立時建構的 wrapper,終其一生都從自己的環境變數與選項解析,
+**永遠不會去問 relay**,即使你下一刻就安裝了 provider。
 
 所以:先安裝 provider,**再**建構你的 client 與連線。走零程式碼路徑的應用程式不受影響,因為 endpoint
 變數在 process 啟動前就存在了。
@@ -282,9 +312,24 @@ provider 的 data collector 預設開啟。它每次評估都往一個有上限�
 零程式碼安裝是非阻塞的,所以從安裝到 provider 第一次成功抓取之間,每個開關都解析為它的**本地**值——
 環境變數、選項、預設值。
 
-這是 fail-safe 的。這個視窗可能延遲一次 relay 驅動的**啟用**;它永遠不可能引入一次啟用,而對 `otel-mongo`
-而言,它永遠不可能寫入一個你的部署沒有設定過的 `_oteltrace` 欄位。若你希望第一個操作之前就拿到 relay 的
-答案,用 `SetProviderAndWait` 安裝你自己的 provider,那也會讓零程式碼安裝讓位。
+對**啟用**而言這是 fail-safe 的。這個視窗可能延遲一次 relay 驅動的啟用;它永遠不可能引入一次啟用,而對
+`otel-mongo` 而言,它永遠不可能寫入一個你的部署沒有設定過的 `_oteltrace` 欄位。
+
+**對關閉而言則不是,而且這是刻意的:relay 的 `false` 不會跨重啟延續。** 如果你的部署裡有
+`OTEL_NATS_TRACING_ENABLED=true`、而你在 relay 上把該模組關掉,重啟後的 process 會再次 trace,直到它第一次
+成功抓取為止 —— relay 不可達時則是無限期。
+
+這個不對稱是設計決定,不是疏漏。把「provider 尚未就緒」讀成 `false` 會逐 key 生效,而 master key 的本地
+預設值是 `true`,所以每一個配置了 relay 的 process 每次重啟都會被**完全否決**,直到它第一次抓取;relay
+停機多久就黑多久。控制平面不該變成可用性的相依,而一個沒有資料的來源也不該勝過部署明確寫下的值。
+
+所以:**relay 是 runtime 控制;持久狀態屬於環境變數。** 事故煞車的正確程序是兩步,順序不可顛倒:
+
+1. 翻動 relay 旗標。它會在輪詢週期內對所有執行中的 process 生效。
+2. 在任何重啟發生之前,把同一個值落進部署的環境變數。兩邊一致之後,這個視窗就無害了。
+
+若你希望第一個操作之前就拿到 relay 的答案,用 `otelflags.InstallProvider` 安裝你自己的 provider —— 它會
+等待初始化完成,也會讓零程式碼安裝讓位。
 
 ### 只支援 in-process 評估
 
@@ -306,7 +351,30 @@ otel-mongo-tracing:
 ```
 
 沒有它的話,一個 relay flag 會套用到**該 relay 服務的每一個 process**——在 flag 能夠啟用之後,這件事更
-重要了。這個屬性只在零程式碼路徑上提供;若你自己安裝 provider,請自行設定全域 evaluation context。
+重要了。
+
+**如果你是用程式碼而非環境變數設定 `service.name`**,那個值靠它自己到不了本 library。OpenTelemetry 的
+Resource 由環境建構、從不回寫環境,而且 `TracerProvider` 介面與 SDK 的具體型別都沒有提供讀回 Resource 的
+方法。所以你在 Go 程式碼裡傳入的 `service.name`,在設計上就對這裡不可見。兩種補法:
+
+- **由你擁有 provider**(SDK 通常的答案):設定一次 API 級的全域 evaluation context,它就會進入本 library
+  的每一次評估。這裡不會覆寫它 —— 走這條路時 library 傳入的是空的 invocation context。
+
+  ```go
+  openfeature.SetEvaluationContext(openfeature.NewTargetlessEvaluationContext(
+      map[string]any{"service.name": "checkout-api"}))
+  ```
+
+- **你走零程式碼路徑**:在你自己的初始化流程裡、第一個被 instrument 的操作之前,用同一個值設定
+  `OTEL_SERVICE_NAME`。只在它不存在時才設,可以讓明確設定過它的部署繼續作主。
+
+  ```go
+  if _, ok := os.LookupEnv("OTEL_SERVICE_NAME"); !ok {
+      os.Setenv("OTEL_SERVICE_NAME", serviceName)
+  }
+  ```
+
+本 library 只在零程式碼路徑上提供這個屬性。
 
 不支援 per-request targeting。resolver 不持有任何 request 狀態。
 
@@ -327,7 +395,7 @@ otel-mongo-tracing:
 
 ## 解析的成本
 
-每次評估約 **2 µs、336 B、7 次配置**,而一次被 instrument 的操作不只評估一次:
+一次被 instrument 的操作不只評估一次:
 
 | 模組 | 每次被 instrument 的操作評估幾次 |
 |---|---|
@@ -335,14 +403,42 @@ otel-mongo-tracing:
 | `otel-mongo` 讀取 | 2 —— master、tracing |
 | `otel-mongo` 寫入 | 3 —— master、tracing、propagation |
 
-那是 OpenFeature SDK 的評估流水線——hook 鏈、evaluation context 合併、provider registry 的鎖——而不是
+**數量級上,在開發機上一次評估約是個位數微秒與少量記憶體配置** —— 本 repo 沒有附上對應的 benchmark,
+所以請把它當成形狀而非數字,規劃容量前先在你自己的工作負載上量測。
+
+成本來自 OpenFeature SDK 的評估流水線——hook 鏈、evaluation context 合併、provider registry 的鎖——而不是
 查 flag 本身,所以把設定放在記憶體裡也不會讓它變便宜。對 Mongo 的一次往返來說是雜訊;對 NATS publish
-來說不是,它本來就已經為建立一個 span 付出 1–3 µs。
+來說不是,它建立一個 span 的成本本來就在同一個量級。要注意的是,**這個成本與旗標的值無關**:一條 relay
+搆得到、但模組旗標為 `false` 的連線,每次操作照樣評估;只有「relay 不可能存在」的 process 才會整條流水線
+都跳過。
 
 **沒有配置 relay 的 process 一毛都不用付**,也不會配置它搆不到的 instrumented 實作。
 
 刻意不做快取:快取會讓一次 flag 改動比輪詢間隔所暗示的更晚生效。它藏在一個不會變的內部簽名後面,所以
 若某天真實工作負載的 benchmark 顯示有必要,可以在不影響任何 API 的情況下加上去。理由記錄在設計文件裡。
+
+## 旗標管不到什麼
+
+這些開關管的是**本 library 的 instrumentation 路徑**,除此之外什麼都不管。有四條邊界值得明說,因為每一條
+都曾被當成 bug:
+
+**關掉一個模組會停掉 trace context 的傳遞,不只是 span。** disabled 路徑不會把 `traceparent` 注入 NATS
+header、WebSocket envelope 或 Mongo document,也不會在進入時抽取。分散式 trace 因此**在該邊界斷鏈**:
+對面的工作會開一條新的 trace,而不是接續你的。若你想在 library 被靜音時仍保留 trace 串接,`otel-mongo`
+明確支援 —— 見[什麼沒有被 gate](#什麼沒有被-gate)。
+
+**打開一個模組不可能產生你的應用程式並未匯出的遙測。** wrapper 用的是你給它的 `TracerProvider`,或全域
+的那個。如果那是 no-op provider —— 因為應用程式從未設定 OTel SDK,或設定成關閉 —— relay 驅動的啟用改變的
+是哪條程式路徑在跑、成本多少,但永遠不會有 span 被匯出。啟用 instrumentation 與啟用匯出是兩個獨立決定,
+relay 只做得到第一個。
+
+**master 旗標只管這些模組。** `otel-instrumentation-go-tracing` 會停掉本 repo 裡的每一個 instrumentation
+模組。它對 embedding SDK 自己的 provider、它的其他整合、你應用程式的 feature flag,或你的匯出管線,
+都沒有任何作用。
+
+**handshake 無法重來。** 對 `otel-gorilla-ws` 而言,啟用只影響之後才建立的連線,而停用會停掉 span 與
+inject/extract 但不會停掉 envelope。見
+[otel-gorilla-ws:negotiation 是交握時的既成事實](#otel-gorilla-wsnegotiation-是交握時的既成事實)。
 
 ## Per-connection 選項
 
@@ -366,12 +462,14 @@ otel-mongo-tracing:
 **要立刻打開一個模組:** 把它的 relay flag 設成 `true`,在輪詢間隔內生效。對 `otel-gorilla-ws` 而言,
 這只會影響之後才建立的連線。
 
-**要立刻關掉一個模組:** 把它的 relay flag 設成 `false`。有兩個限制要知道:
+**要立刻關掉一個模組:** 把它的 relay flag 設成 `false`。有四個限制要知道:
 
+- 它停掉的是 **trace context 傳遞與 span 兩者**,所以分散式 trace 會在該邊界斷鏈;見「旗標管不到什麼」。
 - 它不會停掉 `ContextFromDocument` / `ContextFromRawDocument`,那兩個依設計就沒有 gate;
   見「什麼沒有被 gate」。
 - 對 `otel-gorilla-ws`,它會停掉 span 與 inject/extract,但**不會**停掉 JSON envelope,所以線路成本
   要等連線重連才會消失。
+- 它不會跨重啟延續。請把同一個值落進環境變數;見「啟動視窗」。
 
 **要停掉整個艦隊:** 把 `otel-instrumentation-go-tracing` 設成 `false`。它底下的任何東西都逃不掉,
 包含那些在 Go 程式碼裡傳了選項的連線。

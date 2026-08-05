@@ -80,7 +80,7 @@ relay **兩個方向都有權威**。安全性來自預設值:總開關 `OTEL_IN
 
 上述有效功能旗標控制 tracing 是否運作。至於 wire envelope 是否寫入/讀取，則取決於**建立 `Conn` 的建構子**（以及 Dial/Upgrade 是否協商到 otel-ws）：
 
-- **`NewConn(rawConn, opts...) (*Conn, error)`** 包裝你自己已經 dial/upgrade 好的 `*websocket.Conn`。**只有在原始連線協商出的 subprotocol 證明了 `otel-ws` 時**才啟用 envelope wrapping —— 在你的 handshake 裡提出或回應 `SubprotocolOTelWS`,並用 `IsOTelNegotiated(raw)` 驗證。設定矛盾時回傳錯誤(`ErrTracingConfigConflict`)。
+- **`NewConn(rawConn, opts...) (*Conn, error)`** 包裝你自己已經 dial/upgrade 好的 `*websocket.Conn`。**只有在原始連線協商出的 subprotocol 證明了 `otel-ws` 時**才啟用 envelope wrapping —— 在你的 handshake 裡提出或回應 `SubprotocolOTelWS`,並用 `IsOTelNegotiated(raw)` 驗證。它讀取的 `OTEL_*_ENABLED` 變數若持有既非真值也非假值的內容,回傳錯誤(包裝 `otelflags.ErrInvalidFlagValue`)。
 - **`Dial(ctx, urlStr, requestHeader, subprotocols, opts...)`** 是符合規格的 client 進入點。它會在 handshake 中注入 `otel-ws` subprotocol；只有當伺服器以 `otel-ws`/`otel-ws+<proto>` subprotocol 確認支援時，才會啟用 envelope wrapping。
 - **`Upgrader{}.Upgrade(w, r, responseHeader)`** 是符合規格的 server 進入點（對應 `websocket.Upgrader.Upgrade`）。它會偵測 client 提出的 subprotocol 清單中是否含有 `otel-ws`，並以 `otel-ws`/`otel-ws+<proto>` 回應；只有在此接受路徑下才會啟用 envelope wrapping。
 

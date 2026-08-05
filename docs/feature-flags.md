@@ -181,9 +181,10 @@ and a site that cannot accept the risk uses one of them:
 3. **The default of `false`.** Absence in every source can never enable it. Something must
    deliberately say `true`: an option, a variable, or a relay flag that somebody created — and the
    relay configuration is written by your own site.
-4. **No relay, no reach.** A process with no `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` and no
-   application-installed provider cannot be reached by a relay at all — see
-   [Install your provider first](#install-your-provider-before-constructing-wrappers).
+4. **No relay, no reach.** A process with no `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` and no provider
+   bound to `otelflags.FlagDomain` cannot be reached by a relay at all — see
+   [Install your provider first](#install-your-provider-before-constructing-wrappers). A provider you
+   installed for your application's own flags does not count.
 
 ## otel-gorilla-ws: negotiation is a handshake fact
 
@@ -268,21 +269,53 @@ provider, err := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{
 })
 if err != nil {
     slog.Warn("feature flag provider unavailable; switches are environment-only", "error", err)
-} else if err := openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, provider); err != nil {
+} else if err := otelflags.InstallProvider(provider); err != nil {
     // Log and continue: the relay is a control plane, not a prerequisite.
     slog.Warn("feature flag provider registration failed", "error", err)
 }
 ```
 
-Bind the **named** domain `otel-instrumentation-go` (`otelflags.FlagDomain`), not the default
-provider. When you do, the zero-code install stands down and you own the provider's lifecycle.
+`otelflags.InstallProvider` binds the **named** domain `otel-instrumentation-go`
+(`otelflags.FlagDomain`), waits for the provider to finish initialising, and records that this
+process deliberately gave the instrumentation switches a relay. When you call it, the zero-code
+install stands down and you own the provider's lifecycle.
+
+The provider does not have to be GO Feature Flag — any OpenFeature provider works. This is the seam
+an embedding SDK uses to own initialisation, evaluation context, logger and shutdown outright; see
+[Embedding SDKs](#embedding-sdks-owning-the-provider-yourself).
+
+`openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, provider)` still works and is still
+detected. `InstallProvider` is preferred for one reason: detecting a raw binding means asking the
+OpenFeature SDK which provider is bound to a domain, and that question has no exact answer (see
+below), whereas the record `InstallProvider` keeps is exact.
+
+**Never bind the default provider for this purpose.** A provider you installed with
+`openfeature.SetProvider` — your application's own flags — is deliberately **not** treated as a relay
+for the instrumentation switches. It does not make `RelayPossible()` true, it does not cause the
+instrumented implementation to be built, and it never has instrumentation keys evaluated against it.
+
+### Embedding SDKs: owning the provider yourself
+
+If you ship an SDK that wraps these modules and want to own the OpenFeature lifecycle rather than
+inherit the zero-code path, install any provider you like with `otelflags.InstallProvider` during
+your own initialisation, before you construct any wrapper. From then on:
+
+- **Initialisation, logger, poll interval and shutdown are yours.** This library installs nothing,
+  and it never calls `Shutdown` on a provider it did not install.
+- **The evaluation context is yours.** The library attaches a `service.name` targeting attribute
+  *only* on the zero-code auto-install path; when you own the provider it passes an empty invocation
+  context, so an API-level global context you set with `openfeature.SetEvaluationContext` reaches
+  every evaluation unaltered. See [Targeting](#targeting-one-service-instead-of-the-fleet).
+- **The default provider is untouched, in both directions.** Your application's own flags keep
+  resolving through whatever you bound to the default slot, and that provider is never asked about an
+  instrumentation key.
 
 ### Install your provider before constructing wrappers
 
 Whether a relay can exist is resolved **once, when a wrapper is constructed** — an endpoint is
-configured, or a provider is already bound. A wrapper built before either is true resolves from its
-environment and options for the rest of its life and **never consults the relay**, even if you
-install a provider a moment later.
+configured, or a provider is bound to `otelflags.FlagDomain`. A wrapper built before either is true
+resolves from its environment and options for the rest of its life and **never consults the relay**,
+even if you install a provider a moment later.
 
 So: install the provider, *then* construct your clients and connections. Applications using the
 zero-code path are unaffected, since the endpoint variable exists before the process starts.
@@ -318,10 +351,30 @@ fetched configuration, and no evaluation performs network I/O.
 The zero-code install is non-blocking, so between it and the provider's first successful fetch every
 switch resolves to its **local** value — environment, option, default.
 
-This is fail-safe. The window can delay a relay-driven *enable*; it can never introduce one, and for
-`otel-mongo` it can never write an `_oteltrace` field your deployment did not configure. If you want
-the relay's answer before the first operation, install your own provider with `SetProviderAndWait`,
-which also makes the zero-code install stand down.
+For *enabling* this is fail-safe. The window can delay a relay-driven enable; it can never introduce
+one, and for `otel-mongo` it can never write an `_oteltrace` field your deployment did not configure.
+
+**For disabling it is not, and that is deliberate: a relay `false` does not survive a restart.** If
+`OTEL_NATS_TRACING_ENABLED=true` is in your deployment and you turned the module off on the relay, a
+restarted process traces again until its first successful fetch — and indefinitely if the relay is
+unreachable.
+
+That asymmetry is a design decision, not an oversight. Reading "provider not ready" as `false` would
+apply per key, and the master key's local default is `true`, so every restart of every
+relay-configured process would be **fully vetoed** until its first fetch, and stay dark for as long as
+the relay was down. A control plane must not become an availability dependency, and a source with no
+data must not outrank one the deployment wrote down.
+
+So: **the relay is runtime control; durable state belongs in the environment variable.** The
+incident-brake procedure is two steps, in this order:
+
+1. Flip the relay flag. It takes effect within the poll interval, on every running process.
+2. Land the same value in the deployment's environment variable, before anything restarts. Once both
+   agree, the window is harmless.
+
+If you want the relay's answer before the first operation, install your own provider with
+`otelflags.InstallProvider`, which waits for initialisation and also makes the zero-code install
+stand down.
 
 ### In-process evaluation only
 
@@ -344,8 +397,34 @@ otel-mongo-tracing:
 ```
 
 Without it, a relay flag applies to **every process the relay serves** — which matters more now that
-a flag can enable. The attribute is supplied only on the zero-code path; if you install your own
-provider, set a global evaluation context yourself.
+a flag can enable.
+
+**If you set `service.name` programmatically rather than through the environment**, that value cannot
+reach this library on its own. OpenTelemetry's Resource is built from the environment, never written
+back to it, and neither the `TracerProvider` interface nor the SDK's concrete type exposes a way to
+read a Resource back. So a `service.name` you passed in Go code is, by construction, invisible here.
+Two ways to close the gap:
+
+- **You own the provider** (the usual answer for an SDK): set an API-level global evaluation context
+  once, and it reaches every evaluation this library makes. Nothing here overrides it — on that path
+  the library passes an empty invocation context.
+
+  ```go
+  openfeature.SetEvaluationContext(openfeature.NewTargetlessEvaluationContext(
+      map[string]any{"service.name": "checkout-api"}))
+  ```
+
+- **You use the zero-code path**: set `OTEL_SERVICE_NAME` from the same value during your own
+  initialisation, before the first instrumented operation. Setting it only when it is absent leaves a
+  deployment that configured it explicitly in charge.
+
+  ```go
+  if _, ok := os.LookupEnv("OTEL_SERVICE_NAME"); !ok {
+      os.Setenv("OTEL_SERVICE_NAME", serviceName)
+  }
+  ```
+
+The attribute is supplied by this library only on the zero-code path.
 
 Per-request targeting is not supported. The resolver holds no request state.
 
@@ -367,8 +446,7 @@ poll is a conditional `GET` that returns 304 when nothing changed, so tightening
 
 ## What resolution costs
 
-Roughly **2 µs, 336 B and 7 allocations per evaluation**, and an instrumented operation makes more
-than one:
+An instrumented operation makes more than one evaluation:
 
 | Module | Evaluations per instrumented operation |
 |---|---|
@@ -376,10 +454,16 @@ than one:
 | `otel-mongo` read | 2 — master, tracing |
 | `otel-mongo` write | 3 — master, tracing, propagation |
 
-That is the OpenFeature SDK's evaluation pipeline — hook chains, evaluation-context merging, the
+**Order of magnitude, on developer hardware, one evaluation costs single-digit microseconds and a
+handful of allocations** — this repository ships no benchmark for it, so treat that as a shape rather
+than a number and measure on your own workload before planning capacity around it.
+
+The cost is the OpenFeature SDK's evaluation pipeline — hook chains, evaluation-context merging, the
 provider registry lock — not the flag lookup, so keeping the configuration in memory does not make it
-cheaper. Against a Mongo round trip it is noise; against a NATS publish, which already pays 1–3 µs to
-create a span, it is not.
+cheaper. Against a Mongo round trip it is noise; against a NATS publish, which already pays a
+comparable amount to create a span, it is not. Note that the cost is paid **whatever the flag's
+value**: a relay-reachable connection whose module flag is `false` still evaluates on every
+operation, and only a process where no relay is possible skips the pipeline entirely.
 
 **A process with no relay configured pays none of it**, and allocates no instrumented implementation
 it cannot reach.
@@ -388,6 +472,31 @@ Nothing is cached, deliberately: a cache would make a flag change take effect la
 interval already implies. It sits behind an unchanged internal signature, so it can be added without
 affecting any API if a benchmark on a real workload shows it matters. The reasoning is recorded in
 the design document.
+
+## What the flags do not control
+
+The switches govern **this library's instrumentation path**, and nothing else. Four boundaries are
+worth stating outright, because each one has been mistaken for a bug:
+
+**Turning a module off stops trace-context propagation, not only spans.** The disabled path does not
+inject `traceparent` into NATS headers, WebSocket envelopes or Mongo documents, and does not extract
+it on the way in. A distributed trace therefore **breaks at that boundary**: work on the far side
+starts a new trace rather than continuing yours. If you want to keep trace linking while the library
+is silenced, `otel-mongo` supports it explicitly — see [What is not gated](#what-is-not-gated).
+
+**Turning a module on cannot create telemetry your application is not exporting.** The wrappers use
+the `TracerProvider` you give them, or the global one. If that is a no-op provider — because the
+application never configured the OTel SDK, or configured it off — a relay-driven enable changes which
+code path runs and what it costs, but no span is ever exported. Enabling instrumentation and
+enabling export are two separate decisions, and the relay only makes the first one.
+
+**The master flag governs these modules only.** `otel-instrumentation-go-tracing` stops every
+instrumentation module in this repository. It has no effect on an embedding SDK's own provider, its
+other integrations, your application's feature flags, or your export pipeline.
+
+**A handshake cannot be revisited.** For `otel-gorilla-ws`, enabling reaches only connections opened
+afterwards, and disabling stops spans and inject/extract but not the envelope. See
+[otel-gorilla-ws](#otel-gorilla-ws-negotiation-is-a-handshake-fact).
 
 ## Per-connection options
 
@@ -415,12 +524,16 @@ can coexist in one process.
 **To turn a module on right now:** set its relay flag to `true`. It takes effect within the poll
 interval. For `otel-gorilla-ws` this reaches only connections opened afterwards.
 
-**To turn a module off right now:** set its relay flag to `false`. Two limits to know:
+**To turn a module off right now:** set its relay flag to `false`. Four limits to know:
 
+- It stops **trace-context propagation as well as spans**, so distributed traces break at that
+  boundary; see *What the flags do not control*.
 - It does not stop `ContextFromDocument` / `ContextFromRawDocument` — those are ungated by design;
   see *What is not gated*.
 - For `otel-gorilla-ws` it stops spans and inject/extract but **not** the JSON envelope, so the wire
   overhead remains until the connection is cycled.
+- It is not durable across a restart. Land the same value in the environment variable; see
+  *The startup window*.
 
 **To stop everything in a fleet:** set `otel-instrumentation-go-tracing` to `false`. Nothing below it
 can escape that, including connections whose Go code passed an option.

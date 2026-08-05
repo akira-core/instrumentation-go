@@ -15,7 +15,9 @@ The OpenFeature Go SDK is at v1.17.2. Its relevant surface:
 - `openfeature.SetProviderAndWait(p)` installs a process-global **default** provider; `SetNamedProvider(domain, p)` installs one scoped to a domain, which takes precedence over the default for clients bound to that domain.
 - `openfeature.NewClient(domain)` returns a client that resolves through the named provider for `domain` when one exists and falls back to the default otherwise.
 - `client.Boolean(ctx, key, defaultValue, evalCtx)` returns `defaultValue` on any error — including when no provider was ever installed, since the SDK's default is a no-op provider. **This is the whole precedence mechanism** (D2).
-- `openfeature.ProviderMetadata().Name` reports the installed default provider's identity, and `openfeature.NamedProviderMetadata(domain).Name` reports the provider bound to a domain, **falling back to the default's metadata when none is bound** (`openfeature_api.go:178-181`). Either reads back `"NoopProvider"` exactly when nothing has been installed, which makes them a reliable "has the application configured a provider?" test; D7 and D17 both use the named form.
+- `openfeature.ProviderMetadata().Name` reports the installed default provider's identity, and `openfeature.NamedProviderMetadata(domain).Name` reports the provider bound to a domain, **falling back to the default's metadata when none is bound** (`openfeature_api.go:174-184`). That fallback makes the named form a test for "has the application configured *any* provider?" and **not** for "is one bound to our domain?" — a distinction D7 and D17 originally missed; see D22.
+- There is no public API that answers the domain question exactly. `GetNamedProviders()` exists on the unexported `evaluationImpl` interface (`interfaces.go:64`) and is reachable by structural type assertion, but it returns the live map without copying (`openfeature_api.go:187-192`), so reading the result races a concurrent `SetNamedProvider` and can take the process down with `concurrent map read and map write`. It is not usable from a library.
+- `ForEvaluation(clientName)` also falls back to the default provider when nothing is bound to the domain (`openfeature_api.go:281-292`), so a client bound to `FlagDomain` evaluates against the application's default provider whenever our domain is unbound.
 - `Client.evaluate` merges evaluation contexts in the order *API (global) → transaction → client → invocation* (`client.go:695`), so an attribute passed at the invocation site composes with — and wins over — the application's global context without the library ever calling `SetEvaluationContext`.
 - `openfeature/memprovider` provides an in-memory provider suitable for tests.
 
@@ -303,10 +305,11 @@ useTracedImpl := relayPossible || (masterLocal && tracingLocal)
 ```go
 // otel-flags
 func RelayPossible() bool {
-    return strings.TrimSpace(os.Getenv(EnvFlagsEndpoint)) != "" ||
-        openfeature.NamedProviderMetadata(FlagDomain).Name != "NoopProvider"
+    return strings.TrimSpace(os.Getenv(EnvFlagsEndpoint)) != "" || providerBound()
 }
 ```
+
+(The second disjunct was written as `NamedProviderMetadata(FlagDomain).Name != "NoopProvider"` and revised by D22, which explains what that got wrong.)
 
 Revision 1 could key construction on the fully static `gate1 && EnvEnabled(moduleEnv)`, because a relay that can only revoke can never need an implementation the environment did not authorise. Under D2 it can, so that expression is unsound: a module whose environment says off must still be able to start tracing when the relay says so.
 
@@ -581,9 +584,9 @@ if endpoint := os.Getenv(EnvFlagsEndpoint); endpoint != "" &&
 r.client = openfeature.NewClient(FlagDomain)
 ```
 
-Two conditions, both necessary. The endpoint variable is the operator's expression of intent; the `NoopProvider` check is what makes the install an *allowance* rather than a takeover — an application that installs its own provider before constructing any wrapper keeps it, and this path stands down.
+Two conditions, both necessary. The endpoint variable is the operator's expression of intent; the stand-down check is what makes the install an *allowance* rather than a takeover — an application that binds its own provider to `FlagDomain` before constructing any wrapper keeps it, and this path stands down.
 
-The check is written against the **named** domain because `NamedProviderMetadata` falls back to the default's metadata when no named provider is bound. One call therefore covers all three ways an application can already have made its choice — a default provider, a named provider deliberately bound to this domain, or an earlier install by this same code — and only a process that has made none of them reads back `"NoopProvider"`.
+The stand-down check was originally the same `NamedProviderMetadata(FlagDomain).Name == "NoopProvider"` expression as D7, on the reasoning that its fallback conveniently covered all three ways an application could already have made its choice. D22 revises it: deferring to a *default* provider is not a convenience, it is a second silent failure on the path where the operator explicitly asked for a relay.
 
 | Setting | Source | Note |
 |---|---|---|
@@ -609,6 +612,39 @@ The check is written against the **named** domain because `NamedProviderMetadata
 *Consequence — `otel-flags`' `go.mod` gains the GO Feature Flag provider, and the four modules gain it transitively.* That brings roughly ten modules including `go-feature-flag/modules/core`, the ofrep provider, `bluele/gcache`, `diegoholiveira/jsonlogic`, `nikunjy/rules` and a full `antlr4-go/antlr` runtime into every consumer's build — including consumers that never set the endpoint variable. The cost is to `go.sum` length, vulnerability-scanning surface and licence review rather than to runtime, since the linker drops unreached code. D5 at least confines the declaration to one `go.mod` instead of four.
 
 *Consequence — the poller outlives everything.* Nothing shuts the provider down: there is no handle to hand back on a path whose entire premise is that the application writes no code. One goroutine per process, ending with the process. An application that needs lifecycle control installs its own provider and owns it.
+
+### D22. "A provider is bound" means bound to *our* domain, and `InstallProvider` says so exactly
+
+D7 and D17 both asked the SDK "is a provider bound to `FlagDomain`?" by reading `NamedProviderMetadata(FlagDomain).Name`. That call does not answer the question. When nothing is bound to the domain it returns the **default** provider's metadata (`openfeature_api.go:174-184`), so an application that had installed a provider for its own feature flags — no relation to this library, no instrumentation keys in it — read back exactly like one that had bound a provider here.
+
+Two silent failures followed, in opposite directions:
+
+- **Endpoint unset.** `RelayPossible()` reported true. Every wrapper allocated its instrumented implementation, `otel-mongo` registered `shared.NewCommandMonitor` on every client, and every operation evaluated two or three instrumentation keys against the application's business provider. A key collision would have toggled instrumentation on someone else's flag.
+- **Endpoint set.** D17 stood down. No GO Feature Flag provider was installed, so `ForEvaluation` fell back to the business provider for every instrumentation key (`openfeature_api.go:281-292`), which does not have them — the operator's endpoint was silently inert and the control plane did not exist. This is the more serious half, and it is on the path where the operator explicitly asked for a relay.
+
+The fix is one predicate used by both call sites:
+
+```go
+func providerBound() bool {
+    if explicitBind.Load() {          // InstallProvider was called
+        return true
+    }
+    return boundToDomain(openfeature.NamedProviderMetadata(FlagDomain), openfeature.ProviderMetadata())
+}
+
+func boundToDomain(named, def openfeature.Metadata) bool {
+    if named.Name == "NoopProvider" {
+        return false
+    }
+    return named.Name != def.Name    // an answer that merely echoes the default is not a binding
+}
+```
+
+**Why not the exact query.** `GetNamedProviders()` would answer without a heuristic. It is reachable — the method is exported on the unexported `evaluationImpl` interface, so a structural type assertion recovers it — and it is unusable: it returns the live map under a read lock it then releases (`openfeature_api.go:187-192`), so `m[key]` on the result races a concurrent `SetNamedProvider` and takes the process down with `concurrent map read and map write`. Applications install providers from init goroutines; a library cannot buy exactness at the price of a crash. The residual false negative — the same provider *name* in both slots — is closed by `InstallProvider` for anyone who cares, and reported upstream so a future SDK can remove the heuristic entirely.
+
+**`InstallProvider` is a consequence, not a convenience.** Since the heuristic cannot be exact, the recommended install path records the fact instead of inferring it. It also wraps `SetNamedProviderAndWait`, so an application that uses it has no startup window, and it keeps the "never touch the default provider" rule visible at the call site. The raw `SetNamedProviderAndWait(FlagDomain, p)` stays supported through the heuristic.
+
+**The comparison is a separate function on purpose.** The row that matters — the fallback echo — cannot be constructed through the SDK from a test: it fires only while `FlagDomain` is unbound, and the SDK offers no way to unbind a domain once anything has bound it. Splitting `boundToDomain` from the two calls that feed it makes the whole truth table testable.
 
 ## Risks / Trade-offs
 
@@ -697,7 +733,7 @@ The check is written against the **named** domain because `NamedProviderMetadata
 
 ## Post-review remediation (PR #27 grill, 2026-08)
 
-Source: `reviews/code-review-pr-27-openfeature-dynamic-flags.zh-TW.html` and a decision grill on each finding. Items unaffected by either revision stand as decided.
+Source: a code review of PR #27 and a decision grill on each finding. Items unaffected by either revision stand as decided.
 
 | ID | Topic | Decision | Status after revision 2 |
 |----|--------|----------|----------------------|
@@ -720,6 +756,20 @@ Source: `reviews/code-review-pr-27-openfeature-dynamic-flags.zh-TW.html` and a d
 | R17 | otelnats `impl`/`msgHandler`/`traceEventMsgHandler` policy | WONTFIX extract; lockstep comment only | Stands |
 | R18 | Dead nil-handler guard in `tracedConsumeHandler` | Delete dead guard | Stands |
 | R19 | Same-refresh sequential Boolean micro-torn pair | WONTFIX | Stands, and widens from two calls to three |
+
+## Downstream feedback (flywindy/o11y, PR #27, 2026-08-04)
+
+An embedding SDK that wraps these modules reviewed the head of this change and raised four API asks and three findings. Dispositions below.
+
+| ID | Ask | Disposition |
+|----|-----|-------------|
+| A1 | `WithTracingCapability(bool)` — a hard per-connection ceiling below the ladder, so `WithTracingEnabled(false)` can mean "native cost, never traced" and no relay can lift it | **Declined.** Bidirectional relay control is the point of revision 2, and a per-connection opt-out reintroduces a second spelling of one tier — the thing D3 and D14 exist to remove. The process-scoped escapes stay available: the master veto, the per-module variable that application code cannot override, and configuring no relay at all. Cost accepted and now documented: a relay-reachable connection evaluates on every operation whatever the flag's value |
+| A2 | Make provider ownership injectable; split the GO Feature Flag adapter into an optional module so consumers stop inheriting ANTLR/rules/jsonlogic | **Declined for now, documented instead.** The ownership seam already exists and is not GOFF-specific — bind any provider to `FlagDomain` and D17 stands down. The dependency-tree complaint is real (D17 records it as a known consequence), but splitting it costs the zero-code path a blank import, a second module in the release ordering, and a new silent-failure mode when that import is forgotten. No schedule is promised. New: an *Embedding SDKs* section in `feature-flags.md` |
+| A3 | Let an SDK supply `service.name` programmatically; requiring `OTEL_SERVICE_NAME` alongside an OTel Resource creates drift | **Documented, no API.** The drift is real and unfixable from this side: OTel builds the Resource *from* the environment and never writes back, and neither `trace.TracerProvider` nor `sdktrace.TracerProvider` exposes a way to read a Resource. So the value has to be handed over. Two existing routes are now documented — own the provider and set an API-level global evaluation context, which D12 guarantees this library never overrides; or set `OTEL_SERVICE_NAME` if absent during your own init |
+| A4 | Document the full runtime effect: off stops inject/extract too, enable cannot export through a no-op provider, the master governs only these modules | **Accepted.** New *What the flags do not control* section, both languages |
+| F1 | A remote disable does not survive a restart; asks for not-ready ⇒ disabled, or a wait-for-ready policy | **Partially accepted.** Not-ready ⇒ disabled is refused: it applies per key and the master's local default is `true`, so every restart of every relay-configured process would be fully vetoed until its first fetch and indefinitely during a relay outage — the control plane becoming an availability dependency, which "A relay outage must not reach the application" already forbids. Accepted: the asymmetry is now stated in the spec and the docs with a two-step incident-brake procedure, and pinned by a regression test |
+| F2 | An unrelated default provider makes `RelayPossible()` true | **Accepted, and it was worse than reported** — see D22 |
+| F3 | The quoted `2 µs / 336 B / 7 allocations` is not reproducible from the repository | **Accepted as a documentation defect.** No benchmark is added; the figures and the "recorded rather than assumed" claim are replaced with an order-of-magnitude statement and an instruction to measure. The per-operation evaluation count, which is a property of the design rather than of a machine, stays |
 
 ## Open Questions
 

@@ -307,8 +307,41 @@
 - [x] 10.7.10 Rewrite each module's unreleased `CHANGELOG.md` entry against `0.7.0` rather than against section 9's unreleased model. BREAKING: an invalid or empty `OTEL_*_ENABLED` value fails construction; a module variable set without the global one now takes effect; `NewConn` returns an error; `ContextFromDocument`/`ContextFromRawDocument` are ungated; the module now requires `otel-flags`, which brings the GO Feature Flag provider's dependency tree. Removed: both configuration-conflict sentinels. Note that no release ever carried the revoke-only model, so no migration from it is described.
 - [x] 10.7.11 Add `otel-flags/CHANGELOG.md`'s `0.1.0` entry describing the module's purpose and its exported surface.
 
-### 10.8 Explicit non-work
+## 11. Downstream feedback (flywindy/o11y, PR #27)
 
+Dispositions and reasoning: `design.md` § Downstream feedback and D22. Items declined there produce documentation work here, not code.
+
+### 11.1 Provider binding detection (F2 / D22)
+
+- [x] 11.1.1 In `otel-flags`, add `boundToDomain(named, def openfeature.Metadata) bool` — false for `"NoopProvider"`, false when the named metadata merely echoes the default's, true otherwise — and `providerBound()`, which checks the explicit-install record first. Keep the comparison separate from the two SDK calls so the fallback row is testable; the SDK offers no way to unbind a domain, so it cannot be built from a test.
+- [x] 11.1.2 Repoint `RelayPossible` at `providerBound()`. A provider the application installed in the default slot must no longer make it true.
+- [x] 11.1.3 Repoint `installProviderFromEnv`'s stand-down check at `providerBound()`. An unrelated default provider must no longer prevent the install — that failure left an operator's configured endpoint silently inert while every instrumentation key was evaluated against the application's business provider.
+- [x] 11.1.4 Add `InstallProvider(p openfeature.FeatureProvider) error`: `SetNamedProviderAndWait(FlagDomain, p)`, record the install in an `atomic.Bool`, error on nil. Document it as the recommended install path and note that it also closes the startup window. Do **not** use `GetNamedProviders()` — it returns the live map without copying, so reading it races `SetNamedProvider` and can crash the process.
+- [x] 11.1.5 Clear the explicit-install record in `resetInstallState`.
+- [x] 11.1.6 Tests: the `boundToDomain` truth table including the fallback echo and the same-name-in-both-slots false negative; `RelayPossible` false with a default provider only; the auto-install proceeding when only a default provider exists; `InstallProvider` binding, recording, outranking the heuristic, and erroring on nil.
+
+### 11.2 The startup window is not symmetric (F1)
+
+- [x] 11.2.1 Add a regression test pinning that a bound-but-not-ready provider leaves the local value in charge in both directions, including that it cannot veto the master switch.
+- [x] 11.2.2 Document the corollary in `feature-flags.md` and its zh-TW mirror: a relay `false` does not survive a restart; the relay is runtime control and durable state belongs in the environment variable; the incident-brake procedure is flip-the-relay then land-the-variable. State why not-ready ⇒ disabled is refused.
+- [x] 11.2.3 Record the same in the spec delta under *Provider readiness is the application's call*.
+
+### 11.3 Documentation (A2, A3, A4, F3)
+
+- [x] 11.3.1 Add § *What the flags do not control* to `feature-flags.md` and its zh-TW mirror: off stops trace-context propagation as well as spans (traces break at the boundary); a relay enable cannot export through a no-op `TracerProvider`; the master governs only this repository's modules; a handshake cannot be revisited.
+- [x] 11.3.2 Add § *Embedding SDKs: owning the provider yourself* — any OpenFeature provider may be bound, and initialisation, evaluation context, logger and shutdown then belong to the embedder.
+- [x] 11.3.3 Rewrite § *Targeting* for programmatic `service.name`: OTel builds the Resource from the environment and never writes back, and no API exposes a Resource for reading, so the value must be handed over — global evaluation context when you own the provider, or setting `OTEL_SERVICE_NAME` when absent.
+- [x] 11.3.4 Replace the unreproducible `2 µs / 336 B / 7 allocations` figures with an order-of-magnitude statement and an instruction to measure; drop the "recorded rather than assumed" claim. Keep the per-operation evaluation counts, and state that the cost is paid whatever the flag's value.
+- [x] 11.3.5 Point the "install your own provider" examples at `otelflags.InstallProvider` rather than `SetProviderAndWait`, which named the wrong slot and contradicted the surrounding text.
+- [x] 11.3.6 Delete the stale `ErrTracingConfigConflict` references left in `otel-gorilla-ws`'s `NewConn` godoc and both READMEs — the sentinel and its mutual-exclusion rule were removed by D14/D15.
+
+## 12. Explicit non-work
+
+- **A per-connection capability clamp** (`WithTracingCapability`). Declined — see design.md § Downstream feedback A1. A second spelling of one tier is what D3 and D14 removed.
+- **Splitting the GO Feature Flag adapter into an optional module.** Declined for now, with no schedule promised — A2. The ownership seam already exists and is provider-agnostic.
+- **A programmatic targeting-attribute setter.** Not added — A3. Both existing routes are documented instead.
+- **Benchmarks for the evaluation pipeline.** Not added — F3. The unreproducible figures are removed from the documentation rather than backed by code.
+- **Reading a not-ready provider as disabled.** Refused — F1. It would let a provider with nothing to say veto the master switch on every restart.
 - **Caching relay values.** Still deferred (D4), and still invisible behind `Value(i, local) bool`. The case is stronger now that an instrumented operation makes two or three evaluations instead of one, but it is not in this change.
 - **`BooleanValueDetails`.** Not used; relay silence and relay failure both fall through to `local`.
 - **Per-module OpenFeature domains.** Not reintroduced — one domain is what makes one provider serve every module.

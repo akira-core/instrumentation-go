@@ -192,9 +192,13 @@ Exported surface:
   option). Returns the `Lookup` error even when an option was supplied.
 - `MasterLocal() (bool, error)` / `MasterEnabled(local bool) bool` — the master switch. No option
   parameter, by design.
-- `RelayPossible() bool` — endpoint set, or a provider already bound. **Resolve once per
+- `RelayPossible() bool` — endpoint set, or a provider bound to `FlagDomain`. **Resolve once per
   construction; never memoize process-wide** (a `sync.Once` would freeze the answer at whichever
-  wrapper was built first, which in a test binary makes every relay test unreachable).
+  wrapper was built first, which in a test binary makes every relay test unreachable). A provider the
+  application installed as the **default** does not count — see below.
+- `InstallProvider(p) error` — the recommended way for an application to install its own provider:
+  `SetNamedProviderAndWait(FlagDomain, p)` plus a record that this process did so. Waiting means no
+  startup window. Raw `SetNamedProviderAndWait` stays supported.
 - `Resolver` / `NewResolver` / `WithFlagKeys` / `Value(i int, local bool) bool` — per-module
   resolution. Caches nothing. Out-of-range index returns `false` rather than panicking.
 - `EnvGlobalTracing`, `FlagKeyGlobalTracing`, `FlagDomain`, `EnvFlagsEndpoint`, `EnvFlagsAPIKey`,
@@ -264,16 +268,33 @@ provider, _ := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{
     DataCollectorDisabled: true, // required — see feature-flags.md
 })
 // Blocking install; on error log and continue rather than failing startup.
-_ = openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, provider)
+_ = otelflags.InstallProvider(provider)
 ```
+
+**"A provider is bound" means bound to `FlagDomain`, not to the default slot.** `NamedProviderMetadata`
+falls back to the default provider's metadata when the domain is unbound, so reading it alone made an
+application's own business provider look like a relay: wrappers allocated the instrumented
+implementation and evaluated instrumentation keys against it, and — worse — the auto-install stood
+down, leaving an operator's configured endpoint silently inert. `providerBound()` therefore rejects an
+answer that merely echoes the default, and `InstallProvider` records the fact exactly. Do **not** reach
+for `GetNamedProviders()`: it returns the live map without copying, so reading it races
+`SetNamedProvider` and can crash the process.
 
 **They must do it BEFORE constructing any wrapper.** `RelayPossible()` is resolved at construction, so
 a wrapper built earlier resolves statically for its whole life and never consults the relay. This is a
 documented ordering requirement, and the same rule binds the tests.
 
-The startup window is now **fail-safe**: until the provider's first fetch, every switch resolves to its
-local value, so the window can delay a relay-driven enable but can never introduce one — and for
-`otel-mongo` can never write an `_oteltrace` field the deployment did not configure.
+The startup window is **fail-safe for enabling**: until the provider's first fetch, every switch
+resolves to its local value, so the window can delay a relay-driven enable but can never introduce one
+— and for `otel-mongo` can never write an `_oteltrace` field the deployment did not configure.
+
+**It is deliberately not fail-safe for disabling: a relay `false` does not survive a restart.** With
+the env var enabled and the relay disabling, a restarted process traces again until its first fetch,
+and indefinitely while the relay is down. Reading not-ready as `false` is refused — it applies per key
+and the master's local default is `true`, so every restart of every relay-configured process would be
+fully vetoed, turning the control plane into an availability dependency. Relay is runtime control;
+durable state belongs in the environment variable. Pinned by
+`TestValue_NotReadyProviderLeavesLocalInCharge`.
 
 **Tests install their in-memory provider with `openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, …)`,
 never `SetProviderAndWait`** — a named provider outranks the default for these clients. There is no

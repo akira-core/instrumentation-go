@@ -63,6 +63,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	gofeatureflag "github.com/open-feature/go-sdk-contrib/providers/go-feature-flag/pkg"
@@ -250,16 +251,90 @@ func MasterEnabled(local bool) bool { return masterResolver.Value(0, local) }
 // process-wide provider install with every module resolver.
 var masterResolver = NewResolver(WithFlagKeys(FlagKeyGlobalTracing))
 
+// InstallProvider binds provider to FlagDomain and records that this process
+// deliberately gave the instrumentation switches a relay.
+//
+// It is the recommended way for an application to install its own provider. The
+// raw openfeature.SetNamedProviderAndWait(FlagDomain, p) still works and is
+// still detected, but only through the heuristic in providerBound, which cannot
+// tell an explicit binding from a fallback when the same provider is bound to
+// both the default slot and this domain. Going through here removes that one
+// blind spot: the record is exact.
+//
+// It installs with SetNamedProviderAndWait rather than the asynchronous form, so
+// when it returns the provider has finished initialising and no startup window
+// remains. Call it BEFORE constructing any wrapper — see RelayPossible.
+//
+// It writes nothing but the named binding on FlagDomain. The default provider,
+// the global evaluation context, hooks and shutdown all remain the
+// application's.
+func InstallProvider(provider openfeature.FeatureProvider) error {
+	if provider == nil {
+		return errors.New("otel-flags: InstallProvider: provider is nil")
+	}
+	if err := openfeature.SetNamedProviderAndWait(FlagDomain, provider); err != nil {
+		return fmt.Errorf("otel-flags: binding a provider to %q: %w", FlagDomain, err)
+	}
+	explicitBind.Store(true)
+	return nil
+}
+
+// explicitBind records an InstallProvider call. It is never cleared outside
+// tests: an application that installs a provider and later rebinds still has one
+// bound, and unbinding a domain is not something the OpenFeature SDK offers.
+var explicitBind atomic.Bool
+
+// providerBound reports whether a provider is bound to FlagDomain specifically.
+//
+// The subtlety is that NamedProviderMetadata does NOT answer that question.
+// Reading the SDK (go-sdk v1.17.2, openfeature_api.go):
+//
+//	provider, ok := api.namedProviders[name]
+//	if !ok {
+//		return ProviderMetadata() // ← the DEFAULT provider's metadata
+//	}
+//
+// so an application that installed a business provider with SetProvider — for
+// its own flags, with no relation to this library — reads back as if it had
+// bound one here. Believing that had two consequences, both wrong and both
+// silent: every wrapper built the instrumented implementation and evaluated
+// instrumentation keys against the application's business provider on every
+// operation, and installProviderFromEnv stood down, so an operator who had set
+// EnvFlagsEndpoint got no relay at all.
+//
+// So the fallback is stripped: an answer that merely echoes the default provider
+// is not a binding. What survives is one false negative — an application that
+// binds the SAME provider to both slots reads equal and is treated as unbound —
+// which InstallProvider closes for anyone who wants it closed.
+func providerBound() bool {
+	if explicitBind.Load() {
+		return true
+	}
+	return boundToDomain(openfeature.NamedProviderMetadata(FlagDomain), openfeature.ProviderMetadata())
+}
+
+// boundToDomain holds the comparison itself, separately from the two SDK calls
+// that feed it, because the case that matters most cannot be built through the
+// SDK from a test: once anything binds FlagDomain there is no way to unbind it,
+// and the fallback this exists to defeat only fires while the domain is unbound.
+func boundToDomain(named, def openfeature.Metadata) bool {
+	if named.Name == noopProviderName {
+		return false
+	}
+	return named.Name != def.Name
+}
+
 // RelayPossible reports whether a relay could ever have an opinion in this
-// process: an endpoint is configured, or a provider is already bound to
-// FlagDomain (or installed as the default, which NamedProviderMetadata falls
-// back to).
+// process: an endpoint is configured, or a provider is bound to FlagDomain.
 //
 // When it is false, Client.Boolean can only ever return the value passed to it,
 // so the relay is not merely silent — it is structurally incapable of speaking.
 // Callers use that to keep the pre-dynamic zero-cost path: resolve from
 // env > option > default alone, allocate the instrumented implementation only if
 // that answer is on, and never touch the OpenFeature SDK.
+//
+// A provider the application installed for its OWN flags does not count; see
+// providerBound.
 //
 // Callers MUST resolve it once per construction and MUST NOT memoize it
 // process-wide. A package-level sync.Once would be cheaper and would guarantee
@@ -275,7 +350,7 @@ func RelayPossible() bool {
 	if strings.TrimSpace(os.Getenv(EnvFlagsEndpoint)) != "" {
 		return true
 	}
-	return openfeature.NamedProviderMetadata(FlagDomain).Name != noopProviderName
+	return providerBound()
 }
 
 // Resolver resolves one module's flag keys through the OpenFeature client.
@@ -415,14 +490,13 @@ func installProviderFromEnv() openfeature.EvaluationContext {
 	if endpoint == "" {
 		return empty
 	}
-	// NamedProviderMetadata, not ProviderMetadata: it reports the provider bound
-	// to FlagDomain and falls back to the default provider's metadata when none
-	// is. One check therefore covers all three ways an application can already
-	// have made its choice — a default provider, a named provider on our domain,
-	// or an earlier install by this same code — and only a process that has made
-	// none of them reads back "NoopProvider". Checking the default alone would
-	// clobber an application that deliberately bound a provider to this domain.
-	if openfeature.NamedProviderMetadata(FlagDomain).Name != noopProviderName {
+	// Stand down for a provider the application bound to THIS domain, and only
+	// for that. A provider it installed as the default is its own business and
+	// says nothing about the instrumentation switches — deferring to one used to
+	// mean an operator who had set EnvFlagsEndpoint silently got no relay, while
+	// every instrumentation key was evaluated against the application's business
+	// provider. See providerBound.
+	if providerBound() {
 		return empty
 	}
 

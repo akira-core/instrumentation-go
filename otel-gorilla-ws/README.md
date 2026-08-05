@@ -86,7 +86,7 @@ Three things to know:
 
 The effective feature flag above gates whether tracing runs at all. Separately, whether the wire envelope gets written/read depends on **which constructor** created the `Conn` (and, for Dial/Upgrade, whether otel-ws was negotiated):
 
-- **`NewConn(rawConn, opts...) (*Conn, error)`** wraps a `*websocket.Conn` you already dialed/upgraded yourself. It enables envelope wrapping **only when the raw connection's negotiated subprotocol proves `otel-ws`** — offer or echo `SubprotocolOTelWS` during your handshake, and check `IsOTelNegotiated(raw)` to verify. It returns an error when the configuration is contradictory (`ErrTracingConfigConflict`).
+- **`NewConn(rawConn, opts...) (*Conn, error)`** wraps a `*websocket.Conn` you already dialed/upgraded yourself. It enables envelope wrapping **only when the raw connection's negotiated subprotocol proves `otel-ws`** — offer or echo `SubprotocolOTelWS` during your handshake, and check `IsOTelNegotiated(raw)` to verify. It returns an error when an `OTEL_*_ENABLED` variable it reads holds a value that is neither truthy nor falsy (wrapping `otelflags.ErrInvalidFlagValue`).
 - **`Dial(ctx, urlStr, requestHeader, subprotocols, opts...)`** is the spec-compliant client entry point. It injects the `otel-ws` subprotocol into the handshake; envelope wrapping is enabled only if the server confirms support by returning an `otel-ws`/`otel-ws+<proto>` subprotocol.
 - **`Upgrader{}.Upgrade(w, r, responseHeader)`** is the spec-compliant server entry point (mirrors `websocket.Upgrader.Upgrade`). It detects `otel-ws` in the client's proposed subprotocols and responds with `otel-ws`/`otel-ws+<proto>`, enabling envelope wrapping only on that acceptance path.
 

@@ -82,7 +82,9 @@ The master switch SHALL be resolved per operation, like every other relay-backed
 - **THEN** no module traces, because the master only ever removes permission
 
 ### Requirement: Implementation selection keys on whether a relay can exist
-`otel-flags` SHALL expose `RelayPossible() bool`, reporting `true` when `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` is set to a non-empty value **or** `openfeature.NamedProviderMetadata(FlagDomain).Name` is not `"NoopProvider"`.
+`otel-flags` SHALL expose `RelayPossible() bool`, reporting `true` when `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` is set to a non-empty value **or** a provider is bound to `FlagDomain` in the sense defined by *Detecting a provider bound to the flag domain*.
+
+A provider the application installed in the **default** slot for its own feature flags SHALL NOT make `RelayPossible` report `true`.
 
 Each wrapper SHALL resolve it once, at construction, and SHALL allocate its instrumented implementation when:
 
@@ -118,14 +120,56 @@ Everything derived from a wrapper — `oteljetstream.New(conn)`, `Client.Databas
 - **WHEN** a `Conn` or `Client` was constructed on the passthrough-only path and a JetStream wrapper, `Database` or `Collection` is derived from it
 - **THEN** the derived wrapper is also passthrough-only and does not re-resolve `relayPossible`
 
+### Requirement: Detecting a provider bound to the flag domain
+"A provider is bound to `FlagDomain`" SHALL mean a provider the application bound to that domain specifically. A provider installed in the default slot SHALL NOT satisfy it.
+
+`openfeature.NamedProviderMetadata(domain)` alone SHALL NOT be used to decide this. The go-sdk implementation falls back to the default provider's metadata when nothing is bound to the domain, so an application that installed a provider for its own flags reads back identically to one that bound a provider here. That reading produced two silent failures: every wrapper allocated its instrumented implementation and evaluated instrumentation keys against the application's business provider on every operation, and the auto-install stood down, so an operator who had set `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` received no relay at all.
+
+Detection SHALL therefore be:
+
+1. `true` when the process installed a provider through `InstallProvider` (see *Application-installed providers*); otherwise
+2. `true` when `openfeature.NamedProviderMetadata(FlagDomain).Name` is neither `"NoopProvider"` nor equal to `openfeature.ProviderMetadata().Name`; otherwise
+3. `false`.
+
+Step 2 admits exactly one false negative — an application that binds the same provider *name* to both the default slot and `FlagDomain` reads as unbound. `InstallProvider` SHALL close it for any application that cares. Only the public OpenFeature API SHALL be used: `GetNamedProviders()` would answer exactly but returns the live map without copying, so reading it races a concurrent `SetNamedProvider` and can crash the process with `concurrent map read and map write`.
+
+The comparison SHALL be implemented separately from the two SDK calls that feed it, so the fallback row can be tested; once anything binds `FlagDomain` the SDK offers no way to unbind it, and the fallback fires only while the domain is unbound.
+
+#### Scenario: Default provider only
+- **WHEN** the application calls `openfeature.SetProvider(businessProvider)`, no endpoint is configured, and a wrapper is constructed
+- **THEN** `RelayPossible()` reports false, no instrumented implementation is allocated, and no instrumentation key is ever evaluated against the business provider
+
+#### Scenario: Default provider does not stand the auto-install down
+- **WHEN** `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` is set and the application has installed a provider in the default slot only
+- **THEN** the auto-install proceeds and binds a GO Feature Flag provider to `FlagDomain`, leaving the default provider untouched
+
+### Requirement: Application-installed providers
+`otel-flags` SHALL expose `InstallProvider(provider openfeature.FeatureProvider) error`, which SHALL bind `provider` to `FlagDomain` with `SetNamedProviderAndWait`, record that this process installed one, and return an error for a nil provider rather than panicking. Documentation SHALL present it as the recommended way for an application or embedding SDK to install its own provider.
+
+It SHALL write no other OpenFeature state: not the default provider, not the global evaluation context, not hooks, not shutdown.
+
+A raw `openfeature.SetNamedProviderAndWait(FlagDomain, p)` SHALL remain supported and SHALL still be detected through step 2 above.
+
+Because it waits for initialisation, an application that calls it before constructing any wrapper SHALL have no startup window.
+
+#### Scenario: Explicit install outranks the heuristic
+- **WHEN** an application binds the same provider type to the default slot and installs one through `InstallProvider`
+- **THEN** `RelayPossible()` reports true, because the recorded install is exact where the metadata comparison is not
+
 ### Requirement: Provider readiness is the application's call
 The auto-install path SHALL register non-blocking, so that the first instrumented operation of a process never waits on a relay round trip.
 
 The window this leaves — from install until the provider's first successful fetch — SHALL resolve every switch to its locally supplied value. A process therefore starts at exactly the state its environment and options declare, and the relay's opinion arrives one fetch later. The window SHALL NOT be able to enable a switch the deployment left off, and for `otel-mongo` SHALL NOT be able to write a `_oteltrace` field the deployment did not configure.
 
-An application that requires the relay's answer before its first operation SHALL install its own provider with `openfeature.SetProviderAndWait` before constructing any wrapper, which both closes the window and makes the auto-install path stand down. This SHALL be documented as the application's option, not as a requirement on it.
+The corollary SHALL be documented rather than left to be discovered: **a relay `false` is not durable across a restart.** When the local value is enabled and the relay disables, a restarted process traces again until its first successful fetch, and indefinitely while the relay is unreachable. The documentation SHALL state that the relay is runtime control and that durable state belongs in the environment variable, and SHALL give the two-step incident-brake procedure — flip the relay flag, then land the same value in the deployment's environment before anything restarts.
 
-The library SHALL NOT attempt to detect or compensate for a not-ready provider: doing so would require branching on evaluation errors, which the resolver deliberately does not do, and would give a not-ready provider a different meaning from an absent one.
+A not-ready provider SHALL NOT be read as `false`. That reading applies per key, and the master key's local default is `true`, so every restart of every relay-configured process would be fully vetoed until its first fetch and would stay dark for the duration of a relay outage — turning the control plane into an availability dependency, and letting a source with no data outrank one the deployment wrote down. The library SHALL NOT otherwise detect or compensate for a not-ready provider either: doing so would require branching on evaluation errors, which the resolver deliberately does not do, and would give a not-ready provider a different meaning from an absent one.
+
+An application that requires the relay's answer before its first operation SHALL install its own provider with `InstallProvider` before constructing any wrapper, which both closes the window and makes the auto-install path stand down. This SHALL be documented as the application's option, not as a requirement on it.
+
+#### Scenario: A not-ready provider leaves the local value in charge
+- **WHEN** a provider is bound to `FlagDomain` but has not completed a successful fetch, and a switch is resolved
+- **THEN** the locally supplied value is returned for every value of that local — including `true` for the master switch, which a provider with nothing to say SHALL NOT be able to veto
 
 #### Scenario: The window delays an enable, not a disable
 - **WHEN** the relay enables a module whose environment variable is unset, and an operation runs after the auto-install but before the provider's first successful fetch
@@ -136,8 +180,12 @@ The library SHALL NOT attempt to detect or compensate for a not-ready provider: 
 - **THEN** no `_oteltrace` field is written during the window, because the evaluation default is the local value of `false`
 
 #### Scenario: Blocking install closes the window
-- **WHEN** an application calls `openfeature.SetProviderAndWait` before constructing any wrapper
+- **WHEN** an application calls `InstallProvider` before constructing any wrapper
 - **THEN** the first operation already observes the relay's value, and no auto-install occurs
+
+#### Scenario: A remote disable does not survive a restart
+- **WHEN** a module's environment variable is set to enabled, the relay disables that module, and the process restarts
+- **THEN** the module traces again until the provider's first successful fetch, and the documentation states this and prescribes landing the value in the environment variable
 
 ### Requirement: A relay outage must not reach the application
 A relay that becomes unreachable after the provider has fetched successfully SHALL NOT affect the application: the in-process evaluator serves its last successfully fetched configuration, so the current state survives the outage and no evaluation performs network I/O.
@@ -171,7 +219,7 @@ An application SHALL be able to obtain relay control by setting environment vari
 `Resolver` SHALL, inside the same `sync.Once` that lazily creates the OpenFeature client, construct and register a provider when **both** of the following hold:
 
 1. `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` is set to a non-empty value; and
-2. `openfeature.NamedProviderMetadata(FlagDomain).Name` equals `"NoopProvider"` — which is true only when the application has bound neither a default provider nor a named one to this domain, since that call falls back to the default provider's metadata.
+2. no provider is bound to `FlagDomain` in the sense defined by *Detecting a provider bound to the flag domain* — a provider the application installed in the default slot for its own flags SHALL NOT stand the install down, because it says nothing about the instrumentation switches and deferring to one leaves the operator's endpoint with nothing behind it.
 
 Registration SHALL use `SetNamedProvider` on `FlagDomain` and SHALL be non-blocking. The provider SHALL be configured as follows, and no setting other than the three variables SHALL be exposed:
 
@@ -200,7 +248,7 @@ No shutdown SHALL be exposed for an auto-installed provider; its polling gorouti
 - **THEN** a GO Feature Flag provider is registered on `FlagDomain` and subsequent relay changes reach every module
 
 #### Scenario: Application-installed provider wins
-- **WHEN** the application installs its own provider before the first instrumented operation and the endpoint variable is also set
+- **WHEN** the application binds its own provider to `FlagDomain` before the first instrumented operation and the endpoint variable is also set
 - **THEN** no auto-install occurs and every value resolves through the application's provider
 
 #### Scenario: Endpoint unset
@@ -258,7 +306,7 @@ The shared module MAY define **process-scoped** names, which are properties of t
 | `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` | `EnvFlagsPollInterval` |
 | `OTEL_SERVICE_NAME` | `EnvServiceName` — the OTel-specified targeting attribute source |
 | — | `FlagDomain`, the single OpenFeature domain, exported because module-package tests install their provider on it |
-| — | `RelayPossible() bool`, `Lookup(name) (bool, bool, error)`, `ErrInvalidFlagValue` |
+| — | `RelayPossible() bool`, `InstallProvider(p) error`, `Lookup(name) (bool, bool, error)`, `ErrInvalidFlagValue` |
 
 #### Scenario: Shared module names no module
 - **WHEN** `otel-flags/flags.go` is inspected
