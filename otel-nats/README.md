@@ -79,7 +79,10 @@ change follows it without being re-established.
 
 > Full reference — every resolution table, connecting a relay with no application code, revocation
 > latency, per-service targeting, and the operational summary:
-> **[feature-flags.md](../feature-flags.md)** · 繁體中文:**[feature-flags.zh-TW.md](../feature-flags.zh-TW.md)**
+> **[docs/feature-flags.md](../docs/feature-flags.md)** ·
+> Tutorial: **[docs/otel-nats-kill-switch.en-US.html](../docs/otel-nats-kill-switch.en-US.html)** ·
+> 繁體中文:**[docs/feature-flags.zh-TW.md](../docs/feature-flags.zh-TW.md)** ·
+> **[docs/otel-nats-kill-switch.zh-TW.html](../docs/otel-nats-kill-switch.zh-TW.html)**
 
 ### 1. Initialize provider and propagator (application responsibility)
 

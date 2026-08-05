@@ -74,7 +74,7 @@ relay **兩個方向都有權威**。安全性來自預設值:總開關 `OTEL_IN
   見 [otel-ws.md](../otel-ws.md)。
 
 > 完整參考 —— 全部解析表格、零程式碼連上 relay、撤銷延遲、針對單一服務的 targeting、維運速查:
-> **[feature-flags.zh-TW.md](../feature-flags.zh-TW.md)** · English:**[feature-flags.md](../feature-flags.md)**
+> **[docs/feature-flags.zh-TW.md](../docs/feature-flags.zh-TW.md)** · English:**[docs/feature-flags.md](../docs/feature-flags.md)**
 
 ### NewConn 與 Dial / Upgrader 的差異
 

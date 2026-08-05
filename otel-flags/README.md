@@ -4,7 +4,7 @@ The feature-switch layer shared by this repository's OpenTelemetry instrumentati
 
 It emits no spans and wraps no client. Applications do not normally import it — `otel-mongo`, `otel-mongo/v2`, `otel-nats` and `otel-gorilla-ws` do, and configuration reaches it through environment variables and constructor options. Import it directly only to match on `ErrInvalidFlagValue`.
 
-For the operator-facing reference — every switch, every variable, worked examples and the relay wiring — see [`feature-flags.md`](../feature-flags.md) at the repo root ([繁體中文](../feature-flags.zh-TW.md)).
+For the operator-facing reference — every switch, every variable, worked examples and the relay wiring — see [`docs/feature-flags.md`](../docs/feature-flags.md) ([繁體中文](../docs/feature-flags.zh-TW.md)). Hands-on tutorial: [`docs/otel-nats-kill-switch.en-US.html`](../docs/otel-nats-kill-switch.en-US.html).
 
 ## The precedence ladder
 

@@ -79,12 +79,14 @@ A switch is decided only by `1`/`true`/`yes`/`on` or `0`/`false`/`no`/`off`. Uns
 opinion" and falls through to the next rung. **Anything else — including the empty string — is a
 construction error**, so audit your `OTEL_*_ENABLED` values before upgrading.
 
-> **Everything else is in [feature-flags.md](feature-flags.md)**: the full resolution tables and
+> **Everything else is in [docs/feature-flags.md](docs/feature-flags.md)**: the full resolution tables and
 > worked examples, why the option sits below its environment variable, the other relay-connection
 > variables, per-service targeting, how long a change takes to take effect, the requirement to
 > install your provider *before* constructing wrappers, what turning a module off does *not* stop,
 > and the operational summary. One home, so the two cannot drift.
-> 繁體中文:[feature-flags.zh-TW.md](feature-flags.zh-TW.md)
+> Hands-on tutorial: [docs/otel-nats-kill-switch.en-US.html](docs/otel-nats-kill-switch.en-US.html)
+> · 繁體中文:[docs/feature-flags.zh-TW.md](docs/feature-flags.zh-TW.md) ·
+> [docs/otel-nats-kill-switch.zh-TW.html](docs/otel-nats-kill-switch.zh-TW.html)
 
 ## Layout
 
@@ -111,8 +113,11 @@ instrumentation-go/
 │   └── README.md
 ├── otel-ws.md               # Subprotocol / propagation design notes (cross-language)
 ├── otel-flags/              # Shared feature-switch layer (released, required by all four)
-├── feature-flags.md         # Full tracing feature-flag reference
-├── feature-flags.zh-TW.md   # …and its Traditional Chinese translation
+├── docs/
+│   ├── feature-flags.md              # Full tracing feature-flag reference
+│   ├── feature-flags.zh-TW.md        # …and its Traditional Chinese translation
+│   ├── otel-nats-kill-switch.en-US.html  # Hands-on relay tutorial (en-US)
+│   └── otel-nats-kill-switch.zh-TW.html  # Hands-on relay tutorial (zh-TW)
 ├── CLAUDE.md                # Contributor / agent notes
 └── README.md
 ```

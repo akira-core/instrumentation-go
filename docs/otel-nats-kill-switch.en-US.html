@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="zh-Hant">
+<html lang="en-US">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>otel-nats × kill-switch relay-proxy 使用指南</title>
+  <title>otel-nats × kill-switch relay-proxy tutorial</title>
   <style>
     :root {
       --bg: #0f1419;
@@ -19,7 +19,7 @@
       --danger: #e85d5d;
       --code-bg: #0b1016;
       --mono: "JetBrains Mono", "SF Mono", "Fira Code", ui-monospace, monospace;
-      --sans: "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", system-ui, sans-serif;
+      --sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
     }
 
     * { box-sizing: border-box; }
@@ -284,22 +284,22 @@
 </head>
 <body>
   <div class="layout">
-    <nav aria-label="目錄">
+    <nav aria-label="Table of contents">
       <div class="brand">otel-nats × kill-switch</div>
-      <div class="sub">zh-TW · instrumentation-go 0.8.0+</div>
+      <div class="sub">en-US · instrumentation-go 0.8.0+</div>
       <a href="#overview">1. Overview</a>
       <a href="#ladder">2. Precedence ladder</a>
-      <a href="#switches">3. Three switches</a>
+      <a href="#switches">3. The three switches</a>
       <a href="#tristate">4. Env tri-state</a>
-      <a href="#quickstart">5. Quickstart（zero-code）</a>
+      <a href="#quickstart">5. Quickstart (zero-code)</a>
       <a href="#env">6. Environment variables</a>
-      <a href="#self-provider">7. 自行安裝 provider</a>
+      <a href="#self-provider">7. Install your own provider</a>
       <a href="#with-option">8. WithTracingEnabled</a>
       <a href="#tracer-setup">9. TracerProvider setup</a>
       <a href="#usage">10. otel-nats usage</a>
-      <a href="#relay-flag">11. Relay flag</a>
+      <a href="#relay-flag">11. Relay flag definition</a>
       <a href="#toggle">12. Hot toggle</a>
-      <a href="#targeting">13. Targeting</a>
+      <a href="#targeting">13. Targeting one service</a>
       <a href="#latency">14. Change latency</a>
       <a href="#cheatsheet">15. Ops cheatsheet</a>
       <a href="#pitfalls">16. Common pitfalls</a>
@@ -307,21 +307,21 @@
 
     <main>
       <div class="lang-switch">
-        <a href="otel-nats-kill-switch.en-US.html">en-US</a>
-        <a class="current" href="otel-nats-kill-switch.zh-TW.html">zh-TW</a>
+        <a class="current" href="otel-nats-kill-switch.en-US.html">en-US</a>
+        <a href="otel-nats-kill-switch.zh-TW.html">zh-TW</a>
       </div>
 
-      <h1>otel-nats × kill-switch relay-proxy 使用指南</h1>
+      <h1>otel-nats × kill-switch relay-proxy tutorial</h1>
       <p class="lead">
-        逐步說明如何把 <code>otel-nats</code>（v0.8.0+）接到
-        <a href="https://gofeatureflag.org">GO Feature Flag</a> relay proxy，
-        透過 <a href="https://openfeature.dev">OpenFeature</a> 在執行期
-        <strong>雙向切換</strong> NATS tracing——不必 redeploy。
-        涵蓋零程式碼 env 路徑，以及自行安裝 provider。
+        Step-by-step guide to wire <code>otel-nats</code> (v0.8.0+) to a
+        <a href="https://gofeatureflag.org">GO Feature Flag</a> relay proxy via
+        <a href="https://openfeature.dev">OpenFeature</a>, so operators can toggle
+        NATS tracing <strong>on or off at runtime</strong> — no redeploy.
+        Covers the zero-code env path and installing your own provider.
       </p>
 
       <div class="toc-mobile callout">
-        <strong>本頁章節：</strong>
+        <strong>Sections:</strong>
         Overview → Ladder → Switches → Tri-state → Quickstart → Env → Provider →
         WithTracingEnabled → TracerProvider → Usage → Relay flag → Toggle →
         Targeting → Latency → Cheatsheet → Pitfalls
@@ -329,28 +329,28 @@
 
       <h2 id="overview">1. Overview</h2>
       <p>
-        <code>otel-nats</code> 是 NATS / JetStream 的 OpenTelemetry instrumentation。
-        它<strong>不</strong>自行初始化 TracerProvider；由應用設定 global provider /
-        propagator。從 0.8.0 起，每個 switch 沿著四層 <strong>ladder</strong> 解析。
-        最上層的 relay <strong>雙向有效</strong>：可以關掉正在跑的模組，也可以打開
-        deployment 當初沒開的模組。
+        <code>otel-nats</code> is OpenTelemetry instrumentation for NATS / JetStream.
+        It does <strong>not</strong> initialize a TracerProvider; the application sets
+        the global provider / propagator. From 0.8.0, every switch resolves down a
+        four-rung <strong>ladder</strong>. A relay at the top is authoritative
+        <strong>in both directions</strong>: it can disable a running module and enable
+        one the deployment left off.
       </p>
       <ul>
-        <li><strong>Deployer</strong> 用 env（或 <code>WithTracingEnabled</code>）決定 resting state。</li>
-        <li><strong>Operator</strong> 用 relay flag <code>otel-nats-tracing</code> 熱切換，不用重啟。</li>
-        <li>沒接 relay 時，只由 env + option + default 決定——沒有 OpenFeature 成本。</li>
+        <li><strong>Deployer</strong> sets env vars (or <code>WithTracingEnabled</code>) for the resting state.</li>
+        <li><strong>Operator</strong> flips relay flag <code>otel-nats-tracing</code> without restarting.</li>
+        <li>With no relay configured, behavior is decided by env + option + defaults only — no OpenFeature cost.</li>
       </ul>
 
       <div class="callout ok">
-        <strong>一句話：</strong>安全性來自 default（module 預設 <code>false</code>；
-        master 預設 <code>true</code> 是 veto 不是 enabler），
-        不是把 relay 鎖成只能關不能開。
+        <strong>One line:</strong> Safety comes from the defaults (module default
+        <code>false</code>; master default <code>true</code> is a veto, not an enabler),
+        not from locking the relay to revoke-only.
       </div>
 
       <p>
-        完整參考（所有模組、表格、Mongo propagation 風險）：
-        <a href="feature-flags.zh-TW.md">feature-flags.zh-TW.md</a> ·
-        <a href="feature-flags.md">feature-flags.md</a>。
+        Full reference (all modules, tables, Mongo propagation risk):
+        <a href="feature-flags.md">feature-flags.md</a>.
       </p>
 
       <h2 id="ladder">2. Precedence ladder</h2>
@@ -364,45 +364,45 @@
             <th>Source</th>
             <th>Owner</th>
             <th>Scope</th>
-            <th>不 redeploy 能改？</th>
+            <th>Change without redeploy?</th>
           </tr>
         </thead>
         <tbody>
           <tr>
             <td><strong>relay</strong></td>
             <td>operator</td>
-            <td>fleet 或單一 service</td>
-            <td><strong>可以 — 唯一一層</strong></td>
+            <td>fleet or one service</td>
+            <td><strong>Yes — the only one</strong></td>
           </tr>
           <tr>
             <td><strong>env</strong></td>
             <td>deployer</td>
-            <td>單一 process</td>
-            <td>否</td>
+            <td>one process</td>
+            <td>No</td>
           </tr>
           <tr>
             <td><strong>option</strong></td>
-            <td>建構 wrapper 的 caller</td>
-            <td>單一 connection</td>
-            <td>否</td>
+            <td>caller constructing the wrapper</td>
+            <td>one connection</td>
+            <td>No</td>
           </tr>
           <tr>
             <td><strong>default</strong></td>
             <td>library</td>
-            <td>沒人表態的地方</td>
-            <td>否</td>
+            <td>everywhere nobody spoke</td>
+            <td>No</td>
           </tr>
         </tbody>
       </table>
 
       <div class="callout warn">
-        <strong>Option 排在 env 之下。</strong>
-        <code>OTEL_NATS_TRACING_ENABLED=false</code> 會贏過
-        <code>WithTracingEnabled(true)</code>。兩者同時設是合法的；
-        已沒有 <code>ErrTracingConfigConflict</code>。
+        <strong>The option sits below its env var.</strong>
+        <code>OTEL_NATS_TRACING_ENABLED=false</code> wins over
+        <code>WithTracingEnabled(true)</code>. Supplying both is legal; there is no
+        <code>ErrTracingConfigConflict</code>.
       </div>
 
-      <h2 id="switches">3. Three switches</h2>
+      <h2 id="switches">3. The three switches</h2>
       <table>
         <thead>
           <tr>
@@ -419,7 +419,7 @@
             <td><code>otel-instrumentation-go-tracing</code></td>
             <td>—</td>
             <td><code>OTEL_INSTRUMENTATION_GO_TRACING_ENABLED</code></td>
-            <td><code>true</code>（veto）</td>
+            <td><code>true</code> (veto)</td>
           </tr>
           <tr>
             <td>NATS tracing</td>
@@ -436,14 +436,14 @@
       </div>
 
       <p>
-        <strong>Master 是 veto，不是 enabler。</strong>預設 <code>true</code> 代表
-       「沒有異議」。設成 <code>true</code> 不會改變任何事；只有
-        <code>false</code> 會關掉 process 內所有模組。在 relay 上建立
-        <code>otel-instrumentation-go-tracing: true</code> 沒有實用效果。
+        <strong>Master is a veto, not an enabler.</strong> Default <code>true</code> means
+        “no objection”. Setting it <code>true</code> changes nothing; only
+        <code>false</code> stops every module. Creating
+        <code>otel-instrumentation-go-tracing: true</code> on a relay does nothing useful.
       </p>
       <p>
-        <strong>Master 為 true 不會打開任何東西。</strong>Module 預設
-        <code>false</code> 才讓零設定 process 保持安靜。
+        <strong>Nothing turns on because the master is true.</strong> The module default
+        of <code>false</code> keeps a zero-config process silent.
       </p>
 
       <h3>Worked examples</h3>
@@ -452,89 +452,90 @@
           <tr><th>Configuration</th><th>Result</th></tr>
         </thead>
         <tbody>
-          <tr><td>什麼都沒設</td><td>off</td></tr>
-          <tr><td>只有 <code>OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true</code></td><td>off — master 不會 enable</td></tr>
-          <tr><td>只有 <code>OTEL_NATS_TRACING_ENABLED=true</code></td><td><strong>on</strong> — master 預設 true</td></tr>
-          <tr><td><code>WithTracingEnabled(true)</code>，無 env</td><td>該 connection on</td></tr>
-          <tr><td><code>WithTracingEnabled(true)</code> + <code>OTEL_NATS_TRACING_ENABLED=false</code></td><td><strong>off</strong> — env 贏過 option</td></tr>
-          <tr><td>relay <code>otel-nats-tracing: true</code>，module env 未設</td><td><strong>on</strong> — relay 可以 enable</td></tr>
-          <tr><td>relay <code>otel-nats-tracing: false</code>，module env <code>true</code></td><td>off — relay 可以 disable</td></tr>
-          <tr><td>master env <code>false</code> + 其他全開</td><td>off — veto 贏</td></tr>
+          <tr><td>nothing set</td><td>off</td></tr>
+          <tr><td><code>OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true</code> only</td><td>off — master enables nothing</td></tr>
+          <tr><td><code>OTEL_NATS_TRACING_ENABLED=true</code> only</td><td><strong>on</strong> — master defaults true</td></tr>
+          <tr><td><code>WithTracingEnabled(true)</code>, no env</td><td>on for that connection</td></tr>
+          <tr><td><code>WithTracingEnabled(true)</code> + <code>OTEL_NATS_TRACING_ENABLED=false</code></td><td><strong>off</strong> — env outranks option</td></tr>
+          <tr><td>relay <code>otel-nats-tracing: true</code>, module env unset</td><td><strong>on</strong> — relay can enable</td></tr>
+          <tr><td>relay <code>otel-nats-tracing: false</code>, module env <code>true</code></td><td>off — relay can disable</td></tr>
+          <tr><td>master env <code>false</code> + everything else on</td><td>off — veto wins</td></tr>
         </tbody>
       </table>
 
-      <h2 id="tristate">4. Env tri-state</h2>
+      <h2 id="tristate">4. Environment values are a strict tri-state</h2>
       <table>
         <thead><tr><th>Value</th><th>Outcome</th></tr></thead>
         <tbody>
-          <tr><td>unset</td><td>no opinion — 往 option、再往 default 掉</td></tr>
-          <tr><td><code>1</code> / <code>true</code> / <code>yes</code> / <code>on</code></td><td>此層決定（on）</td></tr>
-          <tr><td><code>0</code> / <code>false</code> / <code>no</code> / <code>off</code></td><td>此層決定（off）</td></tr>
-          <tr><td>其他任何值，<strong>包含空字串</strong></td><td><strong>construction error</strong>，包 <code>otelflags.ErrInvalidFlagValue</code></td></tr>
+          <tr><td>unset</td><td>no opinion — fall through to option, then default</td></tr>
+          <tr><td><code>1</code> / <code>true</code> / <code>yes</code> / <code>on</code></td><td>this source decides (on)</td></tr>
+          <tr><td><code>0</code> / <code>false</code> / <code>no</code> / <code>off</code></td><td>this source decides (off)</td></tr>
+          <tr><td>anything else, <strong>including empty string</strong></td><td><strong>construction error</strong> wrapping <code>otelflags.ErrInvalidFlagValue</code></td></tr>
         </tbody>
       </table>
 
       <div class="callout danger">
-        <strong><code>export VAR=</code> 是 invalid，不是 falsy。</strong>
-        升級前請稽核所有 <code>OTEL_*_ENABLED</code>——未展開的
-        <code>${SOMETHING}</code> template 會撞上此規則並讓建構失敗。
+        <strong><code>export VAR=</code> is invalid, not falsy.</strong>
+        Audit every <code>OTEL_*_ENABLED</code> value before upgrading — unexpanded
+        <code>${SOMETHING}</code> templates hit this case and fail construction.
       </div>
 
-      <h2 id="quickstart">5. Quickstart（zero-code relay）</h2>
+      <h2 id="quickstart">5. Quickstart (zero-code relay)</h2>
       <p>
-        最常見路徑：<strong>只設環境變數</strong>。當
-        <code>OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT</code> 有設、且尚未綁定
-        provider 時，library 會自動在 OpenFeature domain
-        <code>otel-instrumentation-go</code> 安裝 GOFF provider。應用不必寫任何
-        OpenFeature 程式碼。
+        Most common path: <strong>set environment variables only</strong>. The library
+        auto-installs a GOFF provider on OpenFeature domain
+        <code>otel-instrumentation-go</code> when
+        <code>OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT</code> is set and no provider is
+        already bound. No OpenFeature code in the application.
       </p>
 
       <div class="steps">
         <div class="step">
-          <h4>部署 relay proxy<span class="badge ops">ops</span></h4>
+          <h4>Deploy the relay proxy<span class="badge ops">ops</span></h4>
           <p>
-            跑 GO Feature Flag relay（預設埠 <code>1031</code>），flag config 需包含
-            <code>otel-nats-tracing</code>。
+            Run a GO Feature Flag relay (default port <code>1031</code>) with a flag
+            config that includes <code>otel-nats-tracing</code>.
           </p>
         </div>
 
         <div class="step">
-          <h4>選定 resting state<span class="badge env">env</span></h4>
-<pre><code># 範例：部署時 NATS tracing 開著；relay 可雙向切
+          <h4>Choose a resting state<span class="badge env">env</span></h4>
+<pre><code># Example: deploy with NATS tracing on; relay can flip either way
 OTEL_NATS_TRACING_ENABLED=true
 
-# 可選 process-wide veto（預設已是 true / 無異議）
+# Optional process-wide veto (default is already true / no objection)
 # OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true</code></pre>
           <p>
-            或者 module env 不設（預設 off），之後用 relay enable——也可以。
+            Or leave the module env unset (default off) and enable later via relay —
+            that also works.
           </p>
         </div>
 
         <div class="step">
-          <h4>指向 relay<span class="badge env">env</span></h4>
+          <h4>Point at the relay<span class="badge env">env</span></h4>
 <pre><code>OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT=http://relay-proxy:1031
 
-# 可選
-OTEL_INSTRUMENTATION_GO_FLAGS_API_KEY=...          # relay 有認證時
-OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL=60s    # 必須是 Go duration；預設 60s
-OTEL_SERVICE_NAME=my-service                      # targeting 用</code></pre>
-          <p>未設 <code>FLAGS_ENDPOINT</code> ⇒ 不安裝 provider，不走 OpenFeature。</p>
+# Optional
+OTEL_INSTRUMENTATION_GO_FLAGS_API_KEY=...          # if relay auth is on
+OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL=60s    # Go duration only; default 60s
+OTEL_SERVICE_NAME=my-service                      # for targeting</code></pre>
+          <p>Unset <code>FLAGS_ENDPOINT</code> ⇒ no provider, no OpenFeature path.</p>
         </div>
 
         <div class="step">
-          <h4>啟動時設 TracerProvider<span class="badge code">code</span></h4>
-          <p>見 <a href="#tracer-setup">§9</a>。然後連線：</p>
+          <h4>Set TracerProvider at startup<span class="badge code">code</span></h4>
+          <p>See <a href="#tracer-setup">§9</a>. Then connect:</p>
 <pre><code>conn, err := otelnats.Connect(natsURL /* nats.Option... */)</code></pre>
         </div>
 
         <div class="step">
-          <h4>定義 relay flag<span class="badge ops">ops</span></h4>
+          <h4>Define the relay flag<span class="badge ops">ops</span></h4>
 <pre><code>otel-nats-tracing:
   variations:
     enabled: true
     disabled: false
   defaultRule:
-    variation: enabled   # 或 disabled — resting state 由你決定</code></pre>
+    variation: enabled   # or disabled — resting state is yours</code></pre>
         </div>
       </div>
 
@@ -553,13 +554,13 @@ OTEL_SERVICE_NAME=my-service                      # targeting 用</code></pre>
           </tr>
           <tr>
             <td><code>OTEL_NATS_TRACING_ENABLED</code></td>
-            <td>NATS module switch（local rung 在建構時固定）</td>
+            <td>NATS module switch (fixed at construction for the local rung)</td>
             <td><code>false</code></td>
           </tr>
         </tbody>
       </table>
 
-      <h3>Relay connection（process-scoped，非模組行為）</h3>
+      <h3>Relay connection (process-scoped, not module behavior)</h3>
       <table>
         <thead>
           <tr><th>Variable</th><th>Role</th><th>Default</th></tr>
@@ -567,38 +568,38 @@ OTEL_SERVICE_NAME=my-service                      # targeting 用</code></pre>
         <tbody>
           <tr>
             <td><code>OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT</code></td>
-            <td>Relay URL；未設 ⇒ 不安裝 provider</td>
+            <td>Relay URL; unset ⇒ no provider</td>
             <td>unset</td>
           </tr>
           <tr>
             <td><code>OTEL_INSTRUMENTATION_GO_FLAGS_API_KEY</code></td>
-            <td>可選 API key（永不寫入 log）</td>
+            <td>Optional API key (never logged)</td>
             <td>empty</td>
           </tr>
           <tr>
             <td><code>OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL</code></td>
-            <td>必須是 Go duration（<code>60s</code>）；寫 <code>60</code> 會被拒</td>
+            <td>Must be a Go duration (<code>60s</code>); bare <code>60</code> is rejected</td>
             <td><code>60s</code></td>
           </tr>
           <tr>
             <td><code>OTEL_SERVICE_NAME</code></td>
-            <td>zero-code 路徑也把它當 <code>service.name</code> targeting 屬性</td>
+            <td>Also supplies <code>service.name</code> targeting on the zero-code path</td>
             <td>—</td>
           </tr>
         </tbody>
       </table>
 
-      <h2 id="self-provider">7. 自行安裝 OpenFeature provider</h2>
+      <h2 id="self-provider">7. Install your own OpenFeature provider</h2>
       <p>
-        需要生命週期控制、與業務 flag 共用 provider、或要
-        <strong>阻塞等到 ready</strong>（關掉 startup window）時用這條路。
-        必須在<strong>建構任何 wrapper 之前</strong>安裝——
-        <code>relayPossible</code> 在 construction 時固定。
+        Use this when you need lifecycle control, a shared provider with business flags,
+        or a <strong>blocking wait until ready</strong> (closes the startup window).
+        Install <strong>before constructing any wrapper</strong> — <code>relayPossible</code>
+        is fixed at construction.
       </p>
 
       <div class="steps">
         <div class="step">
-          <h4>先裝 provider，再建 wrapper<span class="badge code">code</span></h4>
+          <h4>Install before wrappers<span class="badge code">code</span></h4>
 <pre><code>import (
     gofeatureflag "github.com/open-feature/go-sdk-contrib/providers/go-feature-flag/pkg"
     "github.com/open-feature/go-sdk/openfeature"
@@ -608,10 +609,10 @@ OTEL_SERVICE_NAME=my-service                      # targeting 用</code></pre>
 
 provider, err := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{
     Endpoint:              "http://relay-proxy:1031",
-    DataCollectorDisabled: true, // 必要 —— 見下方
+    DataCollectorDisabled: true, // required — see below
 })
 if err != nil {
-    // 記錄後繼續 —— relay 不是硬相依
+    // Log and continue — relay is not a hard dependency
     logger.Error("feature flag provider unavailable", "error", err)
 } else if err := openfeature.SetNamedProviderAndWait(
     otelflags.FlagDomain, provider,
@@ -621,11 +622,11 @@ if err != nil {
         </div>
 
         <div class="step">
-          <h4>不要同時設 FLAGS_ENDPOINT<span class="badge env">env</span></h4>
+          <h4>Do not also set FLAGS_ENDPOINT<span class="badge env">env</span></h4>
           <p>
-            自行安裝時，請<strong>不要</strong>再設
-            <code>OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT</code>，
-            讓 auto-install 乾淨讓路。
+            When you install yourself, leave
+            <code>OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT</code> unset so the auto-install
+            stands down cleanly.
           </p>
         </div>
       </div>
@@ -637,22 +638,23 @@ if err != nil {
           <tr>
             <td><code>DataCollectorDisabled: true</code></td>
             <td>
-              預設 collector 在 relay 掛掉時可能把每次 NATS publish 卡在 failed flush。
-              Zero-code 路徑已寫死關掉。
+              Default collector can stall every NATS publish behind a failed flush when
+              the relay is down. Zero-code path hardcodes this off.
             </td>
           </tr>
           <tr>
             <td>In-process evaluation only</td>
-            <td>Remote evaluation 會把 HTTP 塞進每筆 instrumented operation。</td>
+            <td>Remote evaluation puts HTTP on every instrumented operation.</td>
           </tr>
           <tr>
             <td>Named domain <code>otel-instrumentation-go</code></td>
-            <td>用 <code>SetNamedProviderAndWait</code>，不要碰 default provider。</td>
+            <td>Use <code>SetNamedProviderAndWait</code>, not the default provider.</td>
           </tr>
           <tr>
             <td>Provider before wrappers</td>
             <td>
-              太早建的 wrapper 會終身靜態解析，永遠不問 relay。
+              A wrapper built too early resolves statically for life and never consults
+              the relay.
             </td>
           </tr>
         </tbody>
@@ -660,23 +662,24 @@ if err != nil {
 
       <h3>Startup window</h3>
       <p>
-        Zero-code install 是 non-blocking。在第一次成功 fetch 之前，每個 switch
-        落到<strong>local</strong> 值（env / option / default）。這是 fail-safe：
-        window 只能延遲 relay-driven enable，不可能憑空引入一個。
+        Zero-code install is non-blocking. Until the first successful fetch, every switch
+        resolves to its <strong>local</strong> value (env / option / default). That is
+        fail-safe: the window can delay a relay-driven enable; it cannot introduce one.
       </p>
 
       <h2 id="with-option">8. <code>WithTracingEnabled</code></h2>
       <p>
-        供給<strong>module</strong> 這一層——低於 env、高於 hardcoded default、
-        遠低於 relay。它不會釘死任何東西：connection 每次操作仍會解析 master + relay。
+        Supplies the <strong>module</strong> tier for one connection — below its env var,
+        above the hardcoded default, far below the relay. It does not pin anything: the
+        connection still resolves master + relay on every operation.
       </p>
 
 <pre><code>conn, err := otelnats.ConnectWithOptions(url, nil,
     otelnats.WithTracingEnabled(true),
 )
-// 與 OTEL_NATS_TRACING_ENABLED 同時設是合法的 —— 有設 env 就由 env 贏。</code></pre>
+// Legal alongside OTEL_NATS_TRACING_ENABLED — the env var wins if set.</code></pre>
 
-      <p>接受此 option 的 API：</p>
+      <p>Accepted by:</p>
       <ul>
         <li><code>otelnats.ConnectWithOptions</code></li>
         <li><code>otelnats.ConnectTLSWithOptions</code></li>
@@ -684,15 +687,15 @@ if err != nil {
       </ul>
 
       <div class="callout">
-        Subscription 與 JetStream consumer <strong>每則訊息</strong>重新解析，
-        所以 flag 變更不必重建訂閱。
+        Subscriptions and JetStream consumers re-resolve per <strong>message</strong>,
+        so a flag change reaches them without re-establishing the subscription.
       </div>
 
-      <h2 id="tracer-setup">9. TracerProvider 與 Propagator</h2>
+      <h2 id="tracer-setup">9. TracerProvider and Propagator</h2>
       <p>
-        依 OTel Go Contrib：套件只透過 option 接受 TracerProvider / Propagators，
-        <strong>不提供 InitTracer</strong>。預設用
-        <code>otel.GetTracerProvider()</code> / <code>otel.GetTextMapPropagator()</code>。
+        Per OTel Go Contrib: the package accepts TracerProvider / Propagators via options;
+        it does <strong>not</strong> provide InitTracer. Defaults to
+        <code>otel.GetTracerProvider()</code> / <code>otel.GetTextMapPropagator()</code>.
       </p>
 
 <pre><code>import (
@@ -700,7 +703,7 @@ if err != nil {
     "go.opentelemetry.io/otel/propagation"
 )
 
-tp, err := newTracerProvider() // 你的 OTLP + resource 設定
+tp, err := newTracerProvider() // your OTLP + resource setup
 if err != nil { log.Fatal(err) }
 defer tp.Shutdown(ctx)
 
@@ -715,7 +718,7 @@ conn, err := otelnats.ConnectWithOptions(url, nil,
     otelnats.WithPropagators(otel.GetTextMapPropagator()),
 )</code></pre>
 
-      <p>可執行範例：<code>otel-nats/examples/</code>。</p>
+      <p>Runnable example: <code>otel-nats/examples/</code>.</p>
 
       <h2 id="usage">10. otel-nats basic usage</h2>
 
@@ -729,7 +732,7 @@ defer conn.Close()
 _ = conn.Publish(ctx, "subject", []byte("data"))
 
 _, _ = conn.Subscribe("subject", func(m otelnats.Msg) {
-    ctx := m.Context() // 從 header 解出的 trace；傳給下游
+    ctx := m.Context() // extracted trace; thread into downstream calls
     _ = ctx
 })</code></pre>
 
@@ -737,7 +740,7 @@ _, _ = conn.Subscribe("subject", func(m otelnats.Msg) {
 <pre><code>import "github.com/akira-core/instrumentation-go/otel-nats/oteljetstream"
 
 js, err := oteljetstream.New(conn)
-// CreateOrUpdateStream / Consumer 之後：
+// after CreateOrUpdateStream / Consumer:
 cons.Consume(func(m oteljetstream.Msg) {
     ctx := m.Context()
     _ = m.Ack()
@@ -753,20 +756,18 @@ cons.Consume(func(m oteljetstream.Msg) {
     variation: enabled</code></pre>
 
       <ul>
-        <li><code>enabled</code>（<code>true</code>）= 允許 tracing（較低 rung 也允許時）。</li>
-        <li><code>disabled</code>（<code>false</code>）= 停止產出 span；NATS 訊息路徑仍執行。</li>
-        <li>Master key <code>otel-instrumentation-go-tracing</code> 用來
-          <strong>veto 整個 process</strong>——設 <code>false</code>，
-          不要建立 <code>true</code> 期待它會 enable。</li>
+        <li><code>enabled</code> (<code>true</code>) = allow tracing (when lower rungs also allow).</li>
+        <li><code>disabled</code> (<code>false</code>) = stop span production; NATS message path still runs.</li>
+        <li>Master key <code>otel-instrumentation-go-tracing</code> exists to <strong>veto the whole process</strong> — set it <code>false</code>, never create it as <code>true</code> expecting an enable.</li>
       </ul>
 
-      <p>四個模組共用 domain <code>otel-instrumentation-go</code>：</p>
+      <p>All four modules share domain <code>otel-instrumentation-go</code>:</p>
       <table>
         <thead>
           <tr><th>Relay flag</th><th>Paired env</th><th>Module</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>otel-instrumentation-go-tracing</code></td><td><code>OTEL_INSTRUMENTATION_GO_TRACING_ENABLED</code></td><td>all（veto）</td></tr>
+          <tr><td><code>otel-instrumentation-go-tracing</code></td><td><code>OTEL_INSTRUMENTATION_GO_TRACING_ENABLED</code></td><td>all (veto)</td></tr>
           <tr><td><code>otel-nats-tracing</code></td><td><code>OTEL_NATS_TRACING_ENABLED</code></td><td>otel-nats</td></tr>
           <tr><td><code>otel-mongo-tracing</code></td><td><code>OTEL_MONGO_TRACING_ENABLED</code></td><td>otel-mongo / v2</td></tr>
           <tr><td><code>otel-mongo-propagation</code></td><td><code>OTEL_MONGO_PROPAGATION_ENABLED</code></td><td>otel-mongo / v2</td></tr>
@@ -774,52 +775,52 @@ cons.Consume(func(m oteljetstream.Msg) {
         </tbody>
       </table>
 
-      <h2 id="toggle">12. Hot toggle（雙向）</h2>
+      <h2 id="toggle">12. Hot toggle (both directions)</h2>
       <div class="steps">
         <div class="step">
-          <h4>確認 relay 可達</h4>
+          <h4>Confirm relay is reachable</h4>
           <p>
-            已設 <code>FLAGS_ENDPOINT</code>（或自行 provider 在 wrapper
-            <em>之前</em>裝好），且 wrapper 已建構。
+            <code>FLAGS_ENDPOINT</code> set (or your own provider installed
+            <em>before</em> wrappers), and wrappers already constructed.
           </p>
         </div>
         <div class="step">
-          <h4>翻 flag<span class="badge kill">ops</span></h4>
-<pre><code># 關掉 NATS tracing
+          <h4>Flip the flag<span class="badge kill">ops</span></h4>
+<pre><code># Disable NATS tracing
 defaultRule:
   variation: disabled
 
-# 重新打開
+# Re-enable
 defaultRule:
   variation: enabled</code></pre>
         </div>
         <div class="step">
-          <h4>等 provider poll</h4>
+          <h4>Wait for the provider poll</h4>
           <p>
-            Latency ≈ relay 重讀設定 + provider poll interval。
-            生產預設 poll：<code>60s</code>。
+            Latency ≈ relay config reload + provider poll interval.
+            Production default poll: <code>60s</code>.
           </p>
         </div>
         <div class="step">
           <h4>Verify</h4>
           <ul>
-            <li>NATS publish / subscribe / reply <strong>仍執行</strong></li>
-            <li>新的 NATS PRODUCER / CONSUMER span 依預期出現或停止</li>
+            <li>NATS publish / subscribe / reply <strong>still run</strong></li>
+            <li>New NATS PRODUCER / CONSUMER spans appear or stop as expected</li>
           </ul>
         </div>
       </div>
 
       <div class="callout warn">
-        <strong>Relay 可以 enable。</strong>
-        若 deployment 當初把 module 關掉（env 未設 / default），把 flag 設成
-        <code>enabled</code> 會在一個 poll interval 內打開 tracing——這是設計行為。
-        不能接受這個風險的站點：不要設
-        <code>OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT</code>，或用 master veto /
-        module env <code>false</code>（env 贏過 application option；有綁 provider
-        時 relay 仍贏過 env）。
+        <strong>Relay can enable.</strong>
+        If the deployment left the module off (env unset / default), setting the flag
+        to <code>enabled</code> turns tracing on within the poll interval — by design.
+        Sites that cannot accept that keep
+        <code>OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT</code> unset, or set the master
+        veto / module env to <code>false</code> (env outranks application options; relay
+        still outranks env when a provider is bound).
       </div>
 
-      <h2 id="targeting">13. Targeting 單一 service</h2>
+      <h2 id="targeting">13. Targeting one service</h2>
 <pre><code>otel-nats-tracing:
   variations:
     enabled: true
@@ -831,23 +832,23 @@ defaultRule:
     variation: enabled</code></pre>
 
       <ul>
-        <li>Zero-code 路徑會從 <code>OTEL_SERVICE_NAME</code> 送 <code>service.name</code>。</li>
-        <li>自行安裝 provider：自己設 evaluation context。</li>
-        <li>只有 process 級——不支援 per-request targeting。</li>
+        <li>Zero-code path sends <code>service.name</code> from <code>OTEL_SERVICE_NAME</code>.</li>
+        <li>Self-installed provider: set evaluation context yourself.</li>
+        <li>Process-level only — no per-request targeting.</li>
       </ul>
 
       <h2 id="latency">14. Change latency</h2>
       <table>
         <thead><tr><th>Source</th><th>Delay</th></tr></thead>
         <tbody>
-          <tr><td>Module resolution</td><td>無 —— 每次操作讀當下值</td></tr>
-          <tr><td>Provider poll（zero-code）</td><td>最多 <code>OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL</code>（預設 60s）</td></tr>
-          <tr><td>Provider poll（self-install）</td><td>由你設定；GOFF 預設常為 120s</td></tr>
+          <tr><td>Module resolution</td><td>none — every operation reads the current value</td></tr>
+          <tr><td>Provider poll (zero-code)</td><td>up to <code>OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL</code> (default 60s)</td></tr>
+          <tr><td>Provider poll (self-install)</td><td>whatever you set; GOFF default often 120s</td></tr>
         </tbody>
       </table>
       <p>
-        事故應變請以 poll interval 為準——<strong>兩個方向</strong>都一樣。
-        Poll 是帶 ETag 的 conditional GET（無變更回 304），縮短間隔成本低。
+        Plan incident response around the poll interval in <strong>both</strong>
+        directions. Polls are conditional GETs (304 when unchanged); tightening is cheap.
       </p>
 
       <h2 id="cheatsheet">15. Ops cheatsheet</h2>
@@ -855,36 +856,36 @@ defaultRule:
         <thead><tr><th>Goal</th><th>Action</th></tr></thead>
         <tbody>
           <tr>
-            <td>讓 NATS 可被 relay 控制</td>
-            <td>設 <code>FLAGS_ENDPOINT</code> + 建立 <code>otel-nats-tracing</code>。不用寫應用程式碼。</td>
+            <td>Make NATS relay-controllable</td>
+            <td>Set <code>FLAGS_ENDPOINT</code> + create <code>otel-nats-tracing</code>. No app code.</td>
           </tr>
           <tr>
-            <td>立刻停 NATS tracing</td>
-            <td>Relay flag → <code>false</code> / <code>disabled</code>。等一次 poll。</td>
+            <td>Stop NATS tracing now</td>
+            <td>Relay flag → <code>false</code> / <code>disabled</code>. Wait one poll.</td>
           </tr>
           <tr>
-            <td>立刻開 NATS tracing</td>
-            <td>Relay flag → <code>true</code> / <code>enabled</code>。等一次 poll。</td>
+            <td>Start NATS tracing now</td>
+            <td>Relay flag → <code>true</code> / <code>enabled</code>. Wait one poll.</td>
           </tr>
           <tr>
-            <td>只停一個 service</td>
-            <td><code>OTEL_SERVICE_NAME</code> + <code>service.name</code> targeting。</td>
+            <td>Stop one service</td>
+            <td><code>OTEL_SERVICE_NAME</code> + <code>service.name</code> targeting.</td>
           </tr>
           <tr>
-            <td>停掉整個 process</td>
-            <td>Master relay <code>otel-instrumentation-go-tracing: false</code>，或 env <code>OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=false</code> + redeploy。</td>
+            <td>Stop the whole process</td>
+            <td>Master relay <code>otel-instrumentation-go-tracing: false</code>, or env <code>OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=false</code> + redeploy.</td>
           </tr>
           <tr>
-            <td>無 relay 停一個模組</td>
-            <td><code>OTEL_NATS_TRACING_ENABLED=false</code> + redeploy。App option 無法覆寫。</td>
+            <td>Stop one module without relay</td>
+            <td><code>OTEL_NATS_TRACING_ENABLED=false</code> + redeploy. App options cannot override.</td>
           </tr>
           <tr>
-            <td>關掉 startup window</td>
-            <td>建構 wrapper 之前 <code>SetNamedProviderAndWait</code>。</td>
+            <td>Close the startup window</td>
+            <td><code>SetNamedProviderAndWait</code> before constructing wrappers.</td>
           </tr>
           <tr>
-            <td>完全不要 relay</td>
-            <td>不設 <code>FLAGS_ENDPOINT</code>。只靠 env + option + default。</td>
+            <td>No relay at all</td>
+            <td>Leave <code>FLAGS_ENDPOINT</code> unset. Env + option + defaults only.</td>
           </tr>
         </tbody>
       </table>
@@ -892,40 +893,40 @@ defaultRule:
       <h2 id="pitfalls">16. Common pitfalls</h2>
       <ol>
         <li>
-          <strong><code>export VAR=</code> 或 <code>enabled</code> / <code>2</code></strong> →
-          construction error。只用 allow-list。
+          <strong><code>export VAR=</code> or <code>enabled</code> / <code>2</code></strong> →
+          construction error. Use only the allow-list.
         </li>
         <li>
-          <strong><code>POLL_INTERVAL=60</code>（無單位）</strong> → 被拒；寫 <code>60s</code>。
+          <strong><code>POLL_INTERVAL=60</code> (no unit)</strong> → rejected; use <code>60s</code>.
         </li>
         <li>
-          <strong>自行裝 provider 卻忘了 <code>DataCollectorDisabled: true</code></strong> →
-          relay 中斷可能拖住 NATS 路徑。
+          <strong>Self-install without <code>DataCollectorDisabled: true</code></strong> →
+          relay outage can stall NATS paths.
         </li>
         <li>
-          <strong>先建 wrapper 再裝 provider</strong> → 那些 wrapper 永遠看不到 relay。
+          <strong>Install provider after constructing wrappers</strong> → those wrappers
+          never see the relay.
         </li>
         <li>
-          <strong>以為 master <code>true</code> 會 enable 什麼</strong> → 不會。
+          <strong>Expecting master <code>true</code> to enable something</strong> → it does not.
         </li>
         <li>
-          <strong>以為切換是瞬間</strong> → 以 poll interval 為準（預設最多 60s）。
+          <strong>Expecting an immediate flip</strong> → budget the poll interval (default 60s).
         </li>
         <li>
-          <strong>以為 option 贏過 env</strong> → 相對 0.7.0 已反轉；env 贏。
+          <strong>Assuming option beats env</strong> → reversed vs 0.7.0; env wins.
         </li>
       </ol>
 
       <footer>
         <p>
-          權威來源：
-          <a href="feature-flags.zh-TW.md">feature-flags.zh-TW.md</a> ·
+          Authoritative reference:
           <a href="feature-flags.md">feature-flags.md</a> ·
-          <a href="../otel-nats/README.zh-TW.md">otel-nats/README.zh-TW.md</a>
+          <a href="../otel-nats/README.md">otel-nats/README.md</a>
         </p>
         <p>
-          適用 <code>otel-nats</code> 0.8.0+（雙向 ladder 模型）。
-          en-US: <a href="otel-nats-kill-switch.en-US.html">otel-nats-kill-switch.en-US.html</a>
+          Applies to <code>otel-nats</code> 0.8.0+ with the bidirectional ladder model.
+          zh-TW: <a href="otel-nats-kill-switch.zh-TW.html">otel-nats-kill-switch.zh-TW.html</a>
         </p>
       </footer>
     </main>

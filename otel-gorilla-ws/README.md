@@ -80,7 +80,7 @@ Three things to know:
 
 > Full reference — every resolution table, connecting a relay with no application code, revocation
 > latency, per-service targeting, and the operational summary:
-> **[feature-flags.md](../feature-flags.md)** · 繁體中文:**[feature-flags.zh-TW.md](../feature-flags.zh-TW.md)**
+> **[docs/feature-flags.md](../docs/feature-flags.md)** · 繁體中文:**[docs/feature-flags.zh-TW.md](../docs/feature-flags.zh-TW.md)**
 
 ### NewConn vs. Dial / Upgrader
 

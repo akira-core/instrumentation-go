@@ -1,6 +1,8 @@
 # Tracing feature flags(繁體中文)
 
-> English version: [feature-flags.md](feature-flags.md)
+> English version: [feature-flags.md](feature-flags.md) ·
+> 實作教學:[otel-nats-kill-switch.zh-TW.html](otel-nats-kill-switch.zh-TW.html) /
+> [otel-nats-kill-switch.en-US.html](otel-nats-kill-switch.en-US.html)
 
 每一個 instrumentation 模組都可以被打開或關掉。本文件是這個決策的**唯一參考**:每個開關做什麼、由誰擁有、
 哪些能在 process 執行期間改變、哪些不能。

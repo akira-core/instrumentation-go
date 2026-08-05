@@ -1,6 +1,8 @@
 # Tracing feature flags
 
-> 繁體中文版本:[feature-flags.zh-TW.md](feature-flags.zh-TW.md)
+> 繁體中文版本:[feature-flags.zh-TW.md](feature-flags.zh-TW.md) ·
+> Hands-on tutorial:[otel-nats-kill-switch.en-US.html](otel-nats-kill-switch.en-US.html) /
+> [otel-nats-kill-switch.zh-TW.html](otel-nats-kill-switch.zh-TW.html)
 
 Every instrumentation module can be switched on or off. This document is the single reference for
 how that decision is made — what each switch does, who owns it, which ones can change while a

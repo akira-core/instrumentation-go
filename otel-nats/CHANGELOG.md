@@ -29,7 +29,7 @@ All notable changes to the `otel-nats` module (`otelnats` + `oteljetstream`) are
 
 - **Flag changes are not immediate.** End-to-end latency is the provider's poll interval — 60 s by default — in **both** directions. This module adds none of its own.
 - The library still never touches the **default** OpenFeature provider, the global evaluation context, hooks or shutdown. The one piece of state it may write is a **named** provider on `otel-instrumentation-go`, and only when the environment asks for one and the application installed none. `DataCollectorDisabled: true` and in-process evaluation are hardcoded on that path.
-- Full reference: [`feature-flags.md`](../feature-flags.md) ([繁體中文](../feature-flags.zh-TW.md)).
+- Full reference: [`docs/feature-flags.md`](../docs/feature-flags.md) ([繁體中文](../docs/feature-flags.zh-TW.md)).
 
 ## [0.7.0] - 2026-07-15
 

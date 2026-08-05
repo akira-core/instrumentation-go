@@ -77,10 +77,12 @@ OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT=http://relay:1031
 開關只由 `1`/`true`/`yes`/`on` 或 `0`/`false`/`no`/`off` 決定。未設定代表「沒有意見」,往下一層掉。
 **其他任何值——包含空字串——都是建構錯誤**,所以升級前請先稽核你的 `OTEL_*_ENABLED` 值。
 
-> **其餘全部在 [feature-flags.md](feature-flags.md)**:完整的解析表與實例、為什麼選項排在環境變數之下、
+> **其餘全部在 [docs/feature-flags.zh-TW.md](docs/feature-flags.zh-TW.md)**:完整的解析表與實例、為什麼選項排在環境變數之下、
 > 其他 relay 連線變數、針對單一服務的 targeting、一次改動要多久生效、必須在建構 wrapper **之前**安裝
 > provider 的規則、關掉一個模組**不會**停掉什麼,以及維運速查。只有一份,兩邊不會漂移。
-> English: [feature-flags.md](feature-flags.md)
+> 實作教學:[docs/otel-nats-kill-switch.zh-TW.html](docs/otel-nats-kill-switch.zh-TW.html)
+> · English:[docs/feature-flags.md](docs/feature-flags.md) ·
+> [docs/otel-nats-kill-switch.en-US.html](docs/otel-nats-kill-switch.en-US.html)
 
 ## 目錄結構
 
@@ -106,8 +108,11 @@ instrumentation-go/
 │   ├── go.mod
 │   └── README.md
 ├── otel-ws.md               # 子協定／傳播設計筆記（跨語言）
-├── feature-flags.md         # 追蹤功能開關完整參考（英文）
-├── feature-flags.zh-TW.md   # 追蹤功能開關完整參考（繁體中文）
+├── docs/
+│   ├── feature-flags.md              # Tracing feature-flag 完整參考（英文）
+│   ├── feature-flags.zh-TW.md        # …繁體中文翻譯
+│   ├── otel-nats-kill-switch.en-US.html  # Relay 實作教學（en-US）
+│   └── otel-nats-kill-switch.zh-TW.html  # Relay 實作教學（zh-TW）
 ├── CLAUDE.md                # 貢獻者／代理用說明
 └── README.md
 ```

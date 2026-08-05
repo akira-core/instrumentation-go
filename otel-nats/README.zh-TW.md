@@ -72,7 +72,10 @@ relay **兩個方向都有權威** —— 能關掉執行中的模組,也能打�
 訂閱與 JetStream consumer **每則訊息**重新解析,所以 flag 改變前建立的訂閱不用重建就會跟上。
 
 > 完整參考 —— 全部解析表格、零程式碼連上 relay、撤銷延遲、針對單一服務的 targeting、維運速查:
-> **[feature-flags.zh-TW.md](../feature-flags.zh-TW.md)** · English:**[feature-flags.md](../feature-flags.md)**
+> **[docs/feature-flags.zh-TW.md](../docs/feature-flags.zh-TW.md)** ·
+> 教學:**[docs/otel-nats-kill-switch.zh-TW.html](../docs/otel-nats-kill-switch.zh-TW.html)** ·
+> English:**[docs/feature-flags.md](../docs/feature-flags.md)** ·
+> **[docs/otel-nats-kill-switch.en-US.html](../docs/otel-nats-kill-switch.en-US.html)**
 
 ### 1. 初始化 Provider 與 Propagator（應用程式負責）
 
