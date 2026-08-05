@@ -245,11 +245,25 @@ next rung down decides". Do **not** use `BooleanValueDetails`: the distinction h
 
 Three further **process-scoped** variables configure the relay connection rather than any module:
 `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` (unset ⇒ no provider is installed **and** `RelayPossible()`
-is false), `_API_KEY`, and `_POLL_INTERVAL` (Go duration strings only, default `60s`).
+is false), `_API_KEY`, and `_POLL_INTERVAL` (Go duration strings only, default `60s`, and the centre
+of the period rather than an exact one — see `jitterInterval` below).
 `OTEL_SERVICE_NAME` supplies a `service.name` targeting attribute, on the auto-install path only.
 
-**Flag-change latency is the provider's poll interval — 60 s by default — in both directions.** The
-resolver adds none of its own.
+**Flag-change latency is the provider's poll interval — 60 s by default, up to 66 s — in both
+directions.** The resolver adds nothing beyond `jitterInterval` (`otel-flags/flags.go`), which
+deviates the auto-installed provider's interval by at most ±10%, drawn once per process, so a fleet
+does not poll the relay on a shared period. It mirrors upstream's `newBackgroundUpdater`
+(`retriever/background_updater.go`) — uniform magnitude in `[0, 10%)`, sign from that draw's parity
+in nanoseconds — which is what the relay proxy's `enablePollingJitter` runs one hop further up,
+between the relay and the flag storage. An interval the application configures on its own provider is
+untouched.
+
+**The provider's first fetch is deliberately not jittered.** `InProcess.Init` fetches the whole
+configuration once, unconditionally, then starts a plain ticker; later polls are ETag-conditional and
+answered 304. So the expensive request is at process start and stays correlated across a fleet
+restart. Delaying the install to scatter it would lengthen the startup window in which every switch
+resolves to its local value — fail-safe for enabling, **not** for disabling — which is exactly the
+case an operator reaches for the relay to stop, `_oteltrace` writes included.
 
 **Never touch the DEFAULT provider from library code** — never `openfeature.SetProvider`,
 `SetEvaluationContext`, `AddHooks` or `Shutdown`, the same rule as never initializing a

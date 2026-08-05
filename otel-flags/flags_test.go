@@ -696,6 +696,51 @@ func TestPollIntervalFromEnv(t *testing.T) {
 	}
 }
 
+func TestJitterInterval(t *testing.T) {
+	const (
+		base    = 60 * time.Second
+		samples = 500
+	)
+	maxJitter := time.Duration(float64(base) * pollJitterFraction)
+	lo, hi := base-maxJitter, base+maxJitter
+
+	seen := make(map[time.Duration]struct{}, samples)
+	for range samples {
+		got := jitterInterval(base)
+		if got < lo || got > hi {
+			t.Fatalf("jitterInterval(%v) = %v, want within [%v, %v]", base, got, lo, hi)
+		}
+		// Upstream takes the sign from the magnitude's parity in nanoseconds; an
+		// even magnitude is added, an odd one subtracted. Pinned so a rewrite that
+		// silently diverges from newBackgroundUpdater is visible here.
+		magnitude := got - base
+		if magnitude < 0 {
+			magnitude = -magnitude
+		}
+		if wantAdded := magnitude%2 == 0; wantAdded != (got >= base) {
+			t.Fatalf("jitterInterval(%v) = %v: magnitude %v is even=%v, so it should have been %s",
+				base, got, magnitude, wantAdded, map[bool]string{true: "added", false: "subtracted"}[wantAdded])
+		}
+		seen[got] = struct{}{}
+	}
+	// A constant would satisfy the bounds check above while leaving the fleet in
+	// lockstep, which is the whole point of the function.
+	if len(seen) == 1 {
+		t.Fatalf("jitterInterval returned the same value %v across %d calls; no jitter was applied",
+			base, samples)
+	}
+}
+
+func TestJitterInterval_NonPositiveAndTinyIntervalsPassThrough(t *testing.T) {
+	// Below ten nanoseconds the magnitude truncates to zero, and rand.Int64N
+	// panics on a non-positive bound.
+	for _, d := range []time.Duration{-time.Second, 0, 1, 9} {
+		if got := jitterInterval(d); got != d {
+			t.Errorf("jitterInterval(%v) = %v, want it returned unchanged", d, got)
+		}
+	}
+}
+
 func TestAutoInstall_MalformedIntervalStillInstalls(t *testing.T) {
 	clearProvider(t)
 	resetInstallState(t)

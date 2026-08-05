@@ -244,7 +244,7 @@ Set environment variables. No import, no Go code, nothing else to remember.
 |---|---|
 | `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` | relay proxy URL. Unset ⇒ nothing is installed, no OpenFeature state is written, and no evaluation ever happens |
 | `OTEL_INSTRUMENTATION_GO_FLAGS_API_KEY` | optional; never logged |
-| `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` | optional; Go duration strings only (`30s`, `2m`), default `60s`. A malformed value warns, falls back and still installs |
+| `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` | optional; Go duration strings only (`30s`, `2m`), default `60s`. A malformed value warns, falls back and still installs. The value sets the centre of the polling period, not an exact one: it is deviated by at most ±10%, drawn once per process |
 | `OTEL_SERVICE_NAME` | optional; supplies a `service.name` targeting attribute, on this path only |
 
 The library installs a GO Feature Flag provider as a **named** provider on the domain
@@ -430,15 +430,27 @@ Per-request targeting is not supported. The resolver holds no request state.
 
 ## How long a change takes to take effect
 
-**The provider's poll interval — 60 seconds by default.** The library adds nothing of its own: it
+**The provider's poll interval — 60 seconds by default, widened by up to 10%.** The library
 re-resolves on every operation, so the moment the provider has the new configuration, the next
-operation uses it.
+operation uses it; the jitter below is the only delay it adds.
 
 | | Delay |
 |---|---|
 | The modules' own resolution | none — every operation reads the current value |
-| Provider poll interval (zero-code path) | **up to 60 s**, tunable with `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` |
-| Provider poll interval (your own provider) | whatever you set; the GO Feature Flag default is **120 s** |
+| Provider poll interval (zero-code path) | **up to 66 s** — the configured 60 s deviated by at most ±10%, tunable with `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` |
+| Provider poll interval (your own provider) | whatever you set; the GO Feature Flag default is **120 s**. This library does not jitter an interval you configured yourself |
+
+The deviation is drawn once per process and fixed for its lifetime, so a fleet started from one
+deployment does not keep polling the relay on a shared period. It follows the same rule as the relay
+proxy's `enablePollingJitter`, which does this one hop further up, between the relay proxy and your
+flag storage.
+
+Be clear about what neither of them spreads: the provider fetches the whole configuration once,
+unconditionally, while it initialises, and only then starts its ticker. That request's timing is the
+process's own start time, so a simultaneous fleet restart still arrives at the relay together.
+Delaying it to scatter that burst is deliberately not done — the window it would lengthen is the one
+in which every switch resolves to its local value, and that window is fail-safe for enabling but not
+for disabling.
 
 Plan an incident response around the poll interval, not around "immediately" — in **both**
 directions, enabling as well as disabling. If 60 s is too slow for your risk profile, lower it: the

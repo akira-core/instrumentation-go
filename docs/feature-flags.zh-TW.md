@@ -214,7 +214,7 @@ master、模組、含 relay——在**交握前的那一刻**為開。交握無�
 |---|---|
 | `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` | relay proxy URL。未設 ⇒ 不安裝任何東西、不寫入任何 OpenFeature 狀態、永遠不做評估 |
 | `OTEL_INSTRUMENTATION_GO_FLAGS_API_KEY` | 選用;永遠不會被記進 log |
-| `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` | 選用;只接受 Go duration 字串(`30s`、`2m`),預設 `60s`。格式錯誤會警告、退回預設值,並**仍然安裝** |
+| `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` | 選用;只接受 Go duration 字串(`30s`、`2m`),預設 `60s`。格式錯誤會警告、退回預設值,並**仍然安裝**。這個值設定的是輪詢週期的中心,不是精確值:每個 process 會抽一次、偏移最多 ±10% |
 | `OTEL_SERVICE_NAME` | 選用;提供 `service.name` targeting 屬性,僅限這條路徑 |
 
 函式庫會把 GO Feature Flag provider 以**具名(named)**provider 的身分註冊在 `otel-instrumentation-go`
@@ -380,14 +380,22 @@ Resource 由環境建構、從不回寫環境,而且 `TracerProvider` 介面與 
 
 ## 一次改動要多久才生效
 
-**provider 的輪詢間隔——預設 60 秒。** 函式庫本身不增加任何延遲:它每次操作都重新解析,所以 provider
-一拿到新設定,下一個操作就會用到。
+**provider 的輪詢間隔——預設 60 秒,再放寬最多 10%。** 函式庫每次操作都重新解析,所以 provider
+一拿到新設定,下一個操作就會用到;它唯一增加的延遲就是下面這段抖動。
 
 | | 延遲 |
 |---|---|
 | 模組本身的解析 | 無 —— 每次操作都讀當下的值 |
-| provider 輪詢間隔(零程式碼路徑) | **最多 60 秒**,可用 `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` 調整 |
-| provider 輪詢間隔(你自己的 provider) | 你設多少就是多少;GO Feature Flag 的預設是 **120 秒** |
+| provider 輪詢間隔(零程式碼路徑) | **最多 66 秒** —— 設定的 60 秒再偏移最多 ±10%,可用 `OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL` 調整 |
+| provider 輪詢間隔(你自己的 provider) | 你設多少就是多少;GO Feature Flag 的預設是 **120 秒**。你自己設定的間隔,本函式庫不會加抖動 |
+
+偏移量在每個 process 只抽一次,之後固定不變,這樣同一次部署起來的整批 process 就不會一直用同一個週期
+打 relay。規則與 relay proxy 的 `enablePollingJitter` 相同——後者做的是再上一跳,relay proxy 到你的
+flag 儲存那段。
+
+要講清楚兩者都沒有打散的東西:provider 初始化時會無條件把整份設定抓一次,之後才啟動 ticker。那一次請求
+的時間點就是 process 自己的啟動時間,所以整批同時重啟時,它們仍然會一起打到 relay。刻意不去延後它:被
+延長的那段窗口正是每個開關都讀 local 值的窗口,而該窗口對啟用是 fail-safe,對停用不是。
 
 規劃事故應變時要以輪詢間隔為準,不要以「立即」為準——**兩個方向都一樣**,啟用與停用都受它約束。
 如果 60 秒對你的風險輪廓來說太慢,把它調小:輪詢是一個帶 ETag 的條件式 `GET`,沒變動時回 304,

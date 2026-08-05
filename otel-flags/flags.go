@@ -52,7 +52,8 @@
 //
 // Nothing here is cached. Value evaluates on every call, so a relay change is
 // observed on the next operation; the end-to-end delay is the provider's poll
-// interval, not anything this package adds.
+// interval, which this package lengthens by at most a tenth — see
+// jitterInterval — and nothing else.
 package otelflags
 
 import (
@@ -60,6 +61,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"strings"
 	"sync"
@@ -92,7 +94,10 @@ const (
 	// EnvFlagsPollInterval overrides how often the provider polls the relay.
 	// Go duration strings only: a bare integer is rejected rather than read as
 	// milliseconds, because misreading a polling interval that way is
-	// catastrophic rather than merely wrong.
+	// catastrophic rather than merely wrong. The value configured here is
+	// jittered by at most plus or minus a tenth for the life of the process —
+	// see jitterInterval — so it sets the centre of the polling period, not an
+	// exact one.
 	EnvFlagsPollInterval = "OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL"
 
 	// EnvServiceName is the OpenTelemetry-specified service name. It is the only
@@ -122,8 +127,9 @@ const FlagKeyGlobalTracing = "otel-instrumentation-go-tracing"
 const FlagDomain = "otel-instrumentation-go"
 
 // defaultPollInterval is how often the auto-installed provider polls the relay,
-// and therefore the upper bound on how long a flag change takes to reach a
-// running process. It is set explicitly because the provider's own default is
+// and therefore — once jitterInterval has widened it by at most a tenth — the
+// upper bound on how long a flag change takes to reach a running process. It is
+// set explicitly because the provider's own default is
 // two minutes — too slow for a control plane whose job includes stopping an
 // incident — and because that default applies whenever the configured interval
 // is non-positive.
@@ -518,7 +524,7 @@ func installProviderFromEnv() openfeature.EvaluationContext {
 	provider, err := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{
 		Endpoint:                  endpoint,
 		APIKey:                    os.Getenv(EnvFlagsAPIKey),
-		FlagChangePollingInterval: pollIntervalFromEnv(),
+		FlagChangePollingInterval: jitterInterval(pollIntervalFromEnv()),
 
 		// Both hardcoded, and deliberately not exposed as environment variables,
 		// so the zero-code path cannot be misconfigured into either failure. The
@@ -584,4 +590,65 @@ func pollIntervalFromEnv() time.Duration {
 	default:
 		return d
 	}
+}
+
+// pollJitterFraction is the maximum deviation jitterInterval applies, as a
+// fraction of the interval. It is upstream's value: the relay proxy's
+// EnablePollingJitter uses the same 0.1 for the same reason on the hop above
+// this one.
+const pollJitterFraction = 0.1
+
+// jitterInterval perturbs the polling interval by at most plus or minus a
+// tenth, so that a fleet started from one deployment does not keep polling the
+// relay on a shared period.
+//
+// Be precise about what this does and does not buy, because it is easy to
+// oversell. The provider fetches the whole configuration once, unconditionally,
+// inside Init, and only then starts a plain time.NewTicker; every later poll is
+// ETag-conditional and answered with a 304 when nothing changed. So the
+// expensive request is the one at process start, its timing is the process's
+// own start time, and nothing here moves it. What this smooths is the cheap
+// steady-state poll, and the reason to bother is only that a large fleet on an
+// identical period turns even those into a periodic spike.
+//
+// Jittering the START instead — delaying the install so the first fetch
+// scatters — would address the expensive request, and is deliberately not done.
+// The startup window that ends at that fetch is the window in which every
+// switch resolves to its local value: fail-safe for enabling, not for
+// disabling, since a relay's false does not survive a restart. Lengthening it
+// prolongs exactly the case an operator reaches for the relay to stop,
+// including otel-mongo writing an _oteltrace field the relay was configured to
+// stop writing — and a fleet restart is when a kill switch is most likely to be
+// in use. That trades flag correctness for a spike a relay proxy answers from
+// memory. The hop where correlated polling genuinely hurts is the relay's own
+// retriever, and the relay proxy jitters that itself via enablePollingJitter.
+//
+// The deviation is fixed per process, not per tick, because the ticker's
+// interval is chosen once inside Init and is not reachable afterwards. Phases
+// therefore decorrelate by drift rather than immediately.
+//
+// The arithmetic deliberately mirrors upstream's newBackgroundUpdater
+// (go-feature-flag, retriever/background_updater.go), so both hops of the
+// polling chain deviate by the same rule: draw a magnitude uniformly from
+// [0, 10% of the interval), then take the sign from that draw's parity in
+// nanoseconds. Coupling the sign to the magnitude's low bit is upstream's
+// choice and not one worth copying on its own merits — the bit is close enough
+// to fair that the result is near-symmetric, and matching upstream is worth more
+// than a marginally better distribution.
+//
+// An interval too short to yield a non-zero magnitude — below ten nanoseconds,
+// including zero and negatives — is returned unchanged. pollIntervalFromEnv
+// never produces one, but rand panics on a non-positive bound, and returning the
+// input keeps the provider's own handling of such an interval reachable.
+func jitterInterval(d time.Duration) time.Duration {
+	maxJitter := float64(d) * pollJitterFraction
+	if int64(maxJitter) <= 0 {
+		return d
+	}
+	//nolint:gosec // G404: load spreading, not a secret; an adversary who can predict this learns when a poll happens and nothing else.
+	jitter := time.Duration(rand.Int64N(int64(maxJitter)))
+	if jitter%2 == 0 {
+		return d + jitter
+	}
+	return d - jitter
 }
