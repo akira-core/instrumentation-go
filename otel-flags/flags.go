@@ -510,7 +510,81 @@ func (r *Resolver) Value(key string, local bool) bool {
 
 	ctx, cancel := evaluationContext()
 	defer cancel()
-	return r.evaluator().Boolean(ctx, key, local, currentEvalCtx())
+	// The details variant rather than Boolean: same value on every path — the SDK
+	// guarantees details.Value is the default it was handed whenever the
+	// evaluation failed — plus the error code, which is the only evidence a
+	// broken relay ever produces. The error is used for logging and never
+	// propagates: spec 1.4.10 makes evaluation non-throwing, and the ladder is
+	// built on Value having no failure mode.
+	details, err := r.evaluator().BooleanValueDetails(ctx, key, local, currentEvalCtx())
+	recordEvaluation(key, details.ErrorCode, err)
+	return details.Value
+}
+
+// evaluationErrorCodes remembers the last error code observed per flag key, so
+// only a CHANGE is reported. The steady state — every evaluation succeeding, or
+// every evaluation failing the same way — is silent.
+//
+// Package-level rather than per-Resolver because the key is what identifies the
+// switch: two modules resolving the same key through different resolvers are
+// looking at one flag and should not report it twice.
+var evaluationErrorCodes sync.Map // string → openfeature.ErrorCode
+
+// quietErrorCodes are the outcomes that mean the relay has no opinion, which is
+// a perfectly ordinary state rather than a fault.
+//
+// A deployment that creates the master kill switch and none of the module keys
+// is entirely reasonable, and a uniform rule would emit a warning per module in
+// every process it serves. Logs that are noisy in the normal case train people
+// to ignore them, which is the failure this diagnostic exists to prevent. They
+// survive at debug because they are the only signal available to someone who
+// mistyped a key name on the relay, or whose provider never finished its first
+// fetch.
+//
+// Everything else — TARGETING_KEY_MISSING, TYPE_MISMATCH, PARSE_ERROR,
+// INVALID_CONTEXT, PROVIDER_FATAL, GENERAL — means something is broken and is
+// reported at warn. The classification lives here, in one place, rather than
+// being spread across call sites.
+var quietErrorCodes = map[openfeature.ErrorCode]bool{
+	openfeature.FlagNotFoundCode:     true,
+	openfeature.ProviderNotReadyCode: true,
+}
+
+// recordEvaluation reports a change in how key resolves, and nothing else.
+//
+// The value a failed evaluation returns is deliberately indistinguishable from
+// relay silence — both mean "the next rung down decides", and that is what makes
+// the ladder total. What the review found is that the DIAGNOSTIC was
+// indistinguishable too: a provider stuck in ERROR and a relay with nothing to
+// say produced identical behaviour and identical silence, for the life of the
+// process. This is the one place that distinction is made.
+func recordEvaluation(key string, code openfeature.ErrorCode, err error) {
+	// The SDK populates the code on every documented failure path, but an error
+	// with no code would otherwise read as a recovery.
+	if code == "" && err != nil {
+		code = openfeature.GeneralCode
+	}
+
+	prev, seen := evaluationErrorCodes.Swap(key, code)
+	if seen && prev.(openfeature.ErrorCode) == code {
+		return
+	}
+
+	switch {
+	case code == "":
+		// Not on the first evaluation: an evaluation that simply worked is the
+		// ordinary case and says nothing worth a line.
+		if seen {
+			slog.Info("feature flag evaluation recovered; the relay decides this switch again",
+				"key", key, "domain", FlagDomain)
+		}
+	case quietErrorCodes[code]:
+		slog.Debug("the relay has no value for this flag; the local value stands",
+			"key", key, "code", string(code), "domain", FlagDomain)
+	default:
+		slog.Warn("feature flag evaluation failed; the local value stands and the relay cannot change this switch",
+			"key", key, "code", string(code), "reason", err, "domain", FlagDomain)
+	}
 }
 
 // evaluationContext bounds one evaluation.

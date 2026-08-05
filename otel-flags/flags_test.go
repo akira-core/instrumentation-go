@@ -633,6 +633,186 @@ func TestValue_NotReadyProviderLeavesLocalInCharge(t *testing.T) {
 	}
 }
 
+// --- evaluation diagnostics ------------------------------------------------
+
+// codeProvider fails every boolean evaluation with a fixed error code, the way
+// a real provider reports a missing targeting key or an unreachable relay.
+//
+// The zero code models success: the SDK returns the value with no error, which
+// is what a recovery looks like from here.
+type codeProvider struct {
+	openfeature.NoopProvider
+	code openfeature.ErrorCode
+}
+
+func (codeProvider) Metadata() openfeature.Metadata {
+	return openfeature.Metadata{Name: "CodeProvider"}
+}
+
+func (p codeProvider) BooleanEvaluation(_ context.Context, _ string, defaultValue bool,
+	_ openfeature.FlattenedContext,
+) openfeature.BoolResolutionDetail {
+	if p.code == "" {
+		return openfeature.BoolResolutionDetail{
+			Value:                    defaultValue,
+			ProviderResolutionDetail: openfeature.ProviderResolutionDetail{Reason: openfeature.StaticReason},
+		}
+	}
+	var resErr openfeature.ResolutionError
+	switch p.code {
+	case openfeature.TargetingKeyMissingCode:
+		resErr = openfeature.NewTargetingKeyMissingResolutionError("no targeting key")
+	case openfeature.FlagNotFoundCode:
+		resErr = openfeature.NewFlagNotFoundResolutionError("no such flag")
+	case openfeature.ProviderNotReadyCode:
+		resErr = openfeature.NewProviderNotReadyResolutionError("first fetch has not completed")
+	case openfeature.ProviderFatalCode:
+		resErr = openfeature.NewProviderFatalResolutionError("unrecoverable")
+	default:
+		resErr = openfeature.NewGeneralResolutionError("something went wrong")
+	}
+	return openfeature.BoolResolutionDetail{
+		Value: defaultValue,
+		ProviderResolutionDetail: openfeature.ProviderResolutionDetail{
+			ResolutionError: resErr,
+			Reason:          openfeature.ErrorReason,
+		},
+	}
+}
+
+// freshKey returns a flag key this process has no remembered error code for.
+//
+// The memory is per key and per process by design — that is what makes the
+// steady state silent — so a test that asserts on a TRANSITION has to start from
+// nothing, including on the second pass of a -count=2 run.
+func freshKey(t *testing.T, key string) string {
+	t.Helper()
+	evaluationErrorCodes.Delete(key)
+	t.Cleanup(func() { evaluationErrorCodes.Delete(key) })
+	return key
+}
+
+// setCodeProvider binds a provider that fails every evaluation with code.
+func setCodeProvider(t *testing.T, code openfeature.ErrorCode) {
+	t.Helper()
+	if err := openfeature.SetNamedProviderAndWait(FlagDomain, codeProvider{code: code}); err != nil {
+		t.Fatalf("SetNamedProviderAndWait: %v", err)
+	}
+	t.Cleanup(func() { clearProvider(t) })
+}
+
+// TestValue_LogsWhatWasInvisible is the whole reason evaluation reads the
+// details variant.
+//
+// The two highest-severity findings of the August review were both silent for
+// the same reason: a provider that failed to initialise reported
+// PROVIDER_NOT_READY on every evaluation, and a missing targeting key reported
+// TARGETING_KEY_MISSING on every evaluation. The error code was populated the
+// whole time and nothing read it. The RETURN value stays indistinguishable
+// between relay silence and relay failure — that is deliberate, and the ladder
+// depends on it — but the log no longer is.
+func TestValue_LogsWhatWasInvisible(t *testing.T) {
+	buf := captureLogs(t)
+	setCodeProvider(t, openfeature.TargetingKeyMissingCode)
+
+	key := freshKey(t, "logs-targeting-key")
+	r := NewResolver()
+	if got := r.Value(key, true); !got {
+		t.Fatalf("Value(true) = false on a failed evaluation; the local value must stand")
+	}
+
+	log := buf.String()
+	if !strings.Contains(log, "level=WARN") {
+		t.Fatalf("a broken evaluation was not reported at warn: %q", log)
+	}
+	for _, want := range []string{key, string(openfeature.TargetingKeyMissingCode)} {
+		if !strings.Contains(log, want) {
+			t.Errorf("the log does not name %q: %q", want, log)
+		}
+	}
+}
+
+// TestValue_LogsOncePerTransition keeps the diagnostic from becoming the noise
+// it exists to cut through: an instrumented operation evaluates two flags, so a
+// line per evaluation would be thousands per second under a relay outage.
+func TestValue_LogsOncePerTransition(t *testing.T) {
+	buf := captureLogs(t)
+	setCodeProvider(t, openfeature.GeneralCode)
+
+	key := freshKey(t, "logs-once")
+	r := NewResolver()
+	for range 5 {
+		_ = r.Value(key, false)
+	}
+
+	if n := strings.Count(buf.String(), key); n != 1 {
+		t.Fatalf("%d lines for five identical failures, want 1: %q", n, buf.String())
+	}
+}
+
+func TestValue_LogsTheRecovery(t *testing.T) {
+	buf := captureLogs(t)
+	setCodeProvider(t, openfeature.GeneralCode)
+
+	key := freshKey(t, "logs-recovery")
+	r := NewResolver()
+	_ = r.Value(key, false)
+
+	// The relay comes back.
+	if err := openfeature.SetNamedProviderAndWait(FlagDomain, codeProvider{}); err != nil {
+		t.Fatalf("SetNamedProviderAndWait: %v", err)
+	}
+	_ = r.Value(key, false)
+
+	if !strings.Contains(buf.String(), "level=INFO") {
+		t.Fatalf("the recovery was not reported: %q", buf.String())
+	}
+}
+
+// TestValue_QuietWhenTheRelaySimplyHasNoOpinion covers the tier split.
+//
+// A deployment that creates the master kill switch and none of the module keys
+// is entirely reasonable, and would emit a warning per module per process under
+// a uniform rule. Logs that are noisy in the normal case train people to ignore
+// them, which is the failure the diagnostic exists to prevent. The line survives
+// at debug because it is the only signal available to someone who mistyped a key
+// name on the relay.
+func TestValue_QuietWhenTheRelaySimplyHasNoOpinion(t *testing.T) {
+	for _, code := range []openfeature.ErrorCode{openfeature.FlagNotFoundCode, openfeature.ProviderNotReadyCode} {
+		t.Run(string(code), func(t *testing.T) {
+			buf := captureLogs(t)
+			setCodeProvider(t, code)
+
+			key := freshKey(t, "quiet-"+string(code))
+			r := NewResolver()
+			_ = r.Value(key, false)
+
+			log := buf.String()
+			if strings.Contains(log, "level=WARN") {
+				t.Fatalf("%s was reported at warn; the relay having no opinion is a normal state: %q", code, log)
+			}
+			if !strings.Contains(log, key) {
+				t.Errorf("%s was not reported at all; a mistyped key name would have no signal: %q", code, log)
+			}
+		})
+	}
+}
+
+// TestValue_FirstSuccessIsSilent keeps the ordinary case — every process, every
+// flag, forever — from emitting a line.
+func TestValue_FirstSuccessIsSilent(t *testing.T) {
+	buf := captureLogs(t)
+	setCodeProvider(t, "")
+
+	key := freshKey(t, "silent-success")
+	r := NewResolver()
+	_ = r.Value(key, false)
+
+	if strings.Contains(buf.String(), key) {
+		t.Fatalf("a successful evaluation was logged: %q", buf.String())
+	}
+}
+
 // --- provider auto-install -------------------------------------------------
 
 // A syntactically valid endpoint that nothing listens on. Construction performs
