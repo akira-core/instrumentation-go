@@ -62,13 +62,25 @@ func boolFlag(v bool) memprovider.InMemoryFlag {
 // binding left behind elsewhere in this binary.
 func setRelay(t *testing.T, tracing, propagation bool) {
 	t.Helper()
+	setRelayFlags(t, map[string]*bool{
+		flagKeyMongoTracing:     &tracing,
+		flagKeyMongoPropagation: &propagation,
+	})
+}
+
+// setRelayFlags binds an in-memory provider serving whichever keys are given,
+// which is what lets a test put the MASTER key on the relay alongside this
+// module's two. A nil entry models a key the relay simply does not define.
+func setRelayFlags(t *testing.T, keys map[string]*bool) {
+	t.Helper()
+	flags := map[string]memprovider.InMemoryFlag{}
+	for key, v := range keys {
+		if v != nil {
+			flags[key] = boolFlag(*v)
+		}
+	}
 	require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain,
-		memprovider.NewInMemoryProvider(
-			map[string]memprovider.InMemoryFlag{
-				flagKeyMongoTracing:     boolFlag(tracing),
-				flagKeyMongoPropagation: boolFlag(propagation),
-			},
-		)))
+		memprovider.NewInMemoryProvider(flags)))
 	t.Cleanup(func() {
 		require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, openfeature.NoopProvider{}))
 	})
@@ -171,6 +183,63 @@ func TestMasterVetoBeatsTheRelay(t *testing.T) {
 	g := envGateState(t)
 	assert.False(t, g.effectiveTracing(), "…so no relay value can produce a span")
 	assert.False(t, g.effectivePropagation(), "…nor a byte of _oteltrace")
+}
+
+// TestMasterRelayVetoBeatsEverything is the master switch's RELAY spelling —
+// the rung above the environment veto TestMasterVetoBeatsTheRelay covers, and
+// the one that makes "one relay flag stops every module" true rather than
+// aspirational. It must stop a client whose own key the relay enables, and one
+// whose Go code asked for tracing and propagation outright.
+func TestMasterRelayVetoBeatsEverything(t *testing.T) {
+	capableEnv(t)
+
+	on, off := true, false
+	setRelayFlags(t, map[string]*bool{
+		otelflags.FlagKeyGlobalTracing: &off,
+		flagKeyMongoTracing:            &on,
+		flagKeyMongoPropagation:        &on,
+	})
+
+	coll := NewCollection(&mongo.Collection{}, noop.NewTracerProvider().Tracer("test"), otel.GetTextMapPropagator())
+	assert.IsType(t, &direct.Collection{}, coll.impl(),
+		"the master key on the relay must stop a module its own key enables")
+
+	optioned, err := resolveGates(boolPtr(true), boolPtr(true))
+	require.NoError(t, err)
+	assert.False(t, optioned.effectiveTracing(),
+		"…including a client carrying WithTracingEnabled(true)")
+	assert.False(t, optioned.effectivePropagation(),
+		"…and not one byte of _oteltrace may reach the operator's documents")
+
+	// Control. Everything else here says on — the module variables, the module
+	// keys, the master's local default — so lifting the veto must restore
+	// tracing. Without this, a build that ignored the master key entirely would
+	// still pass the assertions above by never having been off.
+	setRelayFlags(t, map[string]*bool{
+		otelflags.FlagKeyGlobalTracing: &on,
+		flagKeyMongoTracing:            &on,
+		flagKeyMongoPropagation:        &on,
+	})
+	assert.IsType(t, &traced.Collection{}, coll.impl(),
+		"lifting the master veto restores tracing on the same live Collection")
+}
+
+// TestMasterRelayTrueDoesNotEnable pins the master's asymmetry in its relay
+// spelling: its local default is already true, so serving it true changes
+// nothing and the module tier still has to say yes. Only false has an effect.
+func TestMasterRelayTrueDoesNotEnable(t *testing.T) {
+	silentRelayEnv(t)
+
+	on, off := true, false
+	setRelayFlags(t, map[string]*bool{
+		otelflags.FlagKeyGlobalTracing: &on,
+		flagKeyMongoTracing:            &off,
+		flagKeyMongoPropagation:        &off,
+	})
+
+	coll := NewCollection(&mongo.Collection{}, noop.NewTracerProvider().Tracer("test"), otel.GetTextMapPropagator())
+	assert.IsType(t, &direct.Collection{}, coll.impl(),
+		"the master saying on cannot enable a module whose own key says off")
 }
 
 // TestWithTracingEnabledDoesNotPin: the option supplies one rung and says

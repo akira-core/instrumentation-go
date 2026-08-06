@@ -65,10 +65,22 @@ func relayFlag(v bool) memprovider.InMemoryFlag {
 // moment anything in the process had auto-installed.
 func setRelay(t *testing.T, tracing bool) {
 	t.Helper()
+	setRelayFlags(t, map[string]*bool{flagKeyWSTracing: &tracing})
+}
+
+// setRelayFlags binds an in-memory provider serving whichever keys are given,
+// which is what lets a test put the MASTER key on the relay alongside this
+// module's own. A nil entry models a key the relay simply does not define.
+func setRelayFlags(t *testing.T, keys map[string]*bool) {
+	t.Helper()
+	flags := map[string]memprovider.InMemoryFlag{}
+	for key, v := range keys {
+		if v != nil {
+			flags[key] = relayFlag(*v)
+		}
+	}
 	require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain,
-		memprovider.NewInMemoryProvider(
-			map[string]memprovider.InMemoryFlag{flagKeyWSTracing: relayFlag(tracing)},
-		)))
+		memprovider.NewInMemoryProvider(flags)))
 	t.Cleanup(func() {
 		require.NoError(t, openfeature.SetNamedProviderAndWait(otelflags.FlagDomain, openfeature.NoopProvider{}))
 	})
@@ -153,6 +165,58 @@ func TestMasterVetoStopsNegotiationAndSpans(t *testing.T) {
 		assert.False(t, mustTracing(t), "module variable off and the relay silent → no negotiation")
 		assert.False(t, newTestConn(t, false).featureEnabled())
 	})
+}
+
+// TestMasterRelayVetoStopsNegotiationAndSpans is the master switch's RELAY
+// spelling — the rung above the environment veto the subtest in
+// TestMasterVetoStopsNegotiationAndSpans covers. Both of this module's gated
+// decisions must fall: the handshake never offers otel-ws, and no span is
+// created.
+func TestMasterRelayVetoStopsNegotiationAndSpans(t *testing.T) {
+	moduleOnEnv(t)
+
+	on, off := true, false
+	setRelayFlags(t, map[string]*bool{
+		otelflags.FlagKeyGlobalTracing: &off,
+		flagKeyWSTracing:               &on,
+	})
+
+	c := newTestConn(t, false)
+
+	assert.False(t, mustTracing(t),
+		"the master key on the relay must stop otel-ws being negotiated, even though this module's key says on")
+	assert.False(t, mustTracing(t, WithTracingEnabled(true)),
+		"…including for a connection carrying WithTracingEnabled(true)")
+	assert.False(t, c.featureEnabled(),
+		"…and no span may be created on a connection already open")
+
+	// Control. Everything else here says on — the module variable, the module
+	// key, the master's local default — so lifting the veto must restore both
+	// decisions. Without this, a build that ignored the master key entirely
+	// would still pass the assertions above by never having been off.
+	setRelayFlags(t, map[string]*bool{
+		otelflags.FlagKeyGlobalTracing: &on,
+		flagKeyWSTracing:               &on,
+	})
+	assert.True(t, mustTracing(t), "lifting the master veto restores negotiation")
+	assert.True(t, c.featureEnabled(), "…and spans on the same live connection")
+}
+
+// TestMasterRelayTrueDoesNotEnable pins the master's asymmetry in its relay
+// spelling: its local default is already true, so serving it true changes
+// nothing and this module's key still has to say yes. Only false has an effect.
+func TestMasterRelayTrueDoesNotEnable(t *testing.T) {
+	clearWSFlagEnv(t)
+
+	on, off := true, false
+	setRelayFlags(t, map[string]*bool{
+		otelflags.FlagKeyGlobalTracing: &on,
+		flagKeyWSTracing:               &off,
+	})
+
+	assert.False(t, mustTracing(t),
+		"the master saying on cannot enable a module whose own key says off")
+	assert.False(t, newTestConn(t, false).featureEnabled())
 }
 
 // TestWithTracingEnabledDoesNotPin: the option supplies one rung and says

@@ -6,6 +6,20 @@ All notable changes to the `otel-mongo` module (v1, `go.mongodb.org/mongo-driver
 
 ## [0.8.0] - unreleased
 
+> **Release candidates.** `v0.8.0-rc.2` is the first one that carries the `otel-flags` 0.2.0 flag layer.
+> `rc.1` builds and runs, but against `otel-flags` 0.1.0, where flag keys are bound to a resolver
+> **by index**, the OpenFeature provider is installed lazily at the first evaluation, and an
+> unreadable `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` or `_POLL_INTERVAL` warns instead of failing
+> construction. Test the relay against `0.8.0-rc.2` or later.
+>
+> What `0.8.0-rc.2` adds over `rc.1`: flag keys passed **by name**, which removes a coupling in which
+> swapping two registration lines compiled, passed, and silently made one flag control another; the
+> provider installed at construction through `otelflags.ValidateAndInstall`; the two
+> relay-connection variables validated at construction; evaluation error codes logged once per
+> transition, two-tier, so relay silence is distinguishable from relay failure in the log even
+> though it is not in the value; a failed provider install retried rather than latched; and the
+> switch matrix covered end to end against a real GO Feature Flag relay proxy — including the master switch's relay key, which no test in this module previously exercised.
+
 ### Changed
 
 - **BREAKING** Feature switches now resolve down a **four-step ladder** — `relay > env > option > default`, first source with an opinion winning — and the relay proxy is **authoritative in both directions**: it can turn this module off, and it can turn it on when the deployment left it off. This replaces the revoke-only model that was developed but never released. Safety now comes from the defaults rather than from a restriction on the relay: every per-module switch defaults to **off**, and the process-wide master switch defaults to **on** only because it is a veto rather than an enabler.
@@ -35,6 +49,7 @@ All notable changes to the `otel-mongo` module (v1, `go.mongodb.org/mongo-driver
 
 ### Notes
 
+- **Test coverage.** The master switch's **relay** key (`otel-instrumentation-go-tracing`) is now unit-tested here; before this it was covered only in `otel-nats`, so "one relay flag stops every module" was unverified for this one. A new `tests/integration/relayflags_test.go` runs a real GO Feature Flag relay proxy against a real MongoDB and asserts the switches on the **stored documents**: the relay revoking what the environment enabled, the relay **enabling** propagation a deployment explicitly disabled, propagation revoked while tracing stays on, the master veto, and a relay that defines neither key leaving the environment in charge. Propagation is the one switch in this repository that writes into the operator's own data, so its relay control is asserted against bytes MongoDB actually holds rather than against a boolean.
 - **Flag changes are not immediate.** End-to-end latency is the provider's poll interval — 60 s by default — in **both** directions. This module adds none of its own.
 - The library still never touches the **default** OpenFeature provider, the global evaluation context, hooks or shutdown. The one piece of state it may write is a **named** provider on `otel-instrumentation-go`, and only when the environment asks for one and the application installed none. `DataCollectorDisabled: true` and in-process evaluation are hardcoded on that path.
 - Full reference: [`docs/feature-flags.md`](../docs/feature-flags.md) ([繁體中文](../docs/feature-flags.zh-TW.md)).

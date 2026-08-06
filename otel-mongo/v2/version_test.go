@@ -7,7 +7,7 @@ import "testing"
 // trace.WithInstrumentationVersion on every tracer, so a silent drift here
 // changes otel.scope.version on every emitted span.
 func TestVersion(t *testing.T) {
-	if got := Version(); got != "2.8.0-rc.1" {
-		t.Errorf("Version() = %q, want %q", got, "2.8.0-rc.1")
+	if got := Version(); got != "2.8.0-rc.2" {
+		t.Errorf("Version() = %q, want %q", got, "2.8.0-rc.2")
 	}
 }
