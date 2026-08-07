@@ -3,190 +3,33 @@ package otelmongo
 import (
 	"os"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	otelflags "github.com/akira-core/instrumentation-go/otel-flags"
 )
 
-func TestMongoTracingEnabled_DefaultFalse(t *testing.T) {
-	prev, existed := os.LookupEnv(envMongoTracingEnabled)
-	_ = os.Unsetenv(envMongoTracingEnabled)
-	t.Cleanup(func() {
-		if existed {
-			_ = os.Setenv(envMongoTracingEnabled, prev)
-		} else {
-			_ = os.Unsetenv(envMongoTracingEnabled)
-		}
-	})
-	if mongoTracingEnabled() {
-		t.Fatal("expected tracing disabled when env var is unset")
-	}
-}
+// These tests pin how this module composes the ladder — relay > env > option >
+// default — and the master switch ANDed above it. The truthiness rules
+// themselves live in otel-flags and are tested there.
+//
+// Not parallel-safe: the process environment and the OpenFeature provider are
+// both process-global. No t.Parallel in this file.
 
-func TestMongoTracingEnabled_EmptyStringIsEnabled(t *testing.T) {
-	t.Setenv(envGlobalTracingEnabled, "")
-	t.Setenv(envMongoTracingEnabled, "")
-	if !mongoTracingEnabled() {
-		t.Fatal("expected empty string to mean enabled")
-	}
-}
+// envGlobalTracingEnabled aliases the master switch's variable for the tests
+// that were written against it. The production code no longer names it: it is
+// process-scoped, so it belongs to otel-flags.
+const envGlobalTracingEnabled = otelflags.EnvGlobalTracing
 
-func TestMongoTracingEnabled_FalseTokens(t *testing.T) {
-	for _, v := range []string{"false", "0", "off", "no"} {
-		t.Setenv(envMongoTracingEnabled, v)
-		if mongoTracingEnabled() {
-			t.Fatalf("expected disabled for value %q", v)
-		}
-	}
-}
-
-func TestMongoTracingEnabled_GlobalOffOverridesModule(t *testing.T) {
-	t.Setenv(envGlobalTracingEnabled, "false")
-	t.Setenv(envMongoTracingEnabled, "true")
-	if mongoTracingEnabled() {
-		t.Fatal("expected global flag to disable mongo tracing")
-	}
-}
-
-func TestMongoPropagationEnabled(t *testing.T) {
-	t.Run("unset global and propagation -> false", func(t *testing.T) {
-		_ = os.Unsetenv(envGlobalTracingEnabled)
-		_ = os.Unsetenv(envMongoPropagationEnabled)
-		if mongoPropagationEnabled() {
-			t.Fatal("expected propagation disabled when env vars are unset")
-		}
-	})
-
-	t.Run("global on tracing off propagation on -> false", func(t *testing.T) {
-		t.Setenv(envGlobalTracingEnabled, "true")
-		t.Setenv(envMongoTracingEnabled, "false")
-		t.Setenv(envMongoPropagationEnabled, "true")
-		if mongoPropagationEnabled() {
-			t.Fatal("expected propagation disabled when mongo tracing is off")
-		}
-	})
-
-	t.Run("global on tracing on propagation unset -> false", func(t *testing.T) {
-		t.Setenv(envGlobalTracingEnabled, "true")
-		t.Setenv(envMongoTracingEnabled, "true")
-		_ = os.Unsetenv(envMongoPropagationEnabled)
-		if mongoPropagationEnabled() {
-			t.Fatal("expected propagation disabled when module flag is unset")
-		}
-	})
-
-	t.Run("global on tracing on propagation on -> true", func(t *testing.T) {
-		t.Setenv(envGlobalTracingEnabled, "true")
-		t.Setenv(envMongoTracingEnabled, "true")
-		t.Setenv(envMongoPropagationEnabled, "true")
-		if !mongoPropagationEnabled() {
-			t.Fatal("expected propagation enabled")
-		}
-	})
-}
-
-func TestResolveFlag(t *testing.T) {
-	t.Run("override true wins env false", func(t *testing.T) {
-		override := true
-		if !resolveFlag(&override, false) {
-			t.Fatal("expected override true to win")
-		}
-	})
-
-	t.Run("override false wins env true", func(t *testing.T) {
-		override := false
-		if resolveFlag(&override, true) {
-			t.Fatal("expected override false to win")
-		}
-	})
-}
-
-func TestConnectPropagationResolution(t *testing.T) {
-	t.Run("global off cannot enable propagation via WithTracePropagationEnabled", func(t *testing.T) {
-		t.Setenv(envGlobalTracingEnabled, "false")
-		t.Setenv(envMongoTracingEnabled, "true")
-		t.Setenv(envMongoPropagationEnabled, "true")
-		cfg := newClientConfig([]ClientOption{WithTracePropagationEnabled(true)})
-		if resolveDocumentPropagation(mongoTracingEnabled(), cfg.PropagationEnabled) {
-			t.Fatal("expected propagation disabled when global tracing is off")
-		}
-	})
-
-	t.Run("mongo tracing off cannot enable propagation via WithTracePropagationEnabled", func(t *testing.T) {
-		t.Setenv(envGlobalTracingEnabled, "true")
-		t.Setenv(envMongoTracingEnabled, "false")
-		t.Setenv(envMongoPropagationEnabled, "true")
-		cfg := newClientConfig([]ClientOption{WithTracePropagationEnabled(true)})
-		if resolveDocumentPropagation(mongoTracingEnabled(), cfg.PropagationEnabled) {
-			t.Fatal("expected propagation disabled when mongo tracing is off")
-		}
-	})
-
-	t.Run("tracing on option false wins over env propagation true", func(t *testing.T) {
-		t.Setenv(envGlobalTracingEnabled, "true")
-		t.Setenv(envMongoTracingEnabled, "true")
-		t.Setenv(envMongoPropagationEnabled, "true")
-		cfg := newClientConfig([]ClientOption{WithTracePropagationEnabled(false)})
-		if resolveDocumentPropagation(mongoTracingEnabled(), cfg.PropagationEnabled) {
-			t.Fatal("expected WithTracePropagationEnabled(false) to disable propagation")
-		}
-	})
-
-	t.Run("tracing on option true enables when env propagation unset", func(t *testing.T) {
-		t.Setenv(envGlobalTracingEnabled, "true")
-		t.Setenv(envMongoTracingEnabled, "true")
-		_ = os.Unsetenv(envMongoPropagationEnabled)
-		cfg := newClientConfig([]ClientOption{WithTracePropagationEnabled(true)})
-		if !resolveDocumentPropagation(mongoTracingEnabled(), cfg.PropagationEnabled) {
-			t.Fatal("expected WithTracePropagationEnabled(true) to enable propagation when tracing is on")
-		}
-	})
-}
-
-// TestResolveDocumentPropagation_OptionDrivenTracing_NoEnv is the unskippable
-// (no-Docker) guard for the CLAUDE.md-documented regression:
-// resolveDocumentPropagation must trust the caller's already-resolved
-// effective tracing state and must NOT recompute the env-only
-// mongoTracingEnabled() internally — otherwise WithTracingEnabled(true) +
-// WithTracePropagationEnabled(true) with all env gates unset silently stays
-// disabled. The Docker-gated ConnectWithOptions variant of this test skips on
-// machines without a MongoDB container; this one always runs.
-func TestResolveDocumentPropagation_OptionDrivenTracing_NoEnv(t *testing.T) {
-	clearMongoTracingEnv(t)
-
-	on, off := true, false
-	if !resolveDocumentPropagation(true, &on) {
-		t.Fatal("effective tracing on + override true must enable propagation even with all env vars unset")
-	}
-	if resolveDocumentPropagation(true, nil) {
-		t.Fatal("effective tracing on + no override must fall back to the (unset → disabled) env default")
-	}
-	if resolveDocumentPropagation(true, &off) {
-		t.Fatal("override false must disable propagation")
-	}
-	if resolveDocumentPropagation(false, &on) {
-		t.Fatal("effective tracing off must veto propagation regardless of the override")
-	}
-}
-
-// effectiveClientFlags mirrors ConnectWithOptions' tracing/propagation
-// resolution without opening a Mongo connection — keep in lockstep with
-// client.go ConnectWithOptions.
-func effectiveClientFlags(opts []ClientOption) (tracing, prop bool) {
-	cfg := newClientConfig(opts)
-	enabled := mongoTracingEnabled()
-	if cfg.TracingEnabled != nil {
-		enabled = *cfg.TracingEnabled
-	}
-	if !enabled {
-		return false, false
-	}
-	return true, resolveDocumentPropagation(enabled, cfg.PropagationEnabled)
-}
-
-// unsetEnvRestore clears name for the rest of the test and restores its prior
-// value (or absence) on cleanup. Plain os.Unsetenv has no t.Cleanup
-// counterpart, and t.Setenv(name, "") is not equivalent to actually unsetting
-// it here — see TestMongoTracingEnabled_EmptyStringIsEnabled.
-func unsetEnvRestore(t *testing.T, name string) {
+// setOrUnset makes an environment variable present with value, or absent,
+// restoring the previous state when the test ends.
+func setOrUnset(t *testing.T, name string, set bool, value string) {
 	t.Helper()
+	if set {
+		t.Setenv(name, value)
+		return
+	}
 	prev, existed := os.LookupEnv(name)
 	_ = os.Unsetenv(name)
 	t.Cleanup(func() {
@@ -198,153 +41,270 @@ func unsetEnvRestore(t *testing.T, name string) {
 	})
 }
 
-type envState string
+// silentFlagEnv clears every switch these tests touch, including the endpoint,
+// so a case starts from "no relay, no opinion".
+func silentFlagEnv(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{
+		envGlobalTracingEnabled,
+		envMongoTracingEnabled,
+		envMongoPropagationEnabled,
+		otelflags.EnvFlagsEndpoint,
+		otelflags.EnvFlagsPollInterval,
+	} {
+		setOrUnset(t, name, false, "")
+	}
+}
 
-const (
-	envUnset envState = "unset"
-	envOn    envState = "on"
-	envOff   envState = "off"
+func boolPtr(b bool) *bool { return &b }
+
+type envValue struct {
+	set   bool
+	value string
+}
+
+var (
+	envUnset = envValue{}
+	envOn    = envValue{set: true, value: "1"}
+	envOff   = envValue{set: true, value: "false"}
 )
 
-type optState string
-
-const (
-	optAbsent optState = "absent"
-	optOn     optState = "on"
-	optOff    optState = "off"
-)
-
-// TestWithTracingEnabled_EnvOptionMatrix pins the full env × WithTracingEnabled
-// decision table (option authoritative in either direction).
-func TestWithTracingEnabled_EnvOptionMatrix(t *testing.T) {
+// TestTracing_TierMatrix pins how the master switch and this module's tracing
+// switch compose, with no relay configured so the local answer is final.
+//
+// Two rows reverse earlier releases: the module variable alone is now enough
+// (the master defaults to enabled), and the environment variable beats the
+// option (so there is no conflict row).
+func TestTracing_TierMatrix(t *testing.T) {
 	cases := []struct {
-		name string
-		env  envState
-		opt  optState
-		want bool
+		name   string
+		master envValue
+		module envValue
+		option *bool
+		want   bool
 	}{
-		{"env unset, option absent → off", envUnset, optAbsent, false},
-		{"env unset, option on → on", envUnset, optOn, true},
-		{"env unset, option off → off", envUnset, optOff, false},
-		{"env on, option absent → on", envOn, optAbsent, true},
-		{"env off, option absent → off", envOff, optAbsent, false},
-		{"env on, option off → off", envOn, optOff, false},
-		{"env off, option on → on", envOff, optOn, true},
-		{"env on, option on → on", envOn, optOn, true},
+		{name: "nothing set", master: envUnset, module: envUnset, want: false},
+
+		{name: "master on alone", master: envOn, module: envUnset, want: false},
+		{name: "master on, module on", master: envOn, module: envOn, want: true},
+		{name: "master on, module off", master: envOn, module: envOff, want: false},
+		{name: "master off, module on", master: envOff, module: envOn, want: false},
+		{name: "master off, option on", master: envOff, module: envUnset, option: boolPtr(true), want: false},
+
+		{name: "module on alone", master: envUnset, module: envOn, want: true},
+
+		{name: "option on, variable unset", master: envUnset, module: envUnset, option: boolPtr(true), want: true},
+		{name: "option off, variable unset", master: envUnset, module: envUnset, option: boolPtr(false), want: false},
+		{name: "variable off beats option on", master: envUnset, module: envOff, option: boolPtr(true), want: false},
+		{name: "variable on beats option off", master: envUnset, module: envOn, option: boolPtr(false), want: true},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			switch tc.env {
-			case envUnset:
-				clearMongoTracingEnv(t)
-			case envOn:
-				enableTracing(t)
-				unsetEnvRestore(t, envMongoPropagationEnabled)
-			case envOff:
-				t.Setenv(envGlobalTracingEnabled, "false")
-				t.Setenv(envMongoTracingEnabled, "false")
-				unsetEnvRestore(t, envMongoPropagationEnabled)
-				resetPropEnabledCacheForTest()
-				t.Cleanup(resetPropEnabledCacheForTest)
-			}
+			silentFlagEnv(t)
+			setOrUnset(t, envGlobalTracingEnabled, tc.master.set, tc.master.value)
+			setOrUnset(t, envMongoTracingEnabled, tc.module.set, tc.module.value)
 
-			var opts []ClientOption
-			switch tc.opt {
-			case optOn:
-				opts = []ClientOption{WithTracingEnabled(true)}
-			case optOff:
-				opts = []ClientOption{WithTracingEnabled(false)}
-			}
-
-			got, _ := effectiveClientFlags(opts)
-			if got != tc.want {
-				t.Fatalf("effective tracing = %v, want %v", got, tc.want)
-			}
+			g, err := resolveGates(tc.option, nil)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, g.effectiveTracing())
 		})
 	}
 }
 
-// TestWithTracePropagationEnabled_EnvOptionMatrix pins propagation resolution
-// once effective tracing is known: prop option overrides OTEL_MONGO_PROPAGATION_ENABLED
-// only while effective tracing is on; tracing off force-disables propagation.
-func TestWithTracePropagationEnabled_EnvOptionMatrix(t *testing.T) {
+// TestPropagationTier_Matrix pins the second Mongo switch, which follows the
+// same ladder with its own default of false.
+func TestPropagationTier_Matrix(t *testing.T) {
 	cases := []struct {
-		name        string
-		tracingEnv  envState
-		propEnv     envState
-		tracingOpt  optState
-		propOpt     optState
-		wantTracing bool
-		wantProp    bool
+		name   string
+		env    envValue
+		option *bool
+		want   bool
 	}{
-		// effective tracing off → prop always off
-		{"tracing env off, prop env on, prop opt on → tracing off, prop off", envOff, envOn, optAbsent, optOn, false, false},
-		{"tracing opt off (env on), prop opt on → tracing off, prop off", envOn, envOn, optOff, optOn, false, false},
-		{"tracing unset, no opts → both off", envUnset, envUnset, optAbsent, optAbsent, false, false},
-
-		// effective tracing on via env; prop follows env/option
-		{"tracing env on, prop unset, no prop opt → prop off", envOn, envUnset, optAbsent, optAbsent, true, false},
-		{"tracing env on, prop on, no prop opt → prop on", envOn, envOn, optAbsent, optAbsent, true, true},
-		{"tracing env on, prop off, no prop opt → prop off", envOn, envOff, optAbsent, optAbsent, true, false},
-		{"tracing env on, prop on, prop opt off → prop off", envOn, envOn, optAbsent, optOff, true, false},
-		{"tracing env on, prop unset, prop opt on → prop on", envOn, envUnset, optAbsent, optOn, true, true},
-		{"tracing env on, prop off, prop opt on → prop on", envOn, envOff, optAbsent, optOn, true, true},
-		{"tracing env on, prop on, prop opt on → prop on", envOn, envOn, optAbsent, optOn, true, true},
-
-		// effective tracing on via option (env off/unset); prop option still works
-		{"tracing opt on (env unset), prop opt on → both on", envUnset, envUnset, optOn, optOn, true, true},
-		{"tracing opt on (env off), prop opt on → both on", envOff, envOff, optOn, optOn, true, true},
-		{"tracing opt on (env unset), no prop opt → prop off", envUnset, envUnset, optOn, optAbsent, true, false},
-		{"tracing opt on (env unset), prop opt off → prop off", envUnset, envOn, optOn, optOff, true, false},
+		{name: "unset", env: envUnset, want: false},
+		{name: "env on", env: envOn, want: true},
+		{name: "env off", env: envOff, want: false},
+		{name: "option on, env unset", env: envUnset, option: boolPtr(true), want: true},
+		{name: "option off, env unset", env: envUnset, option: boolPtr(false), want: false},
+		{name: "env off beats option on", env: envOff, option: boolPtr(true), want: false},
+		{name: "env on beats option off", env: envOn, option: boolPtr(false), want: true},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			setMongoEnv := func(tracing, prop envState) {
-				switch tracing {
-				case envUnset:
-					unsetEnvRestore(t, envGlobalTracingEnabled)
-					unsetEnvRestore(t, envMongoTracingEnabled)
-				case envOn:
-					t.Setenv(envGlobalTracingEnabled, "1")
-					t.Setenv(envMongoTracingEnabled, "1")
-				case envOff:
-					t.Setenv(envGlobalTracingEnabled, "false")
-					t.Setenv(envMongoTracingEnabled, "false")
-				}
-				switch prop {
-				case envUnset:
-					unsetEnvRestore(t, envMongoPropagationEnabled)
-				case envOn:
-					t.Setenv(envMongoPropagationEnabled, "1")
-				case envOff:
-					t.Setenv(envMongoPropagationEnabled, "false")
-				}
-				resetPropEnabledCacheForTest()
-				t.Cleanup(resetPropEnabledCacheForTest)
-			}
-			setMongoEnv(tc.tracingEnv, tc.propEnv)
+			silentFlagEnv(t)
+			t.Setenv(envMongoTracingEnabled, "1")
+			setOrUnset(t, envMongoPropagationEnabled, tc.env.set, tc.env.value)
 
-			var opts []ClientOption
-			switch tc.tracingOpt {
-			case optOn:
-				opts = append(opts, WithTracingEnabled(true))
-			case optOff:
-				opts = append(opts, WithTracingEnabled(false))
-			}
-			switch tc.propOpt {
-			case optOn:
-				opts = append(opts, WithTracePropagationEnabled(true))
-			case optOff:
-				opts = append(opts, WithTracePropagationEnabled(false))
-			}
-
-			gotTracing, gotProp := effectiveClientFlags(opts)
-			if gotTracing != tc.wantTracing || gotProp != tc.wantProp {
-				t.Fatalf("got tracing=%v prop=%v, want tracing=%v prop=%v",
-					gotTracing, gotProp, tc.wantTracing, tc.wantProp)
-			}
+			g, err := resolveGates(nil, tc.option)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, g.effectivePropagation())
 		})
 	}
+}
+
+// TestOperatorCanStopDocumentWrites is why the option sits below the environment
+// variable. Every other switch only produces or withholds telemetry; this one
+// appends a permanent field to the operator's own documents, so the operator
+// needs a setting the application's Go code cannot override.
+func TestOperatorCanStopDocumentWrites(t *testing.T) {
+	silentFlagEnv(t)
+	t.Setenv(envMongoTracingEnabled, "1")
+	t.Setenv(envMongoPropagationEnabled, "false")
+
+	g, err := resolveGates(nil, boolPtr(true))
+	require.NoError(t, err)
+	assert.True(t, g.effectiveTracing(), "tracing itself is unaffected")
+	assert.False(t, g.effectivePropagation(),
+		"WithTracePropagationEnabled(true) must not bypass OTEL_MONGO_PROPAGATION_ENABLED=false")
+}
+
+// TestAbsenceNeverEnablesPropagation: nothing may write _oteltrace unless some
+// source says so explicitly.
+func TestAbsenceNeverEnablesPropagation(t *testing.T) {
+	silentFlagEnv(t)
+	t.Setenv(envMongoTracingEnabled, "1")
+
+	g, err := resolveGates(nil, nil)
+	require.NoError(t, err)
+	require.True(t, g.effectiveTracing())
+	assert.False(t, g.effectivePropagation(),
+		"the propagation default must be false, so absence can never start writing into documents")
+}
+
+// TestResolveGates_ReportsEveryBadValueAtOnce pins that a deployment carrying
+// several unreadable values learns about all of them in one run.
+func TestResolveGates_ReportsEveryBadValueAtOnce(t *testing.T) {
+	silentFlagEnv(t)
+	t.Setenv(envGlobalTracingEnabled, "maybe")
+	t.Setenv(envMongoTracingEnabled, "perhaps")
+	t.Setenv(envMongoPropagationEnabled, "")
+
+	_, err := resolveGates(nil, nil)
+	require.ErrorIs(t, err, otelflags.ErrInvalidFlagValue)
+	for _, name := range []string{envGlobalTracingEnabled, envMongoTracingEnabled, envMongoPropagationEnabled} {
+		assert.Contains(t, err.Error(), name, "the joined error must name every bad variable")
+	}
+}
+
+// TestResolveGates_InvalidProviderConfigFailsConstruction extends the same rule
+// to the variables otel-flags owns.
+//
+// They are process-scoped and this module never names them, but they are read
+// during construction, so a value nobody can interpret must stop the constructor
+// here as surely as one of this module's own does.
+func TestResolveGates_InvalidProviderConfigFailsConstruction(t *testing.T) {
+	tests := []struct {
+		name  string
+		env   string
+		value string
+	}{
+		{name: "a bare integer poll interval", env: otelflags.EnvFlagsPollInterval, value: "60"},
+		{name: "an endpoint with no scheme", env: otelflags.EnvFlagsEndpoint, value: "relay:1031"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			silentFlagEnv(t)
+			t.Setenv(tc.env, tc.value)
+
+			_, err := resolveGates(nil, nil)
+			require.ErrorIs(t, err, otelflags.ErrInvalidFlagValue)
+			assert.Contains(t, err.Error(), tc.env)
+		})
+	}
+}
+
+// TestResolveGates_InvalidValueFailsEvenWithAnOption pins that the option does
+// not excuse an unreadable variable that outranks it.
+func TestResolveGates_InvalidValueFailsEvenWithAnOption(t *testing.T) {
+	silentFlagEnv(t)
+	t.Setenv(envMongoPropagationEnabled, "enabled")
+
+	_, err := resolveGates(nil, boolPtr(true))
+	require.ErrorIs(t, err, otelflags.ErrInvalidFlagValue)
+	assert.Contains(t, err.Error(), envMongoPropagationEnabled)
+}
+
+func TestEnvGates_ResolvesFromTheEnvironmentAlone(t *testing.T) {
+	silentFlagEnv(t)
+	t.Setenv(envMongoTracingEnabled, "1")
+	t.Setenv(envMongoPropagationEnabled, "1")
+
+	g := envGates()
+	assert.True(t, g.effectiveTracing())
+	assert.True(t, g.effectivePropagation())
+}
+
+// TestEnvGates_FallsBackToDisabledOnAnInvalidValue pins the one place an
+// unreadable value cannot be reported: NewCollection accepts no options and has
+// no error return, so it degrades to fully disabled rather than guessing.
+func TestEnvGates_FallsBackToDisabledOnAnInvalidValue(t *testing.T) {
+	silentFlagEnv(t)
+	t.Setenv(envMongoTracingEnabled, "enabled")
+
+	g := envGates()
+	assert.False(t, g.effectiveTracing())
+	assert.False(t, g.tracedPossible())
+}
+
+// TestPropagationIsForceDisabledWhenTracingIsOff pins the single-switch rule:
+// Mongo tracing and Mongo document propagation cannot disagree, however the
+// tracing "off" came about.
+func TestPropagationIsForceDisabledWhenTracingIsOff(t *testing.T) {
+	silentFlagEnv(t)
+	t.Setenv(envMongoPropagationEnabled, "1")
+	t.Setenv(envMongoTracingEnabled, "false")
+
+	g := envGates()
+	require.False(t, g.effectiveTracing())
+	require.True(t, g.propLocal, "the propagation tier itself is on…")
+	assert.False(t, g.effectivePropagation(), "…but tracing off force-disables it")
+}
+
+func TestPropagationWhenTracing_DoesNotReResolveTracing(t *testing.T) {
+	silentFlagEnv(t)
+	t.Setenv(envMongoTracingEnabled, "1")
+	t.Setenv(envMongoPropagationEnabled, "1")
+
+	g := envGates()
+	// propagationWhenTracing is what the instrumented impls hold. They are
+	// reached only after the facade resolved tracing true for this operation, so
+	// it must equal propagationGiven(true) exactly (design R5).
+	assert.Equal(t, g.propagationGiven(true), g.propagationWhenTracing())
+}
+
+// TestConnectRejectsUnreadableConfiguration pins that the check runs before any
+// connection is opened.
+func TestConnectRejectsUnreadableConfiguration(t *testing.T) {
+	silentFlagEnv(t)
+	t.Setenv(envMongoTracingEnabled, "yes please")
+
+	_, err := ConnectWithOptions(t.Context(), []ClientOption{WithTracingEnabled(true)})
+	require.ErrorIs(t, err, otelflags.ErrInvalidFlagValue)
+}
+
+// TestTracedPossible_NoRelayKeepsTheZeroCostPath pins the allocation rule.
+func TestTracedPossible_NoRelayKeepsTheZeroCostPath(t *testing.T) {
+	silentFlagEnv(t)
+
+	g, err := resolveGates(nil, nil)
+	require.NoError(t, err)
+	require.False(t, g.relayPossible)
+	assert.False(t, g.tracedPossible(),
+		"no relay can exist and the local answer is off → nothing instrumented, and no command monitor")
+}
+
+// TestTracedPossible_RelayForcesAllocation is the other half: the relay can
+// enable, so the instrumented implementations must exist even with the
+// environment silent.
+func TestTracedPossible_RelayForcesAllocation(t *testing.T) {
+	silentFlagEnv(t)
+	t.Setenv(otelflags.EnvFlagsEndpoint, "http://127.0.0.1:1")
+
+	g, err := resolveGates(nil, nil)
+	require.NoError(t, err)
+	require.True(t, g.relayPossible)
+	assert.True(t, g.tracedPossible(),
+		"a later relay enable could never take effect if nothing instrumented were built")
 }

@@ -5,33 +5,45 @@ import (
 	"testing"
 )
 
-// TestEnvTruthyMatchesModuleFlags is the golden table pinning envTruthy against
-// the modules' internal flags.EnvEnabled. The modules vendor internal copies
-// that cannot be imported, so the semantics can only be held together by this
-// table. The set-but-empty row is the one that used to diverge: an empty value
-// is TRUTHY (docker `-e VAR`, or a mistyped GitHub Actions matrix key, produces
-// exactly that), and reading it as falsy makes the whole matrix assert the
-// disabled branch against an enabled wrapper.
-func TestEnvTruthyMatchesModuleFlags(t *testing.T) {
-	const key = "OTEL_TESTKIT_ENVTRUTHY_PROBE"
+// TestEnvValueMatchesModuleFlags is the golden table pinning the harness's
+// per-variable read against otelflags.Lookup, which the modules use directly.
+//
+// Three rows changed with the ladder, and each one used to make the matrix
+// assert the wrong branch:
+//
+//   - set-but-empty and whitespace are no longer truthy. They are unreadable,
+//     and a module carrying one fails at construction — so the harness treats
+//     them as disabled rather than as an enthusiastic yes.
+//   - an arbitrary value like "x" is unreadable too, not truthy.
+//   - unset now falls through to the caller's default, which is ENABLED for the
+//     master switch and DISABLED for a module switch.
+func TestEnvValueMatchesModuleFlags(t *testing.T) {
+	const key = "OTEL_TESTKIT_ENVVALUE_PROBE"
 	cases := []struct {
 		name  string
 		value string
 		set   bool
+		def   bool
 		want  bool
 	}{
-		{name: "unset", set: false, want: false},
-		{name: "set-but-empty", value: "", set: true, want: true},
-		{name: "whitespace", value: "  ", set: true, want: true},
-		{name: "zero", value: "0", set: true, want: false},
-		{name: "false", value: "false", set: true, want: false},
-		{name: "FALSE", value: "FALSE", set: true, want: false},
-		{name: "no", value: "no", set: true, want: false},
-		{name: "off", value: "off", set: true, want: false},
-		{name: "padded-zero", value: " 0 ", set: true, want: false},
-		{name: "one", value: "1", set: true, want: true},
-		{name: "true", value: "true", set: true, want: true},
-		{name: "arbitrary", value: "x", set: true, want: true},
+		{name: "unset takes the default false", set: false, def: false, want: false},
+		{name: "unset takes the default true", set: false, def: true, want: true},
+
+		{name: "set-but-empty is unreadable", value: "", set: true, def: true, want: false},
+		{name: "whitespace is unreadable", value: "  ", set: true, def: true, want: false},
+		{name: "arbitrary is unreadable", value: "x", set: true, def: true, want: false},
+
+		{name: "zero", value: "0", set: true, def: true, want: false},
+		{name: "false", value: "false", set: true, def: true, want: false},
+		{name: "FALSE", value: "FALSE", set: true, def: true, want: false},
+		{name: "no", value: "no", set: true, def: true, want: false},
+		{name: "off", value: "off", set: true, def: true, want: false},
+		{name: "padded-zero", value: " 0 ", set: true, def: true, want: false},
+
+		{name: "one", value: "1", set: true, def: false, want: true},
+		{name: "true", value: "true", set: true, def: false, want: true},
+		{name: "on", value: "on", set: true, def: false, want: true},
+		{name: "yes", value: "yes", set: true, def: false, want: true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -43,18 +55,22 @@ func TestEnvTruthyMatchesModuleFlags(t *testing.T) {
 					t.Fatalf("unset %s: %v", key, err)
 				}
 			}
-			if got := envTruthy(key); got != c.want {
-				t.Errorf("envTruthy(%s=%q set=%v) = %v, want %v", key, c.value, c.set, got, c.want)
+			if got := envValue(key, "", c.def); got != c.want {
+				t.Errorf("envValue(%s=%q set=%v def=%v) = %v, want %v", key, c.value, c.set, c.def, got, c.want)
 			}
 		})
 	}
 }
 
-// TestEnvTruthyEmptyKey pins that an empty GateEnv field (a transport with no
-// independent propagation gate) never reads the environment.
-func TestEnvTruthyEmptyKey(t *testing.T) {
-	if envTruthy("") {
-		t.Error("envTruthy(\"\") = true, want false")
+// TestEnvValueEmptyKey pins that an empty GateEnv field (a transport with no
+// independent propagation gate) never reads the environment and takes the
+// default.
+func TestEnvValueEmptyKey(t *testing.T) {
+	if envValue("", "", false) {
+		t.Error("envValue(\"\", \"\", false) = true, want false")
+	}
+	if !envValue("", "", true) {
+		t.Error("envValue(\"\", \"\", true) = false, want true")
 	}
 }
 

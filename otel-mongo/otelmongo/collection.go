@@ -21,7 +21,46 @@ import (
 // reachable from the direct path) is compiler-enforced by package boundary.
 type Collection struct {
 	*mongo.Collection
-	impl collectionImpl
+
+	// direct is always present; traced is nil when the instrumented path was
+	// never built (global kill switch off with no override). tracing is read per
+	// operation, so a relay change reaches this Collection without it being
+	// rebuilt.
+	direct  *direct.Collection
+	traced  *traced.Collection
+	tracing func() bool
+}
+
+// impl returns the implementation this operation runs through. The nil check
+// stays adjacent to the return on purpose: hoisting it into a generic ternary
+// would box a possibly-nil *traced.Collection into a non-nil interface at the
+// call site, turning a compile-time-obvious mistake into a nil-receiver panic.
+func (c *Collection) impl() collectionImpl {
+	if c.traced != nil && c.tracing() {
+		return c.traced
+	}
+	return c.direct
+}
+
+// newCursor wraps raw in a facade Cursor carrying both implementations, so
+// iteration follows the flag rather than the value it held at Find time.
+func (c *Collection) newCursor(raw *mongo.Cursor) *Cursor {
+	cur := &Cursor{Cursor: raw, direct: direct.NewCursor(raw), tracing: c.tracing}
+	if c.traced != nil {
+		cur.traced = traced.NewCursor(raw, c.traced.Tracer, c.traced.Propagator, c.traced.PropagationEnabled)
+	}
+	return cur
+}
+
+// newChangeStream wraps raw in a facade ChangeStream carrying both
+// implementations. This matters more than for Cursor: a change stream can stay
+// open across many flag changes.
+func (c *Collection) newChangeStream(raw *mongo.ChangeStream) *ChangeStream {
+	cs := &ChangeStream{ChangeStream: raw, direct: direct.NewChangeStream(raw), tracing: c.tracing}
+	if c.traced != nil {
+		cs.traced = c.traced.NewChangeStreamFor(raw)
+	}
+	return cs
 }
 
 // collectionImpl is the polymorphic core of Collection. Methods return raw
@@ -31,7 +70,7 @@ type Collection struct {
 type collectionImpl interface {
 	InsertOne(ctx context.Context, document any, opts ...*options.InsertOneOptions) (*mongo.InsertOneResult, error)
 	InsertMany(ctx context.Context, documents []any, opts ...*options.InsertManyOptions) (*mongo.InsertManyResult, error)
-	Find(ctx context.Context, filter any, opts ...*options.FindOptions) (*mongo.Cursor, shared.CursorImpl, error)
+	Find(ctx context.Context, filter any, opts ...*options.FindOptions) (*mongo.Cursor, error)
 	FindOne(ctx context.Context, filter any, opts ...*options.FindOneOptions) (*mongo.SingleResult, shared.SingleResultImpl)
 	UpdateOne(ctx context.Context, filter, update any, opts ...*options.UpdateOptions) (*mongo.UpdateResult, error)
 	UpdateMany(ctx context.Context, filter, update any, opts ...*options.UpdateOptions) (*mongo.UpdateResult, error)
@@ -40,10 +79,10 @@ type collectionImpl interface {
 	DeleteMany(ctx context.Context, filter any, opts ...*options.DeleteOptions) (*mongo.DeleteResult, error)
 	CountDocuments(ctx context.Context, filter any, opts ...*options.CountOptions) (int64, error)
 	Distinct(ctx context.Context, fieldName string, filter any, opts ...*options.DistinctOptions) ([]interface{}, error)
-	Aggregate(ctx context.Context, pipeline any, opts ...*options.AggregateOptions) (*mongo.Cursor, shared.CursorImpl, error)
+	Aggregate(ctx context.Context, pipeline any, opts ...*options.AggregateOptions) (*mongo.Cursor, error)
 	UpdateByID(ctx context.Context, id, update any, opts ...*options.UpdateOptions) (*mongo.UpdateResult, error)
 	BulkWrite(ctx context.Context, models []mongo.WriteModel, opts ...*options.BulkWriteOptions) (*mongo.BulkWriteResult, error)
-	Watch(ctx context.Context, pipeline interface{}, opts ...*options.ChangeStreamOptions) (*mongo.ChangeStream, shared.ChangeStreamImpl, error)
+	Watch(ctx context.Context, pipeline interface{}, opts ...*options.ChangeStreamOptions) (*mongo.ChangeStream, error)
 }
 
 var (
@@ -52,51 +91,65 @@ var (
 )
 
 // NewCollection wraps an existing *mongo.Collection with trace propagation.
-// Document _oteltrace injection follows the env gates:
-// OTEL_INSTRUMENTATION_GO_TRACING_ENABLED **and** OTEL_MONGO_TRACING_ENABLED
-// must both be on before OTEL_MONGO_PROPAGATION_ENABLED is consulted. When the
-// gate is off the returned wrapper is a passthrough — no spans, no
-// _oteltrace, no propagator extract.
+//
+// It resolves the switches from the environment alone, since it accepts no
+// options. The instrumented implementation is built when a relay could ever
+// enable this module, or when the environment already does; the effective
+// per-operation answer is the master switch AND OTEL_MONGO_TRACING_ENABLED, each
+// resolved down the full ladder. OTEL_MONGO_PROPAGATION_ENABLED is a further
+// switch below tracing for _oteltrace writes. With no relay configured and the
+// environment silent, the returned wrapper is a pure passthrough — no spans, no
+// _oteltrace, no propagator extract, and no OpenFeature evaluation.
 func NewCollection(coll *mongo.Collection, tracer trace.Tracer, propagator propagation.TextMapPropagator) *Collection {
-	if !mongoTracingEnabled() {
-		return &Collection{Collection: coll, impl: direct.NewCollection(coll)}
-	}
-	return &Collection{
+	gate := envGates()
+	c := &Collection{
 		Collection: coll,
-		impl: &traced.Collection{
-			Coll:               coll,
-			Tracer:             tracer,
-			Propagator:         propagator,
-			PropagationEnabled: mongoPropagationEnabled(),
-		},
+		direct:     direct.NewCollection(coll),
+		tracing:    gate.effectiveTracing,
 	}
+	if !gate.tracedPossible() {
+		return c
+	}
+	c.traced = &traced.Collection{
+		Coll:               coll,
+		Tracer:             tracer,
+		Propagator:         propagator,
+		PropagationEnabled: gate.propagationWhenTracing,
+	}
+	return c
 }
 
 // newCollectionForDatabase builds the collectionImpl that Database.Collection
 // hands to its Collection facade. Uses the Database's cached gates instead of
 // re-reading the env so a single Connect-time decision flows through.
 func newCollectionForDatabase(d *Database, raw *mongo.Collection) *Collection {
-	if !d.tracingEnabled {
-		return &Collection{Collection: raw, impl: direct.NewCollection(raw)}
-	}
-	return &Collection{
+	c := &Collection{
 		Collection: raw,
-		impl: &traced.Collection{
-			Coll:               raw,
-			Tracer:             d.tracer,
-			Propagator:         d.propagator,
-			PropagationEnabled: d.propagationEnabled,
-			ServerAddr:         d.serverAddr,
-			ServerPort:         d.serverPort,
-		},
+		direct:     direct.NewCollection(raw),
+		tracing:    d.effectiveTracing,
 	}
+	if !d.gate.tracedPossible() {
+		return c
+	}
+	c.traced = &traced.Collection{
+		Coll:       raw,
+		Tracer:     d.tracer,
+		Propagator: d.propagator,
+		// propagationWhenTracing, not effectivePropagation: this impl is reached
+		// only after the facade resolved tracing true for the operation, so
+		// re-resolving it here would straddle two verdicts (design R5).
+		PropagationEnabled: d.propagationWhenTracing,
+		ServerAddr:         d.serverAddr,
+		ServerPort:         d.serverPort,
+	}
+	return c
 }
 
 // InsertOne inserts a document. When tracing is enabled, the call is wrapped
 // in a CLIENT span and (with propagation on) the current trace's traceparent
 // is injected into the document's "_oteltrace" field.
 func (c *Collection) InsertOne(ctx context.Context, document any, opts ...*options.InsertOneOptions) (*InsertOneResult, error) {
-	res, err := c.impl.InsertOne(ctx, document, opts...)
+	res, err := c.impl().InsertOne(ctx, document, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +159,7 @@ func (c *Collection) InsertOne(ctx context.Context, document any, opts ...*optio
 // InsertMany inserts multiple documents, injecting the current trace's
 // traceparent into each "_oteltrace" when propagation is on.
 func (c *Collection) InsertMany(ctx context.Context, documents []any, opts ...*options.InsertManyOptions) (*InsertManyResult, error) {
-	res, err := c.impl.InsertMany(ctx, documents, opts...)
+	res, err := c.impl().InsertMany(ctx, documents, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -115,24 +168,27 @@ func (c *Collection) InsertMany(ctx context.Context, documents []any, opts ...*o
 
 // Find executes a find command and returns a Cursor.
 func (c *Collection) Find(ctx context.Context, filter any, opts ...*options.FindOptions) (*Cursor, error) {
-	raw, cImpl, err := c.impl.Find(ctx, filter, opts...)
+	raw, err := c.impl().Find(ctx, filter, opts...)
 	if err != nil {
 		return nil, err
 	}
-	return &Cursor{Cursor: raw, impl: cImpl}, nil
+	return c.newCursor(raw), nil
 }
 
 // FindOne executes a find command returning at most one document. The span
 // (if any) is held in the returned *SingleResult and ended when Decode is called.
 func (c *Collection) FindOne(ctx context.Context, filter any, opts ...*options.FindOneOptions) *SingleResult {
-	raw, sImpl := c.impl.FindOne(ctx, filter, opts...)
+	// SingleResult is the documented exception to per-call selection: the
+	// instrumented impl holds the live FindOne span, so its implementation is
+	// fixed by whichever path executed the FindOne. See design.md D8.
+	raw, sImpl := c.impl().FindOne(ctx, filter, opts...)
 	return &SingleResult{SingleResult: raw, impl: sImpl}
 }
 
 // UpdateOne injects the current trace context into the update and replaces
 // the document's _oteltrace (when propagation is on).
 func (c *Collection) UpdateOne(ctx context.Context, filter any, update any, opts ...*options.UpdateOptions) (*UpdateResult, error) {
-	res, err := c.impl.UpdateOne(ctx, filter, update, opts...)
+	res, err := c.impl().UpdateOne(ctx, filter, update, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +197,7 @@ func (c *Collection) UpdateOne(ctx context.Context, filter any, update any, opts
 
 // UpdateMany injects the current trace context into the update for all matched documents.
 func (c *Collection) UpdateMany(ctx context.Context, filter any, update any, opts ...*options.UpdateOptions) (*UpdateResult, error) {
-	res, err := c.impl.UpdateMany(ctx, filter, update, opts...)
+	res, err := c.impl().UpdateMany(ctx, filter, update, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -150,7 +206,7 @@ func (c *Collection) UpdateMany(ctx context.Context, filter any, update any, opt
 
 // ReplaceOne injects the current trace context into the replacement document.
 func (c *Collection) ReplaceOne(ctx context.Context, filter any, replacement any, opts ...*options.ReplaceOptions) (*UpdateResult, error) {
-	res, err := c.impl.ReplaceOne(ctx, filter, replacement, opts...)
+	res, err := c.impl().ReplaceOne(ctx, filter, replacement, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +215,7 @@ func (c *Collection) ReplaceOne(ctx context.Context, filter any, replacement any
 
 // DeleteOne deletes one matching document.
 func (c *Collection) DeleteOne(ctx context.Context, filter any, opts ...*options.DeleteOptions) (*DeleteResult, error) {
-	res, err := c.impl.DeleteOne(ctx, filter, opts...)
+	res, err := c.impl().DeleteOne(ctx, filter, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +224,7 @@ func (c *Collection) DeleteOne(ctx context.Context, filter any, opts ...*options
 
 // DeleteMany deletes all documents matching filter.
 func (c *Collection) DeleteMany(ctx context.Context, filter any, opts ...*options.DeleteOptions) (*DeleteResult, error) {
-	res, err := c.impl.DeleteMany(ctx, filter, opts...)
+	res, err := c.impl().DeleteMany(ctx, filter, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -177,26 +233,26 @@ func (c *Collection) DeleteMany(ctx context.Context, filter any, opts ...*option
 
 // CountDocuments counts documents matching filter.
 func (c *Collection) CountDocuments(ctx context.Context, filter any, opts ...*options.CountOptions) (int64, error) {
-	return c.impl.CountDocuments(ctx, filter, opts...)
+	return c.impl().CountDocuments(ctx, filter, opts...)
 }
 
 // Distinct returns distinct values for fieldName.
 func (c *Collection) Distinct(ctx context.Context, fieldName string, filter any, opts ...*options.DistinctOptions) ([]interface{}, error) {
-	return c.impl.Distinct(ctx, fieldName, filter, opts...)
+	return c.impl().Distinct(ctx, fieldName, filter, opts...)
 }
 
 // Aggregate runs an aggregation pipeline and returns a Cursor.
 func (c *Collection) Aggregate(ctx context.Context, pipeline any, opts ...*options.AggregateOptions) (*Cursor, error) {
-	raw, cImpl, err := c.impl.Aggregate(ctx, pipeline, opts...)
+	raw, err := c.impl().Aggregate(ctx, pipeline, opts...)
 	if err != nil {
 		return nil, err
 	}
-	return &Cursor{Cursor: raw, impl: cImpl}, nil
+	return c.newCursor(raw), nil
 }
 
 // UpdateByID updates one document by _id, injecting the current trace into the update.
 func (c *Collection) UpdateByID(ctx context.Context, id any, update any, opts ...*options.UpdateOptions) (*UpdateResult, error) {
-	res, err := c.impl.UpdateByID(ctx, id, update, opts...)
+	res, err := c.impl().UpdateByID(ctx, id, update, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -220,7 +276,7 @@ func (c *Collection) FindByIDs(ctx context.Context, ids []any, opts ...*options.
 
 // BulkWrite runs multiple write operations, injecting trace context into write models.
 func (c *Collection) BulkWrite(ctx context.Context, models []mongo.WriteModel, opts ...*options.BulkWriteOptions) (*BulkWriteResult, error) {
-	res, err := c.impl.BulkWrite(ctx, models, opts...)
+	res, err := c.impl().BulkWrite(ctx, models, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -229,9 +285,9 @@ func (c *Collection) BulkWrite(ctx context.Context, models []mongo.WriteModel, o
 
 // Watch starts a change stream on the collection.
 func (c *Collection) Watch(ctx context.Context, pipeline interface{}, opts ...*options.ChangeStreamOptions) (*ChangeStream, error) {
-	raw, csImpl, err := c.impl.Watch(ctx, pipeline, opts...)
+	raw, err := c.impl().Watch(ctx, pipeline, opts...)
 	if err != nil {
 		return nil, err
 	}
-	return &ChangeStream{ChangeStream: raw, impl: csImpl}, nil
+	return c.newChangeStream(raw), nil
 }

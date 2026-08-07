@@ -12,53 +12,50 @@ import (
 	"go.opentelemetry.io/otel"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
+	otelflags "github.com/akira-core/instrumentation-go/otel-flags"
 )
 
-// clearWSTracingEnv unsets both tracing env vars for the duration of the
-// test, restoring their prior values on cleanup, and resets the process-wide
-// gate so the change is observed.
+// clearWSTracingEnv unsets every switch for the duration of the test, which is
+// also the state in which WithTracingEnabled is the deciding rung.
 func clearWSTracingEnv(t *testing.T) {
 	t.Helper()
-	prevGlobal, globalExisted := os.LookupEnv(envGlobalTracingEnabled)
-	prevWS, wsExisted := os.LookupEnv(envWSTracingEnabled)
-	_ = os.Unsetenv(envGlobalTracingEnabled)
-	_ = os.Unsetenv(envWSTracingEnabled)
-	t.Cleanup(func() {
-		if globalExisted {
-			_ = os.Setenv(envGlobalTracingEnabled, prevGlobal)
-		} else {
-			_ = os.Unsetenv(envGlobalTracingEnabled)
-		}
-		if wsExisted {
-			_ = os.Setenv(envWSTracingEnabled, prevWS)
-		} else {
-			_ = os.Unsetenv(envWSTracingEnabled)
-		}
-	})
-	resetWSGateForTest()
-	t.Cleanup(resetWSGateForTest)
+	clearWSFlagEnv(t)
 }
 
-// enableWSTracingEnv sets both tracing env vars truthy for the duration of
-// the test and resets the process-wide gate so the change is observed.
-func enableWSTracingEnv(t *testing.T) {
+// optionDecidesEnv leaves the module variable UNSET so the option decides.
+//
+// This replaces the old moduleEnvOnly, and the change is the point: the option
+// is now BELOW its environment variable, so a test that sets the variable and
+// then passes a contradicting option is asserting the variable's value, not the
+// option's.
+func optionDecidesEnv(t *testing.T) {
 	t.Helper()
-	t.Setenv(envGlobalTracingEnabled, "true")
+	clearWSFlagEnv(t)
+}
+
+// moduleEnvOn turns this module's variable on and leaves the master unset.
+func moduleEnvOn(t *testing.T) {
+	t.Helper()
+	clearWSFlagEnv(t)
 	t.Setenv(envWSTracingEnabled, "true")
-	resetWSGateForTest()
-	t.Cleanup(resetWSGateForTest)
 }
 
 // TestConfigureConn_TracingEnabledFalse_UsesNoopTracer pins that option-off
 // (env on) installs a noop tracer — matrix below only asserts featureEnabled.
 func TestConfigureConn_TracingEnabledFalse_UsesNoopTracer(t *testing.T) {
-	enableWSTracingEnv(t)
+	optionDecidesEnv(t)
 	globalTP, globalRecorder := newRecorderTP(t)
 	otel.SetTracerProvider(globalTP)
 
 	c := &Conn{}
-	configureConn(c, resolveConnOptions([]Option{WithTracingEnabled(false)}))
-	if c.featureEnabled {
+	cfg := resolveConnOptions([]Option{WithTracingEnabled(false)})
+	gate, err := resolveGates(cfg)
+	if err != nil {
+		t.Fatalf("resolveGates: %v", err)
+	}
+	configureConn(c, cfg, gate)
+	if c.featureEnabled() {
 		t.Fatal("expected featureEnabled false")
 	}
 	_, span := c.tracer.Start(context.Background(), "option-disabled")
@@ -68,81 +65,100 @@ func TestConfigureConn_TracingEnabledFalse_UsesNoopTracer(t *testing.T) {
 	}
 }
 
-// TestWithTracingEnabled_EnvOptionMatrix pins the full env × option decision
-// table for featureEnabled. Option is authoritative in either direction when
-// present; when absent, the GLOBAL∧MODULE env gate decides (unset/falsy → off).
-func TestWithTracingEnabled_EnvOptionMatrix(t *testing.T) {
-	type envState string
-	const (
-		envUnset envState = "unset"
-		envOn    envState = "on"
-		envOff   envState = "off" // explicit falsy, not merely unset
-	)
-	type optState string
-	const (
-		optAbsent optState = "absent"
-		optOn     optState = "on"
-		optOff    optState = "off"
-	)
+// TestTracingTiers_EnvOptionMatrix pins how the ladder and the master switch
+// compose, with no relay configured so the local answer is final.
+//
+// Two rows reverse earlier releases: the module variable alone is now enough
+// (the master defaults to enabled), and the environment variable beats the
+// option (so there is no conflict row — supplying both is ordinary
+// configuration).
+func TestTracingTiers_EnvOptionMatrix(t *testing.T) {
+	type v struct {
+		set   bool
+		value string
+	}
+	unset := v{}
+	on := v{set: true, value: "1"}
+	off := v{set: true, value: "false"}
 
 	cases := []struct {
-		name string
-		env  envState
-		opt  optState
-		want bool
+		name   string
+		master v
+		module v
+		option *bool
+		want   bool
 	}{
-		{"env unset, option absent → off", envUnset, optAbsent, false},
-		{"env unset, option on → on", envUnset, optOn, true},
-		{"env unset, option off → off", envUnset, optOff, false},
-		{"env on, option absent → on", envOn, optAbsent, true},
-		{"env off, option absent → off", envOff, optAbsent, false},
-		{"env on, option off → off", envOn, optOff, false},
-		{"env off, option on → on", envOff, optOn, true},
-		{"env on, option on → on", envOn, optOn, true},
+		{name: "nothing set", master: unset, module: unset, want: false},
+
+		{name: "master on alone", master: on, module: unset, want: false},
+		{name: "master on, module on", master: on, module: on, want: true},
+		{name: "master on, module off", master: on, module: off, want: false},
+		{name: "master off, module on", master: off, module: on, want: false},
+		{name: "master off, option on", master: off, module: unset, option: ptr(true), want: false},
+
+		{name: "module on alone", master: unset, module: on, want: true},
+
+		{name: "option on, variable unset", master: unset, module: unset, option: ptr(true), want: true},
+		{name: "option off, variable unset", master: unset, module: unset, option: ptr(false), want: false},
+		{name: "variable off beats option on", master: unset, module: off, option: ptr(true), want: false},
+		{name: "variable on beats option off", master: unset, module: on, option: ptr(false), want: true},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			switch tc.env {
-			case envUnset:
-				clearWSTracingEnv(t)
-			case envOn:
-				enableWSTracingEnv(t)
-			case envOff:
-				t.Setenv(envGlobalTracingEnabled, "false")
-				t.Setenv(envWSTracingEnabled, "false")
-				resetWSGateForTest()
-				t.Cleanup(resetWSGateForTest)
-			}
+			setOrUnset(t, otelflags.EnvFlagsEndpoint, false, "")
+			setOrUnset(t, otelflags.EnvGlobalTracing, tc.master.set, tc.master.value)
+			setOrUnset(t, envWSTracingEnabled, tc.module.set, tc.module.value)
 
 			var opts []Option
-			switch tc.opt {
-			case optOn:
-				opts = []Option{WithTracingEnabled(true)}
-			case optOff:
-				opts = []Option{WithTracingEnabled(false)}
+			if tc.option != nil {
+				opts = []Option{WithTracingEnabled(*tc.option)}
 			}
-
 			cfg := resolveConnOptions(opts)
-			if got := effectiveFeatureEnabled(cfg); got != tc.want {
-				t.Fatalf("effectiveFeatureEnabled = %v, want %v", got, tc.want)
+
+			gate, err := resolveGates(cfg)
+			if err != nil {
+				t.Fatalf("resolveGates: %v", err)
+			}
+			if got := gate.tracing(); got != tc.want {
+				t.Fatalf("gate.tracing() = %v, want %v", got, tc.want)
 			}
 
 			c := &Conn{}
-			configureConn(c, cfg)
-			if c.featureEnabled != tc.want {
-				t.Fatalf("featureEnabled = %v, want %v", c.featureEnabled, tc.want)
+			configureConn(c, cfg, gate)
+			if c.featureEnabled() != tc.want {
+				t.Fatalf("featureEnabled = %v, want %v", c.featureEnabled(), tc.want)
 			}
 		})
 	}
 }
 
-// TestNewConn_WithTracingEnabled_OverridesEnvGate is a full-stack proof: the
-// env gate resolves to disabled (unset), but NewConn(conn,
-// WithTracingEnabled(true)) still produces real spans end-to-end through a
-// real WebSocket round trip.
-func TestNewConn_WithTracingEnabled_OverridesEnvGate(t *testing.T) {
-	clearWSTracingEnv(t)
+func ptr(b bool) *bool { return &b }
+
+// setOrUnset makes an environment variable present with value, or absent,
+// restoring the previous state when the test ends.
+func setOrUnset(t *testing.T, name string, set bool, value string) {
+	t.Helper()
+	if set {
+		t.Setenv(name, value)
+		return
+	}
+	prev, existed := os.LookupEnv(name)
+	_ = os.Unsetenv(name)
+	t.Cleanup(func() {
+		if existed {
+			_ = os.Setenv(name, prev)
+		} else {
+			_ = os.Unsetenv(name)
+		}
+	})
+}
+
+// TestNewConn_WithTracingEnabled_Traces is a full-stack proof that the option is
+// usable on its own: with every environment variable unset, WithTracingEnabled
+// (true) is the deciding rung and real spans reach a real WebSocket round trip.
+func TestNewConn_WithTracingEnabled_Traces(t *testing.T) {
+	optionDecidesEnv(t)
 
 	sr := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
@@ -170,9 +186,12 @@ func TestNewConn_WithTracingEnabled_OverridesEnvGate(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = rawConn.Close() })
 
-	conn := NewConn(rawConn, WithTracingEnabled(true))
-	if !conn.featureEnabled {
-		t.Fatal("expected featureEnabled true: option must override the disabled env gate")
+	conn, errNewConn := NewConn(rawConn, WithTracingEnabled(true))
+	if errNewConn != nil {
+		t.Fatalf("NewConn: %v", errNewConn)
+	}
+	if !conn.featureEnabled() {
+		t.Fatal("expected featureEnabled true: the option decides when its variable is unset")
 	}
 
 	if err := conn.WriteMessage(context.Background(), websocket.TextMessage, []byte("hello")); err != nil {
@@ -183,14 +202,14 @@ func TestNewConn_WithTracingEnabled_OverridesEnvGate(t *testing.T) {
 	}
 
 	if len(sr.Ended()) == 0 {
-		t.Fatal("expected recorded spans: WithTracingEnabled(true) must produce real spans despite the disabled env gate")
+		t.Fatal("expected recorded spans: WithTracingEnabled(true) must produce real spans with the environment silent")
 	}
 }
 
 // TestUpgrader_Upgrade_WithTracingEnabled_OverridesEnvGate proves the option
 // reaches the server-side Upgrader.Upgrade path too, not just NewConn/Dial.
-func TestUpgrader_Upgrade_WithTracingEnabled_OverridesEnvGate(t *testing.T) {
-	clearWSTracingEnv(t)
+func TestUpgrader_Upgrade_WithTracingEnabled_SuppliesGate1(t *testing.T) {
+	optionDecidesEnv(t)
 
 	sr := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
@@ -207,8 +226,8 @@ func TestUpgrader_Upgrade_WithTracingEnabled_OverridesEnvGate(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		if !conn.featureEnabled {
-			t.Error("expected featureEnabled true on the server-side Conn: option must override the disabled env gate")
+		if !conn.featureEnabled() {
+			t.Error("expected featureEnabled true on the server-side Conn: the option must reach Upgrade")
 		}
 		if err := conn.WriteMessage(context.Background(), websocket.TextMessage, []byte("server hello")); err != nil {
 			t.Errorf("WriteMessage: %v", err)
@@ -308,7 +327,10 @@ func TestUpgrader_TracingDisabled_DoesNotNegotiateOTelWS(t *testing.T) {
 // a client whose effective tracing is off never offers otel-ws, so an
 // otel-ws-aware server (tracing on) neither confirms nor envelopes.
 func TestDial_TracingDisabled_DoesNotOfferOTelWS(t *testing.T) {
-	enableWSTracingEnv(t)
+	// The module variable is left unset so WithTracingEnabled(false) is the
+	// deciding rung for the client. Setting it truthy would beat the option and
+	// this test would assert the wrong thing.
+	optionDecidesEnv(t)
 
 	payload := `{"clean":"payload"}`
 	up := Upgrader{
@@ -316,7 +338,8 @@ func TestDial_TracingDisabled_DoesNotOfferOTelWS(t *testing.T) {
 		Subprotocols: []string{"json"},
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := up.Upgrade(w, r, nil) // env gates on: would confirm otel-ws if offered
+		// The server passes the option ON, so it would confirm otel-ws if offered.
+		conn, err := up.Upgrade(w, r, nil, WithTracingEnabled(true))
 		if err != nil {
 			t.Errorf("upgrade: %v", err)
 			return
@@ -411,7 +434,7 @@ func TestUpgrader_FeatureOff_StripsOTelFromCallerResponseHeader(t *testing.T) {
 // otel-ws-aware server confirms and envelopes every message, which this
 // client's Conn (tracingEnabled false) never unwraps.
 func TestDial_FeatureOff_StripsOTelFromCallerRequestHeader(t *testing.T) {
-	enableWSTracingEnv(t)
+	optionDecidesEnv(t)
 
 	payload := `{"clean":"payload"}`
 	up := Upgrader{
@@ -419,8 +442,8 @@ func TestDial_FeatureOff_StripsOTelFromCallerRequestHeader(t *testing.T) {
 		Subprotocols: []string{"json"},
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// env gates on: this server WOULD confirm otel-ws if it were offered.
-		conn, err := up.Upgrade(w, r, nil)
+		// This server WOULD confirm otel-ws if it were offered.
+		conn, err := up.Upgrade(w, r, nil, WithTracingEnabled(true))
 		if err != nil {
 			t.Errorf("upgrade: %v", err)
 			return
@@ -464,4 +487,15 @@ func TestDial_FeatureOff_StripsOTelFromCallerRequestHeader(t *testing.T) {
 	if string(got) != payload {
 		t.Fatalf("client received %q, want clean round-tripped payload %q", got, payload)
 	}
+}
+
+// mustGate resolves the gate state for a parsed option set, failing the test on
+// an unreadable configuration.
+func mustGate(t *testing.T, cfg connOptions) gateState {
+	t.Helper()
+	gate, err := resolveGates(cfg)
+	if err != nil {
+		t.Fatalf("resolveGates: %v", err)
+	}
+	return gate
 }

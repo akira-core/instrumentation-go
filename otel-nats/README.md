@@ -19,7 +19,7 @@ otel-nats/
 │   ├── conn_direct.go      # directConn: passthrough connImpl used when tracing is disabled
 │   ├── traceevent.go       # WithTraceDestination / SubscribeTraceEvents / TraceEvent / TraceHop (NATS 2.11+ trace events)
 │   ├── propagation.go      # HeaderCarrier (nats.Header ↔ TextMapCarrier)
-│   ├── env_flags.go        # tracing feature-flag gate (OTEL_INSTRUMENTATION_GO_TRACING_ENABLED + OTEL_NATS_TRACING_ENABLED)
+│   ├── env_flags.go        # this module's flag key, env var, default, and gateState
 │   ├── internal/flags/     # shared EnvEnabled/Gate helpers (byte-identical across instrumentation modules)
 │   └── doc.go
 ├── oteljetstream/          # JetStream: New, JetStream, Stream, Consumer, Consume, Messages, Fetch
@@ -44,29 +44,45 @@ otel-nats/
 
 ### Tracing feature flags
 
-`otel-nats` (`otelnats` + `oteljetstream`) supports:
+```
+tracing = master && natsTracing
+```
 
-- `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` (global master switch)
-- `OTEL_NATS_TRACING_ENABLED` (nats module switch)
+Each switch resolves down a four-step ladder, first source with an opinion winning:
 
-Defaults: **DISABLED** when unset — both vars must be explicitly set to a truthy value to enable tracing via env. Values `false/0/no/off` (case-insensitive) disable; any other set value is truthy.
+```
+relay  >  env  >  option (With*Enabled)  >  hardcoded default
+```
 
-When disabled, both span creation and W3C header propagation are turned off (there is no separate propagation option — tracing and header propagation share one gate).
+The relay is authoritative in **both** directions — it can disable a running module and enable one
+the deployment left off. Safety comes from the defaults: the master switch
+`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` defaults to `true` and is a **veto** (only `false` has an
+effect; it accepts no option), while every per-module switch defaults to **off**.
 
-#### Env × `WithTracingEnabled`
+**The option sits below its environment variable**, reversing `0.7.0`. ``OTEL_NATS_TRACING_ENABLED`=false` disables
+this module even where the Go code passed `WithTracingEnabled(true)`, so an operator has a per-module
+setting application code cannot override. With the variable unset the option decides, so two
+connections in one process can still differ.
 
-`WithTracingEnabled(v bool)` on `ConnectWithOptions` / `ConnectTLSWithOptions` / `ConnectWithCredentialsWithOptions` overrides the two env vars for that `Conn` only. `oteljetstream` wrappers built from that `Conn` inherit the effective state. When the option is absent, env decides.
+A switch is decided only by `1`/`true`/`yes`/`on` or `0`/`false`/`no`/`off`. Unset means "no opinion".
+**Anything else — including the empty string — fails construction** with an error wrapping
+`otelflags.ErrInvalidFlagValue`.
 
-| Env (`GLOBAL` ∧ `OTEL_NATS_TRACING_ENABLED`) | `WithTracingEnabled` | Effective tracing |
-|----------------------------------------------|----------------------|-------------------|
-| off (unset or falsy) | *(absent)* | **off** |
-| off (unset or falsy) | `true` | **on** |
-| off (unset or falsy) | `false` | **off** |
-| on | *(absent)* | **on** |
-| on | `false` | **off** |
-| on | `true` | **on** |
+`WithTracingEnabled` does **not** pin anything: a wrapper carrying it resolves the master switch and
+the relay on every operation.
 
-Useful for deriving NATS tracing from your application's own toggle, and for constructing both traced and untraced connections in the same test binary (the env-only gate is cached for the process lifetime).
+The mutual-exclusion rule and `ErrTracingConfigConflict` are **gone**: supplying an option alongside
+its variable is ordinary configuration, and the variable wins.
+
+Subscriptions and JetStream consumers re-resolve per **message**, so one created before a flag
+change follows it without being re-established.
+
+> Full reference — every resolution table, connecting a relay with no application code, revocation
+> latency, per-service targeting, and the operational summary:
+> **[docs/feature-flags.md](../docs/feature-flags.md)** ·
+> Tutorial: **[docs/otel-nats-kill-switch.en-US.html](../docs/otel-nats-kill-switch.en-US.html)** ·
+> 繁體中文:**[docs/feature-flags.zh-TW.md](../docs/feature-flags.zh-TW.md)** ·
+> **[docs/otel-nats-kill-switch.zh-TW.html](../docs/otel-nats-kill-switch.zh-TW.html)**
 
 ### 1. Initialize provider and propagator (application responsibility)
 

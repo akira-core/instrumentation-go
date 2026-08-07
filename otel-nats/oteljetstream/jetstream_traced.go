@@ -19,7 +19,21 @@ type tracedJSImpl struct {
 	js   jetstream.JetStream
 }
 
+// on reports whether THIS call should be instrumented. Read per call so a relay
+// flag change reaches a JetStream handle that an application typically creates
+// once at startup and keeps for its lifetime.
+//
+// Methods that RETURN a wrapper (Consumer, Stream, PushConsumer) are deliberately
+// NOT gated: they always hand back the instrumented wrapper, which gates its own
+// methods. Returning a passthrough wrapper while the flag happened to be off
+// would pin that consumer or stream forever, which is exactly what per-call
+// resolution exists to avoid.
+func (j *tracedJSImpl) on() bool { return j.conn.TracingEnabled() }
+
 func (j *tracedJSImpl) Publish(ctx context.Context, subject string, data []byte, opts ...jetstream.PublishOpt) (*PubAck, error) {
+	if !j.on() {
+		return j.js.Publish(ctx, subject, data, opts...)
+	}
 	msg := &nats.Msg{
 		Subject: subject,
 		Data:    data,
@@ -29,6 +43,9 @@ func (j *tracedJSImpl) Publish(ctx context.Context, subject string, data []byte,
 }
 
 func (j *tracedJSImpl) PublishMsg(ctx context.Context, msg *nats.Msg, opts ...jetstream.PublishOpt) (*PubAck, error) {
+	if !j.on() {
+		return j.js.PublishMsg(ctx, msg, opts...)
+	}
 	tracer, prop := j.conn.TraceContext()
 	if msg.Header == nil {
 		msg.Header = make(nats.Header)

@@ -14,6 +14,7 @@ on:
       - "otel-nats/v[0-9]*"
       - "otel-gorilla-ws/v[0-9]*"
       - "otel-sampler/v[0-9]*"
+      - "otel-flags/v[0-9]*"
 
 permissions:
   contents: read
@@ -74,6 +75,12 @@ jobs:
               FILE="otel-sampler/otelsampler/version.go"
               CONST_VERSION=$(grep -E '^\s*(const\s+)?instrumentationVersion\s*=' "$FILE" | sed -E 's/.*"([^"]+)".*/\1/')
               ;;
+            otel-flags/v*)
+              MODULE="otel-flags"
+              VERSION="${TAG#otel-flags/v}"
+              FILE="otel-flags/version.go"
+              CONST_VERSION=$(grep -E '^\s*(const\s+)?instrumentationVersion\s*=' "$FILE" | sed -E 's/.*"([^"]+)".*/\1/')
+              ;;
             *)
               echo "::error::Unrecognized release tag shape: $TAG (expected <module>/vX.Y.Z per VERSIONING.md)"
               exit 1
@@ -90,3 +97,34 @@ jobs:
           fi
 
           echo "OK: $TAG matches the version constant in $FILE"
+
+      - name: Reject an in-repo replace directive
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          case "$TAG" in
+            otel-mongo/v2.*) MODULE="otel-mongo/v2" ;;
+            otel-mongo/v*)   MODULE="otel-mongo" ;;
+            otel-nats/v*)    MODULE="otel-nats" ;;
+            otel-gorilla-ws/v*) MODULE="otel-gorilla-ws" ;;
+            otel-sampler/v*) MODULE="otel-sampler" ;;
+            otel-flags/v*)   MODULE="otel-flags" ;;
+            *) echo "::error::Unrecognized tag shape: $TAG"; exit 1 ;;
+          esac
+
+          # A `replace` pointing at another module in this repository is a
+          # development-time device: it makes the working tree build against
+          # itself before otel-flags is published. Consumers IGNORE a replace in
+          # a dependency's go.mod, so one that reaches a published tag does not
+          # merely have no effect — it leaves the module requiring a version that
+          # may not exist, and every `go get` of it fails.
+          #
+          # The failure is invisible until someone outside this repo tries to
+          # build, which is exactly the class of mistake a human checklist loses
+          # to. Hence a check rather than a note in VERSIONING.md.
+          if grep -nE '^\s*replace\s+github\.com/akira-core/instrumentation-go' "$MODULE/go.mod"; then
+            echo "::error::$MODULE/go.mod carries a replace directive pointing at an in-repo module. Consumers ignore it, so this tag would be unbuildable. Remove the replace, run 'GOWORK=off go mod tidy', commit, and re-tag."
+            exit 1
+          fi
+
+          echo "OK: $MODULE/go.mod carries no in-repo replace directive"

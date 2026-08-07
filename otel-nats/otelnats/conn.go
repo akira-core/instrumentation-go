@@ -18,7 +18,7 @@ import (
 const (
 	// ScopeName is the instrumentation scope name for Tracer creation (OTel contrib guideline).
 	ScopeName              = "instrumentation-go/otel-nats/otelnats"
-	instrumentationVersion = "0.7.0"
+	instrumentationVersion = "0.8.0"
 	messagingSystem        = "nats"
 )
 
@@ -38,16 +38,84 @@ type MsgHandler func(m Msg)
 
 // Conn is a tracing-aware wrapper around *nats.Conn. API mirrors nats.Conn; the only
 // difference is Publish/PublishMsg take context.Context and handlers receive Msg.
-// All instrumentation behaviour lives behind a polymorphic connImpl chosen once at
-// connection time — tracedConn when tracing is on, directConn (passthrough) when off.
+// All instrumentation behaviour lives behind a polymorphic connImpl — tracedConn
+// when tracing is on, directConn (passthrough) when off.
+//
+// Selection happens per operation, not once at construction, so a relay flag
+// change reaches a long-lived connection without it being re-established. NO
+// connection is ever static — not even one carrying WithTracingEnabled, which
+// supplies one rung of the ladder and says nothing about the relay or the
+// master switch.
+//
+// What construction does fix is whether an instrumented implementation exists at
+// all. traced is nil only when no relay can exist in this process AND the local
+// answer is off; then no OTel SDK code path is reachable for the connection's
+// lifetime and no evaluation is ever performed.
 type Conn struct {
-	nc   *nats.Conn
-	impl connImpl
+	nc *nats.Conn
+
+	// gate holds everything about this connection's switches that was fixed at
+	// construction. Everything derived from the Conn copies it, so a derived
+	// wrapper inherits the decision rather than re-resolving it.
+	gate gateState
+
+	// direct is always non-nil. traced is non-nil only when gate.tracedPossible
+	// said an instrumented path could ever be reached, and is then selected per
+	// operation.
+	direct connImpl
+	traced connImpl
+}
+
+// impl returns the implementation this operation runs through.
+// The condition must stay lockstep with msgHandler and traceEventMsgHandler
+// (traced == nil? / gate.tracing()?) — do not change one alone.
+func (c *Conn) impl() connImpl {
+	if c.traced != nil && c.gate.tracing() {
+		return c.traced
+	}
+	return c.direct
+}
+
+// msgHandler returns the nats.MsgHandler bound into a subscription. A
+// subscription is created once and often lives for the whole process, so it
+// must NOT pin impl()'s answer at subscribe time — both handlers are built once
+// here and the relay verdict is re-resolved per message, so a subscription
+// created before a revocation follows it.
+func (c *Conn) msgHandler(subject, queue string, handler MsgHandler) nats.MsgHandler {
+	if c.traced == nil {
+		return c.direct.wrapMsgHandler(subject, queue, handler)
+	}
+	th := c.traced.wrapMsgHandler(subject, queue, handler)
+	dh := c.direct.wrapMsgHandler(subject, queue, handler)
+	return func(m *nats.Msg) {
+		if c.gate.tracing() {
+			th(m)
+		} else {
+			dh(m)
+		}
+	}
+}
+
+// traceEventMsgHandler is msgHandler's sibling for SubscribeTraceEvents: hop
+// spans follow the relay verdict per event rather than being pinned at
+// subscribe time.
+func (c *Conn) traceEventMsgHandler() nats.MsgHandler {
+	if c.traced == nil {
+		return c.direct.traceEventHandler()
+	}
+	th := c.traced.traceEventHandler()
+	dh := c.direct.traceEventHandler()
+	return func(m *nats.Msg) {
+		if c.gate.tracing() {
+			th(m)
+		} else {
+			dh(m)
+		}
+	}
 }
 
 // connImpl is the polymorphic core of Conn. Two implementations exist
-// (tracedConn / directConn). Selection happens once at construction so per-
-// method gates are unnecessary.
+// (tracedConn / directConn).
 type connImpl interface {
 	Publish(ctx context.Context, subject string, data []byte) error
 	PublishMsg(ctx context.Context, msg *nats.Msg) error
@@ -117,23 +185,32 @@ func WithTraceDestination(subject string) Option {
 	})
 }
 
-// WithTracingEnabled overrides the env-gate default (OTEL_INSTRUMENTATION_GO_TRACING_ENABLED
-// AND OTEL_NATS_TRACING_ENABLED) for this Conn only, in either direction. When
-// unset, tracing follows the env gates exactly as before. When set, this
-// value is authoritative for the resulting Conn — including everything
-// derived from it, such as oteljetstream wrappers — and takes precedence
-// over both env gates.
+// WithTracingEnabled supplies this module's tracing switch for this Conn only.
 //
-// This lets an application derive NATS tracing from its own toggle instead of
-// requiring every deployment to export the two env vars, and lets tests
-// construct both traced and untraced connections in the same process without
-// process-wide env manipulation (the tracing gate is otherwise cached for the
-// lifetime of the process via sync.Once).
+// It is the THIRD rung of a four-rung ladder — relay > env > option > default —
+// so it is a per-connection default, not an override of anything above it:
 //
-// A Conn constructed with WithTracingEnabled(false) delegates natively with
-// no spans regardless of the env gates; a Conn constructed with
-// WithTracingEnabled(true) traces even if the env gates are off or unset.
-// Connections constructed without this option are unaffected.
+//   - OTEL_NATS_TRACING_ENABLED wins over it. That is deliberate, and it is what
+//     lets a deployment disable this module without silencing the process and
+//     without a relay, even when the application's Go code asked for tracing.
+//   - The relay wins over both, in either direction.
+//   - The master switch (OTEL_INSTRUMENTATION_GO_TRACING_ENABLED, or its relay
+//     key) is ANDed above the whole ladder and accepts no option at all. It
+//     stops a Conn carrying WithTracingEnabled(true) like any other.
+//
+// Supplying it alongside OTEL_NATS_TRACING_ENABLED is legal and no longer an
+// error; the variable simply wins. An unreadable value in that variable is still
+// a construction error, because the option does not excuse a variable that
+// outranks it.
+//
+// It exists for callers who cannot set a process environment variable: tests, or
+// several independently configured connections in one binary. With the variable
+// unset the option is the deciding rung, so a tracing and a non-tracing Conn can
+// be built in the same process.
+//
+// It does not make a Conn static. A Conn carrying it — and everything derived
+// from it, such as oteljetstream wrappers — resolves the master switch and the
+// relay on EVERY operation.
 func WithTracingEnabled(v bool) Option {
 	return optionFunc(func(c *connConfig) {
 		c.TracingEnabled = &v
@@ -145,15 +222,25 @@ func Version() string {
 	return instrumentationVersion
 }
 
-func newConn(nc *nats.Conn, opts ...Option) *Conn {
+func newConn(nc *nats.Conn, opts ...Option) (*Conn, error) {
 	cfg := newConnConfig(opts...)
-	enabled := natsTracingEnabled()
-	if cfg.TracingEnabled != nil {
-		enabled = *cfg.TracingEnabled
+	direct := &directConn{nc: nc}
+
+	// Everything the relay cannot change, fixed here: the master switch's local
+	// value, this module's local value, and whether a relay can exist at all.
+	gate, err := resolveGates(cfg.TracingEnabled)
+	if err != nil {
+		return nil, err
 	}
-	if !enabled {
-		return &Conn{nc: nc, impl: &directConn{nc: nc}}
+	// No relay possible and the local answer is off ⇒ only the passthrough is
+	// built, no OTel code path is reachable, and no evaluation is ever performed.
+	// When a relay IS possible the instrumented implementation must exist even
+	// though the environment says off, because the relay can enable it later and
+	// construction happens once.
+	if !gate.tracedPossible() {
+		return &Conn{nc: nc, gate: gate, direct: direct}, nil
 	}
+
 	if cfg.Propagators == nil {
 		cfg.Propagators = otel.GetTextMapPropagator()
 	}
@@ -162,17 +249,17 @@ func newConn(nc *nats.Conn, opts ...Option) *Conn {
 		tp = otel.GetTracerProvider()
 	}
 	tracer := tp.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()), trace.WithSchemaURL(semconv.SchemaURL))
-	serverAttrs := serverAttrsFromConn(nc)
-	return &Conn{
-		nc: nc,
-		impl: &tracedConn{
-			nc:          nc,
-			tracer:      tracer,
-			propagator:  cfg.Propagators,
-			serverAttrs: serverAttrs,
-			traceDest:   cfg.TraceDest,
-		},
+	traced := &tracedConn{
+		nc:          nc,
+		tracer:      tracer,
+		propagator:  cfg.Propagators,
+		serverAttrs: serverAttrsFromConn(nc),
+		traceDest:   cfg.TraceDest,
 	}
+
+	// Both implementations exist; the per-operation resolution selects between
+	// them. The option supplied one rung of the ladder and pins nothing.
+	return &Conn{nc: nc, gate: gate, direct: direct, traced: traced}, nil
 }
 
 // serverAttrsFromConn parses the connected NATS server address into server.address / server.port attributes.
@@ -195,17 +282,17 @@ func serverAttrsFromConn(nc *nats.Conn) []attribute.KeyValue {
 }
 
 // TracingEnabled reports whether tracing and trace propagation are enabled.
-func (c *Conn) TracingEnabled() bool { return c.impl.TracingEnabled() }
+func (c *Conn) TracingEnabled() bool { return c.impl().TracingEnabled() }
 
 // TraceDest returns the configured Nats-Trace-Dest subject (empty if disabled).
-func (c *Conn) TraceDest() string { return c.impl.TraceDest() }
+func (c *Conn) TraceDest() string { return c.impl().TraceDest() }
 
 // ServerAttrs returns the pre-built server.address / server.port attributes for this connection.
-func (c *Conn) ServerAttrs() []attribute.KeyValue { return c.impl.ServerAttrs() }
+func (c *Conn) ServerAttrs() []attribute.KeyValue { return c.impl().ServerAttrs() }
 
 // TraceContext returns the tracer and propagator used by this Conn. Used by oteljetstream.
 func (c *Conn) TraceContext() (trace.Tracer, propagation.TextMapPropagator) {
-	return c.impl.TraceContext()
+	return c.impl().TraceContext()
 }
 
 // NatsConn returns the underlying *nats.Conn (same as nats package).
@@ -225,49 +312,49 @@ func (c *Conn) Drain() error {
 
 // Publish publishes data to subject. Same as nats.Conn.Publish but accepts context for trace.
 func (c *Conn) Publish(ctx context.Context, subject string, data []byte) error {
-	return c.impl.Publish(ctx, subject, data)
+	return c.impl().Publish(ctx, subject, data)
 }
 
 // PublishMsg publishes the message. Same as nats.Conn.PublishMsg but accepts context for trace.
 // Per OTel messaging semconv: "Send" span with creation context injected into message; consumer
 // spans link to this context. Span name is "{operation.name} {destination}".
 func (c *Conn) PublishMsg(ctx context.Context, msg *nats.Msg) error {
-	return c.impl.PublishMsg(ctx, msg)
+	return c.impl().PublishMsg(ctx, msg)
 }
 
 // Request sends a request and waits for reply. Signature mirrors nats.Conn.Request exactly.
 // When tracing is enabled the producer span uses context.Background() as parent — callers that
 // need to chain into an existing trace should use RequestWithContext or RequestMsgWithContext.
 func (c *Conn) Request(subject string, data []byte, timeout time.Duration) (*nats.Msg, error) {
-	return c.impl.Request(subject, data, timeout)
+	return c.impl().Request(subject, data, timeout)
 }
 
 // RequestWithContext sends a request with the timeout controlled by ctx. Signature mirrors
 // nats.Conn.RequestWithContext exactly; the producer span uses ctx as parent for trace chaining.
 func (c *Conn) RequestWithContext(ctx context.Context, subject string, data []byte) (*nats.Msg, error) {
-	return c.impl.RequestWithContext(ctx, subject, data)
+	return c.impl().RequestWithContext(ctx, subject, data)
 }
 
 // RequestMsg sends a pre-built request message. Signature mirrors nats.Conn.RequestMsg exactly.
 // When tracing is enabled the producer span uses context.Background() as parent.
 func (c *Conn) RequestMsg(msg *nats.Msg, timeout time.Duration) (*nats.Msg, error) {
-	return c.impl.RequestMsg(msg, timeout)
+	return c.impl().RequestMsg(msg, timeout)
 }
 
 // RequestMsgWithContext sends a pre-built request message with ctx-controlled timeout.
 // Signature mirrors nats.Conn.RequestMsgWithContext exactly; the producer span uses ctx as parent.
 func (c *Conn) RequestMsgWithContext(ctx context.Context, msg *nats.Msg) (*nats.Msg, error) {
-	return c.impl.RequestMsgWithContext(ctx, msg)
+	return c.impl().RequestMsgWithContext(ctx, msg)
 }
 
 // Subscribe subscribes to subject. Handler receives Msg (m.Msg, m.Context()).
 func (c *Conn) Subscribe(subject string, handler MsgHandler) (*nats.Subscription, error) {
-	return c.nc.Subscribe(subject, c.impl.wrapMsgHandler(subject, "", handler))
+	return c.nc.Subscribe(subject, c.msgHandler(subject, "", handler))
 }
 
 // QueueSubscribe is the queue-group variant. Handler receives Msg.
 func (c *Conn) QueueSubscribe(subject, queue string, handler MsgHandler) (*nats.Subscription, error) {
-	return c.nc.QueueSubscribe(subject, queue, c.impl.wrapMsgHandler(subject, queue, handler))
+	return c.nc.QueueSubscribe(subject, queue, c.msgHandler(subject, queue, handler))
 }
 
 func publishAttrs(msg *nats.Msg, serverAttrs []attribute.KeyValue) []attribute.KeyValue {

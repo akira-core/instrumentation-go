@@ -2,6 +2,7 @@ package otelgorillaws
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,57 +13,151 @@ import (
 	"go.opentelemetry.io/otel"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
+	otelflags "github.com/akira-core/instrumentation-go/otel-flags"
 )
 
-func resetWSGateForTest() {
-	wsGate.ResetForTest()
+// wsTracing resolves the module's effective tracing state from everything except
+// a relay, which these tests deliberately leave absent. The truthiness rules
+// themselves live in otel-flags and are tested there; these cases pin how this
+// module composes the ladder and the master switch.
+func wsTracing(t *testing.T) bool {
+	t.Helper()
+	gate, err := resolveGates(resolveConnOptions(nil))
+	if err != nil {
+		t.Fatalf("resolveGates: %v", err)
+	}
+	return gate.tracing()
 }
 
-func TestWSTracingEnabled_DefaultFalse(t *testing.T) {
-	prev, existed := os.LookupEnv(envWSTracingEnabled)
-	_ = os.Unsetenv(envWSTracingEnabled)
-	t.Cleanup(func() {
-		if existed {
-			_ = os.Setenv(envWSTracingEnabled, prev)
-		} else {
-			_ = os.Unsetenv(envWSTracingEnabled)
+// clearWSFlagEnv clears every variable these tests touch, so a case starts from
+// "the deployment expressed no opinion".
+func clearWSFlagEnv(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{
+		otelflags.EnvGlobalTracing,
+		envWSTracingEnabled,
+		otelflags.EnvFlagsEndpoint,
+		otelflags.EnvFlagsPollInterval,
+	} {
+		prev, existed := os.LookupEnv(name)
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatalf("unset %s: %v", name, err)
 		}
-	})
-	resetWSGateForTest()
-	t.Cleanup(resetWSGateForTest)
-	if wsTracingEnabled() {
-		t.Fatal("expected tracing disabled when env var is unset")
+		t.Cleanup(func() {
+			if existed {
+				_ = os.Setenv(name, prev)
+			} else {
+				_ = os.Unsetenv(name)
+			}
+		})
 	}
 }
 
-func TestWSTracingEnabled_EmptyStringIsEnabled(t *testing.T) {
-	t.Setenv(envGlobalTracingEnabled, "")
-	t.Setenv(envWSTracingEnabled, "")
-	resetWSGateForTest()
-	t.Cleanup(resetWSGateForTest)
-	if !wsTracingEnabled() {
-		t.Fatal("expected empty string to mean enabled")
+// TestResolveGates_InvalidProviderConfigFailsConstruction extends the
+// fail-on-an-unreadable-value rule to the variables otel-flags owns.
+//
+// They are process-scoped and this module never names them, but they are read
+// during construction, so a value nobody can interpret must stop the constructor
+// here as surely as one of this module's own does.
+func TestResolveGates_InvalidProviderConfigFailsConstruction(t *testing.T) {
+	tests := []struct {
+		name  string
+		env   string
+		value string
+	}{
+		{name: "a bare integer poll interval", env: otelflags.EnvFlagsPollInterval, value: "60"},
+		{name: "an endpoint with no scheme", env: otelflags.EnvFlagsEndpoint, value: "relay:1031"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			clearWSFlagEnv(t)
+			t.Setenv(tc.env, tc.value)
+
+			_, err := resolveGates(resolveConnOptions(nil))
+			if !errors.Is(err, otelflags.ErrInvalidFlagValue) {
+				t.Fatalf("resolveGates err = %v, want ErrInvalidFlagValue", err)
+			}
+			if !strings.Contains(err.Error(), tc.env) {
+				t.Errorf("error does not name the variable: %v", err)
+			}
+		})
 	}
 }
 
-func TestWSTracingEnabled_FalseTokens(t *testing.T) {
-	for _, v := range []string{"false", "0", "off", "no"} {
-		t.Setenv(envWSTracingEnabled, v)
-		resetWSGateForTest()
-		if wsTracingEnabled() {
-			t.Fatalf("expected disabled for value %q", v)
-		}
+func TestWSTracing_NothingConfiguredIsOff(t *testing.T) {
+	clearWSFlagEnv(t)
+	if wsTracing(t) {
+		t.Fatal("tracing on with nothing configured; the module default must be false")
 	}
-	t.Cleanup(resetWSGateForTest)
 }
 
-func TestWSTracingEnabled_GlobalOffOverridesModule(t *testing.T) {
-	t.Setenv(envGlobalTracingEnabled, "false")
+// TestWSTracing_ModuleVariableAloneEnables is the behaviour change against
+// 0.7.0: the module variable used to be inert unless the global one was set.
+func TestWSTracing_ModuleVariableAloneEnables(t *testing.T) {
+	clearWSFlagEnv(t)
 	t.Setenv(envWSTracingEnabled, "true")
-	resetWSGateForTest()
-	t.Cleanup(resetWSGateForTest)
-	if wsTracingEnabled() {
-		t.Fatal("expected global flag to disable ws tracing")
+	if !wsTracing(t) {
+		t.Fatal("tracing off with the module variable truthy; the master defaults to enabled")
+	}
+}
+
+func TestWSTracing_MasterVariableAloneDoesNotEnable(t *testing.T) {
+	clearWSFlagEnv(t)
+	t.Setenv(otelflags.EnvGlobalTracing, "true")
+	if wsTracing(t) {
+		t.Fatal("tracing on with only the master variable set; the master is a veto, not an enabler")
+	}
+}
+
+func TestWSTracing_FalsyTokens(t *testing.T) {
+	for _, v := range []string{"false", "0", "off", "no"} {
+		t.Run(v, func(t *testing.T) {
+			clearWSFlagEnv(t)
+			t.Setenv(envWSTracingEnabled, v)
+			if wsTracing(t) {
+				t.Fatalf("tracing on for value %q", v)
+			}
+		})
+	}
+}
+
+func TestWSTracing_MasterVetoOverridesModule(t *testing.T) {
+	clearWSFlagEnv(t)
+	t.Setenv(otelflags.EnvGlobalTracing, "false")
+	t.Setenv(envWSTracingEnabled, "true")
+	if wsTracing(t) {
+		t.Fatal("the master veto did not stop a module its own variable enabled")
+	}
+}
+
+// TestWSTracing_InvalidValueFailsConstruction covers the BREAKING change that
+// can stop a process from starting; the empty string is included deliberately.
+func TestWSTracing_InvalidValueFailsConstruction(t *testing.T) {
+	for _, v := range []string{"", "enabled", "2", "y"} {
+		t.Run("value="+v, func(t *testing.T) {
+			clearWSFlagEnv(t)
+			t.Setenv(envWSTracingEnabled, v)
+
+			if _, err := resolveGates(resolveConnOptions(nil)); !errors.Is(err, otelflags.ErrInvalidFlagValue) {
+				t.Fatalf("resolveGates err = %v, want ErrInvalidFlagValue", err)
+			}
+		})
+	}
+}
+
+// TestWSTracing_EnvironmentBeatsOption is the ordering that reverses 0.7.0.
+func TestWSTracing_EnvironmentBeatsOption(t *testing.T) {
+	clearWSFlagEnv(t)
+	t.Setenv(envWSTracingEnabled, "false")
+
+	gate, err := resolveGates(resolveConnOptions([]Option{WithTracingEnabled(true)}))
+	if err != nil {
+		t.Fatalf("resolveGates: %v", err)
+	}
+	if gate.tracing() {
+		t.Fatal("the option won over the environment variable; the variable outranks it")
 	}
 }
 
@@ -71,11 +166,8 @@ func TestWSTracingEnabled_GlobalOffOverridesModule(t *testing.T) {
 // WriteMessage/ReadMessage must delegate straight to *websocket.Conn — no
 // span, no JSON envelope, no propagator inject/extract.
 func TestFeatureDisabled_PassesThroughToNativeConn(t *testing.T) {
-	t.Setenv(envGlobalTracingEnabled, "false")
+	clearWSFlagEnv(t)
 	t.Setenv(envWSTracingEnabled, "false")
-	resetWSGateForTest()
-	t.Cleanup(resetWSGateForTest)
-
 	sr := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
 	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
@@ -102,8 +194,11 @@ func TestFeatureDisabled_PassesThroughToNativeConn(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = rawConn.Close() })
 
-	conn := newConn(rawConn, false)
-	if conn.featureEnabled {
+	conn, err := newConn(rawConn, false)
+	if err != nil {
+		t.Fatalf("newConn: %v", err)
+	}
+	if conn.featureEnabled() {
 		t.Fatal("expected featureEnabled false")
 	}
 

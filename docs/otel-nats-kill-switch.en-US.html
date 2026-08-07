@@ -1,0 +1,956 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>otel-nats × kill-switch relay-proxy tutorial</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --surface: #1a2332;
+      --surface-2: #243044;
+      --border: #2d3a4f;
+      --text: #e7ecf3;
+      --muted: #9aa8bc;
+      --accent: #3d9cf0;
+      --accent-dim: #1e5a8a;
+      --ok: #3ecf8e;
+      --warn: #e6a23c;
+      --danger: #e85d5d;
+      --code-bg: #0b1016;
+      --mono: "JetBrains Mono", "SF Mono", "Fira Code", ui-monospace, monospace;
+      --sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.65;
+      font-size: 16px;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      min-height: 100vh;
+    }
+
+    nav {
+      position: sticky;
+      top: 0;
+      align-self: start;
+      height: 100vh;
+      overflow-y: auto;
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      padding: 1.5rem 1rem 2rem;
+    }
+
+    nav .brand {
+      font-weight: 700;
+      font-size: 0.95rem;
+      margin-bottom: 0.25rem;
+      color: var(--accent);
+    }
+
+    nav .sub {
+      font-size: 0.75rem;
+      color: var(--muted);
+      margin-bottom: 1.25rem;
+    }
+
+    nav a {
+      display: block;
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 0.875rem;
+      padding: 0.35rem 0.5rem;
+      border-radius: 4px;
+      margin-bottom: 2px;
+    }
+
+    nav a:hover { background: var(--surface-2); color: var(--text); }
+
+    main {
+      max-width: 880px;
+      padding: 2.5rem 2.5rem 5rem;
+    }
+
+    h1 {
+      font-size: 1.85rem;
+      font-weight: 700;
+      margin: 0 0 0.5rem;
+      letter-spacing: -0.02em;
+    }
+
+    .lead {
+      color: var(--muted);
+      font-size: 1.05rem;
+      margin: 0 0 2rem;
+    }
+
+    h2 {
+      font-size: 1.35rem;
+      margin: 2.75rem 0 1rem;
+      padding-top: 0.5rem;
+      border-top: 1px solid var(--border);
+    }
+
+    h2:first-of-type { border-top: none; margin-top: 1.5rem; }
+
+    h3 {
+      font-size: 1.1rem;
+      margin: 1.75rem 0 0.75rem;
+      color: #c5d4e8;
+    }
+
+    h4 {
+      font-size: 0.95rem;
+      margin: 1.25rem 0 0.5rem;
+      color: var(--accent);
+    }
+
+    p { margin: 0.75rem 0; }
+    ul, ol { margin: 0.5rem 0 1rem; padding-left: 1.4rem; }
+    li { margin: 0.35rem 0; }
+    li::marker { color: var(--muted); }
+
+    a { color: var(--accent); }
+    a:hover { text-decoration: underline; }
+
+    code, kbd {
+      font-family: var(--mono);
+      font-size: 0.85em;
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1em 0.35em;
+    }
+
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem 1.15rem;
+      overflow-x: auto;
+      font-family: var(--mono);
+      font-size: 0.8rem;
+      line-height: 1.55;
+      margin: 0.85rem 0 1.25rem;
+    }
+
+    pre code {
+      background: none;
+      border: none;
+      padding: 0;
+      font-size: inherit;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.875rem;
+      margin: 1rem 0 1.5rem;
+    }
+
+    th, td {
+      border: 1px solid var(--border);
+      padding: 0.55rem 0.7rem;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: var(--surface);
+      color: #c5d4e8;
+      font-weight: 600;
+    }
+
+    tr:nth-child(even) td { background: rgba(26, 35, 50, 0.45); }
+
+    .callout {
+      border-left: 3px solid var(--accent);
+      background: var(--surface);
+      padding: 0.85rem 1rem;
+      margin: 1.25rem 0;
+      border-radius: 0 6px 6px 0;
+      font-size: 0.925rem;
+    }
+
+    .callout.warn { border-left-color: var(--warn); }
+    .callout.danger { border-left-color: var(--danger); }
+    .callout.ok { border-left-color: var(--ok); }
+
+    .step {
+      counter-increment: step;
+      position: relative;
+      padding-left: 2.75rem;
+      margin: 1.75rem 0;
+    }
+
+    .steps { counter-reset: step; }
+
+    .step::before {
+      content: counter(step);
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 1.85rem;
+      height: 1.85rem;
+      background: var(--accent-dim);
+      color: var(--accent);
+      border: 1px solid var(--accent);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 0.85rem;
+    }
+
+    .step h4 { margin-top: 0.15rem; }
+
+    .badge {
+      display: inline-block;
+      font-size: 0.7rem;
+      font-weight: 600;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      padding: 0.15em 0.5em;
+      border-radius: 3px;
+      vertical-align: middle;
+      margin-left: 0.35rem;
+    }
+
+    .badge.env { background: #1e3a5f; color: #7eb8f0; }
+    .badge.code { background: #1e3a32; color: #6ed9a8; }
+    .badge.ops { background: #3a2e1e; color: #e6b86a; }
+    .badge.kill { background: #3a1e1e; color: #f09090; }
+
+    .formula {
+      font-family: var(--mono);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+      text-align: center;
+      font-size: 0.95rem;
+      margin: 1.25rem 0;
+      color: var(--ok);
+    }
+
+    .lang-switch {
+      display: inline-flex;
+      gap: 0.5rem;
+      margin-bottom: 1.25rem;
+      font-size: 0.85rem;
+    }
+
+    .lang-switch a {
+      text-decoration: none;
+      padding: 0.25rem 0.6rem;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--muted);
+    }
+
+    .lang-switch a.current {
+      border-color: var(--accent);
+      color: var(--accent);
+      background: var(--accent-dim);
+    }
+
+    .toc-mobile { display: none; }
+
+    footer {
+      margin-top: 3rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.85rem;
+    }
+
+    @media (max-width: 860px) {
+      .layout { grid-template-columns: 1fr; }
+      nav { display: none; }
+      .toc-mobile { display: block; margin-bottom: 1.5rem; }
+      main { padding: 1.5rem 1.15rem 3rem; }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <nav aria-label="Table of contents">
+      <div class="brand">otel-nats × kill-switch</div>
+      <div class="sub">en-US · instrumentation-go 0.8.0+</div>
+      <a href="#overview">1. Overview</a>
+      <a href="#ladder">2. Precedence ladder</a>
+      <a href="#switches">3. The three switches</a>
+      <a href="#tristate">4. Env tri-state</a>
+      <a href="#quickstart">5. Quickstart (zero-code)</a>
+      <a href="#env">6. Environment variables</a>
+      <a href="#self-provider">7. Install your own provider</a>
+      <a href="#with-option">8. WithTracingEnabled</a>
+      <a href="#tracer-setup">9. TracerProvider setup</a>
+      <a href="#usage">10. otel-nats usage</a>
+      <a href="#relay-flag">11. Relay flag definition</a>
+      <a href="#toggle">12. Hot toggle</a>
+      <a href="#targeting">13. Targeting one service</a>
+      <a href="#latency">14. Change latency</a>
+      <a href="#cheatsheet">15. Ops cheatsheet</a>
+      <a href="#pitfalls">16. Common pitfalls</a>
+    </nav>
+
+    <main>
+      <div class="lang-switch">
+        <a class="current" href="otel-nats-kill-switch.en-US.html">en-US</a>
+        <a href="otel-nats-kill-switch.zh-TW.html">zh-TW</a>
+      </div>
+
+      <h1>otel-nats × kill-switch relay-proxy tutorial</h1>
+      <p class="lead">
+        Step-by-step guide to wire <code>otel-nats</code> (<code>v0.8.0-rc.3</code>+) to a
+        <a href="https://gofeatureflag.org">GO Feature Flag</a> relay proxy via
+        <a href="https://openfeature.dev">OpenFeature</a>, so operators can toggle
+        NATS tracing <strong>on or off at runtime</strong> — no redeploy.
+        Covers the zero-code env path and installing your own provider.
+      </p>
+
+      <div class="toc-mobile callout">
+        <strong>Sections:</strong>
+        Overview → Ladder → Switches → Tri-state → Quickstart → Env → Provider →
+        WithTracingEnabled → TracerProvider → Usage → Relay flag → Toggle →
+        Targeting → Latency → Cheatsheet → Pitfalls
+      </div>
+
+      <h2 id="overview">1. Overview</h2>
+      <p>
+        <code>otel-nats</code> is OpenTelemetry instrumentation for NATS / JetStream.
+        It does <strong>not</strong> initialize a TracerProvider; the application sets
+        the global provider / propagator. From 0.8.0, every switch resolves down a
+        four-rung <strong>ladder</strong>. A relay at the top is authoritative
+        <strong>in both directions</strong>: it can disable a running module and enable
+        one the deployment left off.
+      </p>
+      <ul>
+        <li><strong>Deployer</strong> sets env vars (or <code>WithTracingEnabled</code>) for the resting state.</li>
+        <li><strong>Operator</strong> flips relay flag <code>otel-nats-tracing</code> without restarting.</li>
+        <li>With no relay configured, behavior is decided by env + option + defaults only — no OpenFeature cost.</li>
+      </ul>
+
+      <div class="callout ok">
+        <strong>One line:</strong> Safety comes from the defaults (module default
+        <code>false</code>; master default <code>true</code> is a veto, not an enabler),
+        not from locking the relay to revoke-only.
+      </div>
+
+      <p>
+        Full reference (all modules, tables, Mongo propagation risk):
+        <a href="feature-flags.md">feature-flags.md</a>.
+      </p>
+
+      <h2 id="ladder">2. Precedence ladder</h2>
+      <div class="formula">
+        relay  &gt;  env  &gt;  option (With*Enabled)  &gt;  hardcoded default
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Source</th>
+            <th>Owner</th>
+            <th>Scope</th>
+            <th>Change without redeploy?</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>relay</strong></td>
+            <td>operator</td>
+            <td>fleet or one service</td>
+            <td><strong>Yes — the only one</strong></td>
+          </tr>
+          <tr>
+            <td><strong>env</strong></td>
+            <td>deployer</td>
+            <td>one process</td>
+            <td>No</td>
+          </tr>
+          <tr>
+            <td><strong>option</strong></td>
+            <td>caller constructing the wrapper</td>
+            <td>one connection</td>
+            <td>No</td>
+          </tr>
+          <tr>
+            <td><strong>default</strong></td>
+            <td>library</td>
+            <td>everywhere nobody spoke</td>
+            <td>No</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout warn">
+        <strong>The option sits below its env var.</strong>
+        <code>OTEL_NATS_TRACING_ENABLED=false</code> wins over
+        <code>WithTracingEnabled(true)</code>. Supplying both is legal; there is no
+        <code>ErrTracingConfigConflict</code>.
+      </div>
+
+      <h2 id="switches">3. The three switches</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Switch</th>
+            <th>Relay key</th>
+            <th>Env</th>
+            <th>Option</th>
+            <th>Default</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>master</td>
+            <td><code>otel-instrumentation-go-tracing</code></td>
+            <td><code>OTEL_INSTRUMENTATION_GO_TRACING_ENABLED</code></td>
+            <td>—</td>
+            <td><code>true</code> (veto)</td>
+          </tr>
+          <tr>
+            <td>NATS tracing</td>
+            <td><code>otel-nats-tracing</code></td>
+            <td><code>OTEL_NATS_TRACING_ENABLED</code></td>
+            <td><code>WithTracingEnabled</code></td>
+            <td><code>false</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="formula">
+        tracing = master &amp;&amp; moduleTracing
+      </div>
+
+      <p>
+        <strong>Master is a veto, not an enabler.</strong> Default <code>true</code> means
+        “no objection”. Setting it <code>true</code> changes nothing; only
+        <code>false</code> stops every module. Creating
+        <code>otel-instrumentation-go-tracing: true</code> on a relay does nothing useful.
+      </p>
+      <p>
+        <strong>Nothing turns on because the master is true.</strong> The module default
+        of <code>false</code> keeps a zero-config process silent.
+      </p>
+
+      <h3>Worked examples</h3>
+      <table>
+        <thead>
+          <tr><th>Configuration</th><th>Result</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>nothing set</td><td>off</td></tr>
+          <tr><td><code>OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true</code> only</td><td>off — master enables nothing</td></tr>
+          <tr><td><code>OTEL_NATS_TRACING_ENABLED=true</code> only</td><td><strong>on</strong> — master defaults true</td></tr>
+          <tr><td><code>WithTracingEnabled(true)</code>, no env</td><td>on for that connection</td></tr>
+          <tr><td><code>WithTracingEnabled(true)</code> + <code>OTEL_NATS_TRACING_ENABLED=false</code></td><td><strong>off</strong> — env outranks option</td></tr>
+          <tr><td>relay <code>otel-nats-tracing: true</code>, module env unset</td><td><strong>on</strong> — relay can enable</td></tr>
+          <tr><td>relay <code>otel-nats-tracing: false</code>, module env <code>true</code></td><td>off — relay can disable</td></tr>
+          <tr><td>master env <code>false</code> + everything else on</td><td>off — veto wins</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="tristate">4. Environment values are a strict tri-state</h2>
+      <table>
+        <thead><tr><th>Value</th><th>Outcome</th></tr></thead>
+        <tbody>
+          <tr><td>unset</td><td>no opinion — fall through to option, then default</td></tr>
+          <tr><td><code>1</code> / <code>true</code> / <code>yes</code> / <code>on</code></td><td>this source decides (on)</td></tr>
+          <tr><td><code>0</code> / <code>false</code> / <code>no</code> / <code>off</code></td><td>this source decides (off)</td></tr>
+          <tr><td>anything else, <strong>including empty string</strong></td><td><strong>construction error</strong> wrapping <code>otelflags.ErrInvalidFlagValue</code></td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout danger">
+        <strong><code>export VAR=</code> is invalid, not falsy.</strong>
+        Audit every <code>OTEL_*_ENABLED</code> value before upgrading — unexpanded
+        <code>${SOMETHING}</code> templates hit this case and fail construction.
+      </div>
+
+      <h2 id="quickstart">5. Quickstart (zero-code relay)</h2>
+      <p>
+        Most common path: <strong>set environment variables only</strong>. The library
+        auto-installs a GOFF provider on OpenFeature domain
+        <code>otel-instrumentation-go</code> when
+        <code>OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT</code> is set and no provider is
+        already bound. No OpenFeature code in the application.
+      </p>
+
+      <div class="steps">
+        <div class="step">
+          <h4>Deploy the relay proxy<span class="badge ops">ops</span></h4>
+          <p>
+            Run a GO Feature Flag relay (default port <code>1031</code>) with a flag
+            config that includes <code>otel-nats-tracing</code>.
+          </p>
+        </div>
+
+        <div class="step">
+          <h4>Choose a resting state<span class="badge env">env</span></h4>
+<pre><code># Example: deploy with NATS tracing on; relay can flip either way
+OTEL_NATS_TRACING_ENABLED=true
+
+# Optional process-wide veto (default is already true / no objection)
+# OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true</code></pre>
+          <p>
+            Or leave the module env unset (default off) and enable later via relay —
+            that also works.
+          </p>
+        </div>
+
+        <div class="step">
+          <h4>Point at the relay<span class="badge env">env</span></h4>
+<pre><code>OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT=http://relay-proxy:1031
+
+# Optional
+OTEL_INSTRUMENTATION_GO_FLAGS_API_KEY=...          # if relay auth is on
+OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL=60s    # Go duration only; default 60s
+OTEL_SERVICE_NAME=my-service                      # for targeting</code></pre>
+          <p>Unset <code>FLAGS_ENDPOINT</code> ⇒ no provider, no OpenFeature path.</p>
+        </div>
+
+        <div class="step">
+          <h4>Set TracerProvider at startup<span class="badge code">code</span></h4>
+          <p>See <a href="#tracer-setup">§9</a>. Then connect:</p>
+<pre><code>conn, err := otelnats.Connect(natsURL /* nats.Option... */)</code></pre>
+        </div>
+
+        <div class="step">
+          <h4>Define the relay flag<span class="badge ops">ops</span></h4>
+<pre><code>otel-nats-tracing:
+  variations:
+    enabled: true
+    disabled: false
+  defaultRule:
+    variation: enabled   # or disabled — resting state is yours</code></pre>
+        </div>
+      </div>
+
+      <h2 id="env">6. Environment variables</h2>
+
+      <h3>Tracing gates</h3>
+      <table>
+        <thead>
+          <tr><th>Variable</th><th>Role</th><th>Default</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>OTEL_INSTRUMENTATION_GO_TRACING_ENABLED</code></td>
+            <td>Process-wide master veto</td>
+            <td><code>true</code></td>
+          </tr>
+          <tr>
+            <td><code>OTEL_NATS_TRACING_ENABLED</code></td>
+            <td>NATS module switch (fixed at construction for the local rung)</td>
+            <td><code>false</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Relay connection (process-scoped, not module behavior)</h3>
+      <table>
+        <thead>
+          <tr><th>Variable</th><th>Role</th><th>Default</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT</code></td>
+            <td>Relay URL; unset ⇒ no provider</td>
+            <td>unset</td>
+          </tr>
+          <tr>
+            <td><code>OTEL_INSTRUMENTATION_GO_FLAGS_API_KEY</code></td>
+            <td>Optional API key (never logged)</td>
+            <td>empty</td>
+          </tr>
+          <tr>
+            <td><code>OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL</code></td>
+            <td>Must be a Go duration (<code>60s</code>); bare <code>60</code> is rejected</td>
+            <td><code>60s</code></td>
+          </tr>
+          <tr>
+            <td><code>OTEL_SERVICE_NAME</code></td>
+            <td>Also supplies <code>service.name</code> targeting on the zero-code path</td>
+            <td>—</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2 id="self-provider">7. Install your own OpenFeature provider</h2>
+      <p>
+        Use this when you need lifecycle control, a shared provider with business flags,
+        or a <strong>blocking wait until ready</strong> (closes the startup window).
+        Install <strong>before constructing any wrapper</strong> — <code>relayPossible</code>
+        is fixed at construction.
+      </p>
+
+      <div class="steps">
+        <div class="step">
+          <h4>Install before wrappers<span class="badge code">code</span></h4>
+<pre><code>import (
+    gofeatureflag "github.com/open-feature/go-sdk-contrib/providers/go-feature-flag/pkg"
+    "github.com/open-feature/go-sdk/openfeature"
+
+    otelflags "github.com/akira-core/instrumentation-go/otel-flags"
+)
+
+provider, err := gofeatureflag.NewProvider(gofeatureflag.ProviderOptions{
+    Endpoint:              "http://relay-proxy:1031",
+    DataCollectorDisabled: true, // required — see below
+})
+if err != nil {
+    // Log and continue — relay is not a hard dependency
+    logger.Error("feature flag provider unavailable", "error", err)
+} else if err := openfeature.SetNamedProviderAndWait(
+    otelflags.FlagDomain, provider,
+); err != nil {
+    logger.Error("feature flag provider registration failed", "error", err)
+}</code></pre>
+        </div>
+
+        <div class="step">
+          <h4>Do not also set FLAGS_ENDPOINT<span class="badge env">env</span></h4>
+          <p>
+            When you install yourself, leave
+            <code>OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT</code> unset so the auto-install
+            stands down cleanly.
+          </p>
+        </div>
+      </div>
+
+      <h3>Hard rules</h3>
+      <table>
+        <thead><tr><th>Rule</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>DataCollectorDisabled: true</code></td>
+            <td>
+              Default collector can stall every NATS publish behind a failed flush when
+              the relay is down. Zero-code path hardcodes this off.
+            </td>
+          </tr>
+          <tr>
+            <td>In-process evaluation only</td>
+            <td>Remote evaluation puts HTTP on every instrumented operation.</td>
+          </tr>
+          <tr>
+            <td>Named domain <code>otel-instrumentation-go</code></td>
+            <td>Use <code>SetNamedProviderAndWait</code>, not the default provider.</td>
+          </tr>
+          <tr>
+            <td>Provider before wrappers</td>
+            <td>
+              A wrapper built too early resolves statically for life and never consults
+              the relay.
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Startup window</h3>
+      <p>
+        Zero-code install is non-blocking. Until the first successful fetch, every switch
+        resolves to its <strong>local</strong> value (env / option / default). That is
+        fail-safe: the window can delay a relay-driven enable; it cannot introduce one.
+      </p>
+
+      <h2 id="with-option">8. <code>WithTracingEnabled</code></h2>
+      <p>
+        Supplies the <strong>module</strong> tier for one connection — below its env var,
+        above the hardcoded default, far below the relay. It does not pin anything: the
+        connection still resolves master + relay on every operation.
+      </p>
+
+<pre><code>conn, err := otelnats.ConnectWithOptions(url, nil,
+    otelnats.WithTracingEnabled(true),
+)
+// Legal alongside OTEL_NATS_TRACING_ENABLED — the env var wins if set.</code></pre>
+
+      <p>Accepted by:</p>
+      <ul>
+        <li><code>otelnats.ConnectWithOptions</code></li>
+        <li><code>otelnats.ConnectTLSWithOptions</code></li>
+        <li><code>otelnats.ConnectWithCredentialsWithOptions</code></li>
+      </ul>
+
+      <div class="callout">
+        Subscriptions and JetStream consumers re-resolve per <strong>message</strong>,
+        so a flag change reaches them without re-establishing the subscription.
+      </div>
+
+      <h2 id="tracer-setup">9. TracerProvider and Propagator</h2>
+      <p>
+        Per OTel Go Contrib: the package accepts TracerProvider / Propagators via options;
+        it does <strong>not</strong> provide InitTracer. Defaults to
+        <code>otel.GetTracerProvider()</code> / <code>otel.GetTextMapPropagator()</code>.
+      </p>
+
+<pre><code>import (
+    "go.opentelemetry.io/otel"
+    "go.opentelemetry.io/otel/propagation"
+)
+
+tp, err := newTracerProvider() // your OTLP + resource setup
+if err != nil { log.Fatal(err) }
+defer tp.Shutdown(ctx)
+
+otel.SetTracerProvider(tp)
+otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+    propagation.TraceContext{},
+    propagation.Baggage{},
+))
+
+conn, err := otelnats.ConnectWithOptions(url, nil,
+    otelnats.WithTracerProvider(tp),
+    otelnats.WithPropagators(otel.GetTextMapPropagator()),
+)</code></pre>
+
+      <p>Runnable example: <code>otel-nats/examples/</code>.</p>
+
+      <h2 id="usage">10. otel-nats basic usage</h2>
+
+      <h3>Core NATS</h3>
+<pre><code>import "github.com/akira-core/instrumentation-go/otel-nats/otelnats"
+
+conn, err := otelnats.Connect(natsURL)
+if err != nil { log.Fatal(err) }
+defer conn.Close()
+
+_ = conn.Publish(ctx, "subject", []byte("data"))
+
+_, _ = conn.Subscribe("subject", func(m otelnats.Msg) {
+    ctx := m.Context() // extracted trace; thread into downstream calls
+    _ = ctx
+})</code></pre>
+
+      <h3>JetStream</h3>
+<pre><code>import "github.com/akira-core/instrumentation-go/otel-nats/oteljetstream"
+
+js, err := oteljetstream.New(conn)
+// after CreateOrUpdateStream / Consumer:
+cons.Consume(func(m oteljetstream.Msg) {
+    ctx := m.Context()
+    _ = m.Ack()
+    _ = ctx
+})</code></pre>
+
+      <h2 id="relay-flag">11. Relay flag definition</h2>
+<pre><code>otel-nats-tracing:
+  variations:
+    enabled: true
+    disabled: false
+  defaultRule:
+    variation: enabled</code></pre>
+
+      <ul>
+        <li><code>enabled</code> (<code>true</code>) = allow tracing (when lower rungs also allow).</li>
+        <li><code>disabled</code> (<code>false</code>) = stop span production; NATS message path still runs.</li>
+        <li>Master key <code>otel-instrumentation-go-tracing</code> exists to <strong>veto the whole process</strong> — set it <code>false</code>, never create it as <code>true</code> expecting an enable.</li>
+      </ul>
+
+      <p>All four modules share domain <code>otel-instrumentation-go</code>:</p>
+      <table>
+        <thead>
+          <tr><th>Relay flag</th><th>Paired env</th><th>Module</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>otel-instrumentation-go-tracing</code></td><td><code>OTEL_INSTRUMENTATION_GO_TRACING_ENABLED</code></td><td>all (veto)</td></tr>
+          <tr><td><code>otel-nats-tracing</code></td><td><code>OTEL_NATS_TRACING_ENABLED</code></td><td>otel-nats</td></tr>
+          <tr><td><code>otel-mongo-tracing</code></td><td><code>OTEL_MONGO_TRACING_ENABLED</code></td><td>otel-mongo / v2</td></tr>
+          <tr><td><code>otel-mongo-propagation</code></td><td><code>OTEL_MONGO_PROPAGATION_ENABLED</code></td><td>otel-mongo / v2</td></tr>
+          <tr><td><code>otel-gorilla-ws-tracing</code></td><td><code>OTEL_GORILLA_WS_TRACING_ENABLED</code></td><td>otel-gorilla-ws</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="toggle">12. Hot toggle (both directions)</h2>
+      <div class="steps">
+        <div class="step">
+          <h4>Confirm relay is reachable</h4>
+          <p>
+            <code>FLAGS_ENDPOINT</code> set (or your own provider installed
+            <em>before</em> wrappers), and wrappers already constructed.
+          </p>
+        </div>
+        <div class="step">
+          <h4>Flip the flag<span class="badge kill">ops</span></h4>
+<pre><code># Disable NATS tracing
+defaultRule:
+  variation: disabled
+
+# Re-enable
+defaultRule:
+  variation: enabled</code></pre>
+        </div>
+        <div class="step">
+          <h4>Wait for the provider poll</h4>
+          <p>
+            Latency ≈ relay config reload + provider poll interval.
+            Production default poll: <code>60s</code>.
+          </p>
+        </div>
+        <div class="step">
+          <h4>Verify</h4>
+          <ul>
+            <li>NATS publish / subscribe / reply <strong>still run</strong></li>
+            <li>New NATS PRODUCER / CONSUMER spans appear or stop as expected</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="callout warn">
+        <strong>Relay can enable.</strong>
+        If the deployment left the module off (env unset / default), setting the flag
+        to <code>enabled</code> turns tracing on within the poll interval — by design.
+        Sites that cannot accept that keep
+        <code>OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT</code> unset, or set the master
+        veto / module env to <code>false</code> (env outranks application options; relay
+        still outranks env when a provider is bound).
+      </div>
+
+      <h2 id="targeting">13. Targeting one service</h2>
+<pre><code>otel-nats-tracing:
+  variations:
+    enabled: true
+    disabled: false
+  targeting:
+    - query: service.name eq "checkout-api"
+      variation: disabled
+  defaultRule:
+    variation: enabled</code></pre>
+
+      <ul>
+        <li>Zero-code path sends <code>service.name</code> from <code>OTEL_SERVICE_NAME</code>.</li>
+        <li>Self-installed provider: set evaluation context yourself.</li>
+        <li>Process-level only — no per-request targeting.</li>
+      </ul>
+
+      <h2 id="latency">14. Change latency</h2>
+      <table>
+        <thead><tr><th>Source</th><th>Delay</th></tr></thead>
+        <tbody>
+          <tr><td>Module resolution</td><td>none — every operation reads the current value</td></tr>
+          <tr><td>Provider poll (zero-code)</td><td>up to <code>OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL</code> (default 60s)</td></tr>
+          <tr><td>Provider poll (self-install)</td><td>whatever you set; GOFF default often 120s</td></tr>
+        </tbody>
+      </table>
+      <p>
+        Plan incident response around the poll interval in <strong>both</strong>
+        directions. Polls are conditional GETs (304 when unchanged); tightening is cheap.
+      </p>
+
+      <h2 id="cheatsheet">15. Ops cheatsheet</h2>
+      <table>
+        <thead><tr><th>Goal</th><th>Action</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Make NATS relay-controllable</td>
+            <td>Set <code>FLAGS_ENDPOINT</code> + create <code>otel-nats-tracing</code>. No app code.</td>
+          </tr>
+          <tr>
+            <td>Stop NATS tracing now</td>
+            <td>Relay flag → <code>false</code> / <code>disabled</code>. Wait one poll.</td>
+          </tr>
+          <tr>
+            <td>Start NATS tracing now</td>
+            <td>Relay flag → <code>true</code> / <code>enabled</code>. Wait one poll.</td>
+          </tr>
+          <tr>
+            <td>Stop one service</td>
+            <td><code>OTEL_SERVICE_NAME</code> + <code>service.name</code> targeting.</td>
+          </tr>
+          <tr>
+            <td>Stop the whole process</td>
+            <td>Master relay <code>otel-instrumentation-go-tracing: false</code>, or env <code>OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=false</code> + redeploy.</td>
+          </tr>
+          <tr>
+            <td>Stop one module without relay</td>
+            <td><code>OTEL_NATS_TRACING_ENABLED=false</code> + redeploy. App options cannot override.</td>
+          </tr>
+          <tr>
+            <td>Close the startup window</td>
+            <td><code>SetNamedProviderAndWait</code> before constructing wrappers.</td>
+          </tr>
+          <tr>
+            <td>No relay at all</td>
+            <td>Leave <code>FLAGS_ENDPOINT</code> unset. Env + option + defaults only.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2 id="pitfalls">16. Common pitfalls</h2>
+      <ol>
+        <li>
+          <strong><code>export VAR=</code> or <code>enabled</code> / <code>2</code></strong> →
+          construction error. Use only the allow-list.
+        </li>
+        <li>
+          <strong><code>POLL_INTERVAL=60</code> (no unit)</strong> → rejected; use <code>60s</code>.
+        </li>
+        <li>
+          <strong>Self-install without <code>DataCollectorDisabled: true</code></strong> →
+          relay outage can stall NATS paths.
+        </li>
+        <li>
+          <strong>Install provider after constructing wrappers</strong> → those wrappers
+          never see the relay.
+        </li>
+        <li>
+          <strong>Expecting master <code>true</code> to enable something</strong> → it does not.
+        </li>
+        <li>
+          <strong>Expecting an immediate flip</strong> → budget the poll interval (default 60s).
+        </li>
+        <li>
+          <strong>Assuming option beats env</strong> → reversed vs 0.7.0; env wins.
+        </li>
+        <li>
+          <strong>Testing against <code>v0.8.0-rc.1</code> or <code>rc.2</code></strong> → they
+          <code>require otel-flags v0.1.0</code>, whose API this module's code no longer matches, so
+          they do not build for a consumer at all. Use <code>v0.8.0-rc.3</code> or later.
+        </li>
+        <li>
+          <strong>Binding your provider with <code>openfeature.SetProvider</code></strong> → that is
+          the <em>default</em> slot, and it is deliberately not treated as a relay for these
+          switches. Use <code>otelflags.SetNamedProvider</code>.
+        </li>
+        <li>
+          <strong>Assuming a relay that was down at startup stays dead</strong> → it does not.
+          The provider is rebound until it reaches the relay: one <code>warn</code> line when it
+          first fails, <code>debug</code> for later attempts, one <code>info</code> on recovery.
+        </li>
+        <li>
+          <strong>Reading <code>PROVIDER_NOT_READY</code> at debug as a problem</strong> → that is
+          the ordinary startup window, before the provider's first fetch. Only the <code>warn</code>
+          tier means the relay cannot change a switch.
+        </li>
+      </ol>
+
+      <footer>
+        <p>
+          Authoritative reference:
+          <a href="feature-flags.md">feature-flags.md</a> ·
+          <a href="../otel-nats/README.md">otel-nats/README.md</a>
+        </p>
+        <p>
+          Applies to <code>otel-nats</code> <code>v0.8.0-rc.3</code>+ with the bidirectional ladder
+          model, on <code>otel-flags</code> 0.2.0.
+          zh-TW: <a href="otel-nats-kill-switch.zh-TW.html">otel-nats-kill-switch.zh-TW.html</a>
+        </p>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

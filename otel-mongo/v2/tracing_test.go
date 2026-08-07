@@ -23,8 +23,6 @@ func enableTracing(t *testing.T) {
 	t.Helper()
 	t.Setenv(envGlobalTracingEnabled, "1")
 	t.Setenv(envMongoTracingEnabled, "1")
-	resetPropEnabledCacheForTest()
-	t.Cleanup(resetPropEnabledCacheForTest)
 }
 
 // enableDocumentPropagation sets the same env gates as Collection / ContextFrom* for _oteltrace.
@@ -34,8 +32,6 @@ func enableDocumentPropagation(t *testing.T) {
 	t.Setenv(envGlobalTracingEnabled, "1")
 	t.Setenv(envMongoTracingEnabled, "1")
 	t.Setenv(envMongoPropagationEnabled, "1")
-	resetPropEnabledCacheForTest()
-	t.Cleanup(resetPropEnabledCacheForTest)
 }
 
 func Test_extractMetadataFromRaw(t *testing.T) {
@@ -181,11 +177,9 @@ func Test_ContextFromRawDocument(t *testing.T) {
 		assert.Equal(t, "12345678901234567890123456789012", sc.TraceID().String())
 	})
 
-	t.Run("propagation_disabled_returns_ctx_unchanged_even_with_oteltrace", func(t *testing.T) {
+	t.Run("propagation_disabled_still_extracts", func(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "true")
 		t.Setenv(envMongoPropagationEnabled, "false")
-		resetPropEnabledCacheForTest()
-		t.Cleanup(resetPropEnabledCacheForTest)
 		traceparent := "00-12345678901234567890123456789012-0123456789012345-01"
 		doc := bson.D{
 			{Key: TraceMetadataKey, Value: bson.D{
@@ -196,8 +190,9 @@ func Test_ContextFromRawDocument(t *testing.T) {
 		require.NoError(t, err)
 		ctx := context.Background()
 		out := ContextFromRawDocument(ctx, raw)
-		assert.Equal(t, ctx, out)
-		assert.False(t, trace.SpanFromContext(out).SpanContext().IsValid())
+		sc := trace.SpanFromContext(out).SpanContext()
+		assert.True(t, sc.IsValid(), "extraction is ungated (D10)")
+		assert.Equal(t, "12345678901234567890123456789012", sc.TraceID().String())
 	})
 }
 
@@ -227,19 +222,17 @@ func Test_ContextFromDocument(t *testing.T) {
 		assert.False(t, sc.IsValid())
 	})
 
-	t.Run("propagation_disabled_returns_false_despite_metadata", func(t *testing.T) {
+	t.Run("propagation_disabled_still_extracts", func(t *testing.T) {
 		t.Setenv(envGlobalTracingEnabled, "true")
 		t.Setenv(envMongoPropagationEnabled, "false")
-		resetPropEnabledCacheForTest()
-		t.Cleanup(resetPropEnabledCacheForTest)
 		fullDoc := bson.M{
 			"_oteltrace": bson.M{
 				"traceparent": "00-12345678901234567890123456789012-0123456789012345-01",
 			},
 		}
 		sc, ok := ContextFromDocument(context.Background(), fullDoc)
-		require.False(t, ok)
-		assert.False(t, sc.IsValid())
+		require.True(t, ok, "extraction is ungated (D10)")
+		assert.True(t, sc.IsValid())
 	})
 }
 

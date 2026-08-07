@@ -31,35 +31,56 @@ go get github.com/akira-core/instrumentation-go/otel-gorilla-ws
 
 ### Tracing 功能旗標
 
-`otel-gorilla-ws` 支援：
+```
+effective tracing = master && wsTracing        （各自走完整階梯）
+negotiation       = effective tracing          （handshake 前解析一次）
+span gate         = effective tracing          （每次讀寫重讀）
+```
 
-- `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`（全域總開關）
-- `OTEL_GORILLA_WS_TRACING_ENABLED`（ws 模組開關）
+每個開關沿著一道四階梯解析,最先表態的那一層贏:
 
-預設值：未設定即停用（opt-in）— 經 env 啟用時兩個變數都必須為 truthy。值為 `false/0/no/off`（不分大小寫）停用；其他已設定值（含空字串）視為 truthy。
+```
+relay  >  env  >  option(WithTracingEnabled)  >  寫死的預設值
+```
 
-停用時，send/receive span 與 envelope 注入/抽取皆關閉（直接委派 `*websocket.Conn`）。
+relay **兩個方向都有權威**。安全性來自預設值:總開關 `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` 預設
+`true` 且是**否決權**(只有 `false` 有效果,且不接受 option),而 `OTEL_GORILLA_WS_TRACING_ENABLED`
+預設**關閉**。
 
-#### Env × `WithTracingEnabled`（`featureEnabled`）
+**選項排在它的環境變數之下**,與 `0.7.0` 相反。即使 Go 程式碼傳了 `WithTracingEnabled(true)`,
+`OTEL_GORILLA_WS_TRACING_ENABLED=false` 依然能關掉這個模組。變數未設定時由選項決定。
 
-`NewConn`、`Dial`、`Upgrader.Upgrade` 的 `WithTracingEnabled(v bool)` 會針對該 `Conn` 覆寫兩個環境變數（`featureEnabled` — 是否跑任何 OTel SDK 路徑）。沒傳時聽 env。
+開關只由 `1`/`true`/`yes`/`on` 或 `0`/`false`/`no`/`off` 決定,未設定代表「沒有意見」。
+**其他任何值——包含空字串——都會讓建構失敗。** 互斥規則與 `ErrTracingConfigConflict` **已移除**。
 
-| Env（`GLOBAL` ∧ `OTEL_GORILLA_WS_TRACING_ENABLED`） | `WithTracingEnabled` | 有效功能 |
-|----------------------------------------------------|----------------------|----------|
-| 關（未設或 falsy） | （無） | **關** |
-| 關（未設或 falsy） | `true` | **開** |
-| 關（未設或 falsy） | `false` | **關** |
-| 開 | （無） | **開** |
-| 開 | `false` | **關** |
-| 開 | `true` | **開** |
+**negotiation 與 span gate 是同一個運算式,只是解析時機不同。** 這是本模組全部的微妙之處:handshake 無法
+重來,所以線路決策只做一次,而 span 決策每次呼叫都做。由此產生的不對稱必須事先規劃:
 
-對 `Dial`／`Upgrader.Upgrade`，**有效**功能旗標會在 handshake **之前**解析：關閉時不會 offer／confirm `otel-ws`（避免 wire 損壞）。`WithTracingEnabled(true)` 仍無法把 envelope 強加給未協商 otel-ws 的對端 — 那是 `Conn.tracingEnabled`（協商結果），與 `featureEnabled` 是兩個布林。
+- **打開只影響之後建立的連線。** 在模組關閉期間建立的連線永遠不會取得 envelope,`WithTracingEnabled(true)`
+  也救不回來 —— 沒有協商 `otel-ws` 的對端不會去解析它。這種連線仍可產生**本地** span,只是無法
+  inject/extract。需要它被追蹤就必須重連。
+- **關閉會立刻影響每條連線的 span 與 inject/extract,但不影響 envelope**,因為對端還在解析它。
+  這是唯一關掉後回不到零成本路徑的模組;要移除那份 wire 開銷必須讓連線重連。
+
+**沒有配置 relay 的部署**,協商結果與 `0.7.0` 完全相同,wire 一個 byte 都不會變。
+
+三件要知道的事:
+
+- capability(本地的 `relayPossible || (master && module)`,建構時固定)只箝制**寫入**路徑。對端是否包
+  envelope 是 handshake 的事實,所以 capability 關掉、卻包裝了已協商連線的 wrapper 會寫原始幀,但
+  **讀取時仍然解包** —— 否則你的應用程式會收到原始的 `{"header":…,"data":…}` bytes。
+- 關閉會停掉 span 與 injection,但**不會**停掉已協商連線上的 envelope:對端把每一幀都當 envelope 解析。
+- 自己處理 handshake?提出或回應 `SubprotocolOTelWS`,並在 `NewConn` 前用 `IsOTelNegotiated(raw)` 檢查 ——
+  見 [otel-ws.md](../otel-ws.md)。
+
+> 完整參考 —— 全部解析表格、零程式碼連上 relay、撤銷延遲、針對單一服務的 targeting、維運速查:
+> **[docs/feature-flags.zh-TW.md](../docs/feature-flags.zh-TW.md)** · English:**[docs/feature-flags.md](../docs/feature-flags.md)**
 
 ### NewConn 與 Dial / Upgrader 的差異
 
 上述有效功能旗標控制 tracing 是否運作。至於 wire envelope 是否寫入/讀取，則取決於**建立 `Conn` 的建構子**（以及 Dial/Upgrade 是否協商到 otel-ws）：
 
-- **`NewConn(rawConn, opts...)`** 包裝你自己已經 dial/upgrade 好的 `*websocket.Conn`。只要功能旗標開啟，無論 subprotocol 為何，一律啟用 envelope wrapping — 這是為了相容自行處理 handshake 的呼叫端而保留的行為。
+- **`NewConn(rawConn, opts...) (*Conn, error)`** 包裝你自己已經 dial/upgrade 好的 `*websocket.Conn`。**只有在原始連線協商出的 subprotocol 證明了 `otel-ws` 時**才啟用 envelope wrapping —— 在你的 handshake 裡提出或回應 `SubprotocolOTelWS`,並用 `IsOTelNegotiated(raw)` 驗證。它讀取的 `OTEL_*_ENABLED` 變數若持有既非真值也非假值的內容,回傳錯誤(包裝 `otelflags.ErrInvalidFlagValue`)。
 - **`Dial(ctx, urlStr, requestHeader, subprotocols, opts...)`** 是符合規格的 client 進入點。它會在 handshake 中注入 `otel-ws` subprotocol；只有當伺服器以 `otel-ws`/`otel-ws+<proto>` subprotocol 確認支援時，才會啟用 envelope wrapping。
 - **`Upgrader{}.Upgrade(w, r, responseHeader)`** 是符合規格的 server 進入點（對應 `websocket.Upgrader.Upgrade`）。它會偵測 client 提出的 subprotocol 清單中是否含有 `otel-ws`，並以 `otel-ws`/`otel-ws+<proto>` 回應；只有在此接受路徑下才會啟用 envelope wrapping。
 
@@ -67,7 +88,10 @@ go get github.com/akira-core/instrumentation-go/otel-gorilla-ws
 
 ```go
 raw, _, _ := websocket.DefaultDialer.DialContext(ctx, serverURL, nil)
-conn := otelgorillaws.NewConn(raw)
+conn, err := otelgorillaws.NewConn(raw)
+if err != nil {
+	return err
+}
 
 _ = conn.WriteMessage(ctx, websocket.TextMessage, []byte("hello"))
 recvCtx, msgType, data, _ := conn.ReadMessage(context.Background())

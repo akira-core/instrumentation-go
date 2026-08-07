@@ -84,7 +84,7 @@ func newFailingPropCollection(t *testing.T, sr *tracetest.SpanRecorder) *Collect
 		Coll:               mc.Database("otelmongo_test").Collection("docs"),
 		Tracer:             tp.Tracer("test"),
 		Propagator:         propagation.TraceContext{},
-		PropagationEnabled: true,
+		PropagationEnabled: alwaysTrue,
 		ServerAddr:         "static-fallback-host",
 		ServerPort:         27018,
 	}

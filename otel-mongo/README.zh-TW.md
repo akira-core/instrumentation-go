@@ -43,44 +43,34 @@ otel-mongo/
 
 ### Tracing 功能旗標
 
-`otel-mongo`（v1 + v2）使用一個全域開關加兩個模組開關：
+```
+tracing     = master && mongoTracing
+propagation = tracing && mongoPropagation
+```
 
-- `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`（全域總開關）
-- `OTEL_MONGO_TRACING_ENABLED`（控制本套件的 wrapper **CLIENT** span、與 noop vs 實際 tracer — driver/contrib command span 不受此影響）
-- `OTEL_MONGO_PROPAGATION_ENABLED`（控制 wrapped Collection/Cursor/ChangeStream 的 `_oteltrace` 注入/還原；亦閘控套件層 **ContextFromDocument** / **ContextFromRawDocument**）
+每個開關沿著一道四階梯解析,最先表態的那一層贏:
 
-預設值：未設定即停用。值為 `false/0/no/off` 視為停用。
+```
+relay  >  env  >  option(With*Enabled)  >  寫死的預設值
+```
 
-#### Env × `WithTracingEnabled`（CLIENT span／traced vs direct impl）
+relay **兩個方向都有權威** —— 能關掉執行中的模組,也能打開部署原本沒開的模組。安全性來自**預設值**:
+總開關 `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` 預設 `true` 且是**否決權**(只有 `false` 有效果,
+且不接受任何 option),而每個 per-module 開關預設**關閉**。
 
-`ConnectWithOptions` 的 `WithTracingEnabled(v bool)` 會針對該 `Client`（及其衍生物件）覆寫兩個 tracing 環境變數。沒傳時聽 env。
+**選項排在它的環境變數之下**,與 `0.7.0` 相反。即使 Go 程式碼傳了 `WithTracingEnabled(true)`,
+``OTEL_MONGO_TRACING_ENABLED`=false` 依然能關掉這個模組,所以維運者握有一個程式碼無法覆寫的單模組設定。變數未設定時
+由選項決定,所以同一個 process 裡兩條連線仍然可以不同。
 
-| Env（`GLOBAL` ∧ `OTEL_MONGO_TRACING_ENABLED`） | `WithTracingEnabled` | 有效 tracing |
-|-----------------------------------------------|----------------------|--------------|
-| 關（未設或 falsy） | （無） | **關** |
-| 關（未設或 falsy） | `true` | **開** |
-| 關（未設或 falsy） | `false` | **關** |
-| 開 | （無） | **開** |
-| 開 | `false` | **關** |
-| 開 | `true` | **開** |
+開關只由 `1`/`true`/`yes`/`on` 或 `0`/`false`/`no`/`off` 決定,未設定代表「沒有意見」。
+**其他任何值——包含空字串——都會讓建構失敗**,錯誤包裹 `otelflags.ErrInvalidFlagValue`。
 
-#### 有效 tracing × `WithTracePropagationEnabled`（該 client 的 `_oteltrace`）
+`WithTracingEnabled` **不會**把任何東西釘死:帶著它的 wrapper 每次操作仍然解析總開關與 relay。
 
-Propagation 需要**有效 tracing 為開**。`WithTracePropagationEnabled` 只在 tracing 有效開啟時覆寫 `OTEL_MONGO_PROPAGATION_ENABLED`；tracing 關時無法單獨打開 `_oteltrace`。
+互斥規則與兩個 `Err*ConfigConflict` sentinel **已移除**:選項與變數同時出現是一般設定,變數贏。
 
-| 有效 tracing | `OTEL_MONGO_PROPAGATION_ENABLED` | `WithTracePropagationEnabled` | Client `_oteltrace` |
-|--------------|----------------------------------|-------------------------------|---------------------|
-| 關 | * | * | **關** |
-| 開 | 關／未設 | （無） | **關** |
-| 開 | 開 | （無） | **開** |
-| 開 | * | `true` | **開** |
-| 開 | * | `false` | **關** |
-
-設計理由：關閉 Mongo tracing 時連同 propagation 一併關閉 — 單一 kill switch；不會出現 span 為 noop 但文件仍寫 `_oteltrace` 的情況。
-
-**`ContextFromDocument`／`ContextFromRawDocument`**：process-wide、**只看 env**（三個變數都要開）。per-client option **不影響**這兩個 helper — client 可經 option 注入 `_oteltrace`，但 env 關時 `ContextFromDocument` 仍回 `ok == false`。還原 trace 請用 Collection／Cursor 路徑，或把三個 env 都打開。
-
-當有效 tracing 關閉時，wrapper 不會送 CLIENT span 到你的 TracerProvider（noop），**且**寫入文件不帶 `_oteltrace`。
+> 完整參考 —— 全部解析表格、零程式碼連上 relay、撤銷延遲、針對單一服務的 targeting、維運速查:
+> **[docs/feature-flags.zh-TW.md](../docs/feature-flags.zh-TW.md)** · English:**[docs/feature-flags.md](../docs/feature-flags.md)**
 
 ### 1. 初始化 Provider 與 Propagator（應用程式負責）
 
@@ -127,7 +117,7 @@ coll := db.Collection("mycoll")
 
 ### 3. 從文件還原 trace（例如 change stream）
 
-需 **三個環境變數都開啟**：`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`、`OTEL_MONGO_TRACING_ENABLED`、`OTEL_MONGO_PROPAGATION_ENABLED` — 見上方 **[Tracing 功能旗標](#tracing-功能旗標)**；per-client option 不會啟用它們。任一 env gate 關閉時回傳零值／`ok == false`（忽略 `ok` 的舊呼叫端會靜默 no-op）。
+`ContextFromDocument` / `ContextFromRawDocument` **完全沒有任何 feature-flag 閘門**。它們不開 span、不寫入任何東西、也不做任何 OpenFeature 評估,所以沒有什麼需要開關保護 —— 關掉這個模組也不會停掉它們。這是刻意的:`Decode` 加 `ContextFromDocument` 是函式庫被靜音後保留 trace 連結的官方做法。只有在文件沒有 `_oteltrace`、或 `traceparent` 缺漏/無效時才回傳零值 / `ok == false`。
 
 ```go
 fullDoc := changeStreamEvent.FullDocument
@@ -201,7 +191,7 @@ Cursor.DecodeAndTrace (INTERNAL；文件帶 `_oteltrace` 時連結回原始 span
 
 ### `NewCollection` 與 `Connect`
 
-`NewCollection` 會依照與 `Connect` 相同的環境變數 gate（全域 + `OTEL_MONGO_TRACING_ENABLED` + `OTEL_MONGO_PROPAGATION_ENABLED`）設定**文件層級**的 `_oteltrace` 行為。當任一 tracing gate 關閉時，該 collection 會以停用 propagation 的狀態建立。並沒有針對單一 collection 的 propagation functional option；若需覆寫某個 client 的環境預設值，請使用 **`ConnectWithOptions`** 搭配 **`WithTracePropagationEnabled`**（注意：仍無法跨越已停用的 tracing gate）。
+`NewCollection` 不接受任何 option,所以它單從環境變數解析。instrumented 實作要不要被建立,取決於 relay 是否可能打開這個模組,或環境是否已經打開了;每次操作的實際答案是總開關 AND `OTEL_MONGO_TRACING_ENABLED`,各自走完整階梯,而 `OTEL_MONGO_PROPAGATION_ENABLED` 是它下面管 `_oteltrace` 的另一個開關。並沒有針對單一 collection 的 propagation functional option;若要用程式碼而非環境變數供給那一層,請使用 **`ConnectWithOptions`** 搭配 **`WithTracePropagationEnabled`** —— 注意它輸給 `OTEL_MONGO_PROPAGATION_ENABLED` 與 relay,也無法跨越已停用的 tracing 開關。
 
 ### Cursor 上的 DecodeAndTrace 與 Decode
 

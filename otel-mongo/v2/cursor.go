@@ -24,18 +24,31 @@ var (
 // Cursor wraps *mongo.Cursor with optional trace propagation.
 type Cursor struct {
 	*mongo.Cursor
-	impl shared.CursorImpl
+
+	// direct is always present; traced is nil when the instrumented path was
+	// never built. tracing is read per call, so iteration follows a relay flag
+	// change rather than the value that held when Find returned this cursor.
+	direct  shared.CursorImpl
+	traced  shared.CursorImpl
+	tracing func() bool
+}
+
+func (c *Cursor) impl() shared.CursorImpl {
+	if c.traced != nil && c.tracing() {
+		return c.traced
+	}
+	return c.direct
 }
 
 // DecodeAndTrace decodes the current document into val and returns a
 // context enriched with the trace context extracted from the document's
 // "_oteltrace" field.
 func (c *Cursor) DecodeAndTrace(ctx context.Context, val any) (context.Context, error) {
-	return c.impl.DecodeAndTrace(ctx, val)
+	return c.impl().DecodeAndTrace(ctx, val)
 }
 
 // Decode decodes the current document into val.
-func (c *Cursor) Decode(val any) error { return c.impl.Decode(val) }
+func (c *Cursor) Decode(val any) error { return c.impl().Decode(val) }
 
 // SingleResult wraps *mongo.SingleResult with optional trace propagation.
 type SingleResult struct {

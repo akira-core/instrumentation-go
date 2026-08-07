@@ -49,10 +49,7 @@ func TestCursorDecodeAndTrace_NewTraceIDAndLinksOriginTrace(t *testing.T) {
 	defer func() { _ = cur.Close(context.Background()) }()
 	require.True(t, cur.Next(context.Background()), "expected cursor.Next=true")
 
-	wrapped := &Cursor{
-		Cursor: cur,
-		impl:   traced.NewCursor(cur, tracer, prop, true),
-	}
+	wrapped := &Cursor{Cursor: cur, direct: traced.NewCursor(cur, tracer, prop, alwaysTrue), traced: traced.NewCursor(cur, tracer, prop, alwaysTrue), tracing: alwaysTrue}
 
 	var out bson.D
 	enrichedCtx, err := wrapped.DecodeAndTrace(context.Background(), &out)
@@ -102,10 +99,7 @@ func TestCursorDecodeAndTrace_NoTrace(t *testing.T) {
 	defer func() { _ = cur.Close(context.Background()) }()
 	require.True(t, cur.Next(context.Background()), "expected cursor.Next=true")
 
-	wrapped := &Cursor{
-		Cursor: cur,
-		impl:   traced.NewCursor(cur, tracer, prop, true),
-	}
+	wrapped := &Cursor{Cursor: cur, direct: traced.NewCursor(cur, tracer, prop, alwaysTrue), traced: traced.NewCursor(cur, tracer, prop, alwaysTrue), tracing: alwaysTrue}
 
 	var out bson.D
 	_, err = wrapped.DecodeAndTrace(context.Background(), &out)
@@ -153,10 +147,7 @@ func TestCursorDecodeAndTrace_NoFlagsNoSpan(t *testing.T) {
 	// propagator stay unused but kept for parity with the prior test setup.
 	_ = noop.NewTracerProvider()
 	_ = prop
-	wrapped := &Cursor{
-		Cursor: cur,
-		impl:   direct.NewCursor(cur),
-	}
+	wrapped := &Cursor{Cursor: cur, direct: direct.NewCursor(cur), traced: direct.NewCursor(cur), tracing: alwaysTrue}
 
 	var out bson.D
 	enrichedCtx, err := wrapped.DecodeAndTrace(context.Background(), &out)

@@ -72,10 +72,17 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 	clientProtos := websocket.Subprotocols(r)
 	otelRequested, appClientProtos := splitClientProtocols(clientProtos)
 	cfg := resolveConnOptions(opts)
-	// Gate negotiation on the effective feature flag, resolved BEFORE the
-	// handshake — the wire format each side speaks must match what it
-	// advertises.
-	negotiateOTel := otelRequested && effectiveFeatureEnabled(cfg)
+	// Resolve the whole ladder ONCE, BEFORE the handshake — the wire format each
+	// side speaks must match what it advertises, and a handshake cannot be
+	// revisited. Including the relay here is what lets an operator enable this
+	// module for connections opened from now on; it is also why enabling it
+	// cannot reach connections that already exist. An unreadable configuration
+	// is reported here, before any connection is hijacked.
+	gate, err := resolveGates(cfg)
+	if err != nil {
+		return nil, err
+	}
+	negotiateOTel := otelRequested && gate.tracing()
 
 	// Work on a copy of Inner so we never mutate the caller's upgrader.
 	inner := u.Inner
@@ -137,7 +144,7 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 		return nil, err
 	}
 
-	return newConnFromConfig(raw, negotiateOTel, cfg), nil
+	return newConnFromConfig(raw, negotiateOTel, cfg, gate), nil
 }
 
 // splitClientProtocols returns whether otel-ws propagation was requested and the

@@ -22,13 +22,13 @@ func newRecorderTP(t *testing.T) (*sdktrace.TracerProvider, *tracetest.SpanRecor
 }
 
 func TestConfigureConn_GlobalFallback(t *testing.T) {
-	enableWSTracingEnv(t)
+	moduleEnvOn(t)
 	globalTP, globalRecorder := newRecorderTP(t)
 	otel.SetTracerProvider(globalTP)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 
 	c := &Conn{}
-	configureConn(c, resolveConnOptions(nil))
+	configureConn(c, resolveConnOptions(nil), mustGate(t, resolveConnOptions(nil)))
 
 	_, span := c.tracer.Start(context.Background(), "global-fallback")
 	span.End()
@@ -45,7 +45,7 @@ func TestConfigureConn_FeatureDisabled_UsesNoopTracer(t *testing.T) {
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 
 	c := &Conn{}
-	configureConn(c, resolveConnOptions(nil))
+	configureConn(c, resolveConnOptions(nil), mustGate(t, resolveConnOptions(nil)))
 
 	_, span := c.tracer.Start(context.Background(), "should-not-be-recorded")
 	span.End()
@@ -54,7 +54,7 @@ func TestConfigureConn_FeatureDisabled_UsesNoopTracer(t *testing.T) {
 }
 
 func TestApplyOptions_UsesProvidedOptionsWithoutMutatingGlobals(t *testing.T) {
-	enableWSTracingEnv(t)
+	moduleEnvOn(t)
 	globalTP, globalRecorder := newRecorderTP(t)
 	otel.SetTracerProvider(globalTP)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
@@ -63,10 +63,11 @@ func TestApplyOptions_UsesProvidedOptionsWithoutMutatingGlobals(t *testing.T) {
 	customProp := propagation.NewCompositeTextMapPropagator(propagation.Baggage{})
 
 	c := &Conn{}
-	configureConn(c, resolveConnOptions([]Option{
+	cfg := resolveConnOptions([]Option{
 		WithTracerProvider(customTP),
 		WithPropagators(customProp),
-	}))
+	})
+	configureConn(c, cfg, mustGate(t, cfg))
 
 	_, span := c.tracer.Start(context.Background(), "custom-provider")
 	span.End()

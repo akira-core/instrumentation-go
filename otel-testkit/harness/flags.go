@@ -6,12 +6,18 @@ import (
 	"strconv"
 	"strings"
 
+	otelflags "github.com/akira-core/instrumentation-go/otel-flags"
 	"github.com/akira-core/instrumentation-go/otel-sampler/otelsampler"
 )
 
-// GateEnv names the feature-flag environment variables a plugin's instrumentation
-// reads. Propagation may be empty for transports without an independent
-// propagation gate (e.g. NATS), in which case propagation tracks tracing.
+// GateEnv names the feature-flag environment variables a plugin's
+// instrumentation reads. Propagation may be empty for transports without an
+// independent propagation gate (e.g. NATS), in which case propagation tracks
+// tracing.
+//
+// Global may be empty, in which case otel-flags' own master-switch variable is
+// used. There is rarely a reason to set it: the master switch is process-scoped
+// and there is exactly one of it.
 type GateEnv struct {
 	Global      string
 	Tracing     string
@@ -24,40 +30,44 @@ type Expectation struct {
 	PropagationEnabled bool
 }
 
-// ExpectationFromEnv resolves the expected behavior from the plugin's gate env.
+// ExpectationFromEnv resolves the expected behavior from the plugin's gate env,
+// assuming no relay is configured — which is the harness's situation, since it
+// drives real containers through environment variables alone.
+//
+// It mirrors the modules' composition exactly: the master switch (default
+// ENABLED, because it is a veto rather than an enabler) ANDed with the module's
+// own switch (default DISABLED), and propagation ANDed one level below tracing.
+//
+// It delegates the per-variable read to otelflags.Lookup rather than restating
+// the truthiness rules, so this file can no longer drift from what the modules
+// do. An unreadable value is treated as disabled here: the harness has no error
+// channel, and a module carrying one would fail at construction anyway, which is
+// the failure the matrix would then observe.
 func ExpectationFromEnv(g GateEnv) Expectation {
-	tracing := envTruthy(g.Global) && envTruthy(g.Tracing)
+	master := envValue(g.Global, otelflags.EnvGlobalTracing, true)
+	tracing := master && envValue(g.Tracing, "", false)
 	prop := tracing
 	if g.Propagation != "" {
-		prop = tracing && envTruthy(g.Propagation)
+		prop = tracing && envValue(g.Propagation, "", false)
 	}
 	return Expectation{TracingEnabled: tracing, PropagationEnabled: prop}
 }
 
-// envTruthy mirrors the modules' internal flags.EnvEnabled semantics exactly: an
-// absent value is false; a present value is truthy unless it is one of the
-// recognized falsy tokens ("0", "false", "no", "off", case-insensitive, after
-// trimming). A set-but-empty value is therefore TRUE — the same as the modules
-// treat it. Any divergence here makes the matrix assert the wrong branch, so
-// TestEnvTruthyMatchesModuleFlags pins the whole table.
-//
-// NOTE: this is effectively a fifth copy of internal/flags.EnvEnabled (the four
-// modules vendor byte-identical copies and cannot export theirs). Keep it in
-// sync when that semantics changes.
-func envTruthy(key string) bool {
+// envValue reads key (or fallback when key is empty) down the env > default
+// rungs of the ladder. There is no option rung here: the harness configures
+// containers, not Go constructors.
+func envValue(key, fallbackKey string, def bool) bool {
 	if key == "" {
-		return false
+		key = fallbackKey
 	}
-	v, ok := os.LookupEnv(key)
-	if !ok {
-		return false
+	if key == "" {
+		return def
 	}
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "0", "false", "no", "off":
-		return false
-	default:
-		return true
+	v, set, err := otelflags.Lookup(key)
+	if err != nil || !set {
+		return def && err == nil
 	}
+	return v
 }
 
 // randomnessMask masks a value down to the 56 randomness bits.

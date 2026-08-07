@@ -96,7 +96,7 @@ func TestConnectWithOptions_Disabled_DoesNotWrapCallerMonitor(t *testing.T) {
 	c, err := ConnectWithOptions(context.Background(), nil, options.Client().ApplyURI(uri).SetMonitor(caller))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Disconnect(context.Background()) })
-	require.False(t, c.tracingEnabled, "test assumes tracing env is unset/disabled")
+	require.False(t, c.effectiveTracing(), "test assumes tracing env is unset/disabled")
 
 	coll := c.Database("otelmongo_test").Collection("disabled_monitor_passthrough")
 	t.Cleanup(func() { _ = coll.Drop(context.Background()) })

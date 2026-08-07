@@ -25,7 +25,7 @@ type Collection struct {
 	Coll               *mongo.Collection
 	Tracer             trace.Tracer
 	Propagator         propagation.TextMapPropagator
-	PropagationEnabled bool
+	PropagationEnabled func() bool
 	ServerAddr         string
 	ServerPort         int
 }
@@ -80,7 +80,7 @@ func (t *Collection) InsertOne(ctx context.Context, document any, opts ...*optio
 	defer t.setCapturedServerAttrs(span, capture)
 
 	docToInsert := document
-	if t.PropagationEnabled {
+	if t.propagationOn() {
 		docWithTrace, err := shared.InjectTraceIntoDocument(ctx, document, t.Propagator)
 		if err != nil {
 			err = fmt.Errorf("otelmongo: inject trace: %w", err)
@@ -109,7 +109,7 @@ func (t *Collection) InsertMany(ctx context.Context, documents []any, opts ...*o
 	defer t.setCapturedServerAttrs(span, capture)
 
 	docsToInsert := documents
-	if t.PropagationEnabled {
+	if t.propagationOn() {
 		docsWithTrace := make([]any, 0, len(documents))
 		for _, doc := range documents {
 			d, err := shared.InjectTraceIntoDocument(ctx, doc, t.Propagator)
@@ -131,7 +131,7 @@ func (t *Collection) InsertMany(ctx context.Context, documents []any, opts ...*o
 }
 
 // Find executes a find command and returns the cursor + impl; wraps *mongo.Collection with a CLIENT span (and propagation when enabled).
-func (t *Collection) Find(ctx context.Context, filter any, opts ...*options.FindOptions) (*mongo.Cursor, shared.CursorImpl, error) {
+func (t *Collection) Find(ctx context.Context, filter any, opts ...*options.FindOptions) (*mongo.Cursor, error) {
 	dbName, collName := t.dbAndColl()
 	ctx, span := t.Tracer.Start(ctx, shared.DBSpanName("find", collName),
 		trace.WithSpanKind(trace.SpanKindClient),
@@ -143,10 +143,7 @@ func (t *Collection) Find(ctx context.Context, filter any, opts ...*options.Find
 
 	cursor, err := t.Coll.Find(ctx, filter, opts...)
 	shared.RecordSpanError(span, err)
-	if err != nil {
-		return nil, nil, err
-	}
-	return cursor, NewCursor(cursor, t.Tracer, t.Propagator, t.PropagationEnabled), nil
+	return cursor, err
 }
 
 // FindOne executes a find command returning at most one document; wraps *mongo.Collection with a CLIENT span (and propagation when enabled).
@@ -159,7 +156,7 @@ func (t *Collection) FindOne(ctx context.Context, filter any, opts ...*options.F
 	ctx, capture := shared.WithAddrCapture(ctx)
 	sr := t.Coll.FindOne(ctx, filter, opts...)
 	t.setCapturedServerAttrs(span, capture)
-	return sr, NewSingleResult(sr, span, ctx, t.Propagator, t.PropagationEnabled)
+	return sr, NewSingleResult(sr, span, ctx, t.Propagator, t.propagationOn())
 }
 
 // UpdateOne updates one matching document; wraps *mongo.Collection with a CLIENT span (and propagation when enabled).
@@ -183,7 +180,7 @@ func (t *Collection) runUpdate(ctx context.Context, op string, filter, update an
 	defer t.setCapturedServerAttrs(span, capture)
 
 	updateWithTrace := update
-	if t.PropagationEnabled {
+	if t.propagationOn() {
 		var err error
 		updateWithTrace, err = shared.InjectTraceIntoUpdate(ctx, update, t.Propagator)
 		if err != nil {
@@ -221,7 +218,7 @@ func (t *Collection) ReplaceOne(ctx context.Context, filter any, replacement any
 	defer t.setCapturedServerAttrs(span, capture)
 
 	replacementToUse := replacement
-	if t.PropagationEnabled {
+	if t.propagationOn() {
 		replacementWithTrace, err := shared.InjectTraceIntoDocument(ctx, replacement, t.Propagator)
 		if err != nil {
 			err = fmt.Errorf("otelmongo: inject trace: %w", err)
@@ -308,7 +305,7 @@ func (t *Collection) Distinct(ctx context.Context, fieldName string, filter any,
 }
 
 // Aggregate runs an aggregation pipeline and returns the cursor + impl; wraps *mongo.Collection with a CLIENT span (and propagation when enabled).
-func (t *Collection) Aggregate(ctx context.Context, pipeline any, opts ...*options.AggregateOptions) (*mongo.Cursor, shared.CursorImpl, error) {
+func (t *Collection) Aggregate(ctx context.Context, pipeline any, opts ...*options.AggregateOptions) (*mongo.Cursor, error) {
 	dbName, collName := t.dbAndColl()
 	ctx, span := t.Tracer.Start(ctx, shared.DBSpanName("aggregate", collName),
 		trace.WithSpanKind(trace.SpanKindClient),
@@ -320,10 +317,7 @@ func (t *Collection) Aggregate(ctx context.Context, pipeline any, opts ...*optio
 
 	cursor, err := t.Coll.Aggregate(ctx, pipeline, opts...)
 	shared.RecordSpanError(span, err)
-	if err != nil {
-		return nil, nil, err
-	}
-	return cursor, NewCursor(cursor, t.Tracer, t.Propagator, t.PropagationEnabled), nil
+	return cursor, err
 }
 
 // UpdateByID updates one document by _id; wraps *mongo.Collection with a CLIENT span (and propagation when enabled).
@@ -338,7 +332,7 @@ func (t *Collection) UpdateByID(ctx context.Context, id any, update any, opts ..
 	defer t.setCapturedServerAttrs(span, capture)
 
 	updateWithTrace := update
-	if t.PropagationEnabled {
+	if t.propagationOn() {
 		var err error
 		updateWithTrace, err = shared.InjectTraceIntoUpdate(ctx, update, t.Propagator)
 		if err != nil {
@@ -367,7 +361,7 @@ func (t *Collection) BulkWrite(ctx context.Context, models []mongo.WriteModel, o
 	defer t.setCapturedServerAttrs(span, capture)
 
 	modelsToWrite := models
-	if t.PropagationEnabled {
+	if t.propagationOn() {
 		injected, err := shared.BuildBulkWriteModelsWithTrace(ctx, models, t.Propagator)
 		if err != nil {
 			shared.RecordSpanError(span, err)
@@ -383,8 +377,33 @@ func (t *Collection) BulkWrite(ctx context.Context, models []mongo.WriteModel, o
 	return res, nil
 }
 
+// propagationOn resolves the per-call propagation flag, treating an unset
+// PropagationEnabled as disabled so a partially-built Collection cannot panic.
+func (t *Collection) propagationOn() bool {
+	return t.PropagationEnabled != nil && t.PropagationEnabled()
+}
+
+// NewChangeStreamFor builds the instrumented ChangeStream impl for an already
+// opened change stream, deriving the same span name and reader attributes Watch
+// would. The facade uses it to construct the instrumented half of a dual
+// ChangeStream even when the passthrough path executed the Watch, so a relay
+// flag change reaches a change stream that can outlive many such changes.
+func (t *Collection) NewChangeStreamFor(cs *mongo.ChangeStream) *ChangeStream {
+	dbName, collName := t.dbAndColl()
+	return NewChangeStream(cs, ChangeStreamConfig{
+		Tracer:             t.Tracer,
+		Propagator:         t.Propagator,
+		PropagationEnabled: t.PropagationEnabled,
+		SpanName:           shared.DBSpanName("aggregate", collName),
+		BaseSpanOpts: []trace.SpanStartOption{
+			trace.WithSpanKind(trace.SpanKindClient),
+			trace.WithAttributes(t.changeStreamReaderAttrs(dbName, collName)...),
+		},
+	})
+}
+
 // Watch starts a change stream on the collection; wraps *mongo.Collection with a CLIENT span (and propagation when enabled).
-func (t *Collection) Watch(ctx context.Context, pipeline interface{}, opts ...*options.ChangeStreamOptions) (*mongo.ChangeStream, shared.ChangeStreamImpl, error) {
+func (t *Collection) Watch(ctx context.Context, pipeline interface{}, opts ...*options.ChangeStreamOptions) (*mongo.ChangeStream, error) {
 	dbName, collName := t.dbAndColl()
 	spanName := shared.DBSpanName("aggregate", collName)
 	ctx, span := t.Tracer.Start(ctx, spanName,
@@ -398,20 +417,7 @@ func (t *Collection) Watch(ctx context.Context, pipeline interface{}, opts ...*o
 	cs, err := t.Coll.Watch(ctx, pipeline, opts...)
 	shared.RecordSpanError(span, err)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	// baseSpanOpts seeds the ChangeStream reader's later getMore spans, which are
-	// out of scope for per-command address capture (design non-goal) — they keep
-	// the static t.ServerAddr/ServerPort snapshot, not this Watch call's captured value.
-	baseSpanOpts := []trace.SpanStartOption{
-		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(t.changeStreamReaderAttrs(dbName, collName)...),
-	}
-	return cs, NewChangeStream(cs, ChangeStreamConfig{
-		Tracer:             t.Tracer,
-		Propagator:         t.Propagator,
-		PropagationEnabled: t.PropagationEnabled,
-		SpanName:           spanName,
-		BaseSpanOpts:       baseSpanOpts,
-	}), nil
+	return cs, nil
 }

@@ -20,13 +20,21 @@ import (
 // falling back to otel globals when not provided. The globals are never overwritten.
 type Client struct {
 	*mongo.Client
-	serverAddr         string
-	serverPort         int
-	tracer             trace.Tracer                  // derived from option or otel.GetTracerProvider()
-	propagator         propagation.TextMapPropagator // from option or otel.GetTextMapPropagator()
-	tracingEnabled     bool                          // cached mongoTracingEnabled() result; gates wrapper CLIENT spans
-	propagationEnabled bool
+	serverAddr string
+	serverPort int
+	tracer     trace.Tracer                  // derived from option or otel.GetTracerProvider()
+	propagator propagation.TextMapPropagator // from option or otel.GetTextMapPropagator()
+	gate       gateState
 }
+
+// effectiveTracing reports whether THIS call should be instrumented. Read per
+// operation, not cached: without an override it follows the relay within the
+// resolver's TTL.
+func (c *Client) effectiveTracing() bool { return c.gate.effectiveTracing() }
+
+// effectivePropagation reports whether THIS call should inject or extract
+// _oteltrace. See gateState for static-client and R5 single-operation rules.
+func (c *Client) effectivePropagation() bool { return c.gate.effectivePropagation() }
 
 // ClientOption configures Connect/NewClient. Per OTel contrib: accept TracerProvider and Propagators.
 type ClientOption interface {
@@ -114,8 +122,22 @@ func Connect(opts ...*options.ClientOptions) (*Client, error) {
 // Without options, falls back to otel.GetTracerProvider()/otel.GetTextMapPropagator() at connect time.
 func ConnectWithOptions(traceOpts []ClientOption, opts ...*options.ClientOptions) (*Client, error) {
 	cfg := newClientConfig(traceOpts)
-	enabled := resolveFlag(cfg.TracingEnabled, mongoTracingEnabled())
-	if !enabled {
+	// Which implementations to build is necessarily a static decision, and it
+	// keys on whether a relay could ever have an opinion here. Every unreadable
+	// value is collected before any is returned, so a deployment carrying more
+	// than one learns about all of them at once. This runs before mongo.Connect,
+	// so a rejected configuration opens no connection.
+	//
+	// It cannot key on the environment alone any more: the relay can ENABLE, so
+	// a client whose environment says off must still be able to start tracing
+	// later, and construction happens once. When no relay can exist the static
+	// answer is final and a switched-off client allocates nothing instrumented —
+	// nor registers the command monitor that runs on every MongoDB command.
+	gate, err := resolveGates(cfg.TracingEnabled, cfg.PropagationEnabled)
+	if err != nil {
+		return nil, err
+	}
+	if !gate.tracedPossible() {
 		merged := options.MergeClientOptions(opts...)
 		mc, err := mongo.Connect(merged)
 		if err != nil {
@@ -124,13 +146,12 @@ func ConnectWithOptions(traceOpts []ClientOption, opts ...*options.ClientOptions
 		addr, port := parseServerFromURI(merged.GetURI())
 		tracer := noop.NewTracerProvider().Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
 		return &Client{
-			Client:             mc,
-			serverAddr:         addr,
-			serverPort:         port,
-			tracer:             tracer,
-			propagator:         otel.GetTextMapPropagator(),
-			tracingEnabled:     false,
-			propagationEnabled: false,
+			Client:     mc,
+			serverAddr: addr,
+			serverPort: port,
+			tracer:     tracer,
+			propagator: otel.GetTextMapPropagator(),
+			gate:       gate,
 		}, nil
 	}
 	tp := cfg.TracerProvider
@@ -141,7 +162,6 @@ func ConnectWithOptions(traceOpts []ClientOption, opts ...*options.ClientOptions
 	if prop == nil {
 		prop = otel.GetTextMapPropagator()
 	}
-	propEnabled := resolveDocumentPropagation(enabled, cfg.PropagationEnabled)
 	tracer := tp.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
 	// Driver v2's MergeClientOptions returns the caller's own *ClientOptions
 	// when exactly one is passed (v1 always builds a fresh struct); merge
@@ -155,13 +175,12 @@ func ConnectWithOptions(traceOpts []ClientOption, opts ...*options.ClientOptions
 	}
 	addr, port := parseServerFromURI(merged.GetURI())
 	return &Client{
-		Client:             mc,
-		serverAddr:         addr,
-		serverPort:         port,
-		tracer:             tracer,
-		propagator:         prop,
-		tracingEnabled:     true,
-		propagationEnabled: propEnabled,
+		Client:     mc,
+		serverAddr: addr,
+		serverPort: port,
+		tracer:     tracer,
+		propagator: prop,
+		gate:       gate,
 	}, nil
 }
 
@@ -237,12 +256,11 @@ func parseServerFromURI(uri string) (addr string, port int) {
 // Database returns a wrapped Database for document-level tracing.
 func (c *Client) Database(name string, opts ...options.Lister[options.DatabaseOptions]) *Database {
 	return &Database{
-		Database:           c.Client.Database(name, opts...),
-		serverAddr:         c.serverAddr,
-		serverPort:         c.serverPort,
-		tracer:             c.tracer,
-		propagator:         c.propagator,
-		tracingEnabled:     c.tracingEnabled,
-		propagationEnabled: c.propagationEnabled,
+		Database:   c.Client.Database(name, opts...),
+		serverAddr: c.serverAddr,
+		serverPort: c.serverPort,
+		tracer:     c.tracer,
+		propagator: c.propagator,
+		gate:       c.gate,
 	}
 }

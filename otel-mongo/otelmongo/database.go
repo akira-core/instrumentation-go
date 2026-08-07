@@ -12,13 +12,22 @@ import (
 // collectionImpl without re-reading env.
 type Database struct {
 	*mongo.Database
-	serverAddr         string
-	serverPort         int
-	tracer             trace.Tracer
-	propagator         propagation.TextMapPropagator
-	tracingEnabled     bool
-	propagationEnabled bool
+	serverAddr string
+	serverPort int
+	tracer     trace.Tracer
+	propagator propagation.TextMapPropagator
+
+	// Inherited verbatim from the Client so a Database and its Collections
+	// resolve exactly as the Client that produced them.
+	gate gateState
 }
+
+// effectiveTracing reports whether THIS call should be instrumented.
+func (d *Database) effectiveTracing() bool { return d.gate.effectiveTracing() }
+
+// propagationWhenTracing is the propagation gate for the instrumented impls,
+// which are reached only once tracing has already resolved true (design R5).
+func (d *Database) propagationWhenTracing() bool { return d.gate.propagationWhenTracing() }
 
 // Collection returns a Collection with document-level trace propagation.
 func (d *Database) Collection(name string, opts ...*options.CollectionOptions) *Collection {

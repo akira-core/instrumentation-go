@@ -37,20 +37,34 @@ func WithTracerProvider(tp trace.TracerProvider) Option {
 	}
 }
 
-// WithTracingEnabled overrides the env-gate default (OTEL_INSTRUMENTATION_GO_TRACING_ENABLED
-// AND OTEL_GORILLA_WS_TRACING_ENABLED) for this Conn only, in either
-// direction. When unset, tracing follows the env gates exactly as before.
-// When set, this value is authoritative — it controls featureEnabled, the
-// flag gating whether any OTel SDK code path runs at all (span creation,
-// propagator inject/extract via the wire envelope).
+// WithTracingEnabled supplies this module's tracing switch for this connection
+// only.
 //
-// In Dial and Upgrader.Upgrade the effective feature flag also gates otel-ws
-// subprotocol negotiation: a connection whose effective tracing is off never
-// offers (Dial) or confirms (Upgrade) otel-ws, so the peer is never committed
-// to the JSON envelope wire format that this side would not unwrap. The
-// reverse does not hold — WithTracingEnabled(true) cannot force the envelope
-// onto a connection whose peer did not negotiate otel-ws; negotiation outcome
-// (Conn.tracingEnabled) still requires both sides to agree.
+// It is the THIRD rung of a four-rung ladder — relay > env > option > default —
+// so it is a per-connection default, not an override of anything above it:
+//
+//   - OTEL_GORILLA_WS_TRACING_ENABLED wins over it, so a deployment can disable
+//     this module even where the application's Go code asked for tracing.
+//   - The relay wins over both, in either direction.
+//   - The master switch (OTEL_INSTRUMENTATION_GO_TRACING_ENABLED, or its relay
+//     key) is ANDed above the whole ladder and accepts no option at all.
+//
+// Supplying it alongside OTEL_GORILLA_WS_TRACING_ENABLED is legal; the variable
+// wins. An unreadable value in that variable is still a construction error.
+//
+// In Dial and Upgrader.Upgrade it also participates in gating otel-ws
+// subprotocol negotiation, which is resolved ONCE immediately before the
+// handshake from the whole ladder, relay included. Two consequences worth
+// knowing, because they are not symmetric:
+//
+//   - Enabling reaches only connections opened afterwards. A connection made
+//     while this module was off never gains the envelope, and this option
+//     cannot restore it — a peer that did not negotiate otel-ws will not parse
+//     one. Such a connection can still emit local spans; it just cannot inject
+//     or extract.
+//   - Disabling reaches every connection immediately for spans and
+//     inject/extract, but not for the envelope, which the peer is still
+//     parsing. Removing that wire cost requires cycling the connection.
 func WithTracingEnabled(v bool) Option {
 	return func(o *connOptions) {
 		o.featureEnabled = &v
@@ -69,27 +83,28 @@ func resolveConnOptions(opts []Option) connOptions {
 	return cfg
 }
 
-// effectiveFeatureEnabled resolves the feature flag for a connection: the
-// WithTracingEnabled override when present, otherwise the env gates.
-func effectiveFeatureEnabled(cfg connOptions) bool {
-	if cfg.featureEnabled != nil {
-		return *cfg.featureEnabled
-	}
-	return wsTracingEnabled()
-}
-
-// configureConn applies cfg to c: propagator, featureEnabled and tracer.
-func configureConn(c *Conn, cfg connOptions) {
+// configureConn applies cfg to c: propagator, gate state and tracer.
+//
+// It clamps the WRITE-side envelope decision with capability, so a process where
+// no OTel path can ever run never emits an envelope. It deliberately does NOT
+// clamp c.enveloped, which records whether the PEER envelopes — a fact settled
+// by the handshake that this side's local gate has no power over. Clamping that
+// too is what made ReadMessage hand raw {"header":...,"data":...} bytes to the
+// application.
+func configureConn(c *Conn, cfg connOptions, gate gateState) {
 	if cfg.propagator != nil {
 		c.propagator = cfg.propagator
 	} else {
 		c.propagator = otel.GetTextMapPropagator()
 	}
 
-	c.featureEnabled = effectiveFeatureEnabled(cfg)
+	c.gate = gate
+	c.capable = gate.tracedPossible()
+	c.tracingEnabled = c.enveloped && c.capable
 
-	if !c.featureEnabled {
-		// Feature flag off ⇒ no OTel SDK call on caller's TracerProvider; use noop tracer.
+	if !c.capable {
+		// This connection can never trace ⇒ no OTel SDK call on the caller's
+		// TracerProvider; use a noop tracer.
 		c.tracer = noop.NewTracerProvider().Tracer(ScopeName, trace.WithInstrumentationVersion(Version()))
 		return
 	}

@@ -1,73 +1,101 @@
 package otelmongo
 
 import (
-	"github.com/akira-core/instrumentation-go/otel-mongo/otelmongo/internal/flags"
+	"errors"
+
+	otelflags "github.com/akira-core/instrumentation-go/otel-flags"
 )
 
+// This module's own switches. The process-wide master switch is not named here:
+// it belongs to otel-flags, which owns every process-scoped name.
 const (
-	envGlobalTracingEnabled    = "OTEL_INSTRUMENTATION_GO_TRACING_ENABLED"
 	envMongoTracingEnabled     = "OTEL_MONGO_TRACING_ENABLED"
 	envMongoPropagationEnabled = "OTEL_MONGO_PROPAGATION_ENABLED"
 )
 
-func mongoTracingEnabled() bool {
-	if !flags.EnvEnabled(envGlobalTracingEnabled) {
-		return false
-	}
-	return flags.EnvEnabled(envMongoTracingEnabled)
-}
-
-// mongoPropagationEnvOnly reports OTEL_MONGO_PROPAGATION_ENABLED alone (no global gate).
-// Used by resolveDocumentPropagation as the env default.
-func mongoPropagationEnvOnly() bool {
-	return flags.EnvEnabled(envMongoPropagationEnabled)
-}
-
-func mongoPropagationEnabled() bool {
-	return resolveDocumentPropagation(mongoTracingEnabled(), nil)
-}
-
-// resolveDocumentPropagation returns the effective _oteltrace propagation flag
-// for a Client, given that Client's already-resolved effective tracing state
-// (tracingEnabled — the env gates, or a WithTracingEnabled override if one was
-// supplied). tracingEnabled must be false before propagation is force-disabled,
-// so no _oteltrace inject/extract occurs while wrapper spans are off. When
-// tracingEnabled is true, an explicit option override (e.g.
-// WithTracePropagationEnabled) wins, otherwise OTEL_MONGO_PROPAGATION_ENABLED
-// is the default. WithTracePropagationEnabled cannot bypass tracingEnabled
-// being false, however that false came about.
+// OpenFeature keys an operator flips on the relay proxy to turn this module's
+// behavior on or off without restarting the application. v1 and v2 share both
+// keys, as they share both env vars, so a change to otel-mongo-tracing reaches
+// both.
 //
-// tracingEnabled is a parameter rather than an internal mongoTracingEnabled()
-// call so a WithTracingEnabled(true) override (env gates unset) still lets
-// WithTracePropagationEnabled take effect — the package-level
-// mongoPropagationEnabled() (used only by the process-wide, env-only
-// propEnabledGate that ContextFromDocument/ContextFromRawDocument read) passes
-// the plain env-derived mongoTracingEnabled() explicitly, preserving its
-// existing env-only behavior.
-func resolveDocumentPropagation(tracingEnabled bool, override *bool) bool {
-	if !tracingEnabled {
-		return false
-	}
-	return resolveFlag(override, mongoPropagationEnvOnly())
-}
+// The relay is authoritative in BOTH directions, which matters most for
+// propagation: _oteltrace is roughly 90 bytes written into the application's own
+// documents, never stripped on read, and removable only by a $unset migration.
+// Three things bound that — the master switch above, the propagation tier's
+// hardcoded default of false, and the fact that a process with no relay
+// configured never asks.
+const (
+	flagKeyMongoTracing     = "otel-mongo-tracing"
+	flagKeyMongoPropagation = "otel-mongo-propagation"
+)
 
-func resolveFlag(override *bool, envDefault bool) bool {
-	if override != nil {
-		return *override
-	}
-	return envDefault
-}
-
-// propEnabledGate caches the effective document propagation flag (full three-tier
-// resolution) for the lifetime of the process. Used by package-level
-// ContextFromDocument / ContextFromRawDocument to avoid repeated os.LookupEnv calls
-// in hot loops (e.g. change-stream iteration).
+// Hardcoded defaults — the bottom rung of the ladder. Both false, so a process
+// that configures nothing traces nothing and writes nothing.
 //
-// WARNING: env changes after the first call are ignored. This is intentional — OTel
-// instrumentation env is expected to be set at process startup. Tests must call
-// resetPropEnabledCacheForTest after t.Setenv to re-evaluate.
-var propEnabledGate = flags.NewGate(mongoPropagationEnabled)
+// defaultMongoPropagation is the one default in this repository that protects
+// stored data rather than telemetry volume: nothing may write _oteltrace unless
+// an option, an environment variable or a deliberately created relay flag says
+// so. Absence in every source can never enable it.
+const (
+	defaultMongoTracing     = false
+	defaultMongoPropagation = false
+)
 
-func cachedPropagationEnabled() bool {
-	return propEnabledGate.Enabled()
+// mongoResolver resolves this module's relay values through the process-global
+// OpenFeature client. It caches nothing, so a relay change reaches a live client
+// on its very next operation.
+//
+// One resolver serves both keys, which are passed to Value by name: an index
+// into a per-resolver key list would couple this module's two flags by position,
+// and swapping the two lines that registered them compiled, passed, and made the
+// propagation flag control tracing.
+var mongoResolver = otelflags.NewResolver()
+
+// resolveGates resolves every static tier for one client, collecting ALL
+// configuration errors before returning any of them.
+//
+// A deployment can carry more than one unreadable value — one configuration file
+// setting every OTEL_* variable — so every read runs and the failures are joined
+// in a fixed order (provider configuration, master, tracing, propagation).
+// Returning only the first would make the caller fix one and rediscover the next
+// on the following run, which is the failure mode configuration errors are worst
+// at.
+//
+// otelflags.ValidateAndInstall is part of the same read: it validates the
+// process-scoped provider variables this module never names, and performs the
+// one-time provider install. Doing it here rather than inside the first
+// evaluation keeps a provider initialisation off the hot path of a Mongo
+// command.
+func resolveGates(tracingOption, propagationOption *bool) (gateState, error) {
+	providerErr := otelflags.ValidateAndInstall()
+	masterLocal, masterErr := otelflags.MasterLocal()
+	tracingLocal, tracingErr := otelflags.ResolveLocal(tracingOption, envMongoTracingEnabled, defaultMongoTracing)
+	propLocal, propErr := otelflags.ResolveLocal(propagationOption, envMongoPropagationEnabled, defaultMongoPropagation)
+
+	if err := errors.Join(providerErr, masterErr, tracingErr, propErr); err != nil {
+		return gateState{}, err
+	}
+
+	return gateState{
+		relayPossible: otelflags.RelayPossible(),
+		masterLocal:   masterLocal,
+		tracingLocal:  tracingLocal,
+		propLocal:     propLocal,
+	}, nil
+}
+
+// envGates resolves the static tiers from the environment alone, for the
+// constructors that accept no options.
+//
+// It can still fail — an unreadable environment value does not need an option to
+// conflict with — but its callers have no error return, so it falls back to a
+// fully-disabled gate. That is the safe direction and it is not silent: every
+// option-accepting constructor in this module reports the same value properly,
+// so a deployment carrying one learns about it at its first Connect.
+func envGates() gateState {
+	g, err := resolveGates(nil, nil)
+	if err != nil {
+		return gateState{}
+	}
+	return g
 }

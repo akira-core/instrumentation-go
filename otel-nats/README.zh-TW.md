@@ -19,7 +19,7 @@ otel-nats/
 │   ├── conn_direct.go      # directConn：tracing 停用時使用的 passthrough connImpl
 │   ├── traceevent.go       # WithTraceDestination / SubscribeTraceEvents / TraceEvent / TraceHop（NATS 2.11+ 追蹤事件）
 │   ├── propagation.go      # HeaderCarrier（nats.Header ↔ TextMapCarrier）
-│   ├── env_flags.go        # tracing 功能旗標 gate（OTEL_INSTRUMENTATION_GO_TRACING_ENABLED + OTEL_NATS_TRACING_ENABLED）
+│   ├── env_flags.go        # 本模組的 flag key、環境變數、預設值與 gateState
 │   ├── internal/flags/     # 共用的 EnvEnabled/Gate helper（跨模組保持 byte-identical）
 │   └── doc.go
 ├── oteljetstream/          # JetStream：New、JetStream、Stream、Consumer、Consume、Messages、Fetch
@@ -44,29 +44,38 @@ otel-nats/
 
 ### 追蹤功能旗標
 
-`otel-nats`（`otelnats` + `oteljetstream`）支援：
+```
+tracing = master && natsTracing
+```
 
-- `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`（全域總開關）
-- `OTEL_NATS_TRACING_ENABLED`（nats 模組開關）
+每個開關沿著一道四階梯解析,最先表態的那一層贏:
 
-預設值：**未設定即停用** — 經 env 啟用時兩個變數都必須明確設為 truthy。值為 `false/0/no/off`（不分大小寫）視為停用；其他任何已設定的值皆視為啟用。
+```
+relay  >  env  >  option(With*Enabled)  >  寫死的預設值
+```
 
-停用時，span 建立與 W3C header 傳播皆關閉（沒有獨立的 propagation option — tracing 與 header 傳播共用同一閘門）。
+relay **兩個方向都有權威** —— 能關掉執行中的模組,也能打開部署原本沒開的模組。安全性來自**預設值**:
+總開關 `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` 預設 `true` 且是**否決權**(只有 `false` 有效果,
+且不接受任何 option),而每個 per-module 開關預設**關閉**。
 
-#### Env × `WithTracingEnabled`
+**選項排在它的環境變數之下**,與 `0.7.0` 相反。即使 Go 程式碼傳了 `WithTracingEnabled(true)`,
+``OTEL_NATS_TRACING_ENABLED`=false` 依然能關掉這個模組,所以維運者握有一個程式碼無法覆寫的單模組設定。變數未設定時
+由選項決定,所以同一個 process 裡兩條連線仍然可以不同。
 
-`ConnectWithOptions`／`ConnectTLSWithOptions`／`ConnectWithCredentialsWithOptions` 的 `WithTracingEnabled(v bool)` 會針對該 `Conn` 覆寫兩個環境變數。由該 `Conn` 建立的 `oteljetstream` wrapper 繼承有效狀態。沒傳 option 時聽 env。
+開關只由 `1`/`true`/`yes`/`on` 或 `0`/`false`/`no`/`off` 決定,未設定代表「沒有意見」。
+**其他任何值——包含空字串——都會讓建構失敗**,錯誤包裹 `otelflags.ErrInvalidFlagValue`。
 
-| Env（`GLOBAL` ∧ `OTEL_NATS_TRACING_ENABLED`） | `WithTracingEnabled` | 有效 tracing |
-|----------------------------------------------|----------------------|--------------|
-| 關（未設或 falsy） | （無） | **關** |
-| 關（未設或 falsy） | `true` | **開** |
-| 關（未設或 falsy） | `false` | **關** |
-| 開 | （無） | **開** |
-| 開 | `false` | **關** |
-| 開 | `true` | **開** |
+`WithTracingEnabled` **不會**把任何東西釘死:帶著它的 wrapper 每次操作仍然解析總開關與 relay。
 
-適合讓 NATS tracing 跟隨應用程式自身開關，或在同一測試執行檔中同時建立已追蹤與未追蹤連線（純 env 閘門在 process 生命週期內只解析一次並快取）。
+互斥規則與 `ErrTracingConfigConflict` **已移除**:選項與變數同時出現是一般設定,變數贏。
+
+訂閱與 JetStream consumer **每則訊息**重新解析,所以 flag 改變前建立的訂閱不用重建就會跟上。
+
+> 完整參考 —— 全部解析表格、零程式碼連上 relay、撤銷延遲、針對單一服務的 targeting、維運速查:
+> **[docs/feature-flags.zh-TW.md](../docs/feature-flags.zh-TW.md)** ·
+> 教學:**[docs/otel-nats-kill-switch.zh-TW.html](../docs/otel-nats-kill-switch.zh-TW.html)** ·
+> English:**[docs/feature-flags.md](../docs/feature-flags.md)** ·
+> **[docs/otel-nats-kill-switch.en-US.html](../docs/otel-nats-kill-switch.en-US.html)**
 
 ### 1. 初始化 Provider 與 Propagator（應用程式負責）
 

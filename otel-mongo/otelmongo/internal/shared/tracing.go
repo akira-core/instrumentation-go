@@ -52,8 +52,28 @@ func InjectTraceIntoDocument(ctx context.Context, document any, prop propagation
 	if !ok {
 		return doc, nil
 	}
-	doc = append(doc, bson.E{Key: TraceMetadataKey, Value: *meta})
+	doc = append(withoutTraceMetadata(doc), bson.E{Key: TraceMetadataKey, Value: *meta})
 	return doc, nil
+}
+
+// withoutTraceMetadata returns doc with any existing _oteltrace element removed.
+//
+// Appending unconditionally would duplicate the field on the ordinary
+// read-modify-write cycle, because nothing strips _oteltrace on read: a document
+// decoded into a bson.M, modified and written back still carries it. The
+// duplicate is not merely untidy — ExtractMetadataFromRaw resolves the field
+// with bson.Raw.LookupErr, which returns the FIRST match, so extraction would
+// keep yielding the trace context of the original write and such a loop would
+// pin the linkage there permanently.
+func withoutTraceMetadata(doc bson.D) bson.D {
+	out := doc[:0]
+	for _, e := range doc {
+		if e.Key == TraceMetadataKey {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // ExtractMetadataFromRaw looks up the "_oteltrace" field in raw and reads its
@@ -115,7 +135,7 @@ func InjectTraceIntoUpdate(ctx context.Context, update any, prop propagation.Tex
 		return doc, nil
 	}
 
-	doc = append(doc, bson.E{Key: TraceMetadataKey, Value: *meta})
+	doc = append(withoutTraceMetadata(doc), bson.E{Key: TraceMetadataKey, Value: *meta})
 	return doc, nil
 }
 
@@ -138,7 +158,7 @@ func upsertSetField(doc bson.D, meta TraceMetadata) (bson.D, error) {
 				return doc, fmt.Errorf("unmarshal %s value: %w", elem.Key, err)
 			}
 		}
-		subDoc = append(subDoc, bson.E{Key: TraceMetadataKey, Value: meta})
+		subDoc = append(withoutTraceMetadata(subDoc), bson.E{Key: TraceMetadataKey, Value: meta})
 		doc[i].Value = subDoc
 		if elem.Key == "$set" {
 			foundSet = true

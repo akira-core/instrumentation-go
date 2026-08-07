@@ -2,7 +2,7 @@
 
 OpenTelemetry instrumentation for **NATS** (core + JetStream), **MongoDB** (driver v1 and v2), and **gorilla/websocket**, aligned with [OTel Go Contrib instrumentation guidelines](https://github.com/open-telemetry/opentelemetry-go-contrib/tree/main/instrumentation).
 
-This repository contains **four independent instrumentation modules** (`go.mod` per module), each **versioned and tagged separately**, plus **two supporting modules** — `otel-sampler` (a released consistent-probability sampler applications import) and `otel-testkit` (an untagged, test-only E2E harness). Modules target **Go 1.25**. CI runs `go build`, `go test -race`, and **golangci-lint** per module, then **integration** and **consistent-sampling E2E** jobs (testcontainers; Docker required) — see [.github/workflows/ci.yml](.github/workflows/ci.yml).
+This repository contains **four independent instrumentation modules** (`go.mod` per module), each **versioned and tagged separately**, plus **three supporting modules** — `otel-flags` (the released shared feature-switch layer every wrapper requires), `otel-sampler` (a released consistent-probability sampler applications import) and `otel-testkit` (an untagged, test-only E2E harness). Modules target **Go 1.25**. CI runs `go build`, `go test -race`, and **golangci-lint** per module, then **integration** and **consistent-sampling E2E** jobs (testcontainers; Docker required) — see [.github/workflows/ci.yml](.github/workflows/ci.yml).
 
 Instrumentation packages **do not** create a global `TracerProvider`. They use `otel.GetTracerProvider()` / `otel.GetTextMapPropagator()` unless you pass `WithTracerProvider` / `WithPropagators`. **Applications** must install a provider and W3C propagator at startup (see each module’s **examples/**).
 
@@ -22,6 +22,7 @@ Instrumentation packages **do not** create a global `TracerProvider`. They use `
 
 | Package | Import path | Version (source) | Description |
 |---------|-------------|------------------|-------------|
+| **otel-flags** | `github.com/akira-core/instrumentation-go/otel-flags` | 0.1.0 | The shared feature-switch layer: the precedence ladder, the OpenFeature resolver, and the single-provider guarantee. Required by all four wrappers; applications rarely import it directly. Emits no spans. |
 | **otel-sampler** | `github.com/akira-core/instrumentation-go/otel-sampler/otelsampler` | 0.1.1 | Consistent probability sampler (`ot=th:`/`ot=rv:`) + `WithSingleLinkSeed`, so span-link consumers sample like parent-child ones. Emits no spans. |
 | **otel-testkit** | `github.com/akira-core/instrumentation-go/otel-testkit/harness` | untagged | Black-box E2E harness (in-process OTLP sink + collector + assertions) used by this repo's sampling suites. Test-only, no stability guarantee. |
 
@@ -44,30 +45,48 @@ Then import subpackages as needed (`.../otelmongo`, `.../otelnats`, `.../oteljet
 
 ## Tracing feature flags
 
-Switches are **opt-in via environment variables**: if a variable is **unset**, it is treated as **off**. Set it to any value other than `0`, `false`, `no`, or `off` (case-insensitive) to turn **on**.
+Every module can be switched **on or off** through a [GO Feature Flag](https://gofeatureflag.org)
+relay proxy reached via [OpenFeature](https://openfeature.dev) — without restarting the application.
 
-| Env var | Scope | When unset | Effect |
-|---------|-------|------------|--------|
-| `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | All modules | off | Global gate. Must be on for module-level tracing flags and (for Mongo) document propagation to apply. |
-| `OTEL_MONGO_TRACING_ENABLED` | `otel-mongo` + `otel-mongo/v2` | off | CLIENT spans, non-noop tracer for the wrapper. |
-| `OTEL_MONGO_PROPAGATION_ENABLED` | `otel-mongo` + `otel-mongo/v2` | off | Inject/extract `_oteltrace` on writes/reads; still gated by effective tracing. |
-| `OTEL_NATS_TRACING_ENABLED` | `otelnats` + `oteljetstream` | off | NATS/JetStream wrapper tracing. |
-| `OTEL_GORILLA_WS_TRACING_ENABLED` | `otel-gorilla-ws` | off | WebSocket wrapper tracing. |
+Each switch resolves down a four-step ladder, first source with an opinion winning:
 
-### Env × `WithTracingEnabled` decision table
+```
+relay  >  env  >  option (With*Enabled)  >  hardcoded default
+```
 
-Every module accepts `WithTracingEnabled(v bool)` at construction (`ConnectWithOptions` / `NewConn` / `Dial` / `Upgrade`, etc.). When the option is **present**, it is **authoritative** (overrides env in either direction). When **absent**, env decides (`GLOBAL` AND module switch).
+The relay is authoritative in **both** directions. What keeps that safe is the defaults, not a
+restriction on the relay: every per-module switch defaults to **off**, so a process that configures
+nothing traces nothing. An application that installs no provider and sets no endpoint never runs any
+OpenFeature code at all and behaves exactly as its environment and options say.
 
-| Env (`GLOBAL` ∧ module) | `WithTracingEnabled` | Effective tracing |
-|-------------------------|----------------------|-------------------|
-| off (unset or falsy) | *(absent)* | **off** |
-| off (unset or falsy) | `true` | **on** |
-| off (unset or falsy) | `false` | **off** |
-| on | *(absent)* | **on** |
-| on | `false` | **off** |
-| on | `true` | **on** |
+| Relay flag key | Paired env var | Option | Default | Scope |
+|---|---|---|---|---|
+| `otel-instrumentation-go-tracing` | `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | — | `true` | process-wide **veto**: `false` stops everything, `true` does nothing |
+| `otel-mongo-tracing` | `OTEL_MONGO_TRACING_ENABLED` | `WithTracingEnabled` | `false` | `otel-mongo` + `otel-mongo/v2` |
+| `otel-mongo-propagation` | `OTEL_MONGO_PROPAGATION_ENABLED` | `WithTracePropagationEnabled` | `false` | `_oteltrace` written into your documents |
+| `otel-nats-tracing` | `OTEL_NATS_TRACING_ENABLED` | `WithTracingEnabled` | `false` | `otelnats` + `oteljetstream` |
+| `otel-gorilla-ws-tracing` | `OTEL_GORILLA_WS_TRACING_ENABLED` | `WithTracingEnabled` | `false` | `otel-gorilla-ws` |
 
-Mongo-only: `WithTracePropagationEnabled` controls `_oteltrace` on that client only while effective tracing is **on**; it cannot enable propagation when effective tracing is off. Package-level `ContextFromDocument` / `ContextFromRawDocument` stay **env-only** (all three Mongo env vars) and ignore per-client options. See [otel-mongo/README.md](otel-mongo/README.md) for the propagation sub-table.
+`tracing = master && moduleTracing`; `propagation = tracing && mongoPropagation`.
+
+To connect a relay, set one environment variable — there is no code to write:
+
+```sh
+OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT=http://relay:1031
+```
+
+A switch is decided only by `1`/`true`/`yes`/`on` or `0`/`false`/`no`/`off`. Unset means "no
+opinion" and falls through to the next rung. **Anything else — including the empty string — is a
+construction error**, so audit your `OTEL_*_ENABLED` values before upgrading.
+
+> **Everything else is in [docs/feature-flags.md](docs/feature-flags.md)**: the full resolution tables and
+> worked examples, why the option sits below its environment variable, the other relay-connection
+> variables, per-service targeting, how long a change takes to take effect, the requirement to
+> install your provider *before* constructing wrappers, what turning a module off does *not* stop,
+> and the operational summary. One home, so the two cannot drift.
+> Hands-on tutorial: [docs/otel-nats-kill-switch.en-US.html](docs/otel-nats-kill-switch.en-US.html)
+> · 繁體中文:[docs/feature-flags.zh-TW.md](docs/feature-flags.zh-TW.md) ·
+> [docs/otel-nats-kill-switch.zh-TW.html](docs/otel-nats-kill-switch.zh-TW.html)
 
 ## Layout
 
@@ -93,6 +112,12 @@ instrumentation-go/
 │   ├── go.mod
 │   └── README.md
 ├── otel-ws.md               # Subprotocol / propagation design notes (cross-language)
+├── otel-flags/              # Shared feature-switch layer (released, required by all four)
+├── docs/
+│   ├── feature-flags.md              # Full tracing feature-flag reference
+│   ├── feature-flags.zh-TW.md        # …and its Traditional Chinese translation
+│   ├── otel-nats-kill-switch.en-US.html  # Hands-on relay tutorial (en-US)
+│   └── otel-nats-kill-switch.zh-TW.html  # Hands-on relay tutorial (zh-TW)
 ├── CLAUDE.md                # Contributor / agent notes
 └── README.md
 ```

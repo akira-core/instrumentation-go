@@ -2,7 +2,7 @@
 
 本倉庫提供 **NATS**（核心與 JetStream）、**MongoDB**（Go driver v1 與 v2）以及 **gorilla/websocket** 的 OpenTelemetry 封裝，設計上對齊 [OTel Go Contrib 儀表化指引](https://github.com/open-telemetry/opentelemetry-go-contrib/tree/main/instrumentation)。
 
-共有 **四個獨立的 instrumentation 模組**（各目錄自有 `go.mod`），**版本與 Git tag 分開管理**；另有 **兩個支援模組**——`otel-sampler`（對外發布的一致機率取樣器，由應用程式引入）與 `otel-testkit`（不打 tag、僅供測試的 E2E harness）。模組使用 **Go 1.25**。CI 會對每個模組執行 `go build`、`go test -race`、**golangci-lint**，通過後再跑需 Docker 的 **整合測試** 與 **一致取樣 E2E**（testcontainers）— 見 [.github/workflows/ci.yml](.github/workflows/ci.yml)。
+共有 **四個獨立的 instrumentation 模組**（各目錄自有 `go.mod`），**版本與 Git tag 分開管理**；另有 **三個支援模組**——`otel-flags`（對外發布的共享功能開關層，四個 wrapper 都 require 它）、`otel-sampler`（對外發布的一致機率取樣器，由應用程式引入）與 `otel-testkit`（不打 tag、僅供測試的 E2E harness）。模組使用 **Go 1.25**。CI 會對每個模組執行 `go build`、`go test -race`、**golangci-lint**，通過後再跑需 Docker 的 **整合測試** 與 **一致取樣 E2E**（testcontainers）— 見 [.github/workflows/ci.yml](.github/workflows/ci.yml)。
 
 封裝**不會**自行建立全域 `TracerProvider`，預設使用 `otel.GetTracerProvider()` / `otel.GetTextMapPropagator()`；需要時可透過 `WithTracerProvider`、`WithPropagators` 覆寫。**應用程式**須在啟動時安裝 TracerProvider 與 W3C 傳播器（各模組的 **examples/** 有完整範例）。
 
@@ -22,6 +22,7 @@
 
 | 套件 | Import 路徑 | 原始碼版本 | 說明 |
 |------|-------------|------------|------|
+| **otel-flags** | `github.com/akira-core/instrumentation-go/otel-flags` | 0.1.0 | 共享功能開關層:優先級階梯、OpenFeature resolver、單一 provider 保證。四個 wrapper 都 require 它;應用程式很少直接引入。本身不產生 span。 |
 | **otel-sampler** | `github.com/akira-core/instrumentation-go/otel-sampler/otelsampler` | 0.1.1 | 一致機率取樣器（`ot=th:`／`ot=rv:`）與 `WithSingleLinkSeed`，讓 span-link 消費者的取樣決策與 parent-child 一致。本身不產生 span。 |
 | **otel-testkit** | `github.com/akira-core/instrumentation-go/otel-testkit/harness` | 未打 tag | 黑箱 E2E harness（行程內 OTLP sink + collector + 斷言），供本倉庫取樣測試使用。僅供測試，不保證 API 穩定。 |
 
@@ -44,30 +45,44 @@ go get github.com/akira-core/instrumentation-go/otel-gorilla-ws@otel-gorilla-ws/
 
 ## 追蹤功能開關
 
-環境變數為**未設定視為關閉**。設成 `0`、`false`、`no`、`off`（不分大小寫）亦為關閉；其餘非空字串視為**開啟**。
+每個模組都可以透過 [OpenFeature](https://openfeature.dev) 連上的
+[GO Feature Flag](https://gofeatureflag.org) relay proxy **打開或關掉** —— 不需要重啟應用程式。
 
-| 環境變數 | 作用範圍 | 未設定時 | 說明 |
-|----------|----------|----------|------|
-| `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | 全部模組 | 關 | 總開關；須開啟後，各模組追蹤旗標與（Mongo 的）文件傳播才會生效。 |
-| `OTEL_MONGO_TRACING_ENABLED` | `otel-mongo` + `otel-mongo/v2` | 關 | CLIENT span、非 noop tracer。 |
-| `OTEL_MONGO_PROPAGATION_ENABLED` | `otel-mongo` + `otel-mongo/v2` | 關 | `_oteltrace` 寫入／讀取抽取；仍受有效 tracing 約束。 |
-| `OTEL_NATS_TRACING_ENABLED` | `otelnats` + `oteljetstream` | 關 | NATS／JetStream 封裝追蹤。 |
-| `OTEL_GORILLA_WS_TRACING_ENABLED` | `otel-gorilla-ws` | 關 | WebSocket 封裝追蹤。 |
+每個開關沿著一道四階梯解析,最先表態的那一層贏:
 
-### Env × `WithTracingEnabled` 決策表
+```
+relay  >  env  >  option(With*Enabled)  >  寫死的預設值
+```
 
-各模組建構時皆可傳 `WithTracingEnabled(v bool)`。option **有傳**時為**最終決定**（可雙向覆寫 env）；**沒傳**時聽 env（`GLOBAL` ∧ 模組開關）。
+relay **兩個方向都有權威**。讓這件事安全的是**預設值**,不是對 relay 的限制:每個 per-module 開關預設
+**關閉**,所以什麼都沒設定的 process 不會產生任何 trace。既沒安裝 provider 也沒設 endpoint 的應用程式
+完全不會執行任何 OpenFeature 程式碼,行為就跟它的環境變數與選項說的一模一樣。
 
-| Env（`GLOBAL` ∧ 模組） | `WithTracingEnabled` | 有效 tracing |
-|------------------------|----------------------|--------------|
-| 關（未設或 falsy） | （無） | **關** |
-| 關（未設或 falsy） | `true` | **開** |
-| 關（未設或 falsy） | `false` | **關** |
-| 開 | （無） | **開** |
-| 開 | `false` | **關** |
-| 開 | `true` | **開** |
+| Relay flag key | 配對的環境變數 | 選項 | 預設值 | 範圍 |
+|---|---|---|---|---|
+| `otel-instrumentation-go-tracing` | `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | — | `true` | process 層級**否決權**:`false` 停掉一切,`true` 什麼都不做 |
+| `otel-mongo-tracing` | `OTEL_MONGO_TRACING_ENABLED` | `WithTracingEnabled` | `false` | `otel-mongo` + `otel-mongo/v2` |
+| `otel-mongo-propagation` | `OTEL_MONGO_PROPAGATION_ENABLED` | `WithTracePropagationEnabled` | `false` | 寫進你自己 document 的 `_oteltrace` |
+| `otel-nats-tracing` | `OTEL_NATS_TRACING_ENABLED` | `WithTracingEnabled` | `false` | `otelnats` + `oteljetstream` |
+| `otel-gorilla-ws-tracing` | `OTEL_GORILLA_WS_TRACING_ENABLED` | `WithTracingEnabled` | `false` | `otel-gorilla-ws` |
 
-僅 Mongo：`WithTracePropagationEnabled` 只在有效 tracing **開**時控制該 client 的 `_oteltrace`；有效 tracing 關時無法單獨打開 propagation。套件層 `ContextFromDocument`／`ContextFromRawDocument` 仍**只看 env**（三個 Mongo 變數），不受 per-client option 影響。細節見 [otel-mongo/README.zh-TW.md](otel-mongo/README.zh-TW.md)。
+`tracing = master && moduleTracing`;`propagation = tracing && mongoPropagation`。
+
+要連上 relay,設一個環境變數就好,不用寫任何程式碼:
+
+```sh
+OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT=http://relay:1031
+```
+
+開關只由 `1`/`true`/`yes`/`on` 或 `0`/`false`/`no`/`off` 決定。未設定代表「沒有意見」,往下一層掉。
+**其他任何值——包含空字串——都是建構錯誤**,所以升級前請先稽核你的 `OTEL_*_ENABLED` 值。
+
+> **其餘全部在 [docs/feature-flags.zh-TW.md](docs/feature-flags.zh-TW.md)**:完整的解析表與實例、為什麼選項排在環境變數之下、
+> 其他 relay 連線變數、針對單一服務的 targeting、一次改動要多久生效、必須在建構 wrapper **之前**安裝
+> provider 的規則、關掉一個模組**不會**停掉什麼,以及維運速查。只有一份,兩邊不會漂移。
+> 實作教學:[docs/otel-nats-kill-switch.zh-TW.html](docs/otel-nats-kill-switch.zh-TW.html)
+> · English:[docs/feature-flags.md](docs/feature-flags.md) ·
+> [docs/otel-nats-kill-switch.en-US.html](docs/otel-nats-kill-switch.en-US.html)
 
 ## 目錄結構
 
@@ -93,6 +108,11 @@ instrumentation-go/
 │   ├── go.mod
 │   └── README.md
 ├── otel-ws.md               # 子協定／傳播設計筆記（跨語言）
+├── docs/
+│   ├── feature-flags.md              # Tracing feature-flag 完整參考（英文）
+│   ├── feature-flags.zh-TW.md        # …繁體中文翻譯
+│   ├── otel-nats-kill-switch.en-US.html  # Relay 實作教學（en-US）
+│   └── otel-nats-kill-switch.zh-TW.html  # Relay 實作教學（zh-TW）
 ├── CLAUDE.md                # 貢獻者／代理用說明
 └── README.md
 ```
