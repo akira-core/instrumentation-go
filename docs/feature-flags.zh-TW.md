@@ -13,9 +13,10 @@
 [`otel-flags-error-handling-decisions.md`](otel-flags-error-handling-decisions.md),形塑它的兩輪
 code review 在 [`otel-flags-review-2026-08.md`](otel-flags-review-2026-08.md)。
 
-> **Release candidate。**第一個帶有 `otel-flags` 0.2.0 flag layer 的 `otel-nats` candidate 是
-> **`v0.8.0-rc.3`**,它同時也是第一個 consumer 編譯得起來的版本 —— `rc.1` 與 `rc.2` require 的是
-> `otel-flags v0.1.0`,而模組的程式碼早已不符合那個 API。要測 relay 請用 `rc.3` 以後的版本。
+> **請用正式版,不要用 candidate。**`otel-mongo/v0.8.0`、`otel-mongo/v2.8.0`、`otel-nats/v0.8.0`
+> 與 `otel-gorilla-ws/v0.8.0` 已經發布。所有 `0.8.0-rc.*` tag 都已被取代:四個模組的 `rc.1` 與
+> `rc.2` require 的是 `otel-flags v0.1.0`,而模組的程式碼早已不符合那個 API,對 consumer 來說根本
+> 編譯不起來。`otel-nats/v0.8.0-rc.3` 編譯得起來,但早於最終文件與下面這組實測數字。
 
 ## 一段話講完這個模型
 
@@ -537,8 +538,49 @@ flag 儲存那段。
 | `otel-mongo` 讀取 | 2 —— master、tracing |
 | `otel-mongo` 寫入 | 3 —— master、tracing、propagation |
 
-**數量級上,在開發機上一次評估約是個位數微秒與少量記憶體配置** —— 本 repo 沒有附上對應的 benchmark,
-所以請把它當成形狀而非數字,規劃容量前先在你自己的工作負載上量測。
+### 實測
+
+本 repo 自己沒有附 benchmark。可重現的那一份在姊妹專案
+[`akira-core/instrumentation-demo`](https://github.com/akira-core/instrumentation-demo):它對一台
+in-process NATS server 跑 `otelnats.Conn.Publish`,`-benchmem -count=10`,再用 `benchstat` 比較。
+原始輸出:[`docs/evidence/perf/benchstat.txt`](https://github.com/akira-core/instrumentation-demo/blob/main/docs/evidence/perf/benchstat.txt);
+量測程式:[`backend/internal/flagperf/`](https://github.com/akira-core/instrumentation-demo/tree/main/backend/internal/flagperf)。
+
+`linux/amd64`、2 vCPU Intel Xeon @ 2.20 GHz、Go 1.26.5。**每個模式必須各跑一個 process** ——
+`otel-flags` 的 provider 安裝一旦定案就鎖住整個 process 的生命週期,同一個 binary 裡的第二個模式會繼承
+第一個的決定:
+
+```sh
+for m in no_flag_no_env env_on_no_flag flag_off_memprovider \
+         flag_on_memprovider flag_off_relay flag_on_relay; do
+  FLAGPERF_MODE=$m go test ./internal/flagperf/ -run '^$' \
+    -bench 'BenchmarkPublish$' -benchmem -count=10 | tee "bench-$m.txt"
+done
+benchstat bench-no_flag_no_env.txt bench-flag_on_relay.txt
+```
+
+| 模式 | relay 搆得到? | 旗標 | 有 span? | sec/op | B/op | allocs/op |
+|---|---|---|---|---|---|---|
+| `no_flag_no_env` | 否 | — | 否 | 687 ns ± 20% | 14 | **0** |
+| `env_on_no_flag` | 否 | env on | 是 | 15.6 µs ± 29% | 4.09 KiB | 27 |
+| `flag_off_memprovider` | in-memory provider | off | 否 | 16.6 µs ± 17% | 2.29 KiB | 36 |
+| `flag_off_relay` | GO Feature Flag relay | off | 否 | 25.5 µs ± 21% | 4.06 KiB | 46 |
+| `flag_on_relay` | GO Feature Flag relay | on | 是 | 39.8 µs ± 33% | 8.09 KiB | 72 |
+
+拆成三筆各自獨立的成本來讀:
+
+- **閘門本身**,在這台機器上、對真正的 relay provider:兩列 relay 與其對應的無 relay 列之差,約是每次
+  `Publish` **24 µs 與 45 次配置** —— 而一次 `Publish` 做**兩次**評估,所以**每次評估約 12 µs、23 次
+  配置**。這比本文件過去引用的 `2 µs / 336 B / 7 allocations` 高一個數量級;那組數字從來無法重現,已經
+  撤回。另外注意 in-memory provider 那一列明顯比 relay 那一列便宜,所以拿測試用 provider 量出來的
+  benchmark 會低估實際部署的成本。
+- **span 本身**,與任何旗標無關:`env_on_no_flag` 減 `no_flag_no_env`,約 15 µs 與 27 次配置。
+- **零**,在 `no_flag_no_env`:relay 不可能存在,所以不會配置 instrumented 實作,也不會有任何評估。
+  每次操作 0 次配置,就是動態化之前那條路徑原封不動。
+
+規劃容量前有兩個但書。基準那一列是對 **in-process** NATS server 的 `Publish`,687 ns,比任何真實
+broker 的一跳都便宜得多,所以這裡的**比例**是你能構造出來的最壞情況,而不是部署現場會看到的;而且在
+2 vCPU 的機器上,run 之間的變異是 ±17–33%。請在你自己的工作負載上量測。
 
 成本來自 OpenFeature SDK 的評估流水線——hook 鏈、evaluation context 合併、provider registry 的鎖——而不是
 查 flag 本身,所以把設定放在記憶體裡也不會讓它變便宜。對 Mongo 的一次往返來說是雜訊;對 NATS publish

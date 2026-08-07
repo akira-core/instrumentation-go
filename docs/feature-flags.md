@@ -14,10 +14,11 @@ Applies to `otel-flags` 0.2.0, `otel-mongo` 0.8.0, `otel-mongo/v2` 2.8.0, `otel-
 `otel-flags` 0.2.0 are in [`otel-flags-error-handling-decisions.md`](otel-flags-error-handling-decisions.md),
 and the two review passes that shaped it in [`otel-flags-review-2026-08.md`](otel-flags-review-2026-08.md).
 
-> **Release candidates.** The first `otel-nats` candidate carrying the `otel-flags` 0.2.0 flag layer
-> is **`v0.8.0-rc.3`**, and it is also the first that builds for a consumer at all — `rc.1` and
-> `rc.2` require `otel-flags v0.1.0`, whose API the module's code no longer matches. Test a relay
-> against `rc.3` or later.
+> **Use the released versions, not the candidates.** `otel-mongo/v0.8.0`, `otel-mongo/v2.8.0`,
+> `otel-nats/v0.8.0` and `otel-gorilla-ws/v0.8.0` are tagged. Every `0.8.0-rc.*` tag is superseded:
+> `rc.1` and `rc.2` of all four modules require `otel-flags v0.1.0`, whose API the modules' code no
+> longer matches, so they do not build for a consumer at all. `otel-nats/v0.8.0-rc.3` builds, but
+> predates the final documentation and the measured cost figures below.
 
 ## The model in one paragraph
 
@@ -611,9 +612,55 @@ An instrumented operation makes more than one evaluation:
 | `otel-mongo` read | 2 — master, tracing |
 | `otel-mongo` write | 3 — master, tracing, propagation |
 
-**Order of magnitude, on developer hardware, one evaluation costs single-digit microseconds and a
-handful of allocations** — this repository ships no benchmark for it, so treat that as a shape rather
-than a number and measure on your own workload before planning capacity around it.
+### Measured
+
+This repository ships no benchmark of its own. A reproducible one lives in the companion project
+[`akira-core/instrumentation-demo`](https://github.com/akira-core/instrumentation-demo), which runs
+`otelnats.Conn.Publish` against an in-process NATS server under `-benchmem -count=10` and compares the
+runs with `benchstat`. Raw output:
+[`docs/evidence/perf/benchstat.txt`](https://github.com/akira-core/instrumentation-demo/blob/main/docs/evidence/perf/benchstat.txt);
+harness: [`backend/internal/flagperf/`](https://github.com/akira-core/instrumentation-demo/tree/main/backend/internal/flagperf).
+
+`linux/amd64`, 2 vCPU Intel Xeon @ 2.20 GHz, Go 1.26.5. **One process per mode is mandatory** —
+`otel-flags` latches its provider install for the life of the process, so a second mode in the same
+binary inherits the first one's decision:
+
+```sh
+for m in no_flag_no_env env_on_no_flag flag_off_memprovider \
+         flag_on_memprovider flag_off_relay flag_on_relay; do
+  FLAGPERF_MODE=$m go test ./internal/flagperf/ -run '^$' \
+    -bench 'BenchmarkPublish$' -benchmem -count=10 | tee "bench-$m.txt"
+done
+benchstat bench-no_flag_no_env.txt bench-flag_on_relay.txt
+```
+
+| Mode | Relay reachable | Flag | Span | sec/op | B/op | allocs/op |
+|---|---|---|---|---|---|---|
+| `no_flag_no_env` | no | — | no | 687 ns ± 20% | 14 | **0** |
+| `env_on_no_flag` | no | env on | yes | 15.6 µs ± 29% | 4.09 KiB | 27 |
+| `flag_off_memprovider` | in-memory provider | off | no | 16.6 µs ± 17% | 2.29 KiB | 36 |
+| `flag_off_relay` | GO Feature Flag relay | off | no | 25.5 µs ± 21% | 4.06 KiB | 46 |
+| `flag_on_relay` | GO Feature Flag relay | on | yes | 39.8 µs ± 33% | 8.09 KiB | 72 |
+
+Read it as three separate costs:
+
+- **The gate itself**, on this hardware and against a real relay provider, is the difference between
+  the two relay rows and their no-relay counterparts: roughly **24 µs and 45 allocations per
+  `Publish`** — and a `Publish` makes **two** evaluations, so **~12 µs and ~23 allocations each**. That
+  is an order of magnitude above the `2 µs / 336 B / 7 allocations` this guide used to quote; that
+  claim was never reproducible and has been withdrawn. Note also that the in-memory provider row is
+  substantially cheaper than the relay row, so a benchmark written against a test provider will
+  understate the deployed cost.
+- **The span**, independent of any flag, is `env_on_no_flag` minus `no_flag_no_env`: ~15 µs and 27
+  allocations.
+- **Nothing**, in `no_flag_no_env` — no relay possible, so no instrumented implementation is
+  allocated and no evaluation happens. Zero allocations per operation, which is the pre-dynamic path
+  preserved exactly.
+
+Two caveats before you plan capacity on these. The baseline is a `Publish` to an **in-process** NATS
+server at 687 ns, which is far cheaper than any real broker hop, so the *ratios* here are the
+worst case you can construct rather than what a deployment sees; and the run-to-run variance is
+±17–33% on a 2-vCPU box. Measure on your own workload.
 
 The cost is the OpenFeature SDK's evaluation pipeline — hook chains, evaluation-context merging, the
 provider registry lock — not the flag lookup, so keeping the configuration in memory does not make it

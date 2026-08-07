@@ -25,13 +25,19 @@ func TestIntegration_RoundTrip_TraceContextPropagation(t *testing.T) {
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// assert, not require: this runs on the server's goroutine, where a
+		// require failure would Goexit the handler instead of failing the test.
 		conn, err := upgrader.Upgrade(w, r, nil)
-		require.NoError(t, err)
+		if !assert.NoError(t, err) {
+			return
+		}
 		defer conn.Close()
 
 		outCtx, typ, payload, err := conn.ReadMessage(context.Background())
-		require.NoError(t, err)
-		require.NoError(t, conn.WriteMessage(outCtx, typ, payload))
+		if !assert.NoError(t, err) {
+			return
+		}
+		assert.NoError(t, conn.WriteMessage(outCtx, typ, payload))
 	}))
 	defer srv.Close()
 

@@ -24,15 +24,23 @@ func TestIntegration_Fallback_NonEnvelopeAndClose(t *testing.T) {
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// assert, not require: this runs on the server's goroutine, where a
+		// require failure would Goexit the handler instead of failing the test.
 		rawConn, err := plainUpgrader.Upgrade(w, r, nil)
-		require.NoError(t, err)
+		if !assert.NoError(t, err) {
+			return
+		}
 		defer rawConn.Close()
 
 		_, payload, err := rawConn.ReadMessage()
-		require.NoError(t, err)
-		require.NoError(t, rawConn.WriteMessage(websocket.TextMessage, payload))
+		if !assert.NoError(t, err) {
+			return
+		}
+		if !assert.NoError(t, rawConn.WriteMessage(websocket.TextMessage, payload)) {
+			return
+		}
 
-		require.NoError(t, rawConn.WriteControl(
+		assert.NoError(t, rawConn.WriteControl(
 			websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "bye"),
 			time.Now().Add(time.Second),

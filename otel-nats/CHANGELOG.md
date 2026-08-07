@@ -4,19 +4,13 @@ All notable changes to the `otel-nats` module (`otelnats` + `oteljetstream`) are
 
 > **Coverage note**: this file starts at `0.6.0`. Earlier history lives only in git tags (`otel-nats/vX.Y.Z`) and predates the module's rename from `Marz32onE/instrumentation-go` — see the repo root `VERSIONING.md` for the root cause and the release-tag CI guard that now keeps the version constant and tag in sync going forward.
 
-## [0.8.0] - unreleased
+## [0.8.0] - 2026-08-07
 
-> **Release candidates.** `v0.8.0-rc.3` is the first one that carries the `otel-flags` 0.2.0 flag
-> layer, and the first that builds for a consumer at all: `rc.1` and `rc.2` predate it and both
-> `require otel-flags v0.1.0`, whose API this module's code no longer matches. `rc.2` also carries a
-> version constant reading `0.8.0-rc.1`. Test the relay against `rc.3` or later.
->
-> What `rc.3` adds over `rc.2`: flag keys passed by name rather than by index; the OpenFeature
-> provider installed at construction through `otelflags.ValidateAndInstall`; an unreadable
-> `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` or `_POLL_INTERVAL` failing construction rather than
-> warning and falling back; evaluation error codes logged once per transition, two-tier, so relay
-> silence is distinguishable from relay failure in the log even though it is not in the value; and a
-> failed provider install that is retried rather than latched.
+> **Every `0.8.0-rc.*` tag is superseded by this release.** `rc.1` and `rc.2` both
+> `require otel-flags v0.1.0`, whose API this module's code no longer matches, so neither builds for
+> a consumer at all; `rc.2` additionally carries a version constant reading `0.8.0-rc.1`. `rc.3`
+> builds and is functionally close to this release, but predates the final documentation and the
+> measured resolution cost.
 
 ### Changed
 
@@ -30,9 +24,9 @@ All notable changes to the `otel-nats` module (`otelnats` + `oteljetstream`) are
 - A failing relay is no longer silent. `otel-flags v0.2.0` logs a flag key's OpenFeature error code when it **changes** — `FLAG_NOT_FOUND` and `PROVIDER_NOT_READY` at debug, everything else at warn, a recovery at info — so a provider stuck in `ERROR` or a relay rule that never matches is visible in the application's own logs. The resolved value is unchanged: relay silence and relay failure both still mean "the next rung down decides".
 - **BREAKING** This module now requires `github.com/akira-core/instrumentation-go/otel-flags`, which replaces the vendored `internal/flags` package. That module carries the OpenFeature SDK and the GO Feature Flag provider, so their dependency trees enter your build transitively — roughly ten modules including a full ANTLR runtime, a JSONLogic evaluator and a rules engine. The cost lands on `go.sum`, vulnerability-scanning surface and licence review, not on runtime; the linker drops unreached code. It exists to guarantee **exactly one** OpenFeature provider per binary, which four independent vendored copies could not.
 - **BREAKING** The master switch gains a relay key, `otel-instrumentation-go-tracing`. Setting it to `true` has **no effect** — that is already the default. Setting it to `false` stops every module in every process the relay serves, including connections whose Go code passed an option. Do not create it expecting an enable; it will read as a broken flag.
-- The relay is resolved on **every operation** and nothing is cached, so a flag change takes effect on the next one. An instrumented operation now makes two evaluations at roughly 2 µs and 7 allocations each. A process with **no relay configured** pays none of it and allocates no instrumented implementation it cannot reach — the pre-dynamic zero-cost path is preserved exactly.
+- The relay is resolved on **every operation** and nothing is cached, so a flag change takes effect on the next one. An instrumented operation now makes two evaluations. A process with **no relay configured** pays none of it, allocates no instrumented implementation it cannot reach, and measures 0 allocations per operation — the pre-dynamic zero-cost path is preserved exactly. **The cost is paid whatever the flag's value**: a relay-reachable connection whose module flag is `false` still evaluates on every operation. Measured against a real GO Feature Flag relay provider on a 2-vCPU Xeon, one evaluation costs roughly **12 µs and 23 allocations** — an order of magnitude above the `2 µs / 336 B / 7 allocations` earlier drafts of the guide quoted, which was never reproducible and is withdrawn. The benchmark lives in [`akira-core/instrumentation-demo`](https://github.com/akira-core/instrumentation-demo/tree/main/backend/internal/flagperf); the full table and its caveats are in [`docs/feature-flags.md`](../docs/feature-flags.md).
 - **New ordering requirement.** Whether a relay can exist is resolved once, when a wrapper is constructed. An application that installs its own OpenFeature provider must do so **before** constructing any wrapper; one built earlier resolves statically for its whole life and never consults the relay. Applications using the zero-code path (`OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT`) are unaffected.
-- The non-blocking startup window is now **fail-safe**: until the provider's first fetch every switch resolves to its local value, so the window can delay a relay-driven enable but can never introduce one.
+- The non-blocking startup window is **fail-safe for enabling and deliberately not for disabling**: until the provider's first fetch every switch resolves to its local value, so the window can delay a relay-driven enable but can never introduce one — and equally, **a relay `false` does not survive a restart**. A process whose environment enables this module traces again from start-up until its first fetch, and indefinitely while the relay is unreachable. Reading not-ready as `false` is refused: it applies per key and the master's local default is `true`, so every restart of every relay-configured process would be fully vetoed, making the control plane an availability dependency. The relay is runtime control; durable state belongs in the environment variable. Treat a relay flip as the first half of an incident brake and land the variable in the deployment before anything restarts.
 
 ### Removed
 
