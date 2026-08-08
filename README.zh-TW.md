@@ -12,34 +12,36 @@
 
 | 套件 | Import 路徑 | 原始碼版本 | 說明 |
 |------|-------------|------------|------|
-| **otel-mongo** (v1) | `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | 0.7.0 | MongoDB driver v1 封裝；寫入時注入 `_oteltrace`；`ContextFromDocument` 與解碼輔助。 |
-| **otel-mongo/v2** | `github.com/akira-core/instrumentation-go/otel-mongo/v2` | 0.7.0 | MongoDB driver v2 封裝；與 v1 行為對齊。 |
-| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.7.0 | 核心 NATS；W3C 脈絡在訊息標頭。 |
-| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.7.0 | JetStream 發布／消費／fetch。 |
-| **otel-gorilla-ws** | `github.com/akira-core/instrumentation-go/otel-gorilla-ws` | 0.7.0 | 在 JSON 訊息本文內傳遞 trace context（信封格式）；`NewConn` / `Dial`。 |
+| **otel-mongo** (v1) | `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | 0.8.0 | MongoDB driver v1 封裝；寫入時注入 `_oteltrace`；`ContextFromDocument` 與解碼輔助。 |
+| **otel-mongo/v2** | `github.com/akira-core/instrumentation-go/otel-mongo/v2` | 2.8.0 | MongoDB driver v2 封裝；與 v1 行為對齊。走固定主版號的 `2.x` 線——詳見 [VERSIONING.md](VERSIONING.md)。 |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.8.0 | 核心 NATS；W3C 脈絡在訊息標頭。 |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.8.0 | JetStream 發布／消費／fetch。 |
+| **otel-gorilla-ws** | `github.com/akira-core/instrumentation-go/otel-gorilla-ws` | 0.8.0 | 在 JSON 訊息本文內傳遞 trace context（信封格式）；`NewConn` / `Dial`。 |
 
 ### 支援模組
 
 | 套件 | Import 路徑 | 原始碼版本 | 說明 |
 |------|-------------|------------|------|
-| **otel-flags** | `github.com/akira-core/instrumentation-go/otel-flags` | 0.1.0 | 共享功能開關層:優先級階梯、OpenFeature resolver、單一 provider 保證。四個 wrapper 都 require 它;應用程式很少直接引入。本身不產生 span。 |
+| **otel-flags** | `github.com/akira-core/instrumentation-go/otel-flags` | 0.2.0 | 共享功能開關層:優先級階梯、OpenFeature resolver、單一 provider 保證。四個 wrapper 都 require 它;應用程式很少直接引入。本身不產生 span。 |
 | **otel-sampler** | `github.com/akira-core/instrumentation-go/otel-sampler/otelsampler` | 0.1.1 | 一致機率取樣器（`ot=th:`／`ot=rv:`）與 `WithSingleLinkSeed`，讓 span-link 消費者的取樣決策與 parent-child 一致。本身不產生 span。 |
 | **otel-testkit** | `github.com/akira-core/instrumentation-go/otel-testkit/harness` | 未打 tag | 黑箱 E2E harness（行程內 OTLP sink + collector + 斷言），供本倉庫取樣測試使用。僅供測試，不保證 API 穩定。 |
 
-`otel-sampler` 已發布的 `v0.1.0` tag 指向 rebase 前的 commit，已作廢——請從 `0.1.1` 起用。詳見 [VERSIONING.md](VERSIONING.md)。
+`otel-sampler` 已發布的 `v0.1.0` tag 指向 rebase 前的 commit，已作廢——請從 `0.1.1` 起用。`otel-mongo/v2` 歷史上的 `otel-mongo/v2/v0.x.y` tag 從來就無法被 `go get` 解析，僅保留作為歷史紀錄——請改用 `otel-mongo/v2.x.y` 形式。詳見 [VERSIONING.md](VERSIONING.md)。
 
 各模組詳細文件：[otel-mongo/README.md](otel-mongo/README.md)、[otel-nats/README.md](otel-nats/README.md)、[otel-gorilla-ws/README.md](otel-gorilla-ws/README.md)；三個模組皆另有繁中版：[otel-mongo/README.zh-TW.md](otel-mongo/README.zh-TW.md)、[otel-nats/README.zh-TW.md](otel-nats/README.zh-TW.md)、[otel-gorilla-ws/README.zh-TW.md](otel-gorilla-ws/README.zh-TW.md)。
 
 ## 安裝
 
-依模組路徑搭配對應 **Git tag**（前綴與模組一致，例如 `otel-mongo/v0.6.0`）：
+依模組路徑搭配對應 **Git tag**（前綴與模組一致，例如 `otel-mongo/v0.8.0`）：
 
 ```bash
-go get github.com/akira-core/instrumentation-go/otel-mongo@otel-mongo/v0.6.0
-go get github.com/akira-core/instrumentation-go/otel-mongo/v2@otel-mongo/v2/v0.6.0
-go get github.com/akira-core/instrumentation-go/otel-nats@otel-nats/v0.6.0
-go get github.com/akira-core/instrumentation-go/otel-gorilla-ws@otel-gorilla-ws/v0.6.0
+go get github.com/akira-core/instrumentation-go/otel-mongo@otel-mongo/v0.8.0
+go get github.com/akira-core/instrumentation-go/otel-mongo/v2@otel-mongo/v2.8.0
+go get github.com/akira-core/instrumentation-go/otel-nats@otel-nats/v0.8.0
+go get github.com/akira-core/instrumentation-go/otel-gorilla-ws@otel-gorilla-ws/v0.8.0
 ```
+
+`otel-mongo/v2` 是前綴規則唯一的例外：它的 module path 帶有 `/v2` 主版號後綴，Go 會把該後綴從 tag 前綴中去掉，因此它的 tag 形式是 `otel-mongo/v2.x.y`——**不是** `otel-mongo/v2/v…`。
 
 程式中再 import 子套件（`.../otelmongo`、`.../otelnats`、`.../oteljetstream`；WebSocket 為根套件）。
 
@@ -108,11 +110,19 @@ instrumentation-go/
 │   ├── go.mod
 │   └── README.md
 ├── otel-ws.md               # 子協定／傳播設計筆記（跨語言）
+├── otel-flags/              # 共享功能開關層（已發布，四個 wrapper 都 require）
+├── otel-sampler/
+│   └── otelsampler/         # 一致機率取樣器（已發布，由應用程式引入）
+├── otel-testkit/
+│   ├── harness/             # 黑箱 E2E harness（不打 tag、僅供測試）
+│   └── examples/            # httpdirect / httpdirect-stdlib 參考範本
 ├── docs/
 │   ├── feature-flags.md              # Tracing feature-flag 完整參考（英文）
 │   ├── feature-flags.zh-TW.md        # …繁體中文翻譯
 │   ├── otel-nats-kill-switch.en-US.html  # Relay 實作教學（en-US）
 │   └── otel-nats-kill-switch.zh-TW.html  # Relay 實作教學（zh-TW）
+├── openspec/                # Capability 規格與變更歷史（見 openspec/specs/）
+├── VERSIONING.md            # 各模組 tag 線與發布順序
 ├── CLAUDE.md                # 貢獻者／代理用說明
 └── README.md
 ```
