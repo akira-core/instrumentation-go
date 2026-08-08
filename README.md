@@ -12,34 +12,36 @@ Instrumentation packages **do not** create a global `TracerProvider`. They use `
 
 | Package | Import path | Version (source) | Description |
 |---------|-------------|------------------|-------------|
-| **otel-mongo** (v1) | `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | 0.7.0 | MongoDB driver v1 wrapper; `_oteltrace` on writes; `ContextFromDocument` / decode helpers. |
-| **otel-mongo/v2** | `github.com/akira-core/instrumentation-go/otel-mongo/v2` | 0.7.0 | MongoDB driver v2 wrapper; parity with v1. |
-| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.7.0 | Core NATS; W3C context in message headers. |
-| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.7.0 | JetStream publish/consume/fetch. |
-| **otel-gorilla-ws** | `github.com/akira-core/instrumentation-go/otel-gorilla-ws` | 0.7.0 | Trace context in JSON message body (envelope); `NewConn` / `Dial`. |
+| **otel-mongo** (v1) | `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | 0.8.0 | MongoDB driver v1 wrapper; `_oteltrace` on writes; `ContextFromDocument` / decode helpers. |
+| **otel-mongo/v2** | `github.com/akira-core/instrumentation-go/otel-mongo/v2` | 2.8.0 | MongoDB driver v2 wrapper; parity with v1. Fixed-major `2.x` line — see [VERSIONING.md](VERSIONING.md). |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.8.0 | Core NATS; W3C context in message headers. |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.8.0 | JetStream publish/consume/fetch. |
+| **otel-gorilla-ws** | `github.com/akira-core/instrumentation-go/otel-gorilla-ws` | 0.8.0 | Trace context in JSON message body (envelope); `NewConn` / `Dial`. |
 
 ### Supporting modules
 
 | Package | Import path | Version (source) | Description |
 |---------|-------------|------------------|-------------|
-| **otel-flags** | `github.com/akira-core/instrumentation-go/otel-flags` | 0.1.0 | The shared feature-switch layer: the precedence ladder, the OpenFeature resolver, and the single-provider guarantee. Required by all four wrappers; applications rarely import it directly. Emits no spans. |
+| **otel-flags** | `github.com/akira-core/instrumentation-go/otel-flags` | 0.2.0 | The shared feature-switch layer: the precedence ladder, the OpenFeature resolver, and the single-provider guarantee. Required by all four wrappers; applications rarely import it directly. Emits no spans. |
 | **otel-sampler** | `github.com/akira-core/instrumentation-go/otel-sampler/otelsampler` | 0.1.1 | Consistent probability sampler (`ot=th:`/`ot=rv:`) + `WithSingleLinkSeed`, so span-link consumers sample like parent-child ones. Emits no spans. |
 | **otel-testkit** | `github.com/akira-core/instrumentation-go/otel-testkit/harness` | untagged | Black-box E2E harness (in-process OTLP sink + collector + assertions) used by this repo's sampling suites. Test-only, no stability guarantee. |
 
-`otel-sampler`'s published `v0.1.0` tag points at a pre-rebase commit and is superseded — start at `0.1.1`. See [VERSIONING.md](VERSIONING.md).
+`otel-sampler`'s published `v0.1.0` tag points at a pre-rebase commit and is superseded — start at `0.1.1`. `otel-mongo/v2`'s historical `otel-mongo/v2/v0.x.y` tags were never resolvable by `go get` and are retained as history only — use the `otel-mongo/v2.x.y` shape. See [VERSIONING.md](VERSIONING.md).
 
 Per-module docs: [otel-mongo/README.md](otel-mongo/README.md), [otel-nats/README.md](otel-nats/README.md), [otel-gorilla-ws/README.md](otel-gorilla-ws/README.md) (each also ships a [README.zh-TW.md](otel-mongo/README.zh-TW.md): [otel-nats](otel-nats/README.zh-TW.md), [otel-gorilla-ws](otel-gorilla-ws/README.zh-TW.md)).
 
 ## Install
 
-Use the module path and a **git tag** that matches the release you want (tag prefix matches the module, e.g. `otel-mongo/v0.6.0`):
+Use the module path and a **git tag** that matches the release you want (tag prefix matches the module, e.g. `otel-mongo/v0.8.0`):
 
 ```bash
-go get github.com/akira-core/instrumentation-go/otel-mongo@otel-mongo/v0.6.0
-go get github.com/akira-core/instrumentation-go/otel-mongo/v2@otel-mongo/v2/v0.6.0
-go get github.com/akira-core/instrumentation-go/otel-nats@otel-nats/v0.6.0
-go get github.com/akira-core/instrumentation-go/otel-gorilla-ws@otel-gorilla-ws/v0.6.0
+go get github.com/akira-core/instrumentation-go/otel-mongo@otel-mongo/v0.8.0
+go get github.com/akira-core/instrumentation-go/otel-mongo/v2@otel-mongo/v2.8.0
+go get github.com/akira-core/instrumentation-go/otel-nats@otel-nats/v0.8.0
+go get github.com/akira-core/instrumentation-go/otel-gorilla-ws@otel-gorilla-ws/v0.8.0
 ```
+
+`otel-mongo/v2` is the one exception to the prefix rule: its module path carries the `/v2` major-version suffix, which Go strips from the tag prefix, so its tags are `otel-mongo/v2.x.y` — **not** `otel-mongo/v2/v…`.
 
 Then import subpackages as needed (`.../otelmongo`, `.../otelnats`, `.../oteljetstream`, root `otel-gorilla-ws`).
 
@@ -113,11 +115,18 @@ instrumentation-go/
 │   └── README.md
 ├── otel-ws.md               # Subprotocol / propagation design notes (cross-language)
 ├── otel-flags/              # Shared feature-switch layer (released, required by all four)
+├── otel-sampler/
+│   └── otelsampler/         # Consistent probability sampler (released, imported by applications)
+├── otel-testkit/
+│   ├── harness/             # Black-box E2E harness (untagged, test-only)
+│   └── examples/            # httpdirect / httpdirect-stdlib reference templates
 ├── docs/
 │   ├── feature-flags.md              # Full tracing feature-flag reference
 │   ├── feature-flags.zh-TW.md        # …and its Traditional Chinese translation
 │   ├── otel-nats-kill-switch.en-US.html  # Hands-on relay tutorial (en-US)
 │   └── otel-nats-kill-switch.zh-TW.html  # Hands-on relay tutorial (zh-TW)
+├── openspec/                # Capability specs + change history (see openspec/specs/)
+├── VERSIONING.md            # Per-module tag lines and release ordering
 ├── CLAUDE.md                # Contributor / agent notes
 └── README.md
 ```
