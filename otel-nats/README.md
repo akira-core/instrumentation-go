@@ -200,7 +200,8 @@ conn, err := otelnats.Connect(url, nil)
 | **ConnectWithCredentials** | `ConnectWithCredentials(url, credFile string, natsOpts ...nats.Option)`. Connects with JWT/NKey credentials. |
 | **ScopeName / Version()** | Used when creating Tracer (OTel contrib guideline). |
 | **Request / RequestWithContext / RequestMsg / RequestMsgWithContext** | RPC helpers mirroring `nats.Conn`; open a CLIENT span named `request {subject}` and a linked CLIENT span named bare `receive` for the reply. |
-| **Inbox span names** | A span whose resolved destination is a reply inbox drops the destination from its name (`publish`, `process`, `receive`) and keeps it on the attributes (see **Span names**). |
+| **Inbox span names** | A span whose resolved destination is an unbounded reply inbox drops the destination from its name (`publish`, `process`, `receive`) and keeps it on the attributes. Applies to JetStream too — a stream may capture inbox subjects (see **Span names**). |
+| **`Conn.InboxPrefixes()`** | The inbox prefixes this connection recognises (`0.9.1+`). Used by `oteljetstream`; rarely needed by applications. |
 | **JetStream consumer managers** | `JetStream` fully wraps `StreamConsumerManager`; `Stream` fully wraps `ConsumerManager`. Methods returning `Consumer` or `PushConsumer` remain trace-enabled wrappers (see JetStream section). |
 | **WithTraceDestination / SubscribeTraceEvents** | Convert NATS 2.11+ infrastructure trace events into OTel spans (see **NATS 2.11+ Trace Events**). |
 | **Tests** | Use `otel.SetTracerProvider(tp)` (and `otel.SetTextMapPropagator(prop)` if needed) before Connect. |
@@ -238,29 +239,39 @@ Span names follow the OTel messaging semconv v1.39.0 format `{messaging.operatio
 | Publish to a reply inbox | `publish` | bare — the manual responder half, `conn.Publish(msg.Reply, …)` |
 | Subscribe/QueueSubscribe handler | `process {destination}` | |
 | Handler on a reply inbox subscription | `process` | bare — the manual requester half |
-| JetStream consumer receive/process | `receive {destination}` / `process {destination}` | |
+| JetStream consumer receive/process | `receive {destination}` / `process {destination}` | inbox test applies here too since `0.9.1` — a stream may capture inbox subjects |
+| JetStream over an inbox-capturing stream | `receive` / `process` / `publish` | bare, when the resolved destination is an unbounded inbox |
 
 `{destination}` resolves in this order: the subscription or single-valued JetStream consumer filter subject → the concrete message subject. A resolved destination that differs from the concrete subject (a wildcard subscription or filter) is additionally recorded on the span as `messaging.destination.template`; `messaging.destination.name` always carries the concrete subject. Both are facts the library already holds — it never guesses which token of a subject is an identifier.
 
-The resolved destination is then dropped from the span name entirely when it is a **reply inbox**, matching semconv's rule to omit `{destination}` when no low-cardinality value is available. The inbox stays fully queryable on the attributes: `messaging.destination.name`, `messaging.message.conversation_id`, `messaging.destination.temporary=true` and `messaging.destination.anonymous=true`.
+The resolved destination is then dropped from the span name when it is an **unbounded reply inbox**, matching semconv's rule to omit `{destination}` when no low-cardinality value is available. The inbox stays fully queryable on the attributes: `messaging.destination.name`, `messaging.message.conversation_id`, `messaging.destination.temporary=true` and `messaging.destination.anonymous=true`.
 
-Inboxes are recognised by subject prefix, and **two prefixes are recognised**: this connection's own (`nats.CustomInboxPrefix(p)` ⇒ `p + "."`) and the default `_INBOX.` always. Recognising only the local prefix would fail exactly where custom prefixes are used — a responder sees the *requester's* inbox in `msg.Reply`, and the requester is the side that customises, because granting it `subscribe: _INBOX.>` would hand it every other client's replies while a responder needs no inbox permission at all. Two peers using two *different* custom prefixes will not recognise each other's inboxes; a collector-side span rename covers that case.
+"Unbounded" is the operative word. A filter that is **nothing but an inbox prefix plus wildcards** — `_INBOX.>`, the shape a consumer archiving replies declares — is a fixed string the subscriber chose, so it stays in the span name and is recorded as `messaging.destination.template`. semconv attaches the temporary/anonymous exclusion to `messaging.destination.name` (its *second* choice for `{destination}`), not to `messaging.destination.template` (its first). A filter carrying a literal token, such as `_INBOX.<nuid>.>`, is per-request and is dropped like any concrete inbox. The temporary/anonymous/`conversation_id` markers are recorded either way: they describe the delivery, not the name.
 
-### Subjects that embed identifiers
+Inboxes are recognised by subject prefix, and **two prefixes are recognised**: this connection's own (`nats.CustomInboxPrefix(p)` ⇒ `p + "."`) and the default `_INBOX.` always. Recognising only the local prefix would fail exactly where custom prefixes are used — a responder sees the *requester's* inbox in `msg.Reply`, and the requester is the side that customises, because granting it `subscribe: _INBOX.>` would hand it every other client's replies while a responder needs no inbox permission at all.
 
-A subject like `orders.12345.created` is not templated by this module: no library can tell which token is an identifier, and semconv forbids instrumentation from inferring `messaging.destination.template`. Two cases remain high-cardinality:
+### Residual span-name cardinality
+
+Every unbounded span name the library can *see* is bounded by the rules above. Two sources remain, both structurally invisible to it:
+
+**A peer on a custom inbox prefix this connection does not share.** Two peers using two *different* custom prefixes will not recognise each other's inboxes from a concrete subject alone. Reply-receive spans are unaffected — that path knows structurally that it holds an inbox, whatever its prefix — and so is any fixed subscription or consumer filter, which is bounded regardless of prefix. What remains is a manual `conn.Publish(peerInbox, …)` or a handler subscribed directly on a foreign-prefix inbox.
+
+**Subjects that embed identifiers.** A subject like `orders.12345.created` is not templated by this module: no library can tell which token is an identifier, and semconv permits recording a `messaging.destination.template` that is already known, not inferring one. Two cases stay high-cardinality:
 
 - publish and request spans, which have no subscription or filter to resolve against; and
 - JetStream consumers with **no** filter subject, or with **several** wildcard filter subjects.
 
-Rewrite those downstream, where the pattern is known — the OTel Collector `span` processor does it without touching application code:
+Rewrite both downstream, where the pattern is known — the OTel Collector `span` processor does it without touching application code:
 
 ```yaml
 span/to_attributes:
   name:
     to_attributes:
       rules:
+        # Subjects embedding an identifier.
         - ^receive orders\.(?P<orderId>[^.]+)\.created$
+        # A foreign custom inbox prefix this connection does not recognise.
+        - ^(?P<op>publish|process) SVCB\.(?P<inbox>[^.]+)
 # "receive orders.12345.created" -> "receive orders.{orderId}.created", orderId=12345
 ```
 

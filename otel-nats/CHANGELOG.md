@@ -4,6 +4,68 @@ All notable changes to the `otel-nats` module (`otelnats` + `oteljetstream`) are
 
 > **Coverage note**: this file starts at `0.6.0`. Earlier history lives only in git tags (`otel-nats/vX.Y.Z`) and predates the module's rename from `Marz32onE/instrumentation-go` — see the repo root `VERSIONING.md` for the root cause and the release-tag CI guard that now keeps the version constant and tag in sync going forward.
 
+## [0.9.1] - 2026-08-12
+
+Follow-up to `0.9.0`, closing the two span-naming gaps its own review found. Both are
+fixes to `0.9.0` behaviour; no API is removed and no span is renamed except the ones
+`0.9.0` had already failed to bound.
+
+### Fixed
+
+- **JetStream span names are now bounded when a stream captures inbox subjects.** All
+  five JetStream resolve sites — `PublishMsg`, `Consumer.Next`, the `Consume` delivery
+  handler, the `MessagesContext` iterator and the `Fetch` batch forwarder — passed no
+  inbox prefixes, on the assumption that a JetStream subject is never an inbox. NATS
+  does not enforce that: a stream over `_INBOX.>` is legal and is how
+  request/reply-over-JetStream deployments make replies durable. An unfiltered consumer
+  over such a stream resolved its destination to the concrete per-request subject, so
+  every span was named `receive _INBOX.<nuid>` — the same unbounded-name defect `0.9.0`
+  fixed for core NATS. Those spans are now named `receive` / `process` / `publish` and
+  carry `messaging.destination.temporary`, `.anonymous` and
+  `messaging.message.conversation_id`, matching the core NATS paths. Span-metrics
+  pipelines keyed on span name will see the cardinality drop.
+- **A request addressed AT an inbox keeps its span-start `conversation_id`.** In the
+  callback-style RPC where a peer advertises its own inbox, `startRequestSpan` recorded
+  `messaging.message.conversation_id` = the peer's inbox, and `recordReply` then
+  overwrote it with this request's own reply inbox. The attribute held two values during
+  the span's life and exported the one nothing had observed at start. The late write is
+  now suppressed when the destination is an inbox; the nested conversation stays recorded
+  on the reply-`receive` span, which is the span the reply message belongs to. Ordinary
+  requests to a non-inbox subject are unaffected.
+
+### Changed
+
+- **A consumer filtered on an inbox prefix plus wildcards keeps its destination in the
+  span name.** `_INBOX.>` is a fixed low-cardinality string the subscriber declared, so
+  semconv's first choice for `{destination}` — use `messaging.destination.template` when
+  available — applies unchanged; the temporary/anonymous exclusion is written into the
+  second choice (`messaging.destination.name`) only. Such spans are named
+  `receive _INBOX.>` and carry `messaging.destination.template`. A filter carrying a
+  literal token (`_INBOX.<nuid>.>`, the `<inbox>.>` subscription shape) is still
+  unbounded and still drops the destination.
+- Removed three unreachable `messaging.destination.template` branches on the publish and
+  request paths. `spanname.Resolve` cannot return a template for a call with no filter
+  subject, so those spans never carried the attribute — the dead code implied otherwise.
+
+### Added
+
+- `otelnats.Conn.InboxPrefixes()` — the connection's recognised inbox prefixes, needed by
+  `oteljetstream` to apply the same inbox test. Additive; existing callers are unaffected.
+
+### Known limits
+
+Two sources of unbounded span names remain, both outside what the library can see:
+
+- A peer using a **custom inbox prefix this connection does not share** is not recognised
+  when only its concrete subject is available. `recordReply` is unaffected (it knows
+  structurally that it holds an inbox), and any fixed subscription or consumer filter is
+  unaffected (a declared filter is bounded whatever its prefix).
+- **Subjects embedding identifiers** (`orders.12345.created`) on paths with no filter.
+  semconv permits recording a known `messaging.destination.template`, not inferring one.
+
+Both are handled collector-side with the `span` processor's `name.to_attributes` rules —
+see the "Residual span-name cardinality" section of `otel-nats/README.md`.
+
 ## [0.9.0] - 2026-08-11
 
 ### Breaking
