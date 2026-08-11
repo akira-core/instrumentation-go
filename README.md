@@ -14,8 +14,8 @@ Instrumentation packages **do not** create a global `TracerProvider`. They use `
 |---------|-------------|------------------|-------------|
 | **otel-mongo** (v1) | `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | 0.8.0 | MongoDB driver v1 wrapper; `_oteltrace` on writes; `ContextFromDocument` / decode helpers. |
 | **otel-mongo/v2** | `github.com/akira-core/instrumentation-go/otel-mongo/v2` | 2.8.0 | MongoDB driver v2 wrapper; parity with v1. Fixed-major `2.x` line — see [VERSIONING.md](VERSIONING.md). |
-| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.8.0 | Core NATS; W3C context in message headers. |
-| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.8.0 | JetStream publish/consume/fetch. |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.9.0 | Core NATS; W3C context in message headers. |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.9.0 | JetStream publish/consume/fetch. |
 | **otel-gorilla-ws** | `github.com/akira-core/instrumentation-go/otel-gorilla-ws` | 0.8.0 | Trace context in JSON message body (envelope); `NewConn` / `Dial`. |
 
 ### Supporting modules
@@ -37,7 +37,7 @@ Use the module path and a **git tag** that matches the release you want (tag pre
 ```bash
 go get github.com/akira-core/instrumentation-go/otel-mongo@otel-mongo/v0.8.0
 go get github.com/akira-core/instrumentation-go/otel-mongo/v2@otel-mongo/v2.8.0
-go get github.com/akira-core/instrumentation-go/otel-nats@otel-nats/v0.8.0
+go get github.com/akira-core/instrumentation-go/otel-nats@otel-nats/v0.9.0
 go get github.com/akira-core/instrumentation-go/otel-gorilla-ws@otel-gorilla-ws/v0.8.0
 ```
 

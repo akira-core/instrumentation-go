@@ -8,7 +8,7 @@
 哪些能在 process 執行期間改變、哪些不能。
 
 適用於 `otel-flags` 0.2.0、`otel-mongo` 0.8.0、`otel-mongo/v2` 2.8.0、`otel-nats` 0.8.0、
-`otel-gorilla-ws` 0.8.0 以後的版本。設計記錄:`openspec/changes/openfeature-dynamic-flags/design.md`;
+`otel-gorilla-ws` 0.8.0 以後的版本。設計記錄:`openspec/changes/archive/2026-08-08-openfeature-dynamic-flags/design.md`;
 `otel-flags` 0.2.0 背後的錯誤處理決策在
 [`otel-flags-error-handling-decisions.md`](otel-flags-error-handling-decisions.md),形塑它的兩輪
 code review 在 [`otel-flags-review-2026-08.md`](otel-flags-review-2026-08.md)。

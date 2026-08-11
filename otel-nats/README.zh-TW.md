@@ -125,7 +125,7 @@ conn.QueueSubscribe("subject", "queue", handler)
 
 ### 3. Request/Reply
 
-`Conn.Request` / `RequestWithContext` / `RequestMsg` / `RequestMsgWithContext` 完全對齊 `nats.Conn` 的同名方法，但會為這次 RPC 開啟一個 CLIENT span，並為回覆開啟第二個連結的 CLIENT span（`receive` — 依 OTel messaging span-kind 對照表，pull 屬於 CLIENT）：
+`Conn.Request` / `RequestWithContext` / `RequestMsg` / `RequestMsgWithContext` 完全對齊 `nats.Conn` 的同名方法，但會為這次 RPC 開啟一個 CLIENT span（`request {subject}`），並為回覆開啟第二個連結的 CLIENT span —— 裸 `receive`，不帶 destination 區段，因為回覆送達的是自動產生、只用一次的 inbox（`_INBOX.<nuid>`），而 semconv v1.39.0 規定沒有低基數值可用時就省略 `{destination}`。inbox subject 仍可透過 `messaging.destination.name`、`messaging.destination.temporary=true`、`messaging.destination.anonymous=true` 與 `messaging.message.conversation_id` 查詢：
 
 ```go
 reply, err := conn.RequestWithContext(ctx, "subject", []byte("ping"))
@@ -195,6 +195,7 @@ conn, err := otelnats.Connect(url, nil)
 | **Request / RequestWithContext / RequestMsg / RequestMsgWithContext** | 對齊 `nats.Conn` 的 RPC helper；為請求開啟 CLIENT span，並為回覆接收開啟一個連結的 CLIENT span。 |
 | **JetStream consumer manager** | `JetStream` 完整包裝 `StreamConsumerManager`；`Stream` 完整包裝 `ConsumerManager`。所有回傳 `Consumer` 或 `PushConsumer` 的方法仍會回傳具 trace 包裝的型別（見 JetStream 章節）。 |
 | **WithTraceDestination / SubscribeTraceEvents** | 將 NATS 2.11+ 的基礎設施追蹤事件轉換為 OTel span（見 **NATS 2.11+ 追蹤事件**）。 |
+| **Inbox span 名稱** | 解析出的 destination 若是回覆 inbox，該 span 的名稱去掉 destination（`publish`、`process`、`receive`），inbox 保留在屬性上（見 **Span 名稱**）。 |
 | **測試** | 在 Connect 前呼叫 `otel.SetTracerProvider(tp)`（必要時 `otel.SetTextMapPropagator(prop)`）。 |
 
 ---
@@ -206,7 +207,7 @@ Span kind 依 OTel messaging「Span kind」對照表（`send` → `PRODUCER`、`
 ```
 Publish / PublishMsg                     PRODUCER（send）
 Request / RequestWithContext / ...       CLIENT（request，等待回覆）
-  └── receive <reply-subject>            CLIENT（連結的回覆接收，pull）
+  └── receive                            CLIENT（連結的回覆接收，pull；裸名，不帶 destination）
 Subscribe / QueueSubscribe handler       CONSUMER（process，push 遞送）
 
 JetStream publish                        PRODUCER（send）
@@ -215,6 +216,58 @@ JetStream Fetch / Messages / Next        CLIENT（連結的 receive，pull）
 ```
 
 JetStream 的 `receive`／`process` span 另外帶有 `messaging.consumer.group.name`（durable/consumer 名稱）；core NATS 的 span 則不帶此屬性。
+
+---
+
+## Span 名稱
+
+Span 名稱遵循 OTel messaging semconv v1.39.0 的格式 `{messaging.operation.name} {destination}`：
+
+| 操作 | Span 名稱 | 備註 |
+|---|---|---|
+| Publish（core NATS 或 JetStream） | `publish {subject}` | `0.9.0` 之前是 `send {subject}` |
+| Request | `request {subject}` | `0.9.0` 之前是 `{subject} request` |
+| 回覆接收 | `receive` | 裸名，不帶 destination —— inbox 自動產生且只用一次；`0.9.0` 之前是 `receive {inbox}` |
+| 發布到回覆 inbox | `publish` | 裸名 —— 手動回覆的那一半，`conn.Publish(msg.Reply, …)` |
+| Subscribe/QueueSubscribe handler | `process {destination}` | |
+| 訂閱 inbox 的 handler | `process` | 裸名 —— 手動請求的那一半 |
+| JetStream consumer receive/process | `receive {destination}` / `process {destination}` | |
+
+`{destination}` 的解析順序：訂閱 subject 或單一值的 JetStream consumer filter subject → 具體訊息 subject。解析結果與具體 subject 不同時（wildcard 訂閱或 filter），額外記錄 `messaging.destination.template`；`messaging.destination.name` 一律保留具體 subject。兩者都是 library 已經握有的事實 —— 它不會去猜 subject 的哪一段是識別碼。
+
+解析出的 destination 若是**回覆 inbox**，就整段從 span 名稱移除，對應 semconv「沒有低基數值可用時省略 `{destination}`」的規定。inbox 在屬性上仍完全可查：`messaging.destination.name`、`messaging.message.conversation_id`、`messaging.destination.temporary=true`、`messaging.destination.anonymous=true`。
+
+inbox 以 subject prefix 辨識，且**認兩個 prefix**：本連線自己的（`nats.CustomInboxPrefix(p)` ⇒ `p + "."`）以及永遠認預設的 `_INBOX.`。只認本地 prefix 會在使用 custom prefix 的部署失效 —— responder 在 `msg.Reply` 看到的是**請求端**的 inbox，而請求端才是會換 prefix 的一方：給它 `subscribe: _INBOX.>` 等於讓它收得到所有其他 client 的回覆，而 responder 完全不需要 inbox 權限。兩端各用**不同** custom prefix 時彼此認不出來，那種情況用 collector 端改名處理。
+
+### 內嵌識別碼的 subject
+
+像 `orders.12345.created` 這種 subject，本模組**不會**替它產生樣板：沒有任何 library 能判斷哪一段是識別碼，而 semconv 禁止 instrumentation 推導 `messaging.destination.template`。兩種情況會維持高基數：
+
+- publish 與 request span，沒有訂閱或 filter 可以解析；以及
+- **沒有** filter、或有**多個** wildcard filter subject 的 JetStream consumer。
+
+這些交給下游改寫 —— OTel Collector 的 `span` processor 不需要動應用程式碼：
+
+```yaml
+span/to_attributes:
+  name:
+    to_attributes:
+      rules:
+        - ^receive orders\.(?P<orderId>[^.]+)\.created$
+# "receive orders.12345.created" -> "receive orders.{orderId}.created"，orderId=12345
+```
+
+### 同一個操作的三種寫法
+
+一個 publish span 上會同時出現三種拼法，全都是 semconv 要求的，沒有一個是 bug：
+
+| | 值 | 為什麼 |
+|---|---|---|
+| `messaging.operation.type` | `send` | **固定列舉**：`create`、`send`、`receive`、`process`、`settle` |
+| `messaging.operation.name` | `publish`（或 `request`） | 系統**自己的動詞** —— NATS 叫它 Publish |
+| span 名稱 | `publish {subject}` | semconv 的 `{messaging.operation.name} {destination}` |
+
+span 名稱跟隨 `operation.name`，不是 `operation.type`。
 
 ---
 
