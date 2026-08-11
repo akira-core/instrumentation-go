@@ -269,7 +269,10 @@ single-valued filter subject.
   filter subject to resolve against SHALL keep the concrete subject as its span-name
   `{destination}`.
 - The wrapper SHALL NOT infer a template from a subject's shape (numeric tokens, UUID-like
-  tokens, token counts, or any other heuristic).
+  tokens, token counts, or any other heuristic). semconv licenses recording a
+  `messaging.destination.template` that is already known; it does not license deriving one.
+- Residual high-cardinality span names left by this rule SHALL be documented, together with the
+  collector-side `span` processor rules that resolve them, rather than left implicit.
 
 #### Scenario: Publish to an ID-bearing subject keeps the concrete subject
 
@@ -291,6 +294,14 @@ follows:
   destination, join the filters into one value, or select one filter arbitrarily.
 - `messaging.destination.name` SHALL always carry the concrete delivered subject.
 
+The resolved destination SHALL then be subjected to the same inbox test the core-NATS paths
+apply, using the connection's recognised inbox prefixes. A stream MAY capture inbox subjects —
+a stream over `_INBOX.>` is legal and is how request/reply-over-JetStream makes replies durable
+— so an unfiltered consumer over one resolves to a per-request subject that SHALL NOT appear in
+a span name. This applies to every JetStream span-naming path without exception: the publish
+path, the single-shot `Consumer.Next`, the `Consume` delivery handler, the `Messages` iterator,
+and the `Fetch` batch forwarder.
+
 #### Scenario: Wildcard filter consumer emits one span name
 
 - **WHEN** a consumer with the single filter subject `orders.*` receives messages delivered
@@ -304,6 +315,16 @@ follows:
 - **WHEN** a consumer with the single exact filter subject `orders.new` receives a message
 - **THEN** the receive span SHALL be named `receive orders.new` with no
   `messaging.destination.template` attribute
+
+#### Scenario: Unfiltered consumer over an inbox-capturing stream omits the destination
+
+- **WHEN** a stream configured with subject `_INBOX.>` receives a message published to
+  `_INBOX.<nuid>`, and a consumer with no filter subject delivers it
+- **THEN** the publish span SHALL be named exactly `publish` and the receive/process span
+  exactly `receive` / `process`
+- **AND** each SHALL carry `messaging.destination.temporary=true`,
+  `messaging.destination.anonymous=true` and `messaging.message.conversation_id` set to the
+  concrete inbox subject, with `messaging.destination.name` unchanged
 
 #### Scenario: Multi-filter consumer falls back to the delivered subject
 
