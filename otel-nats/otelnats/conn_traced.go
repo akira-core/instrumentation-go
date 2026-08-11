@@ -26,20 +26,9 @@ type tracedConn struct {
 	inboxPrefixes []string
 }
 
-// inboxAttrs marks a span whose destination is a request/reply inbox. The subject is
-// auto-generated and single-use, so the span NAME omits it (spanname.Resolve) while
-// these attributes keep it queryable: semconv scopes the low-cardinality requirement
-// to the span name, and messaging.destination.name stays Conditionally Required with
-// no carve-out for temporary or anonymous destinations. messaging.destination.name is
-// already set by publishAttrs/receiveAttrs; this adds the three that identify the
-// destination as an inbox.
-func inboxAttrs(subject string) []attribute.KeyValue {
-	return []attribute.KeyValue{
-		semconv.MessagingMessageConversationID(subject),
-		semconv.MessagingDestinationTemporary(true),
-		semconv.MessagingDestinationAnonymous(true),
-	}
-}
+// inboxAttrs marks a span whose destination is a request/reply inbox. Shared with
+// oteljetstream, which needs the same markers for a stream that captures inboxes.
+func inboxAttrs(subject string) []attribute.KeyValue { return spanname.InboxAttrs(subject) }
 
 func (t *tracedConn) TracingEnabled() bool { return true }
 func (t *tracedConn) TraceContext() (trace.Tracer, propagation.TextMapPropagator) {
@@ -47,6 +36,7 @@ func (t *tracedConn) TraceContext() (trace.Tracer, propagation.TextMapPropagator
 }
 func (t *tracedConn) ServerAttrs() []attribute.KeyValue { return t.serverAttrs }
 func (t *tracedConn) TraceDest() string                 { return t.traceDest }
+func (t *tracedConn) InboxPrefixes() []string           { return t.inboxPrefixes }
 
 func (t *tracedConn) Publish(ctx context.Context, subject string, data []byte) error {
 	msg := &nats.Msg{
@@ -108,7 +98,7 @@ func (t *tracedConn) RequestMsgWithContext(ctx context.Context, msg *nats.Msg) (
 // requestWithTimeout is the timeout-driven request path used by Request and RequestMsg.
 // Delegates to nats.Conn.RequestMsg so timeout semantics match the origin driver.
 func (t *tracedConn) requestWithTimeout(parent context.Context, msg *nats.Msg, timeout time.Duration) (*nats.Msg, error) {
-	reqCtx, reqSpan := t.startRequestSpan(parent, msg)
+	reqCtx, reqSpan, destIsInbox := t.startRequestSpan(parent, msg)
 	defer reqSpan.End()
 	reply, err := t.nc.RequestMsg(msg, timeout)
 	if err != nil {
@@ -116,14 +106,14 @@ func (t *tracedConn) requestWithTimeout(parent context.Context, msg *nats.Msg, t
 		reqSpan.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
-	t.recordReply(reqCtx, reqSpan, reply)
+	t.recordReply(reqCtx, reqSpan, reply, destIsInbox)
 	return reply, nil
 }
 
 // requestWithCtx is the ctx-driven request path used by RequestWithContext and RequestMsgWithContext.
 // Delegates to nats.Conn.RequestMsgWithContext so ctx semantics match the origin driver.
 func (t *tracedConn) requestWithCtx(parent context.Context, msg *nats.Msg) (*nats.Msg, error) {
-	reqCtx, reqSpan := t.startRequestSpan(parent, msg)
+	reqCtx, reqSpan, destIsInbox := t.startRequestSpan(parent, msg)
 	defer reqSpan.End()
 	reply, err := t.nc.RequestMsgWithContext(reqCtx, msg)
 	if err != nil {
@@ -131,7 +121,7 @@ func (t *tracedConn) requestWithCtx(parent context.Context, msg *nats.Msg) (*nat
 		reqSpan.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
-	t.recordReply(reqCtx, reqSpan, reply)
+	t.recordReply(reqCtx, reqSpan, reply, destIsInbox)
 	return reply, nil
 }
 
@@ -167,7 +157,10 @@ func (t *tracedConn) startSendSpan(parent context.Context, msg *nats.Msg) (conte
 // messaging.operation.name=request attribute requestAttrs already sets —
 // rather than relabeling the attribute to fit the older RPC-style
 // "{destination} request" (design.md D1).
-func (t *tracedConn) startRequestSpan(parent context.Context, msg *nats.Msg) (context.Context, trace.Span) {
+//
+// Returns whether the destination is an inbox, which decides who owns the span's
+// conversation_id — see recordReply.
+func (t *tracedConn) startRequestSpan(parent context.Context, msg *nats.Msg) (context.Context, trace.Span, bool) {
 	// No filter subject on the request path either — see startSendSpan.
 	name, _, inbox := spanname.Resolve("request", msg.Subject, "", t.inboxPrefixes)
 	attrs := requestAttrs(msg, t.serverAttrs)
@@ -179,7 +172,7 @@ func (t *tracedConn) startRequestSpan(parent context.Context, msg *nats.Msg) (co
 		trace.WithAttributes(attrs...),
 	)
 	t.propagator.Inject(ctx, &HeaderCarrier{H: msg.Header})
-	return ctx, span
+	return ctx, span, inbox
 }
 
 // recordReply emits a CLIENT span representing reply reception (a pull
@@ -199,6 +192,14 @@ func (t *tracedConn) startRequestSpan(parent context.Context, msg *nats.Msg) (co
 // conformant, since the semconv requirement level is Recommended, and expected
 // since samplers only observe span-start attributes.
 //
+// destIsInbox suppresses that late write. A request addressed AT an inbox is the
+// callback half of a manual exchange, and its request span was already given the
+// conversation the message belongs to — the peer's inbox — at span start. Writing
+// this request's own reply inbox over it would make one attribute hold two values
+// during the span's life and export the one nothing had observed at start. The
+// nested conversation stays recorded on the receive span, which is the span the
+// reply message belongs to.
+//
 // The reply inbox is structurally always anonymous and temporary (an
 // auto-generated per-request subject that stops existing once the exchange
 // completes), so inboxAttrs is applied unconditionally here rather than via a
@@ -209,8 +210,10 @@ func (t *tracedConn) startRequestSpan(parent context.Context, msg *nats.Msg) (co
 // omits the segment rather than using the old "(anonymous)" literal). The
 // inbox subject itself stays observable via messaging.destination.name and
 // messaging.message.conversation_id.
-func (t *tracedConn) recordReply(parent context.Context, reqSpan trace.Span, reply *nats.Msg) {
-	reqSpan.SetAttributes(semconv.MessagingMessageConversationID(reply.Subject))
+func (t *tracedConn) recordReply(parent context.Context, reqSpan trace.Span, reply *nats.Msg, destIsInbox bool) {
+	if !destIsInbox {
+		reqSpan.SetAttributes(semconv.MessagingMessageConversationID(reply.Subject))
+	}
 	var originSC trace.SpanContext
 	receiveCtx := parent
 	if reply.Header != nil {
