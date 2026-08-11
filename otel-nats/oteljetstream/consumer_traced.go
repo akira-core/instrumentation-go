@@ -4,8 +4,10 @@ import (
 	"context"
 
 	"github.com/nats-io/nats.go/jetstream"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/akira-core/instrumentation-go/otel-nats/internal/spanname"
 	"github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 )
 
@@ -15,6 +17,7 @@ type tracedConsumer struct {
 	conn         *otelnats.Conn
 	streamName   string
 	consumerName string
+	destination  string
 	c            jetstream.Consumer
 }
 
@@ -27,7 +30,7 @@ func (c *tracedConsumer) on() bool { return c.conn.TracingEnabled() }
 func (c *tracedConsumer) direct() *directConsumer { return &directConsumer{c: c.c} }
 
 func (c *tracedConsumer) Consume(handler MsgHandler, opts ...jetstream.PullConsumeOpt) (ConsumeContext, error) {
-	wrapped := dynamicConsumeHandler(c.conn, c.consumerName, handler)
+	wrapped := dynamicConsumeHandler(c.conn, c.consumerName, c.destination, handler)
 	return wrapConsumeContext(c.c.Consume(wrapped, opts...))
 }
 
@@ -39,7 +42,7 @@ func (c *tracedConsumer) Messages(opts ...jetstream.PullMessagesOpt) (MessagesCo
 	// Always the dynamic iterator: the flag is resolved per Next, never at
 	// Messages time — this iterator is a canonically long-lived object and must
 	// follow relay changes in both directions.
-	return &tracedMessagesContext{conn: c.conn, iter: iter, consumerName: c.consumerName}, nil
+	return &tracedMessagesContext{conn: c.conn, iter: iter, consumerName: c.consumerName, destination: c.destination}, nil
 }
 
 func (c *tracedConsumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (context.Context, jetstream.Msg, error) {
@@ -62,8 +65,11 @@ func (c *tracedConsumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (
 		msgCtx = prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: h})
 	}
 	originSpanCtx := trace.SpanContextFromContext(msgCtx)
-	spanName := "receive " + msg.Subject()
+	name, template, _ := spanname.Resolve("receive", msg.Subject(), c.destination, nil)
 	attrs := receiveMsgAttrs(baseAttrs, msg)
+	if template != "" {
+		attrs = append(attrs, semconv.MessagingDestinationTemplate(template))
+	}
 	startOpts := []trace.SpanStartOption{
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(attrs...),
@@ -77,7 +83,7 @@ func (c *tracedConsumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (
 	// The span is ended immediately: a single-shot fetch has no processing-scope
 	// boundary to close it later. Child spans still parent correctly to an ended
 	// span via its still-valid SpanContext.
-	ctx, span := tracer.Start(context.Background(), spanName, startOpts...)
+	ctx, span := tracer.Start(context.Background(), name, startOpts...)
 	span.End()
 	return ctx, msg, nil
 }
@@ -89,7 +95,7 @@ func (c *tracedConsumer) Fetch(batch int, opts ...jetstream.FetchOpt) (MessageBa
 	if err != nil {
 		return nil, err
 	}
-	return newDynamicMessageBatch(c.conn, c.consumerName, raw), nil
+	return newDynamicMessageBatch(c.conn, c.consumerName, c.destination, raw), nil
 }
 
 func (c *tracedConsumer) FetchBytes(maxBytes int, opts ...jetstream.FetchOpt) (MessageBatch, error) {
@@ -97,7 +103,7 @@ func (c *tracedConsumer) FetchBytes(maxBytes int, opts ...jetstream.FetchOpt) (M
 	if err != nil {
 		return nil, err
 	}
-	return newDynamicMessageBatch(c.conn, c.consumerName, raw), nil
+	return newDynamicMessageBatch(c.conn, c.consumerName, c.destination, raw), nil
 }
 
 func (c *tracedConsumer) FetchNoWait(batch int) (MessageBatch, error) {
@@ -105,7 +111,7 @@ func (c *tracedConsumer) FetchNoWait(batch int) (MessageBatch, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newDynamicMessageBatch(c.conn, c.consumerName, raw), nil
+	return newDynamicMessageBatch(c.conn, c.consumerName, c.destination, raw), nil
 }
 
 func (c *tracedConsumer) Info(ctx context.Context) (*ConsumerInfo, error) {
@@ -121,20 +127,21 @@ func (c *tracedConsumer) CachedInfo() *ConsumerInfo {
 type tracedPushConsumer struct {
 	conn         *otelnats.Conn
 	consumerName string
+	destination  string
 	c            jetstream.PushConsumer
 }
 
 // newTracedPushConsumer wraps a raw jetstream.PushConsumer (and its constructor
 // error) as the instrumented PushConsumer impl.
-func newTracedPushConsumer(conn *otelnats.Conn, name string, cons jetstream.PushConsumer, err error) (PushConsumer, error) {
+func newTracedPushConsumer(conn *otelnats.Conn, name, destination string, cons jetstream.PushConsumer, err error) (PushConsumer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &tracedPushConsumer{conn: conn, consumerName: name, c: cons}, nil
+	return &tracedPushConsumer{conn: conn, consumerName: name, destination: destination, c: cons}, nil
 }
 
 func (c *tracedPushConsumer) Consume(handler MsgHandler, opts ...jetstream.PushConsumeOpt) (ConsumeContext, error) {
-	wrapped := dynamicConsumeHandler(c.conn, c.consumerName, handler)
+	wrapped := dynamicConsumeHandler(c.conn, c.consumerName, c.destination, handler)
 	return wrapConsumeContext(c.c.Consume(wrapped, opts...))
 }
 
@@ -155,7 +162,7 @@ func (c *tracedPushConsumer) CachedInfo() *ConsumerInfo {
 // jetstream's ErrHandlerRequired instead of panicking in the delivery goroutine.
 // When on, tracer/attrs are resolved once per message (not three separate impl()
 // reads via TracingEnabled + TraceContext + ServerAttrs).
-func dynamicConsumeHandler(conn *otelnats.Conn, consumerName string, handler MsgHandler) func(jetstream.Msg) {
+func dynamicConsumeHandler(conn *otelnats.Conn, consumerName, destination string, handler MsgHandler) func(jetstream.Msg) {
 	if handler == nil {
 		return nil
 	}
@@ -172,8 +179,11 @@ func dynamicConsumeHandler(conn *otelnats.Conn, consumerName string, handler Msg
 			msgCtx = prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: h})
 		}
 		originSpanCtx := trace.SpanContextFromContext(msgCtx)
-		spanName := "process " + msg.Subject()
+		name, template, _ := spanname.Resolve("process", msg.Subject(), destination, nil)
 		attrs := receiveMsgAttrs(baseAttrs, msg)
+		if template != "" {
+			attrs = append(attrs, semconv.MessagingDestinationTemplate(template))
+		}
 		startOpts := []trace.SpanStartOption{
 			trace.WithSpanKind(trace.SpanKindConsumer),
 			trace.WithAttributes(attrs...),
@@ -181,7 +191,7 @@ func dynamicConsumeHandler(conn *otelnats.Conn, consumerName string, handler Msg
 		if originSpanCtx.IsValid() {
 			startOpts = append(startOpts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
 		}
-		ctx, span := tracer.Start(context.Background(), spanName, startOpts...)
+		ctx, span := tracer.Start(context.Background(), name, startOpts...)
 		defer span.End()
 		handler(Msg{Msg: msg, Ctx: ctx})
 	}
@@ -198,6 +208,7 @@ type tracedMessagesContext struct {
 	conn         *otelnats.Conn
 	iter         jetstream.MessagesContext
 	consumerName string
+	destination  string
 }
 
 func (m *tracedMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context, jetstream.Msg, error) {
@@ -216,8 +227,11 @@ func (m *tracedMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context
 		msgCtx = prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: h})
 	}
 	originSpanCtx := trace.SpanContextFromContext(msgCtx)
-	spanName := "receive " + msg.Subject()
+	name, template, _ := spanname.Resolve("receive", msg.Subject(), m.destination, nil)
 	attrs := receiveMsgAttrs(baseAttrs, msg)
+	if template != "" {
+		attrs = append(attrs, semconv.MessagingDestinationTemplate(template))
+	}
 	startOpts := []trace.SpanStartOption{
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(attrs...),
@@ -229,7 +243,7 @@ func (m *tracedMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context
 	// ended immediately at handover — matching single-shot Consumer.Next.
 	// Child spans still parent correctly to an ended span via its still-valid
 	// SpanContext.
-	ctx, span := tracer.Start(context.Background(), spanName, startOpts...)
+	ctx, span := tracer.Start(context.Background(), name, startOpts...)
 	span.End()
 	return ctx, msg, nil
 }

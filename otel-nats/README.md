@@ -132,13 +132,13 @@ Optional: pass **WithTracerProvider(tp)**, **WithPropagators(p)**, or **WithTrac
 
 ### 3. Request/Reply
 
-`Conn.Request` / `RequestWithContext` / `RequestMsg` / `RequestMsgWithContext` mirror the equivalent `nats.Conn` methods exactly, but open a CLIENT span for the RPC and a second, linked CLIENT span for the reply (`receive` — a pull per the OTel messaging span-kind mapping):
+`Conn.Request` / `RequestWithContext` / `RequestMsg` / `RequestMsgWithContext` mirror the equivalent `nats.Conn` methods exactly, but open a CLIENT span for the RPC (`request {subject}`) and a second, linked CLIENT span for the reply — bare `receive`, with no destination segment, since the reply arrives on an auto-generated, single-use inbox (`_INBOX.<nuid>`) and semconv v1.39.0 says to omit `{destination}` when no low-cardinality value exists. The inbox subject stays queryable via `messaging.destination.name`, `messaging.destination.temporary=true`, `messaging.destination.anonymous=true`, and `messaging.message.conversation_id`:
 
 ```go
 reply, err := conn.RequestWithContext(ctx, "subject", []byte("ping"))
 if err != nil { log.Fatal(err) }
 // reply.Data — trace context for the request/reply pair is recorded on the CLIENT span;
-// the reply itself is recorded as a linked CLIENT "receive" span.
+// the reply itself is recorded as a linked CLIENT "receive" span (bare, no subject).
 ```
 
 `Request` / `RequestMsg` have no `context.Context` parameter (mirroring `nats.Conn`), so their producer span is rooted at `context.Background()` — use `RequestWithContext` / `RequestMsgWithContext` to chain into an existing trace.
@@ -199,7 +199,8 @@ conn, err := otelnats.Connect(url, nil)
 | **ConnectTLS** | `ConnectTLS(url, certFile, keyFile, caFile string, natsOpts ...nats.Option)`. Connects with mutual TLS. |
 | **ConnectWithCredentials** | `ConnectWithCredentials(url, credFile string, natsOpts ...nats.Option)`. Connects with JWT/NKey credentials. |
 | **ScopeName / Version()** | Used when creating Tracer (OTel contrib guideline). |
-| **Request / RequestWithContext / RequestMsg / RequestMsgWithContext** | RPC helpers mirroring `nats.Conn`; open a CLIENT span for the request and a linked CLIENT span for the reply receive. |
+| **Request / RequestWithContext / RequestMsg / RequestMsgWithContext** | RPC helpers mirroring `nats.Conn`; open a CLIENT span named `request {subject}` and a linked CLIENT span named bare `receive` for the reply. |
+| **Inbox span names** | A span whose resolved destination is a reply inbox drops the destination from its name (`publish`, `process`, `receive`) and keeps it on the attributes (see **Span names**). |
 | **JetStream consumer managers** | `JetStream` fully wraps `StreamConsumerManager`; `Stream` fully wraps `ConsumerManager`. Methods returning `Consumer` or `PushConsumer` remain trace-enabled wrappers (see JetStream section). |
 | **WithTraceDestination / SubscribeTraceEvents** | Convert NATS 2.11+ infrastructure trace events into OTel spans (see **NATS 2.11+ Trace Events**). |
 | **Tests** | Use `otel.SetTracerProvider(tp)` (and `otel.SetTextMapPropagator(prop)` if needed) before Connect. |
@@ -213,7 +214,7 @@ Span kind follows the OTel messaging "Span kind" mapping (`send` → `PRODUCER`,
 ```
 Publish / PublishMsg                     PRODUCER  (send)
 Request / RequestWithContext / ...       CLIENT    (request, awaits reply)
-  └── receive <reply-subject>            CLIENT    (linked reply receive, pull)
+  └── receive                            CLIENT    (linked reply receive, pull — bare name, no destination)
 Subscribe / QueueSubscribe handler       CONSUMER  (process, push-delivered)
 
 JetStream publish                        PRODUCER  (send)
@@ -222,6 +223,58 @@ JetStream Fetch / Messages / Next        CLIENT    (linked receive, pull)
 ```
 
 JetStream `receive`/`process` spans additionally carry `messaging.consumer.group.name` (the durable/consumer name); core NATS spans do not.
+
+---
+
+## Span names
+
+Span names follow the OTel messaging semconv v1.39.0 format `{messaging.operation.name} {destination}`:
+
+| Operation | Span name | Notes |
+|---|---|---|
+| Publish (core NATS or JetStream) | `publish {subject}` | was `send {subject}` before `0.9.0` |
+| Request | `request {subject}` | was `{subject} request` before `0.9.0` |
+| Reply receive | `receive` | bare, no destination — the inbox is auto-generated and single-use; was `receive {inbox}` before `0.9.0` |
+| Publish to a reply inbox | `publish` | bare — the manual responder half, `conn.Publish(msg.Reply, …)` |
+| Subscribe/QueueSubscribe handler | `process {destination}` | |
+| Handler on a reply inbox subscription | `process` | bare — the manual requester half |
+| JetStream consumer receive/process | `receive {destination}` / `process {destination}` | |
+
+`{destination}` resolves in this order: the subscription or single-valued JetStream consumer filter subject → the concrete message subject. A resolved destination that differs from the concrete subject (a wildcard subscription or filter) is additionally recorded on the span as `messaging.destination.template`; `messaging.destination.name` always carries the concrete subject. Both are facts the library already holds — it never guesses which token of a subject is an identifier.
+
+The resolved destination is then dropped from the span name entirely when it is a **reply inbox**, matching semconv's rule to omit `{destination}` when no low-cardinality value is available. The inbox stays fully queryable on the attributes: `messaging.destination.name`, `messaging.message.conversation_id`, `messaging.destination.temporary=true` and `messaging.destination.anonymous=true`.
+
+Inboxes are recognised by subject prefix, and **two prefixes are recognised**: this connection's own (`nats.CustomInboxPrefix(p)` ⇒ `p + "."`) and the default `_INBOX.` always. Recognising only the local prefix would fail exactly where custom prefixes are used — a responder sees the *requester's* inbox in `msg.Reply`, and the requester is the side that customises, because granting it `subscribe: _INBOX.>` would hand it every other client's replies while a responder needs no inbox permission at all. Two peers using two *different* custom prefixes will not recognise each other's inboxes; a collector-side span rename covers that case.
+
+### Subjects that embed identifiers
+
+A subject like `orders.12345.created` is not templated by this module: no library can tell which token is an identifier, and semconv forbids instrumentation from inferring `messaging.destination.template`. Two cases remain high-cardinality:
+
+- publish and request spans, which have no subscription or filter to resolve against; and
+- JetStream consumers with **no** filter subject, or with **several** wildcard filter subjects.
+
+Rewrite those downstream, where the pattern is known — the OTel Collector `span` processor does it without touching application code:
+
+```yaml
+span/to_attributes:
+  name:
+    to_attributes:
+      rules:
+        - ^receive orders\.(?P<orderId>[^.]+)\.created$
+# "receive orders.12345.created" -> "receive orders.{orderId}.created", orderId=12345
+```
+
+### Three words for one operation
+
+A publish span carries three spellings, all required by semconv, none of them a bug:
+
+| | Value | Why |
+|---|---|---|
+| `messaging.operation.type` | `send` | a **fixed enum**: `create`, `send`, `receive`, `process`, `settle` |
+| `messaging.operation.name` | `publish` (or `request`) | the **system's own verb** — NATS calls it Publish |
+| span name | `publish {subject}` | semconv's `{messaging.operation.name} {destination}` |
+
+The span name follows `operation.name`, not `operation.type`.
 
 ---
 

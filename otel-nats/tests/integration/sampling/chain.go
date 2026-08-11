@@ -356,7 +356,7 @@ func subscribeResponder(t *testing.T, cons service, subject string) <-chan conte
 }
 
 // coreRequestReply: Conn.RequestWithContext → responder Subscribe + Respond.
-// Covers three wrapper spans at once: the requester's "<subject> request"
+// Covers three wrapper spans at once: the requester's "request <subject>"
 // CLIENT span and reply "receive" span, and the responder's process span.
 func coreRequestReply(t *testing.T, prod, cons service, prodCtx context.Context, subject string) context.Context {
 	t.Helper()

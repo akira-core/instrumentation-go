@@ -26,7 +26,11 @@ func (s *tracedStream) Consumer(ctx context.Context, name string) (Consumer, err
 	if err != nil {
 		return nil, err
 	}
-	return &tracedConsumer{conn: s.conn, streamName: s.streamName, consumerName: name, c: cons}, nil
+	var destination string
+	if info := cons.CachedInfo(); info != nil {
+		destination = filterDestination(info.Config)
+	}
+	return &tracedConsumer{conn: s.conn, streamName: s.streamName, consumerName: name, destination: destination, c: cons}, nil
 }
 
 func (s *tracedStream) CreateConsumer(ctx context.Context, cfg ConsumerConfig) (Consumer, error) {
@@ -35,7 +39,8 @@ func (s *tracedStream) CreateConsumer(ctx context.Context, cfg ConsumerConfig) (
 		return nil, err
 	}
 	name := consumerNameFromConfig(cfg)
-	return &tracedConsumer{conn: s.conn, streamName: s.streamName, consumerName: name, c: cons}, nil
+	destination := filterDestination(cfg)
+	return &tracedConsumer{conn: s.conn, streamName: s.streamName, consumerName: name, destination: destination, c: cons}, nil
 }
 
 func (s *tracedStream) CreateOrUpdateConsumer(ctx context.Context, cfg ConsumerConfig) (Consumer, error) {
@@ -44,7 +49,8 @@ func (s *tracedStream) CreateOrUpdateConsumer(ctx context.Context, cfg ConsumerC
 		return nil, err
 	}
 	name := consumerNameFromConfig(cfg)
-	return &tracedConsumer{conn: s.conn, streamName: s.streamName, consumerName: name, c: cons}, nil
+	destination := filterDestination(cfg)
+	return &tracedConsumer{conn: s.conn, streamName: s.streamName, consumerName: name, destination: destination, c: cons}, nil
 }
 
 func (s *tracedStream) UpdateConsumer(ctx context.Context, cfg ConsumerConfig) (Consumer, error) {
@@ -53,7 +59,8 @@ func (s *tracedStream) UpdateConsumer(ctx context.Context, cfg ConsumerConfig) (
 		return nil, err
 	}
 	name := consumerNameFromConfig(cfg)
-	return &tracedConsumer{conn: s.conn, streamName: s.streamName, consumerName: name, c: cons}, nil
+	destination := filterDestination(cfg)
+	return &tracedConsumer{conn: s.conn, streamName: s.streamName, consumerName: name, destination: destination, c: cons}, nil
 }
 
 func (s *tracedStream) OrderedConsumer(ctx context.Context, cfg OrderedConsumerConfig) (Consumer, error) {
@@ -61,25 +68,32 @@ func (s *tracedStream) OrderedConsumer(ctx context.Context, cfg OrderedConsumerC
 	if err != nil {
 		return nil, err
 	}
-	return &tracedConsumer{conn: s.conn, streamName: s.streamName, consumerName: orderedConsumerNameFromConfig(cfg), c: cons}, nil
+	destination := filterDestination(jetstream.ConsumerConfig{FilterSubjects: cfg.FilterSubjects})
+	return &tracedConsumer{conn: s.conn, streamName: s.streamName, consumerName: orderedConsumerNameFromConfig(cfg), destination: destination, c: cons}, nil
 }
 
 func (s *tracedStream) PushConsumer(ctx context.Context, consumer string) (PushConsumer, error) {
 	cons, err := s.Stream.PushConsumer(ctx, consumer)
-	return newTracedPushConsumer(s.conn, consumer, cons, err)
+	var destination string
+	if err == nil {
+		if info := cons.CachedInfo(); info != nil {
+			destination = filterDestination(info.Config)
+		}
+	}
+	return newTracedPushConsumer(s.conn, consumer, destination, cons, err)
 }
 
 func (s *tracedStream) CreatePushConsumer(ctx context.Context, cfg ConsumerConfig) (PushConsumer, error) {
 	cons, err := s.Stream.CreatePushConsumer(ctx, cfg)
-	return newTracedPushConsumer(s.conn, consumerNameFromConfig(cfg), cons, err)
+	return newTracedPushConsumer(s.conn, consumerNameFromConfig(cfg), filterDestination(cfg), cons, err)
 }
 
 func (s *tracedStream) CreateOrUpdatePushConsumer(ctx context.Context, cfg ConsumerConfig) (PushConsumer, error) {
 	cons, err := s.Stream.CreateOrUpdatePushConsumer(ctx, cfg)
-	return newTracedPushConsumer(s.conn, consumerNameFromConfig(cfg), cons, err)
+	return newTracedPushConsumer(s.conn, consumerNameFromConfig(cfg), filterDestination(cfg), cons, err)
 }
 
 func (s *tracedStream) UpdatePushConsumer(ctx context.Context, cfg ConsumerConfig) (PushConsumer, error) {
 	cons, err := s.Stream.UpdatePushConsumer(ctx, cfg)
-	return newTracedPushConsumer(s.conn, consumerNameFromConfig(cfg), cons, err)
+	return newTracedPushConsumer(s.conn, consumerNameFromConfig(cfg), filterDestination(cfg), cons, err)
 }

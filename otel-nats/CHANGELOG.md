@@ -4,6 +4,45 @@ All notable changes to the `otel-nats` module (`otelnats` + `oteljetstream`) are
 
 > **Coverage note**: this file starts at `0.6.0`. Earlier history lives only in git tags (`otel-nats/vX.Y.Z`) and predates the module's rename from `Marz32onE/instrumentation-go` — see the repo root `VERSIONING.md` for the root cause and the release-tag CI guard that now keeps the version constant and tag in sync going forward.
 
+## [0.9.0] - 2026-08-11
+
+### Breaking
+
+Span names now follow the OTel messaging semconv v1.39.0 format `{messaging.operation.name} {destination}`. Migrate any dashboard, alert, or span-metrics query keyed on the old span names:
+
+| Old name | New name |
+|---|---|
+| `send {subject}` (publish, core NATS and JetStream) | `publish {subject}` |
+| `{subject} request` | `request {subject}` |
+| `receive {inbox}` (reply-receive) | `receive` (bare, no destination) |
+| `publish {inbox}` (manual reply via `conn.Publish(msg.Reply, …)`) | `publish` (bare, no destination) |
+| `process {inbox}` (handler on an inbox subscription) | `process` (bare, no destination) |
+
+- Publish spans (`Publish`/`PublishMsg`, core NATS and JetStream) are now named `publish {subject}` — the span already carried `messaging.operation.name=publish`; only the name was wrong.
+- Request spans (`Request`/`RequestWithContext`/`RequestMsg`/`RequestMsgWithContext`) are now named `request {subject}`, operation-first, replacing the destination-first `{subject} request`.
+- **Any** core-NATS span whose resolved destination is a request/reply inbox now drops the destination segment from its name, not just the reply-receive span. That covers all three halves of a manual exchange: the reply-receive span (`receive`), a reply published with `conn.Publish(msg.Reply, data)` (`publish`), and a handler on an inbox subscription (`process`). The inbox subject is auto-generated and single-use, and semconv v1.39.0 directs omitting `{destination}` when no low-cardinality value exists. The inbox stays queryable on every one of those spans via `messaging.destination.name`, `messaging.message.conversation_id`, `messaging.destination.temporary=true` and `messaging.destination.anonymous=true`.
+- JetStream consumer `receive`/`process` spans for a wildcard-filter consumer (`orders.*`, `orders.>`) are now named after the filter subject (e.g. `receive orders.*`) instead of the concrete delivered subject, bounding cardinality for wildcard consumers. A consumer with an exact filter subject, multiple filter subjects, or an unobservable filter configuration is unaffected (or falls back to the concrete subject, unchanged from `0.8.0`).
+
+### Added
+
+- JetStream consumer receive/process spans resolve their span-name destination from the consumer's filter subject when it is single-valued: an exact filter keeps the existing concrete name, and a filter containing a wildcard token (`*` or `>`) is used as the span name and additionally recorded as `messaging.destination.template`. A consumer with more than one filter subject, or whose filter configuration is not observable to the wrapper, falls back to the concrete delivered subject.
+- `messaging.destination.template` — set on any span whose resolved span-name destination differs from the concrete message subject (a wildcard subscription or consumer filter). `messaging.destination.name` continues to carry the concrete subject on every span, regardless of what the name uses.
+- `messaging.destination.temporary` / `messaging.destination.anonymous` / `messaging.message.conversation_id` — set on every span whose destination is a reply inbox, not only the reply-receive span.
+- Inbox detection recognises **two** subject prefixes: this connection's own (`nats.CustomInboxPrefix(p)` ⇒ `p + "."`) and the default `_INBOX.` unconditionally. Recognising only the local prefix would fail precisely where custom prefixes are deployed — a responder sees the *requester's* inbox in `msg.Reply`, and the requester is the side that customises, since granting it `subscribe: _INBOX.>` would hand it every other client's replies while a responder needs no inbox permission at all. Two peers on two *different* custom prefixes do not recognise each other's inboxes; a collector-side span rename covers that.
+- Shared span-name and destination-resolution logic lives in a new internal package, `otel-nats/internal/spanname`, used by both `otelnats` and `oteljetstream` — no per-package drift in the filter-then-concrete precedence or the inbox test.
+
+### Not included
+
+No option is provided to template subjects that embed identifiers (`orders.12345.created`). No library can tell which token of a NATS subject is an identifier, and semconv forbids instrumentation from inferring `messaging.destination.template` — it may only record one that is already known, which for this module means a subscription subject or a consumer filter subject. Publish and request spans (which have no subscription to resolve against) and JetStream consumers with no filter or several wildcard filters therefore keep the concrete subject in the span name. Rewrite those downstream, where the pattern is known:
+
+```yaml
+span/to_attributes:
+  name:
+    to_attributes:
+      rules:
+        - ^receive orders\.(?P<orderId>[^.]+)\.created$
+```
+
 ## [0.8.0] - 2026-08-07
 
 > **Every `0.8.0-rc.*` tag is superseded by this release.** `rc.1` and `rc.2` both

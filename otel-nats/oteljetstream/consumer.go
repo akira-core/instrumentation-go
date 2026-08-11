@@ -10,6 +10,7 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/akira-core/instrumentation-go/otel-nats/internal/spanname"
 	"github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 )
 
@@ -119,6 +120,21 @@ func receiveMsgAttrs(base []attribute.KeyValue, msg jetstream.Msg) []attribute.K
 	return attrs
 }
 
+// filterDestination returns a consumer's single filter subject as a low-cardinality
+// span-name destination, or "" when the consumer has no filter, multiple filters, or its
+// filter configuration is not observable here — callers then fall back to the concrete
+// delivered subject (see design.md decision D5 in the otel-nats-low-cardinality-span-names
+// OpenSpec change).
+func filterDestination(cfg jetstream.ConsumerConfig) string {
+	if cfg.FilterSubject != "" {
+		return cfg.FilterSubject
+	}
+	if len(cfg.FilterSubjects) == 1 {
+		return cfg.FilterSubjects[0]
+	}
+	return ""
+}
+
 // directMessageBatch is the passthrough MessageBatch: forwards messages with empty context.
 // No spans, no carriers, no attributes. Stop signals the background goroutine to exit.
 type directMessageBatch struct {
@@ -197,10 +213,10 @@ func newDirectMessageBatch(raw jetstream.MessageBatch) MessageBatch {
 // newDynamicMessageBatch wraps a raw jetstream.MessageBatch with a forwarder
 // that re-checks the connection tracing gate per message (design R2). Construction
 // never freezes direct vs traced for the batch lifetime.
-func newDynamicMessageBatch(conn *otelnats.Conn, consumerName string, raw jetstream.MessageBatch) MessageBatch {
+func newDynamicMessageBatch(conn *otelnats.Conn, consumerName, destination string, raw jetstream.MessageBatch) MessageBatch {
 	ch := make(chan Msg)
 	done := make(chan struct{})
-	spanner := &receiveSpanner{conn: conn, consumerName: consumerName}
+	spanner := &receiveSpanner{conn: conn, consumerName: consumerName, destination: destination}
 	go forwardBatch(raw, ch, done, spanner.wrap)
 	return &messageBatchTrace{ch: ch, raw: raw, done: done}
 }
@@ -217,6 +233,7 @@ func newDynamicMessageBatch(conn *otelnats.Conn, consumerName string, raw jetstr
 type receiveSpanner struct {
 	conn         *otelnats.Conn
 	consumerName string
+	destination  string
 
 	resolved  bool
 	tracer    trace.Tracer
@@ -237,14 +254,19 @@ func (s *receiveSpanner) wrap(msg jetstream.Msg) Msg {
 	if h := msg.Headers(); h != nil {
 		msgCtx = s.prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: h})
 	}
+	name, template, _ := spanname.Resolve("receive", msg.Subject(), s.destination, nil)
+	attrs := receiveMsgAttrs(s.baseAttrs, msg)
+	if template != "" {
+		attrs = append(attrs, semconv.MessagingDestinationTemplate(template))
+	}
 	opts := []trace.SpanStartOption{
 		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(receiveMsgAttrs(s.baseAttrs, msg)...),
+		trace.WithAttributes(attrs...),
 	}
 	if originSpanCtx := trace.SpanContextFromContext(msgCtx); originSpanCtx.IsValid() {
 		opts = append(opts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))
 	}
-	ctx, span := s.tracer.Start(context.Background(), "receive "+msg.Subject(), opts...)
+	ctx, span := s.tracer.Start(context.Background(), name, opts...)
 	span.End()
 	return Msg{Msg: msg, Ctx: ctx}
 }

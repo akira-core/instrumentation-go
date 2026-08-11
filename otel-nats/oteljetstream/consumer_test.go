@@ -598,7 +598,7 @@ func TestJetStreamConsumeLinksDirectlyToProducer(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond)
 
 	spans := sr.Ended()
-	producer := findSpanByNameAndKind(spans, "send "+"delcons.msg", oteltrace.SpanKindProducer)
+	producer := findSpanByNameAndKind(spans, "publish "+"delcons.msg", oteltrace.SpanKindProducer)
 	consumer := findSpanByNameAndKind(spans, "process "+"delcons.msg", oteltrace.SpanKindConsumer)
 	require.NotNil(t, producer)
 	require.NotNil(t, consumer)
@@ -662,7 +662,7 @@ func TestJetStreamFetchLinksDirectlyToProducer(t *testing.T) {
 	require.Equal(t, 1, received)
 
 	spans := sr.Ended()
-	producer := findSpanByNameAndKind(spans, "send "+"delfetch.msg", oteltrace.SpanKindProducer)
+	producer := findSpanByNameAndKind(spans, "publish "+"delfetch.msg", oteltrace.SpanKindProducer)
 	consumer := findSpanByNameAndKind(spans, "receive "+"delfetch.msg", oteltrace.SpanKindClient)
 	require.NotNil(t, producer)
 	require.NotNil(t, consumer)
