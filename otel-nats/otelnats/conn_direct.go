@@ -30,6 +30,10 @@ func (d *directConn) TraceContext() (trace.Tracer, propagation.TextMapPropagator
 func (d *directConn) ServerAttrs() []attribute.KeyValue { return nil }
 func (d *directConn) TraceDest() string                 { return "" }
 
+// InboxPrefixes returns nil: the passthrough path names no spans, so there is
+// nothing for an inbox test to protect.
+func (d *directConn) InboxPrefixes() []string { return nil }
+
 func (d *directConn) Publish(_ context.Context, subject string, data []byte) error {
 	return d.nc.Publish(subject, data)
 }

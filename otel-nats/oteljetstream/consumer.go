@@ -125,6 +125,26 @@ func receiveMsgAttrs(base []attribute.KeyValue, msg jetstream.Msg) []attribute.K
 // filter configuration is not observable here — callers then fall back to the concrete
 // delivered subject (see design.md decision D5 in the otel-nats-low-cardinality-span-names
 // OpenSpec change).
+// resolveMsgSpan computes the span name and the destination-derived attributes for one
+// delivered message. All four consume paths go through it so the inbox test, the
+// template attribute and the inbox markers cannot drift apart between them.
+//
+// inboxPrefixes is threaded from the connection rather than passed as nil: a stream can
+// capture inbox subjects (archiving replies for durability is legal and deployed), and an
+// unfiltered consumer over such a stream resolves its destination to the concrete
+// per-request subject — an unbounded span name unless the inbox test runs.
+func resolveMsgSpan(op string, msg jetstream.Msg, destination string, inboxPrefixes []string, baseAttrs []attribute.KeyValue) (string, []attribute.KeyValue) {
+	name, template, inbox := spanname.Resolve(op, msg.Subject(), destination, inboxPrefixes)
+	attrs := receiveMsgAttrs(baseAttrs, msg)
+	if template != "" {
+		attrs = append(attrs, semconv.MessagingDestinationTemplate(template))
+	}
+	if inbox {
+		attrs = append(attrs, spanname.InboxAttrs(msg.Subject())...)
+	}
+	return name, attrs
+}
+
 func filterDestination(cfg jetstream.ConsumerConfig) string {
 	if cfg.FilterSubject != "" {
 		return cfg.FilterSubject
@@ -254,11 +274,7 @@ func (s *receiveSpanner) wrap(msg jetstream.Msg) Msg {
 	if h := msg.Headers(); h != nil {
 		msgCtx = s.prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: h})
 	}
-	name, template, _ := spanname.Resolve("receive", msg.Subject(), s.destination, nil)
-	attrs := receiveMsgAttrs(s.baseAttrs, msg)
-	if template != "" {
-		attrs = append(attrs, semconv.MessagingDestinationTemplate(template))
-	}
+	name, attrs := resolveMsgSpan("receive", msg, s.destination, s.conn.InboxPrefixes(), s.baseAttrs)
 	opts := []trace.SpanStartOption{
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(attrs...),

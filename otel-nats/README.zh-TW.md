@@ -195,7 +195,8 @@ conn, err := otelnats.Connect(url, nil)
 | **Request / RequestWithContext / RequestMsg / RequestMsgWithContext** | 對齊 `nats.Conn` 的 RPC helper；為請求開啟 CLIENT span，並為回覆接收開啟一個連結的 CLIENT span。 |
 | **JetStream consumer manager** | `JetStream` 完整包裝 `StreamConsumerManager`；`Stream` 完整包裝 `ConsumerManager`。所有回傳 `Consumer` 或 `PushConsumer` 的方法仍會回傳具 trace 包裝的型別（見 JetStream 章節）。 |
 | **WithTraceDestination / SubscribeTraceEvents** | 將 NATS 2.11+ 的基礎設施追蹤事件轉換為 OTel span（見 **NATS 2.11+ 追蹤事件**）。 |
-| **Inbox span 名稱** | 解析出的 destination 若是回覆 inbox，該 span 的名稱去掉 destination（`publish`、`process`、`receive`），inbox 保留在屬性上（見 **Span 名稱**）。 |
+| **Inbox span 名稱** | 解析出的 destination 若是無界的回覆 inbox，該 span 的名稱去掉 destination（`publish`、`process`、`receive`），inbox 保留在屬性上。JetStream 亦適用 —— stream 可能捕捉 inbox subject（見 **Span 名稱**）。 |
+| **`Conn.InboxPrefixes()`** | 本連線認得的 inbox prefix（`0.9.1+`）。供 `oteljetstream` 使用；應用程式很少需要。 |
 | **測試** | 在 Connect 前呼叫 `otel.SetTracerProvider(tp)`（必要時 `otel.SetTextMapPropagator(prop)`）。 |
 
 ---
@@ -231,29 +232,39 @@ Span 名稱遵循 OTel messaging semconv v1.39.0 的格式 `{messaging.operation
 | 發布到回覆 inbox | `publish` | 裸名 —— 手動回覆的那一半，`conn.Publish(msg.Reply, …)` |
 | Subscribe/QueueSubscribe handler | `process {destination}` | |
 | 訂閱 inbox 的 handler | `process` | 裸名 —— 手動請求的那一半 |
-| JetStream consumer receive/process | `receive {destination}` / `process {destination}` | |
+| JetStream consumer receive/process | `receive {destination}` / `process {destination}` | `0.9.1` 起 inbox 判斷也適用 —— stream 可能捕捉 inbox subject |
+| JetStream 走捕捉 inbox 的 stream | `receive` / `process` / `publish` | 解析出的 destination 是無界 inbox 時為裸名 |
 
 `{destination}` 的解析順序：訂閱 subject 或單一值的 JetStream consumer filter subject → 具體訊息 subject。解析結果與具體 subject 不同時（wildcard 訂閱或 filter），額外記錄 `messaging.destination.template`；`messaging.destination.name` 一律保留具體 subject。兩者都是 library 已經握有的事實 —— 它不會去猜 subject 的哪一段是識別碼。
 
-解析出的 destination 若是**回覆 inbox**，就整段從 span 名稱移除，對應 semconv「沒有低基數值可用時省略 `{destination}`」的規定。inbox 在屬性上仍完全可查：`messaging.destination.name`、`messaging.message.conversation_id`、`messaging.destination.temporary=true`、`messaging.destination.anonymous=true`。
+解析出的 destination 若是**無界的回覆 inbox**，就整段從 span 名稱移除，對應 semconv「沒有低基數值可用時省略 `{destination}`」的規定。inbox 在屬性上仍完全可查：`messaging.destination.name`、`messaging.message.conversation_id`、`messaging.destination.temporary=true`、`messaging.destination.anonymous=true`。
 
-inbox 以 subject prefix 辨識，且**認兩個 prefix**：本連線自己的（`nats.CustomInboxPrefix(p)` ⇒ `p + "."`）以及永遠認預設的 `_INBOX.`。只認本地 prefix 會在使用 custom prefix 的部署失效 —— responder 在 `msg.Reply` 看到的是**請求端**的 inbox，而請求端才是會換 prefix 的一方：給它 `subscribe: _INBOX.>` 等於讓它收得到所有其他 client 的回覆，而 responder 完全不需要 inbox 權限。兩端各用**不同** custom prefix 時彼此認不出來，那種情況用 collector 端改名處理。
+關鍵在「無界」。**只由 inbox prefix 加 wildcard 構成**的 filter —— `_INBOX.>`，正是歸檔回覆的 consumer 會宣告的形狀 —— 是訂閱端自己選定的固定字串，因此保留在 span 名稱中並記錄為 `messaging.destination.template`。semconv 把 temporary/anonymous 的排除條款掛在 `messaging.destination.name`（`{destination}` 的**第二**順位）上，而不是掛在 `messaging.destination.template`（第一順位）上。含有字面 token 的 filter（如 `_INBOX.<nuid>.>`）則是逐請求產生的，與具體 inbox 一樣移除。無論名稱保留與否，temporary/anonymous/`conversation_id` 三個標記都照樣記錄：它們描述的是這次投遞，不是名稱。
 
-### 內嵌識別碼的 subject
+inbox 以 subject prefix 辨識，且**認兩個 prefix**：本連線自己的（`nats.CustomInboxPrefix(p)` ⇒ `p + "."`）以及永遠認預設的 `_INBOX.`。只認本地 prefix 會在使用 custom prefix 的部署失效 —— responder 在 `msg.Reply` 看到的是**請求端**的 inbox，而請求端才是會換 prefix 的一方：給它 `subscribe: _INBOX.>` 等於讓它收得到所有其他 client 的回覆，而 responder 完全不需要 inbox 權限。
 
-像 `orders.12345.created` 這種 subject，本模組**不會**替它產生樣板：沒有任何 library 能判斷哪一段是識別碼，而 semconv 禁止 instrumentation 推導 `messaging.destination.template`。兩種情況會維持高基數：
+### 殘餘的 span 名稱基數
+
+library **看得見**的無界 span 名稱都已由上述規則收斂。剩兩個來源，兩者在結構上都是它看不到的：
+
+**使用本連線不認得的 custom inbox prefix 的對端。** 兩端各用**不同** custom prefix 時，光憑具體 subject 彼此認不出來。回覆接收 span 不受影響 —— 那條路徑在結構上就知道自己拿的是 inbox，不管 prefix 是什麼 —— 任何固定的訂閱或 consumer filter 也不受影響，因為宣告出來的 filter 無論 prefix 為何都是有界的。剩下的是手動 `conn.Publish(peerInbox, …)`，以及直接訂閱在外來 prefix inbox 上的 handler。
+
+**內嵌識別碼的 subject。** 像 `orders.12345.created` 這種 subject，本模組**不會**替它產生樣板：沒有任何 library 能判斷哪一段是識別碼，而 semconv 允許記錄「已知的」`messaging.destination.template`，不允許推導一個出來。兩種情況會維持高基數：
 
 - publish 與 request span，沒有訂閱或 filter 可以解析；以及
 - **沒有** filter、或有**多個** wildcard filter subject 的 JetStream consumer。
 
-這些交給下游改寫 —— OTel Collector 的 `span` processor 不需要動應用程式碼：
+兩者都交給下游改寫 —— OTel Collector 的 `span` processor 不需要動應用程式碼：
 
 ```yaml
 span/to_attributes:
   name:
     to_attributes:
       rules:
+        # 內嵌識別碼的 subject。
         - ^receive orders\.(?P<orderId>[^.]+)\.created$
+        # 本連線不認得的外來 custom inbox prefix。
+        - ^(?P<op>publish|process) SVCB\.(?P<inbox>[^.]+)
 # "receive orders.12345.created" -> "receive orders.{orderId}.created"，orderId=12345
 ```
 

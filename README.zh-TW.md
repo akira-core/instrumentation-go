@@ -14,8 +14,8 @@
 |------|-------------|------------|------|
 | **otel-mongo** (v1) | `github.com/akira-core/instrumentation-go/otel-mongo/otelmongo` | 0.8.0 | MongoDB driver v1 封裝；寫入時注入 `_oteltrace`；`ContextFromDocument` 與解碼輔助。 |
 | **otel-mongo/v2** | `github.com/akira-core/instrumentation-go/otel-mongo/v2` | 2.8.0 | MongoDB driver v2 封裝；與 v1 行為對齊。走固定主版號的 `2.x` 線——詳見 [VERSIONING.md](VERSIONING.md)。 |
-| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.9.0 | 核心 NATS；W3C 脈絡在訊息標頭。 |
-| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.9.0 | JetStream 發布／消費／fetch。 |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/otelnats` | 0.9.1 | 核心 NATS；W3C 脈絡在訊息標頭。 |
+| **otel-nats** | `github.com/akira-core/instrumentation-go/otel-nats/oteljetstream` | 0.9.1 | JetStream 發布／消費／fetch。 |
 | **otel-gorilla-ws** | `github.com/akira-core/instrumentation-go/otel-gorilla-ws` | 0.8.0 | 在 JSON 訊息本文內傳遞 trace context（信封格式）；`NewConn` / `Dial`。 |
 
 ### 支援模組
@@ -37,7 +37,7 @@
 ```bash
 go get github.com/akira-core/instrumentation-go/otel-mongo@otel-mongo/v0.8.0
 go get github.com/akira-core/instrumentation-go/otel-mongo/v2@otel-mongo/v2.8.0
-go get github.com/akira-core/instrumentation-go/otel-nats@otel-nats/v0.9.0
+go get github.com/akira-core/instrumentation-go/otel-nats@otel-nats/v0.9.1
 go get github.com/akira-core/instrumentation-go/otel-gorilla-ws@otel-gorilla-ws/v0.8.0
 ```
 

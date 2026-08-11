@@ -18,7 +18,7 @@ import (
 const (
 	// ScopeName is the instrumentation scope name for Tracer creation (OTel contrib guideline).
 	ScopeName              = "instrumentation-go/otel-nats/otelnats"
-	instrumentationVersion = "0.9.0"
+	instrumentationVersion = "0.9.1"
 	messagingSystem        = "nats"
 )
 
@@ -129,6 +129,7 @@ type connImpl interface {
 	TraceContext() (trace.Tracer, propagation.TextMapPropagator)
 	ServerAttrs() []attribute.KeyValue
 	TraceDest() string
+	InboxPrefixes() []string
 }
 
 // Option configures Conn. Per OTel contrib: accept TracerProvider and Propagators, not Tracer.
@@ -319,6 +320,12 @@ func (c *Conn) TraceDest() string { return c.impl().TraceDest() }
 
 // ServerAttrs returns the pre-built server.address / server.port attributes for this connection.
 func (c *Conn) ServerAttrs() []attribute.KeyValue { return c.impl().ServerAttrs() }
+
+// InboxPrefixes returns the subject prefixes that identify a request/reply inbox as
+// seen from this connection (empty when tracing is off). Used by oteljetstream: a
+// stream may capture inbox subjects, so JetStream span names need the same test core
+// NATS applies.
+func (c *Conn) InboxPrefixes() []string { return c.impl().InboxPrefixes() }
 
 // TraceContext returns the tracer and propagator used by this Conn. Used by oteljetstream.
 func (c *Conn) TraceContext() (trace.Tracer, propagation.TextMapPropagator) {

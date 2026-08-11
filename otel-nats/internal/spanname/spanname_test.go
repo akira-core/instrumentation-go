@@ -113,6 +113,95 @@ func TestResolve(t *testing.T) {
 			wantInbox:     true,
 		},
 		{
+			// A filter that is nothing but the inbox prefix plus wildcards is a fixed
+			// string the subscriber declared: bounded, so semconv rule 1 (use
+			// messaging.destination.template when available) applies and the
+			// destination stays in the name. The delivery is still an inbox, so the
+			// inbox verdict — which drives the temporary/anonymous attributes — holds.
+			name:          "prefix-only wildcard filter is bounded and stays in the name",
+			op:            "receive",
+			concrete:      "_INBOX.7Yh2kQ.3",
+			filter:        "_INBOX.>",
+			inboxPrefixes: defaultPrefixes,
+			wantName:      "receive _INBOX.>",
+			wantTemplate:  "_INBOX.>",
+			wantInbox:     true,
+		},
+		{
+			name:          "prefix-only single-token wildcard filter is bounded",
+			op:            "process",
+			concrete:      "_INBOX.7Yh2kQ",
+			filter:        "_INBOX.*",
+			inboxPrefixes: defaultPrefixes,
+			wantName:      "process _INBOX.*",
+			wantTemplate:  "_INBOX.*",
+			wantInbox:     true,
+		},
+		{
+			name:          "prefix-only multi-token wildcard filter is bounded",
+			op:            "receive",
+			concrete:      "_INBOX.7Yh2kQ.3",
+			filter:        "_INBOX.*.*",
+			inboxPrefixes: defaultPrefixes,
+			wantName:      "receive _INBOX.*.*",
+			wantTemplate:  "_INBOX.*.*",
+			wantInbox:     true,
+		},
+		{
+			name:          "prefix-only wildcard filter under a custom prefix is bounded",
+			op:            "receive",
+			concrete:      "SVCA.7Yh2kQ.3",
+			filter:        "SVCA.>",
+			inboxPrefixes: customPrefixes,
+			wantName:      "receive SVCA.>",
+			wantTemplate:  "SVCA.>",
+			wantInbox:     true,
+		},
+		{
+			// The bounded carve-out is per matched prefix: the longest matching prefix
+			// is stripped, so a custom prefix nested under the default one is measured
+			// against its own remainder rather than the default's.
+			name:          "longest matching prefix decides the remainder",
+			op:            "receive",
+			concrete:      "_INBOX.svca.7Yh2kQ.3",
+			filter:        "_INBOX.svca.>",
+			inboxPrefixes: []string{"_INBOX.svca.", "_INBOX."},
+			wantName:      "receive _INBOX.svca.>",
+			wantTemplate:  "_INBOX.svca.>",
+			wantInbox:     true,
+		},
+		{
+			// One literal token after the prefix is enough to make the filter
+			// per-request: this is the "<inbox>.>" subscription shape.
+			name:          "a literal token after the prefix keeps the filter unbounded",
+			op:            "process",
+			concrete:      "_INBOX.7Yh2kQ.3",
+			filter:        "_INBOX.7Yh2kQ.*",
+			inboxPrefixes: defaultPrefixes,
+			wantName:      "process",
+			wantInbox:     true,
+		},
+		{
+			// No filter: the concrete inbox subject carries the nuid, so there is no
+			// bounded form to keep however the destination was reached.
+			name:          "concrete inbox is never bounded",
+			op:            "publish",
+			concrete:      "_INBOX.7Yh2kQ.3",
+			inboxPrefixes: defaultPrefixes,
+			wantName:      "publish",
+			wantInbox:     true,
+		},
+		{
+			// Degenerate shape: a destination equal to the prefix leaves an empty
+			// remainder, which is not a wildcard and must not be treated as bounded.
+			name:          "destination equal to the prefix is not bounded",
+			op:            "receive",
+			concrete:      "_INBOX.",
+			inboxPrefixes: defaultPrefixes,
+			wantName:      "receive",
+			wantInbox:     true,
+		},
+		{
 			name:          "empty destination is not an inbox",
 			op:            "receive",
 			concrete:      "",

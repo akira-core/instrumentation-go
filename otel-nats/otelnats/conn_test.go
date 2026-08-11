@@ -408,6 +408,46 @@ func TestRequestReplySpansShareConversationID(t *testing.T) {
 	assertAttr(t, processSpan.Attributes(), "messaging.message.conversation_id", inbox)
 }
 
+// TestRequestToInboxKeepsTargetConversationID pins that a request addressed AT an
+// inbox — the callback-style RPC where a peer advertised its own inbox — keeps the
+// conversation_id it was given at span start. Two conversations exist on that path:
+// the outer one the peer's inbox identifies, which the request message is sent into
+// and therefore belongs to, and the nested one identified by this request's own reply
+// inbox. Overwriting the first with the second when the reply lands made the attribute
+// change value mid-span, so the exported value disagreed with what anything reading the
+// span at start had seen.
+func TestRequestToInboxKeepsTargetConversationID(t *testing.T) {
+	url := startServer(t)
+	tp, sr := newTestProvider()
+	prop := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{})
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(prop)
+
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	peerInbox := nats.NewInbox()
+	_, err = conn.Subscribe(peerInbox, func(m otelnats.Msg) {
+		_ = m.Msg.Respond([]byte("pong"))
+	})
+	require.NoError(t, err)
+
+	reply, err := conn.Request(peerInbox, []byte("ping"), 2*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, "pong", string(reply.Data))
+	require.NotEqual(t, peerInbox, reply.Subject, "reply arrives on its own inbox, not the target")
+
+	requestSpan := findSpanByNameAndKind(sr.Ended(), "request", oteltrace.SpanKindClient)
+	require.NotNil(t, requestSpan, "an inbox-addressed request names its span bare")
+	assertAttr(t, requestSpan.Attributes(), "messaging.message.conversation_id", peerInbox)
+	assertAttr(t, requestSpan.Attributes(), "messaging.destination.name", peerInbox)
+
+	// The reply-receive span is the nested conversation, and keeps naming it.
+	receiveSpan := waitSpanByNameAndKind(t, sr, "receive", oteltrace.SpanKindClient)
+	assertAttr(t, receiveSpan.Attributes(), "messaging.message.conversation_id", reply.Subject)
+}
+
 // TestFailedRequestOmitsConversationID pins that a request with no responder
 // never observes the inbox, so no conversation_id is set on the send span.
 func TestFailedRequestOmitsConversationID(t *testing.T) {
