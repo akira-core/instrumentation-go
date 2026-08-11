@@ -6,7 +6,6 @@ import (
 	nats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.opentelemetry.io/otel/codes"
-	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/akira-core/instrumentation-go/otel-nats/internal/spanname"
@@ -56,13 +55,10 @@ func (j *tracedJSImpl) PublishMsg(ctx context.Context, msg *nats.Msg, opts ...je
 		msg.Header.Set("Nats-Trace-Dest", dest)
 	}
 	// No inbox prefixes: a JetStream subject is one a stream captures, and streams do
-	// not capture inbox subjects. The three-value signature is shared with the core
-	// paths, where the test does apply.
-	name, template, _ := spanname.Resolve("publish", msg.Subject, "", nil)
+	// not capture inbox subjects. No filter subject either, so Resolve can never
+	// surface a destination template on this path — only the name matters.
+	name, _, _ := spanname.Resolve("publish", msg.Subject, "", nil)
 	attrs := publishAttrs(msg, j.conn.ServerAttrs())
-	if template != "" {
-		attrs = append(attrs, semconv.MessagingDestinationTemplate(template))
-	}
 	ctx, span := tracer.Start(ctx, name,
 		trace.WithSpanKind(trace.SpanKindProducer),
 		trace.WithAttributes(attrs...),

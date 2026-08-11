@@ -144,11 +144,10 @@ func (t *tracedConn) requestWithCtx(parent context.Context, msg *nats.Msg) (*nat
 // here too: without it every reply sent that way names its span after a per-request
 // nuid.
 func (t *tracedConn) startSendSpan(parent context.Context, msg *nats.Msg) (context.Context, trace.Span) {
-	name, template, inbox := spanname.Resolve("publish", msg.Subject, "", t.inboxPrefixes)
+	// No filter subject on the publish path, so Resolve can never surface a
+	// destination template here — only the name and the inbox verdict matter.
+	name, _, inbox := spanname.Resolve("publish", msg.Subject, "", t.inboxPrefixes)
 	attrs := publishAttrs(msg, t.serverAttrs)
-	if template != "" {
-		attrs = append(attrs, semconv.MessagingDestinationTemplate(template))
-	}
 	if inbox {
 		attrs = append(attrs, inboxAttrs(msg.Subject)...)
 	}
@@ -169,11 +168,9 @@ func (t *tracedConn) startSendSpan(parent context.Context, msg *nats.Msg) (conte
 // rather than relabeling the attribute to fit the older RPC-style
 // "{destination} request" (design.md D1).
 func (t *tracedConn) startRequestSpan(parent context.Context, msg *nats.Msg) (context.Context, trace.Span) {
-	name, template, inbox := spanname.Resolve("request", msg.Subject, "", t.inboxPrefixes)
+	// No filter subject on the request path either — see startSendSpan.
+	name, _, inbox := spanname.Resolve("request", msg.Subject, "", t.inboxPrefixes)
 	attrs := requestAttrs(msg, t.serverAttrs)
-	if template != "" {
-		attrs = append(attrs, semconv.MessagingDestinationTemplate(template))
-	}
 	if inbox {
 		attrs = append(attrs, inboxAttrs(msg.Subject)...)
 	}
