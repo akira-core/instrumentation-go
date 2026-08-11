@@ -18,7 +18,7 @@ import (
 const (
 	// ScopeName is the instrumentation scope name for Tracer creation (OTel contrib guideline).
 	ScopeName              = "instrumentation-go/otel-nats/otelnats"
-	instrumentationVersion = "0.8.0"
+	instrumentationVersion = "0.9.0"
 	messagingSystem        = "nats"
 )
 
@@ -250,16 +250,46 @@ func newConn(nc *nats.Conn, opts ...Option) (*Conn, error) {
 	}
 	tracer := tp.Tracer(ScopeName, trace.WithInstrumentationVersion(Version()), trace.WithSchemaURL(semconv.SchemaURL))
 	traced := &tracedConn{
-		nc:          nc,
-		tracer:      tracer,
-		propagator:  cfg.Propagators,
-		serverAttrs: serverAttrsFromConn(nc),
-		traceDest:   cfg.TraceDest,
+		nc:            nc,
+		tracer:        tracer,
+		propagator:    cfg.Propagators,
+		serverAttrs:   serverAttrsFromConn(nc),
+		traceDest:     cfg.TraceDest,
+		inboxPrefixes: inboxPrefixes(nc),
 	}
 
 	// Both implementations exist; the per-operation resolution selects between
 	// them. The option supplied one rung of the ladder and pins nothing.
 	return &Conn{nc: nc, gate: gate, direct: direct, traced: traced}, nil
+}
+
+// inboxPrefixes returns the subject prefixes that identify a request/reply inbox as
+// seen from this connection. Resolved once at construction; nats.Conn.Opts is fixed
+// for the connection's life.
+//
+// Two prefixes are recognised, deliberately:
+//
+//   - this connection's own prefix, nats.CustomInboxPrefix + "." (the dot is appended
+//     by the client, and CustomInboxPrefix rejects a trailing one), which names every
+//     inbox this process creates; and
+//   - the default "_INBOX." always, which names the inboxes of every peer that did not
+//     customise it.
+//
+// Recognising only the local prefix would fail exactly where custom prefixes are used.
+// A responder sees the REQUESTER's inbox in msg.Reply, and the requester is the side
+// that customises — the reason to customise is that granting "subscribe _INBOX.>" hands
+// a client every other client's replies, which is the requester's permission, while a
+// responder needs no inbox permission at all (allow_responses covers it). So the common
+// shape is a custom-prefix requester talking to a default-prefix peer, in both
+// directions.
+//
+// Residual gap: two peers with DIFFERENT custom prefixes do not recognise each other's
+// inboxes. Rare, and a collector-side span rename covers it.
+func inboxPrefixes(nc *nats.Conn) []string {
+	if p := nc.Opts.InboxPrefix; p != "" && p+"." != nats.InboxPrefix {
+		return []string{p + ".", nats.InboxPrefix}
+	}
+	return []string{nats.InboxPrefix}
 }
 
 // serverAttrsFromConn parses the connected NATS server address into server.address / server.port attributes.

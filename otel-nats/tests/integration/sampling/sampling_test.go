@@ -283,7 +283,7 @@ func TestNatsRequestAmbientRoot(t *testing.T) {
 				"ambient-rooted request must not carry the seeded rv across")
 
 			// Both request-path span sites still fire: the requester's
-			// "<subject> request" CLIENT span and the reply "receive" span.
+			// "request <subject>" CLIENT span and the reply "receive" span.
 			// Their trace is reachable only through the responder's link, which
 			// arrives asynchronously — so wait for them rather than sampling
 			// the sink once.
@@ -300,13 +300,13 @@ func TestNatsRequestAmbientRoot(t *testing.T) {
 }
 
 // requestSpanRoles reports whether the wrapper spans include the requester's
-// "<subject> request" CLIENT span and the reply "receive <inbox>" span.
+// "request <subject>" CLIENT span and the bare "receive" reply span.
 func requestSpanRoles(wrapper []harness.Span) (request, receive bool) {
 	for _, s := range wrapper {
 		switch {
-		case strings.HasSuffix(s.Name, " request"):
+		case strings.HasPrefix(s.Name, "request "):
 			request = true
-		case strings.HasPrefix(s.Name, "receive "):
+		case s.Name == "receive":
 			receive = true
 		}
 	}
@@ -357,7 +357,7 @@ func TestNatsSamplingRate(t *testing.T) {
 }
 
 // TestNatsFullSpanShape pins the exact span shape of one publish→subscribe
-// hop: producer app span + wrapper PRODUCER "send" span in the seeded trace;
+// hop: producer app span + wrapper PRODUCER "publish" span in the seeded trace;
 // wrapper CONSUMER "process" span + consumer app span in a new trace linked to
 // the producer's — all carrying the seeded rv.
 func TestNatsFullSpanShape(t *testing.T) {
@@ -372,7 +372,7 @@ func TestNatsFullSpanShape(t *testing.T) {
 
 	runID, _ := driveChain(t, sink, svcs, rates, scenario{"fullshape", coreSubscribe}, rv)
 
-	// Wait until both wrapper spans (producer send, consumer process) arrive.
+	// Wait until both wrapper spans (producer publish, consumer process) arrive.
 	snapshot := sink.WaitFor(20*time.Second, func(ss []harness.Span) bool {
 		w := harness.SpansByScope(ss, otelnats.ScopeName)
 		return len(harness.SpansByService(w, svcs[0].name)) > 0 &&
@@ -386,7 +386,7 @@ func TestNatsFullSpanShape(t *testing.T) {
 	harness.AssertAllSpansCarryRV(t, full, rv)
 
 	wrapper := harness.SpansByScope(full, otelnats.ScopeName)
-	require.Len(t, harness.SpansByService(wrapper, svcs[0].name), 1, "producer: one send span")
+	require.Len(t, harness.SpansByService(wrapper, svcs[0].name), 1, "producer: one publish span")
 	require.Len(t, harness.SpansByService(wrapper, svcs[1].name), 1, "consumer: one process span")
 	apps := harness.SpansByAttr(full, harness.RunAttr, runID)
 	require.Len(t, harness.SpansByService(apps, svcs[0].name), 1, "producer: one app span")

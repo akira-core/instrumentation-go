@@ -10,17 +10,35 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/akira-core/instrumentation-go/otel-nats/internal/spanname"
 )
 
 // tracedConn is the fully-instrumented connImpl: every Publish/PublishMsg/Request
 // opens a producer span, every wrapMsgHandler closure extracts the incoming trace
 // header and opens a consumer span.
 type tracedConn struct {
-	nc          *nats.Conn
-	tracer      trace.Tracer
-	propagator  propagation.TextMapPropagator
-	serverAttrs []attribute.KeyValue
-	traceDest   string
+	nc            *nats.Conn
+	tracer        trace.Tracer
+	propagator    propagation.TextMapPropagator
+	serverAttrs   []attribute.KeyValue
+	traceDest     string
+	inboxPrefixes []string
+}
+
+// inboxAttrs marks a span whose destination is a request/reply inbox. The subject is
+// auto-generated and single-use, so the span NAME omits it (spanname.Resolve) while
+// these attributes keep it queryable: semconv scopes the low-cardinality requirement
+// to the span name, and messaging.destination.name stays Conditionally Required with
+// no carve-out for temporary or anonymous destinations. messaging.destination.name is
+// already set by publishAttrs/receiveAttrs; this adds the three that identify the
+// destination as an inbox.
+func inboxAttrs(subject string) []attribute.KeyValue {
+	return []attribute.KeyValue{
+		semconv.MessagingMessageConversationID(subject),
+		semconv.MessagingDestinationTemporary(true),
+		semconv.MessagingDestinationAnonymous(true),
+	}
 }
 
 func (t *tracedConn) TracingEnabled() bool { return true }
@@ -120,10 +138,23 @@ func (t *tracedConn) requestWithCtx(parent context.Context, msg *nats.Msg) (*nat
 // startSendSpan opens the PRODUCER span used by Publish/PublishMsg, injects
 // trace context, and returns the span-carrying context for the underlying
 // driver call. Fire-and-forget semantics: caller does not block on a peer reply.
+//
+// Publishing to an inbox is the responder half of a manual request/reply exchange
+// (nc.Publish(msg.Reply, data) rather than msg.Respond), so the inbox test applies
+// here too: without it every reply sent that way names its span after a per-request
+// nuid.
 func (t *tracedConn) startSendSpan(parent context.Context, msg *nats.Msg) (context.Context, trace.Span) {
-	ctx, span := t.tracer.Start(parent, "send "+msg.Subject,
+	name, template, inbox := spanname.Resolve("publish", msg.Subject, "", t.inboxPrefixes)
+	attrs := publishAttrs(msg, t.serverAttrs)
+	if template != "" {
+		attrs = append(attrs, semconv.MessagingDestinationTemplate(template))
+	}
+	if inbox {
+		attrs = append(attrs, inboxAttrs(msg.Subject)...)
+	}
+	ctx, span := t.tracer.Start(parent, name,
 		trace.WithSpanKind(trace.SpanKindProducer),
-		trace.WithAttributes(publishAttrs(msg, t.serverAttrs)...),
+		trace.WithAttributes(attrs...),
 	)
 	t.propagator.Inject(ctx, &HeaderCarrier{H: msg.Header})
 	return ctx, span
@@ -132,12 +163,23 @@ func (t *tracedConn) startSendSpan(parent context.Context, msg *nats.Msg) (conte
 // startRequestSpan opens the CLIENT span used by Request/RequestMsg/
 // RequestWithContext/RequestMsgWithContext. Request/reply is an RPC pattern
 // (caller blocks on a peer Respond), so PRODUCER kind would mis-classify it.
-// Span name follows OTel naming guidance for RPC client operations:
-// "{destination} request".
+// Span name is operation-first, "request {destination}", matching semconv
+// v1.39.0's "{messaging.operation.name} {destination}" shape and the
+// messaging.operation.name=request attribute requestAttrs already sets —
+// rather than relabeling the attribute to fit the older RPC-style
+// "{destination} request" (design.md D1).
 func (t *tracedConn) startRequestSpan(parent context.Context, msg *nats.Msg) (context.Context, trace.Span) {
-	ctx, span := t.tracer.Start(parent, msg.Subject+" request",
+	name, template, inbox := spanname.Resolve("request", msg.Subject, "", t.inboxPrefixes)
+	attrs := requestAttrs(msg, t.serverAttrs)
+	if template != "" {
+		attrs = append(attrs, semconv.MessagingDestinationTemplate(template))
+	}
+	if inbox {
+		attrs = append(attrs, inboxAttrs(msg.Subject)...)
+	}
+	ctx, span := t.tracer.Start(parent, name,
 		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(requestAttrs(msg, t.serverAttrs)...),
+		trace.WithAttributes(attrs...),
 	)
 	t.propagator.Inject(ctx, &HeaderCarrier{H: msg.Header})
 	return ctx, span
@@ -159,6 +201,17 @@ func (t *tracedConn) startRequestSpan(parent context.Context, msg *nats.Msg) (co
 // never calls recordReply, so its send span carries no conversation_id —
 // conformant, since the semconv requirement level is Recommended, and expected
 // since samplers only observe span-start attributes.
+//
+// The reply inbox is structurally always anonymous and temporary (an
+// auto-generated per-request subject that stops existing once the exchange
+// completes), so inboxAttrs is applied unconditionally here rather than via a
+// prefix test — correct even under nats.CustomInboxPrefix, and correct even
+// when the peer's prefix is one this connection would not recognise. Per
+// design.md D2 the span name is the bare literal "receive": no
+// spanname.Resolve call and no {destination} segment at all (semconv v1.39.0
+// omits the segment rather than using the old "(anonymous)" literal). The
+// inbox subject itself stays observable via messaging.destination.name and
+// messaging.message.conversation_id.
 func (t *tracedConn) recordReply(parent context.Context, reqSpan trace.Span, reply *nats.Msg) {
 	reqSpan.SetAttributes(semconv.MessagingMessageConversationID(reply.Subject))
 	var originSC trace.SpanContext
@@ -170,7 +223,7 @@ func (t *tracedConn) recordReply(parent context.Context, reqSpan trace.Span, rep
 			receiveCtx = extracted
 		}
 	}
-	attrs := append(receiveAttrs(reply, "", "receive", t.serverAttrs), semconv.MessagingMessageConversationID(reply.Subject))
+	attrs := append(receiveAttrs(reply, "", "receive", t.serverAttrs), inboxAttrs(reply.Subject)...)
 	opts := []trace.SpanStartOption{
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(attrs...),
@@ -178,7 +231,7 @@ func (t *tracedConn) recordReply(parent context.Context, reqSpan trace.Span, rep
 	if originSC.IsValid() {
 		opts = append(opts, trace.WithLinks(trace.Link{SpanContext: originSC}))
 	}
-	_, span := t.tracer.Start(receiveCtx, "receive "+reply.Subject, opts...)
+	_, span := t.tracer.Start(receiveCtx, "receive", opts...)
 	span.End()
 }
 
@@ -186,14 +239,28 @@ func (t *tracedConn) traceEventHandler() nats.MsgHandler {
 	return buildTraceEventHandler(t.tracer, t.propagator)
 }
 
+// wrapMsgHandler opens the CONSUMER span for each delivery. The subscription
+// subject is the destination — a fact the subscriber declared, and already the
+// low-cardinality form for a wildcard subscription. The inbox test still applies:
+// a subscription to an inbox (or to "<inbox>.>", where the FILTER carries the nuid
+// and the concrete subject alone would not reveal it) is the manual half of
+// request/reply, and spanname.Resolve tests the resolved destination for exactly
+// that reason.
 func (t *tracedConn) wrapMsgHandler(subject, queue string, handler MsgHandler) nats.MsgHandler {
 	return func(msg *nats.Msg) {
 		msgCtx := t.propagator.Extract(context.Background(), &HeaderCarrier{H: msg.Header})
 		originSpanCtx := trace.SpanContextFromContext(msgCtx)
-		spanName := "process " + subject
+		spanName, template, inbox := spanname.Resolve("process", msg.Subject, subject, t.inboxPrefixes)
+		attrs := receiveAttrs(msg, queue, "process", t.serverAttrs)
+		if template != "" {
+			attrs = append(attrs, semconv.MessagingDestinationTemplate(template))
+		}
+		if inbox {
+			attrs = append(attrs, inboxAttrs(msg.Subject)...)
+		}
 		opts := []trace.SpanStartOption{
 			trace.WithSpanKind(trace.SpanKindConsumer),
-			trace.WithAttributes(receiveAttrs(msg, queue, "process", t.serverAttrs)...),
+			trace.WithAttributes(attrs...),
 		}
 		if originSpanCtx.IsValid() {
 			opts = append(opts, trace.WithLinks(trace.Link{SpanContext: originSpanCtx}))

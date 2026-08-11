@@ -6,8 +6,10 @@ import (
 	nats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/akira-core/instrumentation-go/otel-nats/internal/spanname"
 	"github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 )
 
@@ -53,9 +55,17 @@ func (j *tracedJSImpl) PublishMsg(ctx context.Context, msg *nats.Msg, opts ...je
 	if dest := j.conn.TraceDest(); dest != "" {
 		msg.Header.Set("Nats-Trace-Dest", dest)
 	}
-	ctx, span := tracer.Start(ctx, "send "+msg.Subject,
+	// No inbox prefixes: a JetStream subject is one a stream captures, and streams do
+	// not capture inbox subjects. The three-value signature is shared with the core
+	// paths, where the test does apply.
+	name, template, _ := spanname.Resolve("publish", msg.Subject, "", nil)
+	attrs := publishAttrs(msg, j.conn.ServerAttrs())
+	if template != "" {
+		attrs = append(attrs, semconv.MessagingDestinationTemplate(template))
+	}
+	ctx, span := tracer.Start(ctx, name,
 		trace.WithSpanKind(trace.SpanKindProducer),
-		trace.WithAttributes(publishAttrs(msg, j.conn.ServerAttrs())...),
+		trace.WithAttributes(attrs...),
 	)
 	defer span.End()
 	prop.Inject(ctx, &otelnats.HeaderCarrier{H: msg.Header})
@@ -81,7 +91,11 @@ func (j *tracedJSImpl) Consumer(ctx context.Context, stream string, consumer str
 	if err != nil {
 		return nil, err
 	}
-	return &tracedConsumer{conn: j.conn, streamName: stream, consumerName: consumer, c: cons}, nil
+	var destination string
+	if info := cons.CachedInfo(); info != nil {
+		destination = filterDestination(info.Config)
+	}
+	return &tracedConsumer{conn: j.conn, streamName: stream, consumerName: consumer, destination: destination, c: cons}, nil
 }
 
 func (j *tracedJSImpl) CreateConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (Consumer, error) {
@@ -90,7 +104,8 @@ func (j *tracedJSImpl) CreateConsumer(ctx context.Context, stream string, cfg Co
 		return nil, err
 	}
 	name := consumerNameFromConfig(cfg)
-	return &tracedConsumer{conn: j.conn, streamName: stream, consumerName: name, c: cons}, nil
+	destination := filterDestination(cfg)
+	return &tracedConsumer{conn: j.conn, streamName: stream, consumerName: name, destination: destination, c: cons}, nil
 }
 
 func (j *tracedJSImpl) CreateOrUpdateConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (Consumer, error) {
@@ -99,7 +114,8 @@ func (j *tracedJSImpl) CreateOrUpdateConsumer(ctx context.Context, stream string
 		return nil, err
 	}
 	name := consumerNameFromConfig(cfg)
-	return &tracedConsumer{conn: j.conn, streamName: stream, consumerName: name, c: cons}, nil
+	destination := filterDestination(cfg)
+	return &tracedConsumer{conn: j.conn, streamName: stream, consumerName: name, destination: destination, c: cons}, nil
 }
 
 func (j *tracedJSImpl) UpdateConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (Consumer, error) {
@@ -108,7 +124,8 @@ func (j *tracedJSImpl) UpdateConsumer(ctx context.Context, stream string, cfg Co
 		return nil, err
 	}
 	name := consumerNameFromConfig(cfg)
-	return &tracedConsumer{conn: j.conn, streamName: stream, consumerName: name, c: cons}, nil
+	destination := filterDestination(cfg)
+	return &tracedConsumer{conn: j.conn, streamName: stream, consumerName: name, destination: destination, c: cons}, nil
 }
 
 func (j *tracedJSImpl) OrderedConsumer(ctx context.Context, stream string, cfg OrderedConsumerConfig) (Consumer, error) {
@@ -116,7 +133,8 @@ func (j *tracedJSImpl) OrderedConsumer(ctx context.Context, stream string, cfg O
 	if err != nil {
 		return nil, err
 	}
-	return &tracedConsumer{conn: j.conn, streamName: stream, consumerName: orderedConsumerNameFromConfig(cfg), c: cons}, nil
+	destination := filterDestination(jetstream.ConsumerConfig{FilterSubjects: cfg.FilterSubjects})
+	return &tracedConsumer{conn: j.conn, streamName: stream, consumerName: orderedConsumerNameFromConfig(cfg), destination: destination, c: cons}, nil
 }
 
 func (j *tracedJSImpl) DeleteConsumer(ctx context.Context, stream string, consumer string) error {
@@ -125,22 +143,28 @@ func (j *tracedJSImpl) DeleteConsumer(ctx context.Context, stream string, consum
 
 func (j *tracedJSImpl) PushConsumer(ctx context.Context, stream string, consumer string) (PushConsumer, error) {
 	cons, err := j.js.PushConsumer(ctx, stream, consumer)
-	return newTracedPushConsumer(j.conn, consumer, cons, err)
+	var destination string
+	if err == nil {
+		if info := cons.CachedInfo(); info != nil {
+			destination = filterDestination(info.Config)
+		}
+	}
+	return newTracedPushConsumer(j.conn, consumer, destination, cons, err)
 }
 
 func (j *tracedJSImpl) CreatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error) {
 	cons, err := j.js.CreatePushConsumer(ctx, stream, cfg)
-	return newTracedPushConsumer(j.conn, consumerNameFromConfig(cfg), cons, err)
+	return newTracedPushConsumer(j.conn, consumerNameFromConfig(cfg), filterDestination(cfg), cons, err)
 }
 
 func (j *tracedJSImpl) CreateOrUpdatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error) {
 	cons, err := j.js.CreateOrUpdatePushConsumer(ctx, stream, cfg)
-	return newTracedPushConsumer(j.conn, consumerNameFromConfig(cfg), cons, err)
+	return newTracedPushConsumer(j.conn, consumerNameFromConfig(cfg), filterDestination(cfg), cons, err)
 }
 
 func (j *tracedJSImpl) UpdatePushConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (PushConsumer, error) {
 	cons, err := j.js.UpdatePushConsumer(ctx, stream, cfg)
-	return newTracedPushConsumer(j.conn, consumerNameFromConfig(cfg), cons, err)
+	return newTracedPushConsumer(j.conn, consumerNameFromConfig(cfg), filterDestination(cfg), cons, err)
 }
 
 func (j *tracedJSImpl) Unwrap() jetstream.JetStream { return j.js }

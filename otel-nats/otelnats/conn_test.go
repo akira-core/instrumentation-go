@@ -102,6 +102,24 @@ func assertIntAttr(t *testing.T, attrs []attribute.KeyValue, key string, want in
 	t.Errorf("attribute %q not found", key)
 }
 
+func assertBoolAttr(t *testing.T, attrs []attribute.KeyValue, key string, want bool) {
+	t.Helper()
+	for _, kv := range attrs {
+		if string(kv.Key) == key {
+			assert.Equal(t, want, kv.Value.AsBool(), "attribute %q", key)
+			return
+		}
+	}
+	t.Errorf("attribute %q not found", key)
+}
+
+func assertNoAttr(t *testing.T, attrs []attribute.KeyValue, key string) {
+	t.Helper()
+	for _, kv := range attrs {
+		assert.NotEqual(t, key, string(kv.Key), "attribute %q should be absent", key)
+	}
+}
+
 func TestW3CPropagationRoundtrip(t *testing.T) {
 	url := startServer(t)
 	tp, _ := newTestProvider()
@@ -156,7 +174,7 @@ func TestPublishCreatesProducerSpan(t *testing.T) {
 	spans := sr.Ended()
 	require.Len(t, spans, 1)
 	s := spans[0]
-	assert.Equal(t, "send "+subject, s.Name())
+	assert.Equal(t, "publish "+subject, s.Name())
 	assert.Equal(t, oteltrace.SpanKindProducer, s.SpanKind())
 	assertAttr(t, s.Attributes(), "messaging.system", "nats")
 	assertAttr(t, s.Attributes(), "messaging.destination.name", subject)
@@ -277,7 +295,7 @@ func TestSubscribeConsumerSpanLinkedToProducer(t *testing.T) {
 		t.Fatal("timeout")
 	}
 
-	producer := waitSpanByNameAndKind(t, sr, "send "+subject, oteltrace.SpanKindProducer)
+	producer := waitSpanByNameAndKind(t, sr, "publish "+subject, oteltrace.SpanKindProducer)
 	consumer := waitSpanByNameAndKind(t, sr, "process "+subject, oteltrace.SpanKindConsumer)
 	require.Len(t, consumer.Links(), 1, "consumer span should have 1 link to producer")
 	linkCtx := consumer.Links()[0].SpanContext
@@ -304,7 +322,7 @@ func TestRequestCreatesClientSpanAndReturnsReply(t *testing.T) {
 	assert.Equal(t, "pong", string(reply.Data))
 
 	spans := sr.Ended()
-	requestSpan := findSpanByNameAndKind(spans, subject+" request", oteltrace.SpanKindClient)
+	requestSpan := findSpanByNameAndKind(spans, "request "+subject, oteltrace.SpanKindClient)
 	require.NotNil(t, requestSpan, "no client span for request")
 
 	var receiveSpan trace.ReadOnlySpan
@@ -315,7 +333,7 @@ func TestRequestCreatesClientSpanAndReturnsReply(t *testing.T) {
 		}
 	}
 	require.NotNil(t, receiveSpan, "no client span for reply receive")
-	assert.True(t, strings.HasPrefix(receiveSpan.Name(), "receive "), "reply receive span name %q", receiveSpan.Name())
+	assert.Equal(t, "receive", receiveSpan.Name())
 }
 
 // TestRequestSpanKeepsRequestBodySize pins that recordReply does not overwrite
@@ -342,11 +360,11 @@ func TestRequestSpanKeepsRequestBodySize(t *testing.T) {
 	require.Equal(t, replyPayload, reply.Data)
 
 	spans := sr.Ended()
-	requestSpan := findSpanByNameAndKind(spans, subject+" request", oteltrace.SpanKindClient)
+	requestSpan := findSpanByNameAndKind(spans, "request "+subject, oteltrace.SpanKindClient)
 	require.NotNil(t, requestSpan, "no client span for request")
 	assertIntAttr(t, requestSpan.Attributes(), "messaging.message.body.size", int64(len(request)))
 
-	receiveSpan := findSpanByNameAndKind(spans, "receive "+reply.Subject, oteltrace.SpanKindClient)
+	receiveSpan := findSpanByNameAndKind(spans, "receive", oteltrace.SpanKindClient)
 	require.NotNil(t, receiveSpan, "no client span for reply receive")
 	assertIntAttr(t, receiveSpan.Attributes(), "messaging.message.body.size", int64(len(replyPayload)))
 }
@@ -379,11 +397,11 @@ func TestRequestReplySpansShareConversationID(t *testing.T) {
 	require.True(t, strings.HasPrefix(inbox, "_INBOX."), "reply subject %q should be an inbox", inbox)
 
 	spans := sr.Ended()
-	requestSpan := findSpanByNameAndKind(spans, subject+" request", oteltrace.SpanKindClient)
+	requestSpan := findSpanByNameAndKind(spans, "request "+subject, oteltrace.SpanKindClient)
 	require.NotNil(t, requestSpan, "no client span for request")
 	assertAttr(t, requestSpan.Attributes(), "messaging.message.conversation_id", inbox)
 
-	receiveSpan := waitSpanByNameAndKind(t, sr, "receive "+inbox, oteltrace.SpanKindClient)
+	receiveSpan := waitSpanByNameAndKind(t, sr, "receive", oteltrace.SpanKindClient)
 	assertAttr(t, receiveSpan.Attributes(), "messaging.message.conversation_id", inbox)
 
 	processSpan := waitSpanByNameAndKind(t, sr, "process "+subject, oteltrace.SpanKindConsumer)
@@ -405,7 +423,7 @@ func TestFailedRequestOmitsConversationID(t *testing.T) {
 	require.Error(t, err)
 
 	spans := sr.Ended()
-	requestSpan := findSpanByNameAndKind(spans, subject+" request", oteltrace.SpanKindClient)
+	requestSpan := findSpanByNameAndKind(spans, "request "+subject, oteltrace.SpanKindClient)
 	require.NotNil(t, requestSpan, "no client span for request")
 	assert.Equal(t, codes.Error, requestSpan.Status().Code, "failed request should record error status")
 	for _, kv := range requestSpan.Attributes() {
@@ -526,4 +544,276 @@ func TestNoDeliverSpanOnPublishAndConsume(t *testing.T) {
 	// Consumer link should point to producer span
 	require.Len(t, consumer.Links(), 1)
 	assert.Equal(t, producer.SpanContext().SpanID(), consumer.Links()[0].SpanContext.SpanID())
+}
+
+// TestPublishSpanNameIsOperationFirst pins the rename from "send {subject}" to
+// "publish {subject}" (design.md D1): the span name now matches the
+// messaging.operation.name attribute already emitted.
+func TestPublishSpanNameIsOperationFirst(t *testing.T) {
+	url := startServer(t)
+	tp, sr := newTestProvider()
+	otel.SetTracerProvider(tp)
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	subject := "test.publish.opname"
+	err = conn.Publish(context.Background(), subject, []byte("hello"))
+	require.NoError(t, err)
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	s := spans[0]
+	assert.Equal(t, "publish "+subject, s.Name())
+	assertAttr(t, s.Attributes(), "messaging.operation.name", "publish")
+}
+
+// TestRequestSpanNameIsOperationFirst pins the rename from the
+// destination-first "{subject} request" to the operation-first
+// "request {subject}".
+func TestRequestSpanNameIsOperationFirst(t *testing.T) {
+	url := startServer(t)
+	tp, sr := newTestProvider()
+	otel.SetTracerProvider(tp)
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	subject := "req.opname"
+	_, err = conn.NatsConn().Subscribe(subject, func(msg *nats.Msg) {
+		_ = msg.Respond([]byte("pong"))
+	})
+	require.NoError(t, err)
+
+	_, err = conn.Request(subject, []byte("ping"), 2*time.Second)
+	require.NoError(t, err)
+
+	spans := sr.Ended()
+	wantName := "request " + subject
+	requestSpan := findSpanByNameAndKind(spans, wantName, oteltrace.SpanKindClient)
+	require.NotNil(t, requestSpan, "no client span named %q", wantName)
+	for _, s := range spans {
+		assert.NotEqual(t, subject+" request", s.Name(), "destination-first span name should not be emitted")
+	}
+}
+
+// TestReplyReceiveSpanBareNameAndDestinationMarkers pins design.md D2: the
+// reply-receive span carries no destination segment in its name and is the
+// only span carrying messaging.destination.temporary/anonymous — an ordinary
+// publish/process span carries neither.
+func TestReplyReceiveSpanBareNameAndDestinationMarkers(t *testing.T) {
+	url := startServer(t)
+	tp, sr := newTestProvider()
+	otel.SetTracerProvider(tp)
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	reqSubject := "req.markers"
+	_, err = conn.NatsConn().Subscribe(reqSubject, func(msg *nats.Msg) {
+		_ = msg.Respond([]byte("pong"))
+	})
+	require.NoError(t, err)
+
+	_, err = conn.Request(reqSubject, []byte("ping"), 2*time.Second)
+	require.NoError(t, err)
+
+	receiveSpan := waitSpanByNameAndKind(t, sr, "receive", oteltrace.SpanKindClient)
+	assertBoolAttr(t, receiveSpan.Attributes(), "messaging.destination.temporary", true)
+	assertBoolAttr(t, receiveSpan.Attributes(), "messaging.destination.anonymous", true)
+
+	ordinarySubject := "test.markers.ordinary"
+	done := make(chan struct{}, 1)
+	_, err = conn.Subscribe(ordinarySubject, func(m otelnats.Msg) {
+		done <- struct{}{}
+	})
+	require.NoError(t, err)
+	err = conn.Publish(context.Background(), ordinarySubject, []byte("ordinary"))
+	require.NoError(t, err)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout")
+	}
+
+	processSpan := waitSpanByNameAndKind(t, sr, "process "+ordinarySubject, oteltrace.SpanKindConsumer)
+	assertNoAttr(t, processSpan.Attributes(), "messaging.destination.temporary")
+	assertNoAttr(t, processSpan.Attributes(), "messaging.destination.anonymous")
+
+	producerSpan := findSpanByNameAndKind(sr.Ended(), "publish "+ordinarySubject, oteltrace.SpanKindProducer)
+	require.NotNil(t, producerSpan)
+	assertNoAttr(t, producerSpan.Attributes(), "messaging.destination.temporary")
+	assertNoAttr(t, producerSpan.Attributes(), "messaging.destination.anonymous")
+}
+
+// TestWildcardSubscribeProcessSpanUsesSubscriptionSubjectAsTemplate pins the
+// span-name destination resolution: a wildcard subscription's process span is
+// named after the subscription subject, not the concrete delivered subject,
+// and records both as messaging.destination.template / messaging.destination.name.
+func TestWildcardSubscribeProcessSpanUsesSubscriptionSubjectAsTemplate(t *testing.T) {
+	url := startServer(t)
+	tp, sr := newTestProvider()
+	otel.SetTracerProvider(tp)
+	conn, err := otelnats.Connect(url, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	wildcard := "orders.*"
+	concrete := "orders.1"
+	done := make(chan struct{}, 1)
+	_, err = conn.Subscribe(wildcard, func(m otelnats.Msg) {
+		done <- struct{}{}
+	})
+	require.NoError(t, err)
+
+	err = conn.Publish(context.Background(), concrete, []byte("order"))
+	require.NoError(t, err)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout")
+	}
+
+	processSpan := waitSpanByNameAndKind(t, sr, "process "+wildcard, oteltrace.SpanKindConsumer)
+	assertAttr(t, processSpan.Attributes(), "messaging.destination.template", wildcard)
+	assertAttr(t, processSpan.Attributes(), "messaging.destination.name", concrete)
+}
+
+// TestPublishToInboxOmitsDestinationFromSpanName pins the responder half of a
+// manual request/reply exchange: nc.Publish(msg.Reply, data) targets a
+// per-request inbox, so the span name drops the destination segment while the
+// inbox stays queryable on the attributes.
+func TestPublishToInboxOmitsDestinationFromSpanName(t *testing.T) {
+	url := startServer(t)
+	tp, sr := newTestProvider()
+	otel.SetTracerProvider(tp)
+	conn, err := otelnats.Connect(url)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	const inbox = "_INBOX.7Yh2kQ.3"
+	require.NoError(t, conn.Publish(context.Background(), inbox, []byte("reply")))
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	s := spans[0]
+	assert.Equal(t, "publish", s.Name())
+	assertAttr(t, s.Attributes(), "messaging.destination.name", inbox)
+	assertAttr(t, s.Attributes(), "messaging.message.conversation_id", inbox)
+	assertBoolAttr(t, s.Attributes(), "messaging.destination.temporary", true)
+	assertBoolAttr(t, s.Attributes(), "messaging.destination.anonymous", true)
+	assertNoAttr(t, s.Attributes(), "messaging.destination.template")
+}
+
+// TestSubscribeToInboxOmitsDestinationFromSpanName pins the other manual
+// request/reply half: a subscription on an inbox subject. The filter is the
+// inbox, so the destination resolution has nothing low-cardinality to name the
+// span after.
+func TestSubscribeToInboxOmitsDestinationFromSpanName(t *testing.T) {
+	url := startServer(t)
+	tp, sr := newTestProvider()
+	otel.SetTracerProvider(tp)
+	conn, err := otelnats.Connect(url)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	const inbox = "_INBOX.7Yh2kQ.3"
+	done := make(chan struct{}, 1)
+	_, err = conn.Subscribe(inbox, func(m otelnats.Msg) { done <- struct{}{} })
+	require.NoError(t, err)
+
+	require.NoError(t, conn.Publish(context.Background(), inbox, []byte("reply")))
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout")
+	}
+
+	s := waitSpanByNameAndKind(t, sr, "process", oteltrace.SpanKindConsumer)
+	assertAttr(t, s.Attributes(), "messaging.destination.name", inbox)
+	assertAttr(t, s.Attributes(), "messaging.message.conversation_id", inbox)
+	assertBoolAttr(t, s.Attributes(), "messaging.destination.temporary", true)
+	assertBoolAttr(t, s.Attributes(), "messaging.destination.anonymous", true)
+}
+
+// TestInboxDetectionUsesResolvedDestination pins why the inbox test runs on the
+// resolved destination rather than the concrete subject: a subscription to
+// "<inbox>.>" resolves to a FILTER that carries the request's nuid, so testing
+// the concrete subject alone would still leave an unbounded string in the name.
+func TestInboxDetectionUsesResolvedDestination(t *testing.T) {
+	url := startServer(t)
+	tp, sr := newTestProvider()
+	otel.SetTracerProvider(tp)
+	conn, err := otelnats.Connect(url)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	const filter = "_INBOX.7Yh2kQ.>"
+	const concrete = "_INBOX.7Yh2kQ.3"
+	done := make(chan struct{}, 1)
+	_, err = conn.Subscribe(filter, func(m otelnats.Msg) { done <- struct{}{} })
+	require.NoError(t, err)
+
+	require.NoError(t, conn.Publish(context.Background(), concrete, []byte("reply")))
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout")
+	}
+
+	s := waitSpanByNameAndKind(t, sr, "process", oteltrace.SpanKindConsumer)
+	assertAttr(t, s.Attributes(), "messaging.destination.name", concrete)
+	assertNoAttr(t, s.Attributes(), "messaging.destination.template")
+}
+
+// TestCustomInboxPrefixRecognisedAlongsideDefault pins both halves of the prefix
+// rule: a connection using nats.CustomInboxPrefix recognises its own inboxes AND
+// still recognises default-prefix peers, which is the common shape because the
+// requester is the side that customises (to keep "subscribe _INBOX.>" from
+// handing it every other client's replies) while responders need no inbox
+// permission at all.
+func TestCustomInboxPrefixRecognisedAlongsideDefault(t *testing.T) {
+	url := startServer(t)
+	tp, sr := newTestProvider()
+	otel.SetTracerProvider(tp)
+	conn, err := otelnats.Connect(url, nats.CustomInboxPrefix("SVCA"))
+	require.NoError(t, err)
+	defer conn.Close()
+
+	const ownInbox = "SVCA.7Yh2kQ.3"
+	const peerInbox = "_INBOX.9Zk4mP.1"
+	require.NoError(t, conn.Publish(context.Background(), ownInbox, []byte("x")))
+	require.NoError(t, conn.Publish(context.Background(), peerInbox, []byte("x")))
+
+	spans := sr.Ended()
+	require.Len(t, spans, 2)
+	for _, s := range spans {
+		assert.Equal(t, "publish", s.Name())
+		assertBoolAttr(t, s.Attributes(), "messaging.destination.anonymous", true)
+	}
+	assertAttr(t, spans[0].Attributes(), "messaging.destination.name", ownInbox)
+	assertAttr(t, spans[1].Attributes(), "messaging.destination.name", peerInbox)
+}
+
+// TestOrdinarySubjectUnaffectedByInboxDetection guards the false-positive edge:
+// a subject that merely shares a prefix boundary with "_INBOX." is named
+// normally and carries none of the inbox markers.
+func TestOrdinarySubjectUnaffectedByInboxDetection(t *testing.T) {
+	url := startServer(t)
+	tp, sr := newTestProvider()
+	otel.SetTracerProvider(tp)
+	conn, err := otelnats.Connect(url)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	const subject = "_INBOXES.orders"
+	require.NoError(t, conn.Publish(context.Background(), subject, []byte("x")))
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	s := spans[0]
+	assert.Equal(t, "publish "+subject, s.Name())
+	assertNoAttr(t, s.Attributes(), "messaging.destination.temporary")
+	assertNoAttr(t, s.Attributes(), "messaging.destination.anonymous")
+	assertNoAttr(t, s.Attributes(), "messaging.message.conversation_id")
 }

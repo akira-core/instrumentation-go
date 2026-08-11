@@ -186,7 +186,7 @@ func TestIntegration_SubscribeExtractsTraceContext(t *testing.T) {
 	}
 
 	consumer := waitSpanByNameAndKind(t, sr, "process "+subject, oteltrace.SpanKindConsumer)
-	producer := findSpanByNameAndKind(sr.Ended(), "send "+subject, oteltrace.SpanKindProducer)
+	producer := findSpanByNameAndKind(sr.Ended(), "publish "+subject, oteltrace.SpanKindProducer)
 	require.Len(t, consumer.Links(), 1, "consumer span should have exactly 1 link")
 	if producer != nil {
 		assert.Equal(t, producer.SpanContext().TraceID(), consumer.Links()[0].SpanContext.TraceID())
@@ -252,7 +252,7 @@ func TestIntegration_SubscribeConsumerSpanLinkedToProducer(t *testing.T) {
 		t.Fatal("timeout")
 	}
 
-	producer := waitSpanByNameAndKind(t, sr, "send "+subject, oteltrace.SpanKindProducer)
+	producer := waitSpanByNameAndKind(t, sr, "publish "+subject, oteltrace.SpanKindProducer)
 	consumer := waitSpanByNameAndKind(t, sr, "process "+subject, oteltrace.SpanKindConsumer)
 	require.Len(t, consumer.Links(), 1, "consumer span should have 1 link")
 	assert.Equal(t, producer.SpanContext().TraceID(), consumer.Links()[0].SpanContext.TraceID())
