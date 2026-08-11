@@ -10,7 +10,7 @@ process is running, and which cannot.
 
 Applies to `otel-flags` 0.2.0, `otel-mongo` 0.8.0, `otel-mongo/v2` 2.8.0, `otel-nats` 0.8.0 and
 `otel-gorilla-ws` 0.8.0 and later. Design record:
-`openspec/changes/openfeature-dynamic-flags/design.md`; the error-handling decisions behind
+`openspec/changes/archive/2026-08-08-openfeature-dynamic-flags/design.md`; the error-handling decisions behind
 `otel-flags` 0.2.0 are in [`otel-flags-error-handling-decisions.md`](otel-flags-error-handling-decisions.md),
 and the two review passes that shaped it in [`otel-flags-review-2026-08.md`](otel-flags-review-2026-08.md).
 
