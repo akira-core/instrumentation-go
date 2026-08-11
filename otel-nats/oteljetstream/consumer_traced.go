@@ -4,10 +4,8 @@ import (
 	"context"
 
 	"github.com/nats-io/nats.go/jetstream"
-	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/akira-core/instrumentation-go/otel-nats/internal/spanname"
 	"github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 )
 
@@ -65,11 +63,7 @@ func (c *tracedConsumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (
 		msgCtx = prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: h})
 	}
 	originSpanCtx := trace.SpanContextFromContext(msgCtx)
-	name, template, _ := spanname.Resolve("receive", msg.Subject(), c.destination, nil)
-	attrs := receiveMsgAttrs(baseAttrs, msg)
-	if template != "" {
-		attrs = append(attrs, semconv.MessagingDestinationTemplate(template))
-	}
+	name, attrs := resolveMsgSpan("receive", msg, c.destination, c.conn.InboxPrefixes(), baseAttrs)
 	startOpts := []trace.SpanStartOption{
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(attrs...),
@@ -179,11 +173,7 @@ func dynamicConsumeHandler(conn *otelnats.Conn, consumerName, destination string
 			msgCtx = prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: h})
 		}
 		originSpanCtx := trace.SpanContextFromContext(msgCtx)
-		name, template, _ := spanname.Resolve("process", msg.Subject(), destination, nil)
-		attrs := receiveMsgAttrs(baseAttrs, msg)
-		if template != "" {
-			attrs = append(attrs, semconv.MessagingDestinationTemplate(template))
-		}
+		name, attrs := resolveMsgSpan("process", msg, destination, conn.InboxPrefixes(), baseAttrs)
 		startOpts := []trace.SpanStartOption{
 			trace.WithSpanKind(trace.SpanKindConsumer),
 			trace.WithAttributes(attrs...),
@@ -227,11 +217,7 @@ func (m *tracedMessagesContext) Next(opts ...jetstream.NextOpt) (context.Context
 		msgCtx = prop.Extract(msgCtx, &otelnats.HeaderCarrier{H: h})
 	}
 	originSpanCtx := trace.SpanContextFromContext(msgCtx)
-	name, template, _ := spanname.Resolve("receive", msg.Subject(), m.destination, nil)
-	attrs := receiveMsgAttrs(baseAttrs, msg)
-	if template != "" {
-		attrs = append(attrs, semconv.MessagingDestinationTemplate(template))
-	}
+	name, attrs := resolveMsgSpan("receive", msg, m.destination, m.conn.InboxPrefixes(), baseAttrs)
 	startOpts := []trace.SpanStartOption{
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(attrs...),
